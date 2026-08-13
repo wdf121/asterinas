@@ -10,7 +10,7 @@ use core::{
 };
 
 use aster_block::{
-    BlockDevice,
+    BlockDevice, BlockDeviceLease,
     bio::{BioCompleteFn, BioSegment},
     id::BlockId,
 };
@@ -42,8 +42,8 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub(crate) struct ExfatFs {
-    block_device: Arc<dyn BlockDevice>,
+pub struct ExfatFs {
+    block_device: BlockDeviceLease,
     super_block: ExfatSuperBlock,
 
     bitmap: Arc<Mutex<ExfatBitmap>>,
@@ -72,12 +72,12 @@ const FAT_LRU_CACHE_SIZE: usize = 1024;
 pub(super) const EXFAT_ROOT_INO: Ino = 1;
 
 impl ExfatFs {
-    pub(crate) fn open(
-        block_device: Arc<dyn BlockDevice>,
+    pub fn open(
+        block_device: BlockDeviceLease,
         mount_option: ExfatMountOptions,
     ) -> Result<Arc<Self>> {
         // Load the super_block
-        let super_block = Self::read_super_block(block_device.as_ref())?;
+        let super_block = Self::read_super_block(block_device.device().as_ref())?;
         let fs_size = super_block.num_clusters as usize * super_block.cluster_size as usize;
         let exfat_fs = Arc::new_cyclic(|weak_self| ExfatFs {
             block_device,
@@ -309,11 +309,11 @@ impl ExfatFs {
     }
 
     pub(super) fn block_device(&self) -> &dyn BlockDevice {
-        self.block_device.as_ref()
+        self.block_device.device().as_ref()
     }
 
     pub(super) fn container_device_id(&self) -> DeviceId {
-        self.block_device.id()
+        self.block_device.device().id()
     }
 
     pub(super) fn super_block(&self) -> ExfatSuperBlock {
@@ -437,7 +437,7 @@ impl FileSystem for ExfatFs {
             BOOT_SIGNATURE as u64,
             self.sector_size(),
             MAX_NAME_LENGTH,
-            self.block_device.id(),
+            self.block_device.device().id(),
         )
     }
 
@@ -504,7 +504,7 @@ impl FsType for ExfatType {
         let key = fs_creation_ctx
             .resolve_block_device()
             .ok()
-            .map(|disk| disk.id())?;
+            .map(|disk| disk.device().id())?;
 
         Some((key, &self.cache))
     }

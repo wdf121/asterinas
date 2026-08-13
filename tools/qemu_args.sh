@@ -7,11 +7,10 @@
 #  - scheme: "normal", "test", "microvm" or "iommu";
 # Other arguments are configured via environmental variables:
 #  - OVMF: "on" or "off";
-#  - OVMF_DIR: directory containing OVMF.fd, OVMF_VARS.fd and microvm/MICROVM.fd;
-#  - BOOT_METHOD: "vmm-direct", "grub-rescue-iso" or "grub-qcow2";
-#  - BOOT_PROTOCOL: "multiboot", "multiboot2", "pvh", "linux-legacy32", "linux-efi-pe64" or "linux-efi-handover64";
-#  - NETDEV: "user", "tap" or "none" ("none" is not supported by microvm);
-#  - QEMU_DISPLAY: QEMU display backend, default is "vnc=0.0.0.0:$VNC_PORT", or "none" to disable it;
+#  - FORCE_OVMF: "on" to keep OVMF enabled regardless of boot method;
+#  - BOOT_METHOD: "qemu-direct", "grub-rescue-iso" or "grub-qcow2";
+#  - BOOT_PROTOCOL: "multiboot", "multiboot2", "linux-legacy32", "linux-efi-pe64" or "linux-efi-handover64";
+#  - NETDEV: "user" or "tap";
 #  - VHOST: "off" or "on";
 #  - VSOCK: "off" or "on";
 #  - VIRTIOFS: "off" or "on";
@@ -29,9 +28,7 @@
 #    xfstests images (xfstests_test.img and xfstests_scratch.img) to the VM.
 
 OVMF=${OVMF:-"on"}
-# Directory holding OVMF.fd, OVMF_VARS.fd and microvm/MICROVM.fd. Defaults to the
-# Docker image's path; the Nix dev shell exports this to the Nix store instead.
-OVMF_DIR=${OVMF_DIR:-/root/ovmf/release}
+FORCE_OVMF=${FORCE_OVMF:-"off"}
 VHOST=${VHOST:-"off"}
 VSOCK=${VSOCK:-"off"}
 VIRTIOFS=${VIRTIOFS:-"off"}
@@ -357,7 +354,9 @@ fi
 
 # When using direct ELF boot, OVMF depends on the boot protocol:
 # linux-efi-* protocols require OVMF; other protocols (e.g. multiboot) do not.
-if [ "$BOOT_METHOD" = "vmm-direct" ]; then
+if [ "$FORCE_OVMF" = "on" ]; then
+    OVMF="on"
+elif [ "$BOOT_METHOD" = "qemu-direct" ]; then
     if [ "$BOOT_PROTOCOL" = "linux-efi-pe64" ] || [ "$BOOT_PROTOCOL" = "linux-efi-handover64" ]; then
         OVMF="on"
     else

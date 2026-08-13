@@ -33,9 +33,14 @@
 
   # List packages installed in system profile.
   # You can use https://search.nixos.org/ to find more packages (and options).
+  # 安装第一版 Linear Device Mapper 验收所需的标准用户态工具。
   environment.systemPackages = with pkgs; [
+    aster-dm-disk-locator
+    e2fsprogs
     hello-asterinas
-    gitMinimal
+    lvm2
+    strace
+    util-linux
   ];
 
   system.nixos.distroName = "Asterinas NixOS";

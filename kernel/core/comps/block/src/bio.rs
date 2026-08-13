@@ -128,9 +128,10 @@ impl Bio {
         assert!(result.is_ok());
 
         let waiter_metadata = metadata.clone();
+        let current_sid_range = metadata.sid_range().clone();
         let submitted_bio = SubmittedBio {
             metadata,
-            sid_offset: 0,
+            current_sid_range,
             complete_fn,
             segments,
         };
@@ -200,7 +201,7 @@ impl From<BioEnqueueError> for Error {
 /// The request queue of a block device only accepts `SubmittedBio`s into the queue.
 pub struct SubmittedBio {
     metadata: Arc<BioMetadata>,
-    sid_offset: u64,
+    current_sid_range: Range<Sid>,
     complete_fn: Option<BioCompleteFn>,
     segments: Vec<BioSegment>,
 }
@@ -211,19 +212,37 @@ impl SubmittedBio {
         self.metadata.type_()
     }
 
-    /// Returns the range of target sectors on the device.
+    /// 返回当前块设备层看到的目标扇区范围。
     pub fn sid_range(&self) -> &Range<Sid> {
-        self.metadata.sid_range()
+        &self.current_sid_range
     }
 
-    /// Returns the offset of the first sector ID.
-    pub fn sid_offset(&self) -> u64 {
-        self.sid_offset
+    /// 保持 BIO 长度不变，将当前扇区范围重映射到新的起始扇区。
+    pub fn remap_sid_start(&mut self, new_start: Sid) -> Result<(), BioEnqueueError> {
+        let length = self
+            .current_sid_range
+            .end
+            .to_raw()
+            .checked_sub(self.current_sid_range.start.to_raw())
+            .ok_or(BioEnqueueError::Refused)?;
+        let new_end = new_start
+            .to_raw()
+            .checked_add(length)
+            .ok_or(BioEnqueueError::Refused)?;
+        self.current_sid_range = new_start..Sid::new(new_end);
+        Ok(())
     }
 
-    /// Sets the offset of the first sector ID.
-    pub fn set_sid_offset(&mut self, offset: u64) {
-        self.sid_offset = offset;
+    /// 在当前映射结果上增加扇区偏移。
+    pub fn add_sid_offset(&mut self, offset: u64) -> Result<(), BioEnqueueError> {
+        let new_start = self
+            .current_sid_range
+            .start
+            .to_raw()
+            .checked_add(offset)
+            .map(Sid::new)
+            .ok_or(BioEnqueueError::Refused)?;
+        self.remap_sid_start(new_start)
     }
 
     /// Returns the slice to the memory segments.
@@ -236,10 +255,25 @@ impl SubmittedBio {
         self.metadata.status()
     }
 
-    /// Completes the `Bio` by consuming `self`, releasing the segments, invoking
-    /// the callback function, and publishing the final status.
+    /// 在完成原回调后追加一个完成回调。
     ///
-    /// The final status becomes visible only after the callback returns.
+    /// 该方法用于 stacked block device 在 BIO 的真正下层完成时释放自身的
+    /// in-flight 引用，而不影响上层提交者原有的完成通知。
+    pub fn chain_complete_fn<F>(&mut self, complete_fn: F)
+    where
+        F: FnOnce(BioStatus) + Send + 'static,
+    {
+        let previous = self.complete_fn.take();
+        self.complete_fn = Some(Box::new(move |status| {
+            if let Some(previous) = previous {
+                previous(status);
+            }
+            complete_fn(status);
+        }));
+    }
+
+    /// Completes the `Bio` by consuming `self`, releasing the segments, and
+    /// invoking the callback function.
     ///
     /// When the driver finishes the request for this `Bio`, it will call this method.
     pub fn complete(self, status: BioStatus) {
@@ -254,10 +288,10 @@ impl SubmittedBio {
 
         drop(segments);
 
-        // Complete the `complete_fn` before publishing the status change,
-        // so that the effects of the callback function are visible to users.
         general_complete_fn(metadata.type_(), status, complete_fn);
 
+        // 回调和资源释放结束后再发布最终状态，保证同步等待者返回时
+        // 整个完成流程已经结束。
         let result = metadata.status.compare_exchange(
             BioStatus::Submit as u32,
             status as u32,
@@ -274,7 +308,7 @@ impl Debug for SubmittedBio {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         f.debug_struct("SubmittedBio")
             .field("metadata", &self.metadata)
-            .field("sid_offset", &self.sid_offset)
+            .field("current_sid_range", &self.current_sid_range)
             .field("segments", &self.segments)
             .finish()
     }
@@ -301,7 +335,7 @@ impl BioMetadata {
         &self.sid_range
     }
 
-    fn status(&self) -> BioStatus {
+    pub fn status(&self) -> BioStatus {
         BioStatus::try_from(self.status.load(Ordering::Acquire)).unwrap()
     }
 }
@@ -440,8 +474,13 @@ impl BioSegment {
     }
 
     /// Constructs a new `BioSegment` with a given `USegment` and the bio direction.
+    ///
+    /// # Panics
+    ///
+    /// If the segment length is not sector aligned, this method will panic.
     pub fn new_from_segment(segment: USegment, direction: BioDirection) -> Self {
         let len = segment.size();
+        assert!(is_sector_aligned(len));
         let dma_stream = DmaStream::map(segment, false).unwrap();
         Self {
             inner: Arc::new(BioSegmentInner {
@@ -583,4 +622,129 @@ fn target_pool(direction: BioDirection) -> Option<&'static Arc<BioSegmentPool>> 
 /// Checks if the given offset is aligned to sector.
 pub(crate) fn is_sector_aligned(offset: usize) -> bool {
     offset.is_multiple_of(SECTOR_SIZE)
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    fn submitted_bio(start: u64, end: u64) -> SubmittedBio {
+        let sid_range = Sid::new(start)..Sid::new(end);
+        SubmittedBio {
+            metadata: Arc::new(BioMetadata {
+                type_: BioType::Read,
+                sid_range: sid_range.clone(),
+                status: AtomicU32::new(BioStatus::Submit as u32),
+                wait_queue: WaitQueue::new(),
+            }),
+            current_sid_range: sid_range,
+            complete_fn: None,
+            segments: Vec::new(),
+        }
+    }
+
+    #[ktest]
+    fn remap_sid_start_preserves_length_and_original_range() {
+        let mut bio = submitted_bio(10, 18);
+
+        bio.remap_sid_start(Sid::new(100)).unwrap();
+
+        assert_eq!(bio.sid_range(), &(Sid::new(100)..Sid::new(108)));
+        assert_eq!(bio.metadata.sid_range(), &(Sid::new(10)..Sid::new(18)));
+    }
+
+    #[ktest]
+    fn add_sid_offset_composes_multiple_block_layers() {
+        let mut bio = submitted_bio(10, 18);
+
+        bio.add_sid_offset(100).unwrap();
+        bio.add_sid_offset(1_000).unwrap();
+
+        assert_eq!(bio.sid_range(), &(Sid::new(1_110)..Sid::new(1_118)));
+    }
+
+    #[ktest]
+    fn remap_sid_start_rejects_overflow_without_changing_range() {
+        let mut bio = submitted_bio(10, 18);
+        let original = bio.sid_range().clone();
+
+        assert_eq!(
+            bio.remap_sid_start(Sid::new(u64::MAX - 3)),
+            Err(BioEnqueueError::Refused)
+        );
+        assert_eq!(bio.sid_range(), &original);
+    }
+
+    #[ktest]
+    fn add_sid_offset_rejects_overflow_without_changing_range() {
+        let mut bio = submitted_bio(u64::MAX - 8, u64::MAX);
+        let original = bio.sid_range().clone();
+
+        assert_eq!(bio.add_sid_offset(9), Err(BioEnqueueError::Refused));
+        assert_eq!(bio.sid_range(), &original);
+    }
+}
+
+/// An aligned unsigned integer number.
+///
+/// An instance of `AlignedUsize<const N: u16>` is guaranteed to have a value that is a multiple
+/// of `N`, a predetermined const value. It is preferable to express an unsigned integer value
+/// in type `AlignedUsize<_>` instead of `usize` if the value must satisfy an alignment requirement.
+/// This helps readability and prevents bugs.
+///
+/// # Examples
+///
+/// ```rust
+/// const SECTOR_SIZE: u16 = 512;
+///
+/// let sector_num = 1234; // The 1234-th sector
+/// let sector_offset: AlignedUsize<SECTOR_SIZE> = {
+///     let sector_offset = sector_num * (SECTOR_SIZE as usize);
+///     AlignedUsize::<SECTOR_SIZE>::new(sector_offset).unwrap()
+/// };
+/// assert!(sector_offset.value().is_multiple_of(sector_offset.align()));
+/// ```
+///
+/// # Limitation
+///
+/// Currently, the alignment const value must be expressed in `u16`;
+/// it is not possible to use a larger or smaller type.
+/// This limitation is inherited from that of Rust's const generics:
+/// your code can be generic over the _value_ of a const, but not the _type_ of the const.
+/// We choose `u16` because it is reasonably large to represent any alignment value
+/// used in practice.
+#[derive(Clone, Debug)]
+pub struct AlignedUsize<const N: u16>(usize);
+
+impl<const N: u16> AlignedUsize<N> {
+    /// Constructs a new instance of aligned integer if the given value is aligned.
+    pub fn new(val: usize) -> Option<Self> {
+        if val.is_multiple_of(N as usize) {
+            Some(Self(val))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the value.
+    pub fn value(&self) -> usize {
+        self.0
+    }
+
+    /// Returns the corresponding ID.
+    ///
+    /// The so-called "ID" of an aligned integer is defined to be `self.value() / self.align()`.
+    /// This value is named ID because one common use case is using `Aligned` to express
+    /// the byte offset of a sector, block, or page. In this case, the `id` method returns
+    /// the ID of the corresponding sector, block, or page.
+    pub fn id(&self) -> usize {
+        self.value() / self.align()
+    }
+
+    /// Returns the alignment.
+    pub fn align(&self) -> usize {
+        N as usize
+    }
 }

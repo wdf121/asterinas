@@ -154,7 +154,7 @@ impl Path {
     }
 
     /// Gets the dentry of current `Path`.
-    pub(in crate::fs) fn dentry(&self) -> &Arc<Dentry> {
+    pub(crate) fn dentry(&self) -> &Arc<Dentry> {
         &self.dentry
     }
 
@@ -785,6 +785,26 @@ impl Path {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         self.check_dir_entry_mutation()?;
         dir_dentry.unlink(name)
+    }
+
+    /// 仅当名称仍指向预期路径的 inode 时删除目录项。
+    pub(crate) fn unlink_if_matches(&self, name: &str, expected: &Self) -> Result<()> {
+        if !Arc::ptr_eq(&self.mount, &expected.mount) {
+            return_errno_with_message!(Errno::EXDEV, "the operation cannot cross mounts");
+        }
+        let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
+        self.check_dir_entry_mutation()?;
+        dir_dentry.unlink_if_matches(name, expected.inode())
+    }
+
+    /// 仅当名称仍指向预期路径的 inode 时删除空目录。
+    pub(crate) fn rmdir_if_matches(&self, name: &str, expected: &Self) -> Result<()> {
+        if !Arc::ptr_eq(&self.mount, &expected.mount) {
+            return_errno_with_message!(Errno::EXDEV, "the operation cannot cross mounts");
+        }
+        let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
+        self.check_dir_entry_mutation()?;
+        dir_dentry.rmdir_if_matches(name, expected.inode())
     }
 
     /// Removes a directory by `rmdir()` the inner inode.

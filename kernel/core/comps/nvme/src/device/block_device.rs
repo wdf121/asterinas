@@ -66,7 +66,30 @@ pub struct NvmeBlockDevice {
     queue: BioRequestSingleQueue,
     name: String,
     id: DeviceId,
-    partition_manager: PartitionManager,
+}
+
+impl aster_block::BlockDevice for NvmeBlockDevice {
+    fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+        self.queue.enqueue(bio)
+    }
+
+    fn metadata(&self) -> BlockDeviceMeta {
+        const { assert!(LBA_SIZE == SECTOR_SIZE) };
+        let sectors = self.device.namespace.nsze;
+
+        BlockDeviceMeta {
+            max_nr_segments_per_bio: self.queue.max_nr_segments_per_bio(),
+            nr_sectors: sectors as usize,
+        }
+    }
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn id(&self) -> DeviceId {
+        self.id
+    }
 }
 
 static NR_NVME_DEVICE: AtomicU32 = AtomicU32::new(0);

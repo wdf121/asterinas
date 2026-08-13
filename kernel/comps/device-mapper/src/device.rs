@@ -1,0 +1,505 @@
+// SPDX-License-Identifier: MPL-2.0
+
+use alloc::{string::String, sync::Arc};
+use core::{
+    fmt::Debug,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+use aster_block::{
+    BlockDevice, BlockDeviceMeta,
+    bio::{BioEnqueueError, SubmittedBio},
+};
+use device_id::DeviceId;
+use ostd::sync::{Mutex, WaitQueue};
+
+use crate::{DmError, DmTable, manager::DmDeviceIdOwner};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DmDevicePhase {
+    Running,
+    Suspending,
+    Suspended,
+}
+
+struct DmIoState {
+    in_flight: AtomicUsize,
+    drained: WaitQueue,
+}
+
+impl DmIoState {
+    fn new() -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            drained: WaitQueue::new(),
+        }
+    }
+
+    fn finish(&self) {
+        let previous = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        if previous == 1 {
+            self.drained.wake_all();
+        }
+    }
+}
+
+struct DmDeviceState {
+    active: Option<Arc<DmTable>>,
+    inactive: Option<Arc<DmTable>>,
+    phase: DmDevicePhase,
+    event_nr: u32,
+}
+
+impl Default for DmDeviceState {
+    fn default() -> Self {
+        Self {
+            active: None,
+            inactive: None,
+            phase: DmDevicePhase::Suspended,
+            event_nr: 0,
+        }
+    }
+}
+
+/// 可供控制面查询的 Device Mapper 设备状态快照。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmDeviceStatus {
+    pub suspended: bool,
+    pub has_active_table: bool,
+    pub has_inactive_table: bool,
+    pub event_nr: u32,
+}
+
+/// 一个运行期 Device Mapper 块设备。
+pub struct DmDevice {
+    id_owner: DmDeviceIdOwner,
+    name: Mutex<String>,
+    uuid: Option<String>,
+    state: Mutex<DmDeviceState>,
+    io: Arc<DmIoState>,
+}
+
+impl DmDevice {
+    pub(crate) fn new(id_owner: DmDeviceIdOwner, name: String, uuid: Option<String>) -> Self {
+        Self {
+            id_owner,
+            name: Mutex::new(name),
+            uuid,
+            state: Mutex::new(DmDeviceState::default()),
+            io: Arc::new(DmIoState::new()),
+        }
+    }
+
+    /// 返回设备名称的克隆（rename 后读取此值可得到最新名称）。
+    pub fn name(&self) -> String {
+        self.name.lock().clone()
+    }
+
+    /// 重命名 DM 设备。
+    ///
+    /// 仅更新设备内部名称，不影响 I/O 状态。调用方（控制面）负责同步更新
+    /// manager 索引与块设备注册。
+    pub fn rename(&self, new_name: String) {
+        let mut name = self.name.lock();
+        *name = new_name;
+    }
+
+    /// 返回 Device Mapper UUID；创建时未指定则返回 `None`。
+    pub fn uuid(&self) -> Option<&str> {
+        self.uuid.as_deref()
+    }
+
+    /// 将完整验证的映射表安装为 inactive table。
+    pub fn load_table(&self, table: Arc<DmTable>) {
+        let mut state = self.state.lock();
+        state.inactive = Some(table);
+        state.event_nr = state.event_nr.wrapping_add(1);
+    }
+
+    /// 清除 inactive table。
+    ///
+    /// Linux DM 将清除不存在的 inactive table 视为成功，因此该操作在空表上
+    /// 幂等，不会改变 event number。
+    pub fn clear_inactive_table(&self) -> Result<(), DmError> {
+        let mut state = self.state.lock();
+        if state.inactive.take().is_some() {
+            state.event_nr = state.event_nr.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// 暂停新的 I/O，并等待已经提交到旧 table 的 I/O 完成。
+    pub fn suspend(&self) -> Result<(), DmError> {
+        {
+            let mut state = self.state.lock();
+            match state.phase {
+                DmDevicePhase::Suspended => return Ok(()),
+                DmDevicePhase::Suspending => return Err(DmError::InvalidState),
+                DmDevicePhase::Running => {
+                    state.phase = DmDevicePhase::Suspending;
+                    state.event_nr = state.event_nr.wrapping_add(1);
+                }
+            }
+        }
+
+        self.io
+            .drained
+            .wait_until(|| (self.io.in_flight.load(Ordering::Acquire) == 0).then_some(()));
+
+        let mut state = self.state.lock();
+        debug_assert_eq!(state.phase, DmDevicePhase::Suspending);
+        state.phase = DmDevicePhase::Suspended;
+        Ok(())
+    }
+
+    /// 激活 inactive table（若存在）并恢复 I/O。
+    ///
+    /// 对运行中的设备，带 inactive table 的 resume 会原子替换 active table；
+    /// 没有 inactive table 时保持幂等。Suspending 阶段必须先完成 drain，避免
+    /// resume 与 suspend 交错使新 I/O 穿过暂停屏障。
+    pub fn resume(&self) -> Result<(), DmError> {
+        let mut state = self.state.lock();
+        if state.phase == DmDevicePhase::Suspending {
+            return Err(DmError::InvalidState);
+        }
+        if state.active.is_none() && state.inactive.is_none() {
+            return Err(DmError::InvalidState);
+        }
+
+        let mut changed = false;
+        if let Some(table) = state.inactive.take() {
+            state.active = Some(table);
+            changed = true;
+        }
+        if state.phase == DmDevicePhase::Suspended {
+            state.phase = DmDevicePhase::Running;
+            changed = true;
+        }
+        if changed {
+            state.event_nr = state.event_nr.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// 返回 active table 的不可变快照。
+    pub fn active_table(&self) -> Option<Arc<DmTable>> {
+        self.state.lock().active.clone()
+    }
+
+    /// 返回 inactive table 的不可变快照。
+    pub fn inactive_table(&self) -> Option<Arc<DmTable>> {
+        self.state.lock().inactive.clone()
+    }
+
+    /// 返回当前状态快照。
+    pub fn status(&self) -> DmDeviceStatus {
+        let state = self.state.lock();
+        DmDeviceStatus {
+            suspended: state.phase != DmDevicePhase::Running,
+            has_active_table: state.active.is_some(),
+            has_inactive_table: state.inactive.is_some(),
+            event_nr: state.event_nr,
+        }
+    }
+}
+
+impl BlockDevice for DmDevice {
+    fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+        let table = {
+            let state = self.state.lock();
+            if state.phase != DmDevicePhase::Running {
+                return Err(BioEnqueueError::Refused);
+            }
+            let table = state.active.clone().ok_or(BioEnqueueError::Refused)?;
+            self.io.in_flight.fetch_add(1, Ordering::AcqRel);
+            table
+        };
+
+        let io = self.io.clone();
+        let table_for_completion = table.clone();
+        bio.chain_complete_fn(move |_status| {
+            // 此 Arc 同时确保被替换的 table 及其 backing lease 直到真正完成才释放。
+            let _table = table_for_completion;
+            io.finish();
+        });
+        if let Err(error) = table.enqueue(bio) {
+            self.io.finish();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn metadata(&self) -> BlockDeviceMeta {
+        self.active_table()
+            .map(|table| table.metadata())
+            .unwrap_or_default()
+    }
+
+    fn name(&self) -> String {
+        self.name.lock().clone()
+    }
+
+    fn id(&self) -> DeviceId {
+        self.id_owner.id()
+    }
+}
+
+impl Debug for DmDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DmDevice")
+            .field("id", &self.id())
+            .field("name", &self.name)
+            .field("uuid", &self.uuid)
+            .field("status", &self.status())
+            .finish()
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use alloc::{string::ToString, vec};
+
+    use aster_block::{
+        BlockDeviceLease,
+        bio::{Bio, BioStatus, BioType},
+        id::Sid,
+    };
+    use device_id::{MajorId, MinorId};
+    use ostd::{
+        prelude::ktest,
+        task::{Task, TaskOptions},
+    };
+
+    use super::*;
+    use crate::DmManager;
+
+    #[derive(Debug)]
+    struct TestBlockDevice;
+
+    #[derive(Debug)]
+    struct DeferredBlockDevice {
+        submitted: Mutex<Option<SubmittedBio>>,
+    }
+
+    impl DeferredBlockDevice {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                submitted: Mutex::new(None),
+            })
+        }
+
+        fn has_submitted_bio(&self) -> bool {
+            self.submitted.lock().is_some()
+        }
+
+        fn complete(&self) {
+            self.submitted
+                .lock()
+                .take()
+                .expect("deferred backing has no submitted BIO")
+                .complete(BioStatus::Complete);
+        }
+    }
+
+    impl BlockDevice for DeferredBlockDevice {
+        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            let mut submitted = self.submitted.lock();
+            if submitted.is_some() {
+                return Err(BioEnqueueError::IsFull);
+            }
+            *submitted = Some(bio);
+            Ok(())
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: 16,
+                nr_sectors: 1_024,
+            }
+        }
+
+        fn name(&self) -> String {
+            String::from("dm-deferred-backing-test")
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(1), MinorId::new(2))
+        }
+    }
+
+    impl BlockDevice for TestBlockDevice {
+        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            bio.complete(BioStatus::Complete);
+            Ok(())
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: 16,
+                nr_sectors: 1_024,
+            }
+        }
+
+        fn name(&self) -> String {
+            String::from("dm-backing-test")
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(1), MinorId::new(1))
+        }
+    }
+
+    fn create_device_and_table() -> (Arc<DmDevice>, Arc<DmTable>) {
+        let manager = DmManager::new().unwrap();
+        let device = manager.create("dm-test".to_string(), None, None).unwrap();
+        let backing = Arc::new(TestBlockDevice) as Arc<dyn BlockDevice>;
+        let table = Arc::new(
+            DmTable::new_linear(
+                Sid::new(0),
+                128,
+                Sid::new(16),
+                BlockDeviceLease::new_untracked(backing),
+            )
+            .unwrap(),
+        );
+        (device, table)
+    }
+
+    #[ktest]
+    fn enforces_suspend_load_resume_state_machine() {
+        let (device, table) = create_device_and_table();
+
+        assert_eq!(
+            device.status(),
+            DmDeviceStatus {
+                suspended: true,
+                has_active_table: false,
+                has_inactive_table: false,
+                event_nr: 0,
+            }
+        );
+        assert_eq!(device.resume(), Err(DmError::InvalidState));
+        device.suspend().unwrap();
+
+        device.load_table(table.clone());
+        assert_eq!(device.status().event_nr, 1);
+        assert!(device.inactive_table().is_some());
+        device.resume().unwrap();
+        assert_eq!(device.status().event_nr, 2);
+        assert!(!device.status().suspended);
+        assert!(device.active_table().is_some());
+        assert!(device.inactive_table().is_none());
+        assert_eq!(device.metadata().max_nr_segments_per_bio, 16);
+        assert_eq!(device.metadata().nr_sectors, 128);
+
+        device.resume().unwrap();
+        assert_eq!(device.status().event_nr, 2);
+
+        device.suspend().unwrap();
+        device.load_table(table);
+        device.clear_inactive_table().unwrap();
+        assert_eq!(device.status().event_nr, 5);
+        device.clear_inactive_table().unwrap();
+        assert_eq!(device.status().event_nr, 5);
+    }
+
+    #[ktest]
+    fn running_resume_replaces_active_table() {
+        let (device, first) = create_device_and_table();
+        let backing = Arc::new(TestBlockDevice) as Arc<dyn BlockDevice>;
+        let replacement = Arc::new(
+            DmTable::new_linear(
+                Sid::new(0),
+                64,
+                Sid::new(32),
+                BlockDeviceLease::new_untracked(backing),
+            )
+            .unwrap(),
+        );
+
+        device.load_table(first);
+        device.resume().unwrap();
+        device.load_table(replacement.clone());
+        device.resume().unwrap();
+
+        assert_eq!(
+            device.active_table().unwrap().length(),
+            replacement.length()
+        );
+        assert!(device.inactive_table().is_none());
+        assert_eq!(device.status().event_nr, 4);
+    }
+
+    #[ktest]
+    fn suspend_waits_for_submitted_io_and_blocks_new_io() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-deferred-test".to_string(), None, None)
+            .unwrap();
+        let backing = DeferredBlockDevice::new();
+        let table = Arc::new(
+            DmTable::new_linear(
+                Sid::new(0),
+                128,
+                Sid::new(16),
+                BlockDeviceLease::new_untracked(backing.clone()),
+            )
+            .unwrap(),
+        );
+        device.load_table(table);
+        device.resume().unwrap();
+
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(BioType::Flush, Sid::new(0), vec![], None)
+            .submit(device.as_ref(), &mut batch)
+            .unwrap();
+        assert!(backing.has_submitted_bio());
+
+        let suspend_finished = Arc::new(Mutex::new(false));
+        {
+            let device = device.clone();
+            let suspend_finished = suspend_finished.clone();
+            TaskOptions::new(move || {
+                device.suspend().unwrap();
+                *suspend_finished.lock() = true;
+            })
+            .spawn()
+            .unwrap();
+        }
+        while !device.status().suspended {
+            Task::yield_now();
+        }
+        assert!(!*suspend_finished.lock());
+        let mut refused_batch = io_util::batch::IoBatch::with_capacity(1);
+        assert_eq!(
+            Bio::new(BioType::Flush, Sid::new(0), vec![], None)
+                .submit(device.as_ref(), &mut refused_batch),
+            Err(BioEnqueueError::Refused)
+        );
+
+        backing.complete();
+        while !*suspend_finished.lock() {
+            Task::yield_now();
+        }
+        assert!(*suspend_finished.lock());
+    }
+
+    #[ktest]
+    fn refuses_io_until_resumed_and_forwards_flush_after_resume() {
+        let (device, table) = create_device_and_table();
+        let flush = || Bio::new(BioType::Flush, Sid::new(0), vec![], None);
+
+        assert_eq!(
+            flush().submit_and_wait(device.as_ref()),
+            Err(BioEnqueueError::Refused)
+        );
+
+        device.load_table(table);
+        device.resume().unwrap();
+        assert_eq!(
+            flush().submit_and_wait(device.as_ref()).unwrap(),
+            BioStatus::Complete
+        );
+    }
+}
