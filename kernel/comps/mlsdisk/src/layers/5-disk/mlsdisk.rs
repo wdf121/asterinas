@@ -159,7 +159,7 @@ impl<D: BlockSet + 'static> aster_block::BlockDevice for MlsDisk<D> {
         }
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> String {
         todo!()
     }
 

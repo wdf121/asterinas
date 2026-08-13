@@ -251,7 +251,7 @@ pub struct PartitionNode {
 
 impl BlockDevice for PartitionNode {
     fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
-        bio.set_sid_offset(self.info.start_sector());
+        bio.add_sid_offset(self.info.start_sector())?;
         self.device.enqueue(bio)
     }
 
@@ -261,8 +261,8 @@ impl BlockDevice for PartitionNode {
         metadata
     }
 
-    fn name(&self) -> &str {
-        &self.name
+    fn name(&self) -> String {
+        self.name.clone()
     }
 
     fn id(&self) -> DeviceId {

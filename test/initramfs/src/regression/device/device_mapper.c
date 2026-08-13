@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: MPL-2.0
+
+#define _GNU_SOURCE
+
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/dm-ioctl.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#include "../common/test.h"
+
+#define DM_CONTROL_PATH "/dev/mapper/control"
+#define DM_IOCTL_ENVELOPE_SIZE 312
+/* DM_EXISTS_FLAG is a kernel-private ABI status bit, absent from Linux UAPI. */
+#define DM_EXISTS_FLAG (1U << 2)
+
+static void init_ioctl(struct dm_ioctl *io)
+{
+	memset(io, 0, sizeof(*io));
+	io->version[0] = DM_VERSION_MAJOR;
+	io->version[1] = DM_VERSION_MINOR;
+	io->version[2] = DM_VERSION_PATCHLEVEL;
+	io->data_size = sizeof(*io);
+	io->data_start = sizeof(*io);
+}
+
+// Verifies the ABI envelope accepted by the control device and the LVM reload
+// suppression sequence: create a tableless device, inspect its active table,
+// then remove it. The table-status query must succeed with target_count == 0.
+FN_TEST(device_mapper_tableless_status_is_linux_compatible)
+{
+	struct dm_ioctl io;
+	char name[DM_NAME_LEN];
+	int fd;
+	uint64_t dev;
+
+	TEST_RES(sizeof(struct dm_ioctl), _ret == DM_IOCTL_ENVELOPE_SIZE);
+	fd = TEST_SUCC(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+
+	init_ioctl(&io);
+	TEST_SUCC(ioctl(fd, DM_VERSION, &io));
+	TEST_RES(io.version[0] == DM_VERSION_MAJOR, _ret == 1);
+	TEST_RES(io.version[1] == DM_VERSION_MINOR, _ret == 1);
+	TEST_RES(io.version[2] == DM_VERSION_PATCHLEVEL, _ret == 1);
+	TEST_RES(io.data_size == DM_IOCTL_ENVELOPE_SIZE, _ret == 1);
+	TEST_RES(io.data_start == DM_IOCTL_ENVELOPE_SIZE, _ret == 1);
+
+	snprintf(name, sizeof(name), "dm-abi-%ld", (long)getpid());
+	init_ioctl(&io);
+	strncpy(io.name, name, sizeof(io.name) - 1);
+	TEST_SUCC(ioctl(fd, DM_DEV_CREATE, &io));
+	TEST_RES(io.flags & DM_EXISTS_FLAG, _ret == 1);
+	dev = io.dev;
+
+	init_ioctl(&io);
+	io.dev = dev;
+	TEST_SUCC(ioctl(fd, DM_TABLE_STATUS, &io));
+	TEST_RES(io.flags & DM_EXISTS_FLAG, _ret == 1);
+	TEST_RES(io.target_count == 0, _ret == 1);
+
+	init_ioctl(&io);
+	io.dev = dev;
+	TEST_SUCC(ioctl(fd, DM_DEV_REMOVE, &io));
+	TEST_SUCC(close(fd));
+}
+END_TEST()

@@ -7,6 +7,7 @@
 #  - scheme: "normal", "test", "microvm" or "iommu";
 # Other arguments are configured via environmental variables:
 #  - OVMF: "on" or "off";
+#  - FORCE_OVMF: "on" to keep OVMF enabled regardless of boot method;
 #  - BOOT_METHOD: "qemu-direct", "grub-rescue-iso" or "grub-qcow2";
 #  - BOOT_PROTOCOL: "multiboot", "multiboot2", "linux-legacy32", "linux-efi-pe64" or "linux-efi-handover64";
 #  - NETDEV: "user" or "tap";
@@ -22,6 +23,7 @@
 #  - ATTACH_XFSTESTS_IMAGES: "true" or "false", whether to attach xfstests images (xfstests_test.img and xfstests_scratch.img) to the VM. Defaults to auto-detection from ENABLE_CONFORMANCE_TEST + CONFORMANCE_TEST_SUITE.
 
 OVMF=${OVMF:-"on"}
+FORCE_OVMF=${FORCE_OVMF:-"off"}
 VHOST=${VHOST:-"off"}
 VSOCK=${VSOCK:-"off"}
 VIRTIOFS=${VIRTIOFS:-"off"}
@@ -247,7 +249,9 @@ fi
 
 # When using qemu-direct boot, OVMF depends on the boot protocol:
 # linux-efi-* protocols require OVMF; other protocols (e.g. multiboot) do not.
-if [ "$BOOT_METHOD" = "qemu-direct" ]; then
+if [ "$FORCE_OVMF" = "on" ]; then
+    OVMF="on"
+elif [ "$BOOT_METHOD" = "qemu-direct" ]; then
     if [ "$BOOT_PROTOCOL" = "linux-efi-pe64" ] || [ "$BOOT_PROTOCOL" = "linux-efi-handover64" ]; then
         OVMF="on"
     else

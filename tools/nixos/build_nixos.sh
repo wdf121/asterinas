@@ -16,6 +16,11 @@ CONFIG_PATH=${DISTRO_DIR}/etc_nixos/${CONFIG_FILE_NAME}
 
 NIX_SYSTEM=$("${SCRIPT_DIR}/print_target_nix_system.sh" "${TARGET_ARCH}") || exit 1
 
+#echo "$NIX_SYSTEM"
+#echo "$CONFIG_PATH"
+#echo "$DISTRO_DIR"
+#exit 1
+
 pushd $DISTRO_DIR
 nix-build aster_nixos_installer/default.nix \
     --argstr target_platform "${NIX_SYSTEM}" \

@@ -128,6 +128,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-device-mapper"
+version = "0.1.0"
+dependencies = [
+ "aster-block",
+ "device-id",
+ "id-alloc",
+ "io-util",
+ "ostd",
+]
+
+[[package]]
 name = "aster-framebuffer"
 version = "0.1.0"
 dependencies = [
@@ -186,6 +197,7 @@ dependencies = [
  "aster-block",
  "aster-cmdline",
  "aster-console",
+ "aster-device-mapper",
  "aster-framebuffer",
  "aster-fuse",
  "aster-i8042",

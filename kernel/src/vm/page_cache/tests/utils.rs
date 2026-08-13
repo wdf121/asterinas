@@ -319,8 +319,8 @@ impl BlockDevice for MockPageCacheBackend {
         }
     }
 
-    fn name(&self) -> &str {
-        "mock-page-cache"
+    fn name(&self) -> String {
+        String::from("mock-page-cache")
     }
 
     fn id(&self) -> DeviceId {

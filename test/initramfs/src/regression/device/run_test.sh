@@ -15,6 +15,7 @@ set -e
 ./vt/vt_ioctl
 
 ./devtmpfs_mode
+./device_mapper
 ./evdev
 ./framebuffer
 ./full

@@ -21,6 +21,42 @@ MODE=$1
 TARGET_ARCH=${TARGET_ARCH:-x86_64}
 SCRIPT_DIR=$(dirname "$0")
 ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
+# 调用方可覆盖路径；默认测试盘与 NixOS 根盘并列但独立保存。
+DM_TEST_IMAGE=${DM_TEST_IMAGE:-"${ASTERINAS_DIR}/target/nixos/test.img"}
+
+append_dm_test_image() {
+    # 每次 NixOS 启动均附加独立的 Device Mapper 测试盘。已有镜像必须原样
+    # 复用，以便跨 QEMU 启动验证 LVM 元数据和文件数据的持久性。
+    if [ ! -e "${DM_TEST_IMAGE}" ]; then
+        echo "Creating Device Mapper test image at ${DM_TEST_IMAGE} (512 MiB)..."
+        mkdir -p "$(dirname "${DM_TEST_IMAGE}")"
+        fallocate -l 512M "${DM_TEST_IMAGE}"
+    fi
+
+    if [ ! -f "${DM_TEST_IMAGE}" ]; then
+        echo "Error: DM_TEST_IMAGE 不是普通文件: ${DM_TEST_IMAGE}" >&2
+        exit 1
+    fi
+
+    DM_TEST_IMAGE=$(realpath "${DM_TEST_IMAGE}")
+    case "${DM_TEST_IMAGE}" in
+        *[[:space:]]*)
+            echo "Error: DM_TEST_IMAGE 路径不能包含空白字符: ${DM_TEST_IMAGE}" >&2
+            exit 1
+            ;;
+    esac
+
+    if [ "${DM_TEST_IMAGE}" = "${ASTERINAS_DIR}/target/nixos/asterinas.img" ]; then
+        echo "Error: DM_TEST_IMAGE 不能指向 NixOS 根磁盘" >&2
+        exit 1
+    fi
+
+    # 这里只附加调用方预先创建的 raw 镜像；脚本绝不创建、截断或调整它。
+    QEMU_ARGS="${QEMU_ARGS} \
+        -drive if=none,format=raw,id=dmtest,file=${DM_TEST_IMAGE},cache=none \
+        -device virtio-blk-pci,bus=pcie.0,addr=0xc,drive=dmtest,serial=vdmtest,disable-legacy=on,disable-modern=off \
+    "
+}
 
 # tools/qemu_args.sh currently emits x86_64-specific arguments.
 # Reject other architectures to avoid invoking non-x86 QEMU with incompatible args.
@@ -33,7 +69,8 @@ fi
 cd "${ASTERINAS_DIR}"
 
 # Get base QEMU arguments from qemu_args.sh script
-QEMU_ARGS=$(${ASTERINAS_DIR}/tools/qemu_args.sh common 2>/dev/null)
+# NixOS 根镜像是带 ESP 的 UEFI 安装；不依赖调用方的通用启动方式选择。
+QEMU_ARGS=$(FORCE_OVMF=on ${ASTERINAS_DIR}/tools/qemu_args.sh common 2>/dev/null)
 
 # Add mode-specific disk and device arguments
 case "$MODE" in
@@ -41,7 +78,7 @@ case "$MODE" in
         NIXOS_DIR="${ASTERINAS_DIR}/target/nixos"
         QEMU_ARGS="${QEMU_ARGS} \
             -drive if=none,format=raw,id=u0,file=${NIXOS_DIR}/asterinas.img \
-            -device virtio-blk-pci,drive=u0,disable-legacy=on,disable-modern=off \
+            -device virtio-blk-pci,drive=u0,bootindex=1,disable-legacy=on,disable-modern=off \
         "
         ;;
     iso)
@@ -69,6 +106,8 @@ case "$MODE" in
         usage
         ;;
 esac
+
+append_dm_test_image
 
 if [ "${ENABLE_KVM}" = "1" ]; then
     QEMU_ARGS="${QEMU_ARGS} -accel kvm"

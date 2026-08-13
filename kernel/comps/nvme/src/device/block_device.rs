@@ -81,8 +81,8 @@ impl aster_block::BlockDevice for NvmeBlockDevice {
         }
     }
 
-    fn name(&self) -> &str {
-        &self.name
+    fn name(&self) -> String {
+        self.name.clone()
     }
 
     fn id(&self) -> DeviceId {

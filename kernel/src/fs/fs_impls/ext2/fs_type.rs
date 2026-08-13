@@ -48,7 +48,7 @@ impl FsType for Ext2Type {
         let key = fs_creation_ctx
             .resolve_block_device()
             .ok()
-            .map(|disk| disk.id())?;
+            .map(|disk| disk.device().id())?;
 
         Some((key, &self.cache))
     }

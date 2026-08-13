@@ -28,7 +28,7 @@ use alloc::{string::ToString, sync::Arc, vec};
 use core::ops::Range;
 
 use aster_block::{
-    BlockDevice, SECTOR_SIZE,
+    BlockDevice, BlockDeviceLease, SECTOR_SIZE,
     bio::{Bio, BioDirection, BioSegment, BioStatus, BioType},
     id::Sid,
 };
@@ -53,7 +53,7 @@ pub use self::{
 fn init() -> Result<(), ComponentInitError> {
     // FIXME: how to find a valid device used to format mlsdisk.
     let id = DeviceId::new(MajorId::new(255), MinorId::new(0));
-    let Some(device) = aster_block::lookup(id) else {
+    let Some(device) = aster_block::lookup_lease(id) else {
         return Err(ComponentInitError::Unknown);
     };
     let raw_disk = RawDisk::new(device);
@@ -66,12 +66,12 @@ fn init() -> Result<(), ComponentInitError> {
 
 #[derive(Clone, Debug)]
 struct RawDisk {
-    inner: Arc<dyn BlockDevice>,
+    inner: BlockDeviceLease,
     region: Range<BlockId>,
 }
 
 impl RawDisk {
-    fn new(host_disk: Arc<dyn BlockDevice>) -> Self {
+    fn new(host_disk: BlockDeviceLease) -> Self {
         let end = host_disk.metadata().nr_sectors * SECTOR_SIZE / BLOCK_SIZE;
         Self {
             inner: host_disk,
@@ -140,6 +140,8 @@ impl BlockSet for RawDisk {
 
 #[cfg(ktest)]
 mod test {
+    use alloc::string::String;
+
     use aster_block::{
         BlockDeviceMeta,
         bio::{BioEnqueueError, SubmittedBio},
@@ -202,7 +204,7 @@ mod test {
             }
         }
 
-        fn name(&self) -> &str {
+        fn name(&self) -> String {
             todo!()
         }
 
@@ -213,7 +215,7 @@ mod test {
 
     fn create_rawdisk(nblocks: usize) -> RawDisk {
         let memory_disk = MemoryDisk::new(nblocks);
-        RawDisk::new(Arc::new(memory_disk))
+        RawDisk::new(BlockDeviceLease::new_untracked(Arc::new(memory_disk)))
     }
 
     #[ktest]

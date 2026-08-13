@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use alloc::format;
+
 use aster_block::{BLOCK_SIZE, BlockDevice, SECTOR_SIZE};
 use aster_nvme::NvmeBlockDevice;
 use aster_virtio::device::block::device::BlockDevice as VirtIoBlockDevice;
@@ -7,8 +9,10 @@ use device_id::DeviceId;
 use ostd::mm::VmIo;
 
 use crate::{
-    context::current_userspace,
-    device::{Device, DeviceType, DevtmpfsInodeMeta, add_node},
+    device::{
+        Device, DeviceType, DevtmpfsInodeMeta, add_node, add_runtime_node,
+        remove_owned_runtime_node,
+    },
     events::IoEvents,
     fs::{
         file::{PerOpenFileOps, SettableStatusFlags, StatusFlags},
@@ -58,10 +62,16 @@ pub(super) fn init_in_first_kthread() {
 
 pub(super) fn init_in_first_process(path_resolver: &PathResolver) -> Result<()> {
     for device in aster_block::collect_all() {
-        let device = Arc::new(BlockFile::new(device));
-        if let Some(devtmpfs_meta) = device.devtmpfs_meta() {
-            let dev_id = device.id().as_encoded_u64();
-            add_node(DeviceType::Block, dev_id, &devtmpfs_meta, path_resolver)?;
+        let block_file = register_wrapper(device)?;
+        if let Some(devtmpfs_meta) = block_file.devtmpfs_meta() {
+            let dev_id = block_file.id().as_encoded_u64();
+            match add_node(DeviceType::Block, dev_id, &devtmpfs_meta, path_resolver) {
+                Ok(node) => block_file.set_node(node),
+                Err(error) => {
+                    remove_wrapper_if_matches(&block_file);
+                    return Err(error);
+                }
+            }
         }
     }
 
@@ -69,12 +79,22 @@ pub(super) fn init_in_first_process(path_resolver: &PathResolver) -> Result<()> 
 }
 
 mod ioctl_defs {
-    use crate::util::ioctl::{NoData, OutData, ioc};
+    use aster_virtio::device::block::VIRTIO_BLOCK_ID_BYTES;
+
+    use crate::util::ioctl::{OutData, ioc};
 
     // Reference: <https://elixir.bootlin.com/linux/v6.18/source/include/uapi/linux/fs.h>
 
-    /// Returns the device size in bytes.
+    /// Returns the device size in bytes (modern 64-bit interface).
     pub(super) type BlkGetSize64 = ioc!(BLKGETSIZE64, 0x12, 114, OutData<u64>);
+
+    /// Returns the device size in 512-byte sectors (legacy interface).
+    /// Linux: _IO(0x12, 96).
+    pub(super) type BlkGetSize = ioc!(BLKGETSIZE, 0x1260, OutData<u64>);
+
+    /// Returns the readahead value in sectors.
+    /// Linux: _IO(0x12, 99).
+    pub(super) type BlkRaGet = ioc!(BLKRAGET, 0x1263, OutData<u64>);
 
     /// Returns the logical sector size of the block device.
     ///
@@ -89,7 +109,13 @@ mod ioctl_defs {
     /// is larger than the hardware sector, such as `ext2`'s 4 KiB block, this
     /// ioctl must return that larger value. Otherwise user programs will align
     /// correctly for the device but still hit `EINVAL` at the filesystem.
-    pub(super) type BlkGetSectorSize = ioc!(BLKSSZGET, 0x12, 104, NoData);
+    pub(super) type BlkGetSectorSize = ioc!(BLKSSZGET, 0x12, 104, OutData<i32>);
+
+    /// 返回 VirtIO Host 提供的原始 20 字节设备标识符。
+    ///
+    /// 这是 Asterinas 内部测试使用的窄接口，不属于 Linux block ioctl ABI。
+    pub(super) type AsterVirtioBlkGetId =
+        ioc!(ASTER_VIRTIO_BLK_GET_ID, b'A', 0x01, OutData<[u8; VIRTIO_BLOCK_ID_BYTES]>);
 }
 
 /// Represents a block device inode in the filesystem.
@@ -98,11 +124,101 @@ mod ioctl_defs {
 // trait. It leads to redundant vtable dispatch, reference counting, and heap allocation. We should
 // devise a better strategy to eliminate the unnecessary intermediate `Arc`.
 #[derive(Debug)]
-struct BlockFile(Arc<dyn BlockDevice>);
+struct BlockFile {
+    id: DeviceId,
+    path: String,
+    state: Arc<Mutex<BlockFileState>>,
+    lifecycle: Mutex<()>,
+    node: Mutex<Option<Path>>,
+    mapper_alias: Mutex<Option<(String, Path)>>,
+}
+
+#[derive(Debug)]
+struct BlockFileState {
+    device: Arc<dyn BlockDevice>,
+    accepting_opens: bool,
+    open_count: usize,
+}
 
 impl BlockFile {
-    fn new(device: Arc<dyn BlockDevice>) -> Self {
-        Self(device)
+    fn new(device: Arc<dyn BlockDevice>, path: String) -> Self {
+        Self::new_with_open_state(device, path, true)
+    }
+
+    fn new_pending(device: Arc<dyn BlockDevice>, path: String) -> Self {
+        Self::new_with_open_state(device, path, false)
+    }
+
+    fn new_with_open_state(
+        device: Arc<dyn BlockDevice>,
+        path: String,
+        accepting_opens: bool,
+    ) -> Self {
+        Self {
+            id: device.id(),
+            path,
+            state: Arc::new(Mutex::new(BlockFileState {
+                device,
+                accepting_opens,
+                open_count: 0,
+            })),
+            lifecycle: Mutex::new(()),
+            node: Mutex::new(None),
+            mapper_alias: Mutex::new(None),
+        }
+    }
+
+    fn set_node(&self, node: Path) {
+        let mut owned_node = self.node.lock();
+        assert!(owned_node.is_none());
+        *owned_node = Some(node);
+    }
+
+    fn node(&self) -> Option<Path> {
+        self.node.lock().clone()
+    }
+
+    fn set_mapper_alias(&self, path: String, alias: Path) {
+        let mut owned_alias = self.mapper_alias.lock();
+        assert!(owned_alias.is_none());
+        *owned_alias = Some((path, alias));
+    }
+
+    fn mapper_alias(&self) -> Option<(String, Path)> {
+        self.mapper_alias.lock().clone()
+    }
+
+    fn replace_mapper_alias(&self, path: String, alias: Path) {
+        *self.mapper_alias.lock() = Some((path, alias));
+    }
+
+    fn clear_mapper_alias(&self) {
+        *self.mapper_alias.lock() = None;
+    }
+
+    fn try_start_accepting_opens(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.accepting_opens || state.open_count != 0 {
+            return false;
+        }
+        state.accepting_opens = true;
+        true
+    }
+
+    fn start_accepting_opens(&self) {
+        assert!(self.try_start_accepting_opens());
+    }
+
+    fn stop_accepting_opens(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        if !state.accepting_opens {
+            return_errno_with_message!(Errno::EBUSY, "the block device lifecycle is changing");
+        }
+        if state.open_count != 0 {
+            return_errno_with_message!(Errno::EBUSY, "the block device is still open");
+        }
+        state.accepting_opens = false;
+        Ok(())
     }
 }
 
@@ -112,15 +228,26 @@ impl Device for BlockFile {
     }
 
     fn id(&self) -> DeviceId {
-        self.0.id()
+        self.id
     }
 
     fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
-        Some(DevtmpfsInodeMeta::new(self.0.name()))
+        Some(DevtmpfsInodeMeta::new(self.path.as_str()))
     }
 
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
-        Ok(Box::new(OpenBlockFile(self.0.clone())))
+        let mut state = self.state.lock();
+        if !state.accepting_opens {
+            return_errno_with_message!(Errno::ENODEV, "the block device is being removed");
+        }
+        state.open_count += 1;
+        let device = state.device.clone();
+        drop(state);
+
+        Ok(Box::new(OpenBlockFile {
+            device,
+            state: self.state.clone(),
+        }))
     }
 }
 
@@ -129,7 +256,18 @@ impl Device for BlockFile {
 // TODO: This type wraps an `Arc<dyn BlockDevice>` in another `Box` just to implement the
 // `PerOpenFileOps` trait. It leads to redundant vtable dispatch and heap allocation. We should
 // devise a better strategy to eliminate the unnecessary intermediate `Box`.
-struct OpenBlockFile(Arc<dyn BlockDevice>);
+struct OpenBlockFile {
+    device: Arc<dyn BlockDevice>,
+    state: Arc<Mutex<BlockFileState>>,
+}
+
+impl Drop for OpenBlockFile {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        debug_assert!(state.open_count > 0);
+        state.open_count -= 1;
+    }
+}
 
 impl FileOps for OpenBlockFile {
     fn read_at(
@@ -143,7 +281,7 @@ impl FileOps for OpenBlockFile {
             return Ok(0);
         }
 
-        let device_size = self.0.metadata().nr_sectors * SECTOR_SIZE;
+        let device_size = self.device.metadata().nr_sectors * SECTOR_SIZE;
         if offset >= device_size {
             return Ok(0);
         }
@@ -154,7 +292,7 @@ impl FileOps for OpenBlockFile {
             // so the writer must be precisely limited here.
             let mut limited_writer = writer.clone_exclusive();
             limited_writer.limit(read_len);
-            self.0.read(offset, &mut limited_writer)?;
+            self.device.read(offset, &mut limited_writer)?;
         }
         writer.skip(read_len);
         Ok(read_len)
@@ -171,7 +309,7 @@ impl FileOps for OpenBlockFile {
             return Ok(0);
         }
 
-        let device_size = self.0.metadata().nr_sectors * SECTOR_SIZE;
+        let device_size = self.device.metadata().nr_sectors * SECTOR_SIZE;
         if offset >= device_size {
             return_errno_with_message!(
                 Errno::ENOSPC,
@@ -185,7 +323,7 @@ impl FileOps for OpenBlockFile {
             // so the reader must be precisely limited here.
             let mut limited_reader = reader.clone();
             limited_reader.limit(write_len);
-            self.0.write(offset, &mut limited_reader)?;
+            self.device.write(offset, &mut limited_reader)?;
         }
         reader.skip(write_len);
         Ok(write_len)
@@ -209,25 +347,51 @@ impl PerOpenFileOps for OpenBlockFile {
     }
 
     fn seek_end(&self) -> Result<Option<usize>> {
-        Ok(Some(self.0.metadata().nr_sectors * SECTOR_SIZE))
+        Ok(Some(self.device.metadata().nr_sectors * SECTOR_SIZE))
     }
 
     fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
         use ioctl_defs::*;
 
         dispatch_ioctl!(match raw_ioctl {
-            _cmd @ BlkGetSectorSize => {
+            cmd @ BlkGetSectorSize => {
                 // TODO: Query the per-device logical block size once block device metadata
                 // exposes it. For now, report the effective minimum I/O granularity enforced
                 // by Asterinas filesystems so userspace can use `BLKSSZGET` for `O_DIRECT`
                 // alignment.
                 let sector_size = SECTOR_SIZE.max(BLOCK_SIZE) as i32;
-                current_userspace!().write_val(raw_ioctl.arg(), &sector_size)?;
+                cmd.write(&sector_size)?;
                 Ok(0)
             }
             cmd @ BlkGetSize64 => {
-                let size = (self.0.metadata().nr_sectors * SECTOR_SIZE) as u64;
+                let size = (self.device.metadata().nr_sectors * SECTOR_SIZE) as u64;
                 cmd.write(&size)?;
+                Ok(0)
+            }
+            cmd @ BlkGetSize => {
+                let sectors = self.device.metadata().nr_sectors as u64;
+                cmd.write(&sectors)?;
+                Ok(0)
+            }
+            cmd @ BlkRaGet => {
+                let readahead = 0_u64;
+                cmd.write(&readahead)?;
+                Ok(0)
+            }
+            cmd @ AsterVirtioBlkGetId => {
+                let virtio_device =
+                    self.device
+                        .downcast_ref::<VirtIoBlockDevice>()
+                        .ok_or_else(|| {
+                            Error::with_message(
+                                Errno::ENOTTY,
+                                "the block device does not expose a VirtIO host ID",
+                            )
+                        })?;
+                let host_id = virtio_device.host_id().ok_or_else(|| {
+                    Error::with_message(Errno::ENODATA, "the VirtIO block device has no host ID")
+                })?;
+                cmd.write(host_id.as_bytes())?;
                 Ok(0)
             }
             _ => return_errno_with_message!(
@@ -243,16 +407,374 @@ impl PerOpenFileOps for OpenBlockFile {
 }
 
 pub(super) fn lookup(id: DeviceId) -> Option<Arc<dyn Device>> {
-    let block_device = aster_block::lookup(id)?;
-
-    let mut registry = DEVICE_REGISTRY.lock();
-    let block_device_file = registry
-        .entry(id.to_raw())
-        .or_insert_with(move || Arc::new(BlockFile::new(block_device)))
-        .clone();
-    Some(block_device_file)
+    let block_file = DEVICE_REGISTRY.lock().get(&id.to_raw()).cloned()?;
+    Some(block_file)
 }
 
-// TODO: Merge the two mapping tables, one is here and the other is in the block component.
-// Maintaining two mapping tables is undesirable due to duplication and (potential) inconsistency.
-static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<dyn Device>>> = Mutex::new(BTreeMap::new());
+pub(crate) fn register_mapper(device: Arc<dyn BlockDevice>, mapper_name: &str) -> Result<()> {
+    validate_mapper_name(mapper_name)?;
+    let primary_path = format!("dm-{}", device.id().minor().get());
+    let alias_path = format!("mapper/{mapper_name}");
+    let alias_target = format!("../{primary_path}");
+    register_runtime_with_alias(device, primary_path, Some((alias_path, alias_target)))
+}
+
+pub(crate) fn rename_mapper(id: DeviceId, old_name: &str, new_name: &str) -> Result<()> {
+    validate_mapper_name(old_name)?;
+    validate_mapper_name(new_name)?;
+    if old_name == new_name {
+        return Ok(());
+    }
+
+    let block_file = lookup_runtime_block_file(id)?;
+    let _lifecycle = block_file.lifecycle.lock();
+    let old_path = format!("mapper/{old_name}");
+    let new_path = format!("mapper/{new_name}");
+    let (alias_path, alias) = block_file.mapper_alias().ok_or_else(|| {
+        Error::with_message(Errno::ESTALE, "the mapper alias registration is missing")
+    })?;
+    if alias_path != old_path {
+        return_errno_with_message!(Errno::ENODEV, "the mapper name does not match the device");
+    }
+
+    let source = crate::device::runtime_node(&old_path)?;
+    if source != alias {
+        return_errno_with_message!(Errno::ESTALE, "the mapper alias is no longer owned");
+    }
+    crate::device::rename_runtime_node(&old_path, &alias, &new_path)?;
+    block_file.replace_mapper_alias(new_path, source);
+    Ok(())
+}
+
+pub(crate) fn unregister_mapper(id: DeviceId, mapper_name: &str) -> Result<Arc<dyn BlockDevice>> {
+    validate_mapper_name(mapper_name)?;
+    let block_file = lookup_runtime_block_file(id)?;
+    let _lifecycle = block_file.lifecycle.lock();
+    let expected_alias_path = format!("mapper/{mapper_name}");
+    let (alias_path, alias) = block_file.mapper_alias().ok_or_else(|| {
+        Error::with_message(Errno::ESTALE, "the mapper alias registration is missing")
+    })?;
+    if alias_path != expected_alias_path {
+        return_errno_with_message!(Errno::ENODEV, "the mapper name does not match the device");
+    }
+
+    let unregistration = begin_runtime_unregistration(&block_file)?;
+    if let Err(error) = remove_owned_node_or_accept_stale(&alias_path, &alias) {
+        abort_runtime_unregistration(unregistration, &block_file);
+        return Err(error);
+    }
+    block_file.clear_mapper_alias();
+
+    if let Some(node) = block_file.node()
+        && let Err(error) = remove_owned_node_or_accept_stale(block_file.path.as_str(), &node)
+    {
+        restore_mapper_alias(&block_file, alias_path);
+        abort_runtime_unregistration(unregistration, &block_file);
+        return Err(error);
+    }
+
+    match aster_block::commit_unregister(unregistration) {
+        Ok(device) => {
+            remove_wrapper_if_matches(&block_file);
+            Ok(device)
+        }
+        Err(error) => {
+            restore_runtime_node(&block_file);
+            restore_mapper_alias(&block_file, alias_path);
+            let _ = block_file.try_start_accepting_opens();
+            Err(map_block_registry_error(error))
+        }
+    }
+}
+
+fn register_runtime_with_alias(
+    device: Arc<dyn BlockDevice>,
+    path: String,
+    alias: Option<(String, String)>,
+) -> Result<()> {
+    let registration =
+        aster_block::register_pending(device.clone()).map_err(map_block_registry_error)?;
+
+    let block_file = match register_pending_wrapper(device, path.clone()) {
+        Ok(block_file) => block_file,
+        Err(error) => {
+            let _ = aster_block::abort_registration(registration);
+            return Err(error);
+        }
+    };
+    let meta = DevtmpfsInodeMeta::new(path.as_str());
+    let node = match add_runtime_node(DeviceType::Block, block_file.id().as_encoded_u64(), &meta) {
+        Ok(node) => node,
+        Err(error) => {
+            remove_wrapper_if_matches(&block_file);
+            let _ = aster_block::abort_registration(registration);
+            return Err(error);
+        }
+    };
+    block_file.set_node(node);
+
+    if let Some((alias_path, alias_target)) = alias {
+        let alias_node = match crate::device::add_runtime_symlink(&alias_path, &alias_target) {
+            Ok(alias_node) => alias_node,
+            Err(error) => {
+                if let Some(node) = block_file.node() {
+                    let _ = remove_owned_runtime_node(block_file.path.as_str(), &node);
+                }
+                remove_wrapper_if_matches(&block_file);
+                let _ = aster_block::abort_registration(registration);
+                return Err(error);
+            }
+        };
+        block_file.set_mapper_alias(alias_path, alias_node);
+    }
+
+    if let Err(error) = aster_block::commit_registration(&registration) {
+        if let Some((alias_path, alias_node)) = block_file.mapper_alias() {
+            let _ = remove_owned_runtime_node(&alias_path, &alias_node);
+            block_file.clear_mapper_alias();
+        }
+        if let Some(node) = block_file.node() {
+            let _ = remove_owned_runtime_node(block_file.path.as_str(), &node);
+        }
+        remove_wrapper_if_matches(&block_file);
+        let _ = aster_block::abort_registration(registration);
+        return Err(map_block_registry_error(error));
+    }
+    block_file.start_accepting_opens();
+
+    Ok(())
+}
+
+/// 删除仍属于本次注册的节点；节点已消失或已被替换也视为清理完成。
+fn remove_owned_node_or_accept_stale(path: &str, expected: &Path) -> Result<()> {
+    match remove_owned_runtime_node(path, expected) {
+        Ok(()) => Ok(()),
+        Err(error) if matches!(error.error(), Errno::ENOENT | Errno::ESTALE) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn lookup_runtime_block_file(id: DeviceId) -> Result<Arc<BlockFile>> {
+    DEVICE_REGISTRY
+        .lock()
+        .get(&id.to_raw())
+        .cloned()
+        .ok_or_else(|| Error::with_message(Errno::ENOENT, "the block device does not exist"))
+}
+
+fn begin_runtime_unregistration(
+    block_file: &Arc<BlockFile>,
+) -> Result<aster_block::PendingBlockDeviceUnregistration> {
+    block_file.stop_accepting_opens()?;
+    match aster_block::begin_unregister(block_file.id()) {
+        Ok(unregistration) => Ok(unregistration),
+        Err(error) => {
+            let _ = block_file.try_start_accepting_opens();
+            Err(map_block_registry_error(error))
+        }
+    }
+}
+
+fn abort_runtime_unregistration(
+    unregistration: aster_block::PendingBlockDeviceUnregistration,
+    block_file: &BlockFile,
+) {
+    let _ = aster_block::abort_unregister(unregistration);
+    let _ = block_file.try_start_accepting_opens();
+}
+
+fn restore_runtime_node(block_file: &BlockFile) {
+    let meta = DevtmpfsInodeMeta::new(block_file.path.as_str());
+    match add_runtime_node(DeviceType::Block, block_file.id().as_encoded_u64(), &meta) {
+        Ok(restored) => *block_file.node.lock() = Some(restored),
+        Err(error) => warn!(
+            "failed to restore runtime block node {}: {:?}",
+            block_file.path, error
+        ),
+    }
+}
+
+fn restore_mapper_alias(block_file: &BlockFile, alias_path: String) {
+    let alias_target = format!("../{}", block_file.path);
+    match crate::device::add_runtime_symlink(&alias_path, &alias_target) {
+        Ok(restored) => block_file.set_mapper_alias(alias_path, restored),
+        Err(error) => warn!("failed to restore mapper alias {}: {:?}", alias_path, error),
+    }
+}
+
+fn validate_mapper_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > crate::fs::utils::NAME_MAX
+        || name.as_bytes().contains(&0)
+        || name.contains('/')
+        || name == "."
+        || name == ".."
+    {
+        return_errno_with_message!(Errno::EINVAL, "the mapper name is invalid");
+    }
+    Ok(())
+}
+
+fn remove_wrapper_if_matches(block_file: &Arc<BlockFile>) {
+    let mut registry = DEVICE_REGISTRY.lock();
+    if registry
+        .get(&block_file.id().to_raw())
+        .is_some_and(|current| Arc::ptr_eq(current, block_file))
+    {
+        registry.remove(&block_file.id().to_raw());
+    }
+}
+
+fn register_wrapper(device: Arc<dyn BlockDevice>) -> Result<Arc<BlockFile>> {
+    let path = device.name().to_string();
+    register_wrapper_with_path(device, path)
+}
+
+fn register_pending_wrapper(device: Arc<dyn BlockDevice>, path: String) -> Result<Arc<BlockFile>> {
+    let id = device.id().to_raw();
+    let block_file = Arc::new(BlockFile::new_pending(device, path));
+    let mut registry = DEVICE_REGISTRY.lock();
+    if registry.contains_key(&id) {
+        return_errno_with_message!(Errno::EEXIST, "the block device wrapper already exists");
+    }
+    registry.insert(id, block_file.clone());
+    Ok(block_file)
+}
+
+fn register_wrapper_with_path(
+    device: Arc<dyn BlockDevice>,
+    path: String,
+) -> Result<Arc<BlockFile>> {
+    let id = device.id().to_raw();
+    let block_file = Arc::new(BlockFile::new(device, path));
+    let mut registry = DEVICE_REGISTRY.lock();
+    if registry.contains_key(&id) {
+        return_errno_with_message!(Errno::EEXIST, "the block device wrapper already exists");
+    }
+    registry.insert(id, block_file.clone());
+    Ok(block_file)
+}
+
+fn map_block_registry_error(error: aster_block::Error) -> Error {
+    match error {
+        aster_block::Error::Registered | aster_block::Error::IdAcquired => {
+            Error::with_message(Errno::EEXIST, "the block device already exists")
+        }
+        aster_block::Error::NotFound => {
+            Error::with_message(Errno::ENOENT, "the block device does not exist")
+        }
+        aster_block::Error::InvalidArgs => {
+            Error::with_message(Errno::EINVAL, "the block device arguments are invalid")
+        }
+        aster_block::Error::IdExhausted => {
+            Error::with_message(Errno::ENOSPC, "no block device ID is available")
+        }
+        aster_block::Error::Busy => {
+            Error::with_message(Errno::EBUSY, "the block device is still in use")
+        }
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use aster_block::{
+        BlockDeviceMeta,
+        bio::{BioEnqueueError, SubmittedBio},
+    };
+    use device_id::{MajorId, MinorId};
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestBlockDevice {
+        id: DeviceId,
+    }
+
+    impl TestBlockDevice {
+        fn new(minor: u32) -> Arc<Self> {
+            Arc::new(Self {
+                id: DeviceId::new(MajorId::new(511), MinorId::new(minor)),
+            })
+        }
+    }
+
+    impl BlockDevice for TestBlockDevice {
+        fn enqueue(&self, _bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            unreachable!()
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta::default()
+        }
+
+        fn name(&self) -> String {
+            String::from("runtime-block-test")
+        }
+
+        fn id(&self) -> DeviceId {
+            self.id
+        }
+    }
+
+    #[ktest]
+    fn blocks_new_opens_while_removing_and_tracks_open_handles() {
+        let block_file = Arc::new(BlockFile::new(
+            TestBlockDevice::new(1),
+            "runtime-block-test".to_string(),
+        ));
+        let opened = block_file.open().unwrap();
+
+        assert_eq!(
+            block_file.stop_accepting_opens().unwrap_err().error(),
+            Errno::EBUSY
+        );
+        drop(opened);
+        block_file.stop_accepting_opens().unwrap();
+        let error = match block_file.open() {
+            Ok(_) => panic!("open unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.error(), Errno::ENODEV);
+    }
+
+    #[ktest]
+    fn pending_wrapper_rejects_opens_until_registration_commits() {
+        let block_file = Arc::new(BlockFile::new_pending(
+            TestBlockDevice::new(2),
+            "runtime-block-pending".to_string(),
+        ));
+
+        let error = match block_file.open() {
+            Ok(_) => panic!("open unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.error(), Errno::ENODEV);
+        block_file.start_accepting_opens();
+        assert!(block_file.open().is_ok());
+    }
+
+    #[ktest]
+    fn validates_mapper_names() {
+        assert!(validate_mapper_name("test-volume").is_ok());
+        assert!(validate_mapper_name("vg-lv").is_ok());
+        for name in ["", ".", "..", "vg/lv", "bad\0name"] {
+            assert_eq!(
+                validate_mapper_name(name).unwrap_err().error(),
+                Errno::EINVAL
+            );
+        }
+        let overlong = "x".repeat(crate::fs::utils::NAME_MAX + 1);
+        assert_eq!(
+            validate_mapper_name(&overlong).unwrap_err().error(),
+            Errno::EINVAL
+        );
+    }
+}
+
+pub(crate) fn open_count(id: DeviceId) -> Option<usize> {
+    let block_file = DEVICE_REGISTRY.lock().get(&id.to_raw()).cloned()?;
+    Some(block_file.state.lock().open_count)
+}
+
+static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<BlockFile>>> = Mutex::new(BTreeMap::new());

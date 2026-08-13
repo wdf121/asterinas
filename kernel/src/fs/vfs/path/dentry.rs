@@ -130,7 +130,7 @@ use crate::{
 /// and pairs a `Dentry` with the `Mount` it was reached through,
 /// since mounts let a single `Dentry`
 /// appear at several locations in the namespace.
-pub(in crate::fs) struct Dentry {
+pub(crate) struct Dentry {
     inode: Arc<dyn Inode>,
     type_: InodeType,
     name_and_parent: NameAndParent,
@@ -674,6 +674,80 @@ impl DirDentry<'_> {
             // Ideally, we would use `fs_event_publisher()` here to avoid creating a
             // `FsEventPublisher` instance on a dying inode. However, it isn't possible because we
             // need to disable new subscribers.
+            let publisher = child_inode.fs_event_publisher_or_init();
+            let removed_nr_subscribers = publisher.disable_new_and_remove_subscribers();
+            child_inode
+                .fs()
+                .fs_event_subscriber_stats()
+                .remove_subscribers(removed_nr_subscribers);
+        }
+        Ok(())
+    }
+
+    /// 仅当当前目录项仍指向预期 inode 时删除它。
+    pub(super) fn unlink_if_matches(
+        &self,
+        name: &str,
+        expected_inode: &Arc<dyn Inode>,
+    ) -> Result<()> {
+        if is_dot_or_dotdot(name) {
+            return_errno_with_message!(Errno::EISDIR, "unlink on . or ..");
+        }
+
+        let dir_inode = self.inode();
+        let child_inode = self.remove_child(name, |dir_inode, name| {
+            let current_inode = dir_inode.lookup(name)?;
+            if !Arc::ptr_eq(&current_inode, expected_inode) {
+                return_errno_with_message!(Errno::ESTALE, "the directory entry was replaced");
+            }
+            dir_inode.unlink(name)
+        })?;
+
+        let nlinks = child_inode.metadata()?.nr_hard_links;
+        fs::vfs::notify::on_link_count(&child_inode);
+        if nlinks == 0 {
+            fs::vfs::notify::on_inode_removed(&child_inode);
+        }
+        fs::vfs::notify::on_delete(dir_inode, &child_inode, || name.to_string());
+        if nlinks == 0 {
+            let publisher = child_inode.fs_event_publisher_or_init();
+            let removed_nr_subscribers = publisher.disable_new_and_remove_subscribers();
+            child_inode
+                .fs()
+                .fs_event_subscriber_stats()
+                .remove_subscribers(removed_nr_subscribers);
+        }
+        Ok(())
+    }
+
+    /// 仅当当前目录项仍指向预期 inode 时删除空目录。
+    pub(super) fn rmdir_if_matches(
+        &self,
+        name: &str,
+        expected_inode: &Arc<dyn Inode>,
+    ) -> Result<()> {
+        if is_dot(name) {
+            return_errno_with_message!(Errno::EINVAL, "rmdir on .");
+        }
+        if is_dotdot(name) {
+            return_errno_with_message!(Errno::ENOTEMPTY, "rmdir on ..");
+        }
+
+        let dir_inode = self.inode();
+        let child_inode = self.remove_child(name, |dir_inode, name| {
+            let current_inode = dir_inode.lookup(name)?;
+            if !Arc::ptr_eq(&current_inode, expected_inode) {
+                return_errno_with_message!(Errno::ESTALE, "the directory entry was replaced");
+            }
+            dir_inode.rmdir(name)
+        })?;
+
+        let nlinks = child_inode.metadata()?.nr_hard_links;
+        if nlinks == 0 {
+            fs::vfs::notify::on_inode_removed(&child_inode);
+        }
+        fs::vfs::notify::on_delete(dir_inode, &child_inode, || name.to_string());
+        if nlinks == 0 {
             let publisher = child_inode.fs_event_publisher_or_init();
             let removed_nr_subscribers = publisher.disable_new_and_remove_subscribers();
             child_inode
