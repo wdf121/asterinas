@@ -355,7 +355,7 @@ mod tests {
         let device = manager.create("dm-test".to_string(), None, None).unwrap();
         let backing = Arc::new(TestBlockDevice) as Arc<dyn BlockDevice>;
         let table = Arc::new(
-            DmTable::new_linear(
+            DmTable::new_single_linear(
                 Sid::new(0),
                 128,
                 Sid::new(16),
@@ -409,7 +409,7 @@ mod tests {
         let (device, first) = create_device_and_table();
         let backing = Arc::new(TestBlockDevice) as Arc<dyn BlockDevice>;
         let replacement = Arc::new(
-            DmTable::new_linear(
+            DmTable::new_single_linear(
                 Sid::new(0),
                 64,
                 Sid::new(32),
@@ -439,7 +439,7 @@ mod tests {
             .unwrap();
         let backing = DeferredBlockDevice::new();
         let table = Arc::new(
-            DmTable::new_linear(
+            DmTable::new_single_linear(
                 Sid::new(0),
                 128,
                 Sid::new(16),

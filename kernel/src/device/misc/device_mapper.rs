@@ -9,7 +9,9 @@
 use alloc::{format, vec};
 
 use aster_block::{BlockDevice, id::Sid, lookup_lease};
-use aster_device_mapper::{DmDevice, DmError, DmManager, DmTable, TableError};
+use aster_device_mapper::{
+    DmDevice, DmError, DmManager, DmTable, TableError, target::linear::LinearTarget,
+};
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::mm::VmIo;
 use spin::Once;
@@ -362,7 +364,9 @@ fn remove_all(buffer: &mut [u8]) -> Result<()> {
 fn device_status(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
     let flags = read_u32(buffer, OFF_FLAGS)?;
-    let target_count = u32::from(selected_table(&device, flags).is_some());
+    let target_count = selected_table(&device, flags)
+        .map(|table| table.linears().len())
+        .unwrap_or(0);
     fill_device_header(buffer, &device)?;
     write_u32(buffer, OFF_TARGET_COUNT, target_count)
 }
@@ -416,54 +420,59 @@ fn table_load_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
         return_errno_with_message!(Errno::EINVAL, "映射表至少需要一个 target");
     }
 
-    if target_count != 1 {
-        return Err(map_table_error(TableError::UnsupportedTargetCount));
-    }
+    let mut cursor = data_start(buffer)?;
+    let mut targets = Vec::new();
+    for index in 0..target_count {
+        let spec_end = cursor
+            .checked_add(DM_TARGET_SPEC_SIZE)
+            .ok_or_else(invalid_buffer)?;
+        require_range(buffer, cursor, DM_TARGET_SPEC_SIZE)?;
 
-    let data_start = data_start(buffer)?;
-    let spec_end = data_start
-        .checked_add(DM_TARGET_SPEC_SIZE)
-        .ok_or_else(invalid_buffer)?;
-    require_range(buffer, data_start, DM_TARGET_SPEC_SIZE)?;
-
-    let logical_start = read_u64(buffer, data_start)?;
-    let length = read_u64(buffer, data_start + 8)?;
-    let next = read_u32(buffer, data_start + 20)? as usize;
-    let next_spec = validate_target_spec_next(data_start, next, buffer.len())?;
-    let target_type =
-        required_c_string(buffer, data_start + 24, DM_TARGET_TYPE_LEN, "target 类型")?;
-    if target_type != "linear" {
-        return_errno_with_message!(Errno::EINVAL, "第一版仅支持 linear target");
-    }
-    let params = c_string_until(buffer, spec_end, next_spec, "linear 参数")?;
-    let (backing_id, backing_start) = parse_linear_params(&params)?;
-    ostd::info!(
-        "[dm] table_load: name={}, backing={}:{}, start_sector={}, logical_start={}, length={}",
-        device.name(),
-        backing_id.major().get(),
-        backing_id.minor().get(),
-        backing_start,
-        logical_start,
-        length
-    );
-    let backing = lookup_lease(backing_id).ok_or_else(|| {
-        ostd::warn!(
-            "[dm] lookup_lease failed for {}:{}, registered devices: {:?}",
+        let logical_start = read_u64(buffer, cursor)?;
+        let length = read_u64(buffer, cursor + 8)?;
+        let next = read_u32(buffer, cursor + 20)? as usize;
+        if index + 1 < target_count && next == 0 {
+            return_errno_with_message!(Errno::EINVAL, "非最后一个 target 的 next 不能为 0");
+        }
+        let next_spec = validate_target_spec_next(cursor, next, buffer.len())?;
+        let target_type =
+            required_c_string(buffer, cursor + 24, DM_TARGET_TYPE_LEN, "target 类型")?;
+        if target_type != "linear" {
+            return_errno_with_message!(Errno::EINVAL, "当前仅支持 linear target");
+        }
+        let params = c_string_until(buffer, spec_end, next_spec, "linear 参数")?;
+        let (backing_id, backing_start) = parse_linear_params(&params)?;
+        ostd::info!(
+            "[dm] table_load: name={}, backing={}:{}, start_sector={}, logical_start={}, length={}",
+            device.name(),
             backing_id.major().get(),
             backing_id.minor().get(),
-            aster_block::list()
+            backing_start,
+            logical_start,
+            length
         );
-        Error::with_message(Errno::ENODEV, "linear backing 设备不存在或正在移除")
-    })?;
-    let table = Arc::new(
-        DmTable::new_linear(
-            Sid::new(logical_start),
-            length,
-            Sid::new(backing_start),
-            backing,
-        )
-        .map_err(map_table_error)?,
-    );
+        let backing = lookup_lease(backing_id).ok_or_else(|| {
+            ostd::warn!(
+                "[dm] lookup_lease failed for {}:{}, registered devices: {:?}",
+                backing_id.major().get(),
+                backing_id.minor().get(),
+                aster_block::list()
+            );
+            Error::with_message(Errno::ENODEV, "linear backing 设备不存在或正在移除")
+        })?;
+        targets.push(
+            LinearTarget::new(
+                Sid::new(logical_start),
+                length,
+                Sid::new(backing_start),
+                backing,
+            )
+            .map_err(map_table_error)?,
+        );
+        cursor = next_spec;
+    }
+
+    let table = Arc::new(DmTable::new_linear(targets).map_err(map_table_error)?);
     device.load_table(table);
     ostd::info!("[dm] table_load: table loaded for {}", device.name());
     fill_device_header(buffer, &device)
@@ -497,14 +506,23 @@ fn table_deps_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     fill_device_header(buffer, device)?;
 
     let start = data_start(buffer)?;
-    if available_from(buffer, start) < 16 {
+    let backing_ids = table.map(|table| table.backing_ids()).unwrap_or_default();
+    let deps_len = 8usize
+        .checked_add(
+            backing_ids
+                .len()
+                .checked_mul(8)
+                .ok_or_else(invalid_buffer)?,
+        )
+        .ok_or_else(invalid_buffer)?;
+    if available_from(buffer, start) < deps_len {
         set_buffer_full(buffer)?;
         return Ok(());
     }
-    write_u32(buffer, start, u32::from(table.is_some()))?;
+    write_u32(buffer, start, backing_ids.len() as u32)?;
     write_u32(buffer, start + 4, 0)?;
-    if let Some(table) = table {
-        write_u64(buffer, start + 8, table.backing_id().as_encoded_u64())?;
+    for (index, id) in backing_ids.into_iter().enumerate() {
+        write_u64(buffer, start + 8 + index * 8, id.as_encoded_u64())?;
     }
     Ok(())
 }
@@ -522,33 +540,36 @@ fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let Some(table) = table else {
         return Ok(());
     };
-    write_u32(buffer, OFF_TARGET_COUNT, 1)?;
+    write_u32(buffer, OFF_TARGET_COUNT, table.linears().len() as u32)?;
 
-    let params = if flags & DM_STATUS_TABLE_FLAG != 0 {
-        let backing = table.backing_id();
-        format!(
-            "{}:{} {}",
-            backing.major().get(),
-            backing.minor().get(),
-            table.linear().backing_start().to_raw()
-        )
-    } else {
-        String::new()
-    };
     let start = data_start(buffer)?;
-    let record_len = table_status_record_len(params.len())?;
-    if available_from(buffer, start) < record_len {
-        set_buffer_full(buffer)?;
-        return Ok(());
+    let mut cursor = start;
+    for target in table.linears() {
+        let params = if flags & DM_STATUS_TABLE_FLAG != 0 {
+            let backing = target.backing_id();
+            format!(
+                "{}:{} {}",
+                backing.major().get(),
+                backing.minor().get(),
+                target.backing_start().to_raw()
+            )
+        } else {
+            String::new()
+        };
+        let record_len = table_status_record_len(params.len())?;
+        if available_from(buffer, cursor) < record_len {
+            set_buffer_full(buffer)?;
+            return Ok(());
+        }
+        write_u64(buffer, cursor, target.logical_range().start.to_raw())?;
+        write_u64(buffer, cursor + 8, target.length())?;
+        write_u32(buffer, cursor + 16, 0)?;
+        write_u32(buffer, cursor + 20, cursor + record_len - start)?;
+        write_c_string_fixed(buffer, cursor + 24, DM_TARGET_TYPE_LEN, "linear")?;
+        write_c_string(buffer, cursor + DM_TARGET_SPEC_SIZE, &params)?;
+        cursor += record_len;
     }
-    write_u64(buffer, start, 0)?;
-    write_u64(buffer, start + 8, table.length())?;
-    write_u32(buffer, start + 16, 0)?;
-    // DM_TABLE_STATUS 的 next 是从第一条 spec 起算的下一记录偏移；Linux
-    // 对最后一条记录也写入对齐后的记录末尾，而不是写 0。
-    write_u32(buffer, start + 20, record_len)?;
-    write_c_string_fixed(buffer, start + 24, DM_TARGET_TYPE_LEN, "linear")?;
-    write_c_string(buffer, start + DM_TARGET_SPEC_SIZE, &params)
+    Ok(())
 }
 
 fn target_version_record_len(target: &TargetVersion) -> Result<usize> {
@@ -929,7 +950,7 @@ fn map_table_error(error: TableError) -> Error {
             Error::with_message(Errno::EINVAL, "linear 映射超过 backing 设备容量")
         }
         TableError::UnsupportedBackingDevice => {
-            Error::with_message(Errno::EINVAL, "第一版不支持 DM-on-DM backing")
+            Error::with_message(Errno::EINVAL, "当前不支持 DM-on-DM backing")
         }
         _ => Error::with_message(Errno::EINVAL, "Device Mapper 映射表无效"),
     }

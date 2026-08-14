@@ -2,10 +2,11 @@
 
 #[cfg(ktest)]
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use aster_block::{
     BlockDeviceLease,
-    bio::{BioEnqueueError, BioType, SubmittedBio},
+    bio::{Bio, BioEnqueueError, BioStatus, BioType, SubmittedBio},
     id::Sid,
 };
 use device_id::DeviceId;
@@ -15,62 +16,89 @@ use crate::{TableError, target::linear::LinearTarget};
 /// 一份通过完整验证且安装后不可变的 Device Mapper 映射表。
 #[derive(Debug)]
 pub struct DmTable {
-    linear: LinearTarget,
+    linears: Vec<LinearTarget>,
+    length: u64,
 }
 
 impl DmTable {
-    /// 创建第一版支持的单段 linear 映射表。
-    pub fn new_linear(
+    /// 创建由一段或多段 linear target 组成的映射表。
+    pub fn new_linear(targets: Vec<LinearTarget>) -> Result<Self, TableError> {
+        if targets.is_empty() {
+            return Err(TableError::UnsupportedTargetCount);
+        }
+
+        let mut expected_start = 0_u64;
+        for target in &targets {
+            if target.logical_range().start.to_raw() != expected_start {
+                return Err(TableError::UnsupportedLogicalStart);
+            }
+            if target.backing().downcast_ref::<crate::DmDevice>().is_some() {
+                return Err(TableError::UnsupportedBackingDevice);
+            }
+            expected_start = target.logical_range().end.to_raw();
+        }
+
+        Ok(Self {
+            linears: targets,
+            length: expected_start,
+        })
+    }
+
+    /// 创建单段 linear 映射表。
+    pub fn new_single_linear(
         logical_start: Sid,
         length: u64,
         backing_start: Sid,
         backing: BlockDeviceLease,
     ) -> Result<Self, TableError> {
-        if logical_start.to_raw() != 0 {
-            return Err(TableError::UnsupportedLogicalStart);
-        }
-        if backing
-            .device()
-            .as_ref()
-            .downcast_ref::<crate::DmDevice>()
-            .is_some()
-        {
-            return Err(TableError::UnsupportedBackingDevice);
-        }
-
-        Ok(Self {
-            linear: LinearTarget::new(logical_start, length, backing_start, backing)?,
-        })
+        Self::new_linear(alloc::vec![LinearTarget::new(
+            logical_start,
+            length,
+            backing_start,
+            backing,
+        )?])
     }
 
     /// 返回映射设备容量，单位为 512 字节扇区。
     pub fn length(&self) -> u64 {
-        self.linear.length()
+        self.length
     }
 
     /// 返回映射设备的块层能力。
     pub fn metadata(&self) -> aster_block::BlockDeviceMeta {
-        let backing = self.linear.backing().metadata();
+        let max_nr_segments_per_bio = self
+            .linears
+            .iter()
+            .map(|target| target.backing().metadata().max_nr_segments_per_bio)
+            .min()
+            .unwrap_or(0);
         aster_block::BlockDeviceMeta {
-            max_nr_segments_per_bio: backing.max_nr_segments_per_bio,
+            max_nr_segments_per_bio,
             nr_sectors: usize::try_from(self.length()).unwrap_or(usize::MAX),
         }
     }
 
-    /// 返回唯一底层块设备的 ID。
-    pub fn backing_id(&self) -> DeviceId {
-        self.linear.backing_id()
+    /// 返回所有 linear target。
+    pub fn linears(&self) -> &[LinearTarget] {
+        &self.linears
     }
 
-    /// 返回唯一的 linear target。
-    pub fn linear(&self) -> &LinearTarget {
-        &self.linear
+    /// 返回底层块设备 ID 列表，按首次出现顺序去重。
+    pub fn backing_ids(&self) -> Vec<DeviceId> {
+        let mut ids = Vec::new();
+        for target in &self.linears {
+            let id = target.backing_id();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
     }
 
     /// 重映射并转发一个 BIO。
     pub fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
         if bio.type_() == BioType::Flush {
-            return self.linear.backing().enqueue(bio);
+            return self.enqueue_flush(bio);
         }
 
         let range = bio.sid_range();
@@ -84,18 +112,49 @@ impl DmTable {
             .to_raw()
             .checked_add(length)
             .ok_or(BioEnqueueError::Refused)?;
-        if range.start < self.linear.logical_range().start
-            || logical_end > self.linear.logical_range().end.to_raw()
-        {
-            return Err(BioEnqueueError::Refused);
-        }
 
-        let backing_start = self
-            .linear
+        let target = self
+            .linears
+            .iter()
+            .find(|target| {
+                range.start >= target.logical_range().start
+                    && logical_end <= target.logical_range().end.to_raw()
+            })
+            .ok_or(BioEnqueueError::Refused)?;
+
+        let backing_start = target
             .map_sector(range.start)
             .ok_or(BioEnqueueError::Refused)?;
         bio.remap_sid_start(backing_start)?;
-        self.linear.backing().enqueue(bio)
+        target.backing().enqueue(bio)
+    }
+
+    fn enqueue_flush(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+        let mut flushed = Vec::new();
+        for target in &self.linears {
+            let backing_id = target.backing_id();
+            if flushed.contains(&backing_id) {
+                continue;
+            }
+            flushed.push(backing_id);
+
+            match Bio::new(BioType::Flush, Sid::new(0), Vec::new(), None)
+                .submit_and_wait(target.backing())
+            {
+                Ok(BioStatus::Complete) => {}
+                Ok(status) => {
+                    bio.complete(status);
+                    return Ok(());
+                }
+                Err(_) => {
+                    bio.complete(BioStatus::IoError);
+                    return Ok(());
+                }
+            }
+        }
+
+        bio.complete(BioStatus::Complete);
+        Ok(())
     }
 }
 
@@ -114,19 +173,26 @@ mod tests {
 
     #[derive(Debug)]
     struct RecordingBlockDevice {
+        id: DeviceId,
         last_range: Mutex<Option<core::ops::Range<Sid>>>,
+        flush_count: Mutex<usize>,
     }
 
     impl RecordingBlockDevice {
-        fn new() -> Arc<Self> {
+        fn new(minor: u32) -> Arc<Self> {
             Arc::new(Self {
+                id: DeviceId::new(MajorId::new(1), MinorId::new(minor)),
                 last_range: Mutex::new(None),
+                flush_count: Mutex::new(0),
             })
         }
     }
 
     impl BlockDevice for RecordingBlockDevice {
         fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            if bio.type_() == BioType::Flush {
+                *self.flush_count.lock() += 1;
+            }
             *self.last_range.lock() = Some(bio.sid_range().clone());
             bio.complete(BioStatus::Complete);
             Ok(())
@@ -144,15 +210,15 @@ mod tests {
         }
 
         fn id(&self) -> DeviceId {
-            DeviceId::new(MajorId::new(1), MinorId::new(1))
+            self.id
         }
     }
 
     #[ktest]
     fn remaps_bio_start_to_backing_device() {
-        let backing = RecordingBlockDevice::new();
+        let backing = RecordingBlockDevice::new(1);
         let table = Arc::new(
-            DmTable::new_linear(
+            DmTable::new_single_linear(
                 Sid::new(0),
                 128,
                 Sid::new(100),
@@ -173,16 +239,103 @@ mod tests {
     }
 
     #[ktest]
-    fn refuses_nonzero_logical_start() {
-        let backing = RecordingBlockDevice::new() as Arc<dyn BlockDevice>;
+    fn supports_multiple_contiguous_linear_targets() {
+        let first = RecordingBlockDevice::new(1);
+        let second = RecordingBlockDevice::new(2);
+        let table = DmTable::new_linear(vec![
+            LinearTarget::new(
+                Sid::new(0),
+                128,
+                Sid::new(100),
+                BlockDeviceLease::new_untracked(first.clone() as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+            LinearTarget::new(
+                Sid::new(128),
+                64,
+                Sid::new(200),
+                BlockDeviceLease::new_untracked(second.clone() as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(table.length(), 192);
+        assert_eq!(table.backing_ids(), vec![first.id(), second.id()]);
+    }
+
+    #[ktest]
+    fn flushes_each_backing_device_once() {
+        let first = RecordingBlockDevice::new(1);
+        let second = RecordingBlockDevice::new(2);
+        let table = Arc::new(
+            DmTable::new_linear(vec![
+                LinearTarget::new(
+                    Sid::new(0),
+                    128,
+                    Sid::new(100),
+                    BlockDeviceLease::new_untracked(first.clone() as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+                LinearTarget::new(
+                    Sid::new(128),
+                    64,
+                    Sid::new(228),
+                    BlockDeviceLease::new_untracked(first.clone() as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+                LinearTarget::new(
+                    Sid::new(192),
+                    64,
+                    Sid::new(200),
+                    BlockDeviceLease::new_untracked(second.clone() as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        let flush = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
 
         assert_eq!(
-            DmTable::new_linear(
+            flush.submit_and_wait(&TableDevice(table)).unwrap(),
+            BioStatus::Complete
+        );
+        assert_eq!(*first.flush_count.lock(), 1);
+        assert_eq!(*second.flush_count.lock(), 1);
+    }
+
+    #[ktest]
+    fn refuses_nonzero_or_gapped_logical_start() {
+        let backing = RecordingBlockDevice::new(1) as Arc<dyn BlockDevice>;
+
+        assert_eq!(
+            DmTable::new_single_linear(
                 Sid::new(1),
                 8,
                 Sid::new(0),
-                BlockDeviceLease::new_untracked(backing)
+                BlockDeviceLease::new_untracked(backing.clone())
             )
+            .unwrap_err(),
+            TableError::UnsupportedLogicalStart
+        );
+
+        assert_eq!(
+            DmTable::new_linear(vec![
+                LinearTarget::new(
+                    Sid::new(0),
+                    8,
+                    Sid::new(0),
+                    BlockDeviceLease::new_untracked(backing.clone())
+                )
+                .unwrap(),
+                LinearTarget::new(
+                    Sid::new(9),
+                    8,
+                    Sid::new(0),
+                    BlockDeviceLease::new_untracked(backing)
+                )
+                .unwrap(),
+            ])
             .unwrap_err(),
             TableError::UnsupportedLogicalStart
         );
