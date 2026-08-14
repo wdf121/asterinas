@@ -1,0 +1,1654 @@
+# Asterinas 根 Makefile 目标完整链路说明
+
+本文档说明 `/root/atom/asterinas/Makefile` 中常用构建、运行、NixOS 相关目标的完整执行链路，重点覆盖：
+
+- `make kernel`
+- `make run_kernel`
+- `make iso`
+- `make run_iso`
+- `make nixos`
+- `make run_nixos`
+- `NIXOS_TEST_SUITE=...` 测试模式下这些目标的分支行为
+
+文档基于当前仓库文件：
+
+- `Makefile`
+- `OSDK.toml`
+- `test/initramfs/Makefile`
+- `tools/qemu_args.sh`
+- `tools/nixos/build_iso.sh`
+- `tools/nixos/build_nixos.sh`
+- `tools/nixos/run.sh`
+- `test/nixos/Makefile`
+- `test/nixos/common/merge_nixos_config.sh`
+
+---
+
+## 1. 顶层 Makefile 的整体角色
+
+根目录 `Makefile` 是总入口，它本身不直接完成所有工作，而是把任务分发给几类下游组件：
+
+```text
+Makefile
+├── test/initramfs/Makefile
+│   └── 负责构建 initramfs 和测试用磁盘镜像
+├── cargo-osdk
+│   ├── 负责构建 kernel
+│   ├── 负责通过 QEMU 运行 kernel
+│   └── 读取 OSDK.toml 获取 boot / grub / qemu 配置
+├── tools/qemu_args.sh
+│   └── 生成 OSDK 或 NixOS 运行时使用的 QEMU 参数
+├── tools/nixos/build_iso.sh
+│   └── 构建 Asterinas NixOS ISO 安装镜像
+├── tools/nixos/build_nixos.sh
+│   └── 在宿主机上直接生成 Asterinas NixOS 根磁盘
+├── tools/nixos/run.sh
+│   └── 用 QEMU 启动 ISO 或已经安装好的 NixOS 根磁盘
+└── test/nixos/Makefile
+    └── NIXOS_TEST_SUITE 模式下的测试包装层
+```
+
+可以把它理解成三层：
+
+```text
+用户命令层：make kernel / make run_kernel / make nixos / make run_nixos
+    ↓
+编排层：根 Makefile、test/nixos/Makefile
+    ↓
+实际执行层：cargo-osdk、nix-build、qemu-system-x86_64、安装脚本
+```
+
+---
+
+## 2. 关键默认变量
+
+根 Makefile 开头定义了一批默认变量，这些变量会影响后续所有构建和运行链路。
+
+| 变量 | 默认值 | 影响范围 |
+|---|---|---|
+| `TARGET_ARCH` | `x86_64` | 目标架构；也会导出为 `OSDK_TARGET_ARCH` |
+| `BENCHMARK` | `none` | 是否在 initramfs 中启用 benchmark 入口 |
+| `BOOT_METHOD` | `grub-rescue-iso` | OSDK 默认启动方式 |
+| `BOOT_PROTOCOL` | `multiboot2` | GRUB 启动协议 |
+| `ENABLE_KVM` | `1` | x86_64 下给 QEMU 加 `-accel kvm` |
+| `INTEL_TDX` | `0` | 是否使用 TDX scheme |
+| `MEM` | `8G` | QEMU 内存大小，主要被 `tools/qemu_args.sh` 使用 |
+| `OVMF` | `on` | 是否使用 OVMF 固件 |
+| `RELEASE` | `1` | 默认 release 构建 |
+| `RELEASE_LTO` | `0` | 是否使用 release-lto profile |
+| `LOG_LEVEL` | `error` | 内核命令行 `loglevel=...` |
+| `SCHEME` | `""` | OSDK scheme，空值表示使用默认配置 |
+| `SMP` | `1` | QEMU CPU 数，也传给 initramfs Nix 构建 |
+| `FEATURES` | 空 | 额外 Cargo feature |
+| `NO_DEFAULT_FEATURES` | `0` | 是否关闭默认 feature |
+| `COVERAGE` | `0` | 是否启用 coverage |
+| `CONSOLE` | `hvc0` | 主控制台，默认走 virtio-console |
+| `AUTO_TEST` | `none` | `run_kernel` 后是否检查自动测试结果 |
+| `NIXOS_DISK_SIZE_IN_MB` | `8192` | NixOS 根磁盘大小 |
+| `NIXOS_DISABLE_SYSTEMD` | `false` | NixOS 构建参数 |
+| `NIXOS_STAGE_2_INIT` | `/bin/sh -l` | 禁用 systemd 时的 stage 2 init |
+| `AUTO_INSTALL` | `true` | ISO 是否自动安装 |
+| `NETDEV` | `user` | QEMU 网络模式 |
+| `VHOST` | `off` | tap 网络时是否启用 vhost |
+| `DNS_SERVER` | `none` | initramfs 内 DNS 设置 |
+
+根 Makefile 中有一行：
+
+```make
+export OSDK_TARGET_ARCH=$(TARGET_ARCH)
+```
+
+所以 `TARGET_ARCH=x86_64/riscv64/loongarch64` 会通过环境变量传给 `cargo-osdk`。
+
+根 Makefile 后面还有：
+
+```make
+export
+```
+
+这会把 Makefile 变量导出给子 make 和脚本。因此 `tools/nixos/*.sh`、`tools/qemu_args.sh`、`test/initramfs/Makefile` 都能读到这些变量。
+
+---
+
+## 3. cargo-osdk 参数是怎么拼出来的
+
+根 Makefile 通过三个变量组装 `cargo osdk build/run/test` 参数：
+
+```make
+CARGO_OSDK_COMMON_ARGS :=
+CARGO_OSDK_BUILD_ARGS := --kcmd-args="loglevel=$(LOG_LEVEL)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="earlycon"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="console=$(CONSOLE)"
+CARGO_OSDK_TEST_ARGS :=
+```
+
+### 3.1 默认 build/run 参数
+
+默认 `RELEASE=1`，所以会追加：
+
+```text
+--release
+```
+
+默认 `SCHEME=""`，所以不指定 scheme，而是追加：
+
+```text
+--boot-method="grub-rescue-iso"
+```
+
+默认 `BOOT_PROTOCOL=multiboot2`，所以追加：
+
+```text
+--grub-boot-protocol=multiboot2
+```
+
+默认 `ENABLE_KVM=1` 且 `TARGET_ARCH=x86_64`，所以追加：
+
+```text
+--qemu-args="-accel kvm"
+```
+
+默认情况下，`make kernel` / `make run_kernel` 里的 OSDK 参数大致是：
+
+```text
+--kcmd-args="loglevel=error"
+--kcmd-args="earlycon"
+--kcmd-args="console=hvc0"
+--release
+--boot-method="grub-rescue-iso"
+--grub-boot-protocol=multiboot2
+--qemu-args="-accel kvm"
+```
+
+### 3.2 release / release-lto 对栈大小的影响
+
+如果：
+
+```bash
+make kernel RELEASE_LTO=1
+```
+
+则追加：
+
+```text
+--profile release-lto
+```
+
+并把：
+
+```make
+OSTD_TASK_STACK_SIZE_IN_PAGES = 8
+```
+
+如果默认 `RELEASE=1`，也会把 `OSTD_TASK_STACK_SIZE_IN_PAGES` 调成较小值：
+
+- `x86_64`：`8`
+- `riscv64`：`16`
+
+这个值被导出后会进入后续 Rust 构建环境。
+
+### 3.3 `AUTO_TEST` 对参数的影响
+
+`AUTO_TEST` 会影响 initramfs 内容和 kernel init 参数。
+
+#### `AUTO_TEST=conformance`
+
+会设置：
+
+```make
+ENABLE_CONFORMANCE_TEST := true
+```
+
+并追加内核命令行：
+
+```text
+CONFORMANCE_TEST_SUITE=$(CONFORMANCE_TEST_SUITE)
+CONFORMANCE_TEST_WORKDIR=$(CONFORMANCE_TEST_WORKDIR)
+EXTRA_BLOCKLISTS=$(EXTRA_BLOCKLISTS)
+```
+
+还会追加 init 参数：
+
+```text
+--init-args="/opt/run_conformance_test.sh"
+```
+
+如果 `CONFORMANCE_TEST_SUITE=xfstests`，还会追加：
+
+```text
+XFSTESTS_RUNLIST=$(XFSTESTS_RUNLIST)
+XFSTESTS_TEST_DEV=$(XFSTESTS_TEST_DEV)
+XFSTESTS_SCRATCH_DEV=$(XFSTESTS_SCRATCH_DEV)
+```
+
+#### `AUTO_TEST=regression`
+
+会设置：
+
+```make
+ENABLE_REGRESSION_TEST := true
+```
+
+并追加：
+
+```text
+INTEL_TDX=$(INTEL_TDX)
+--init-args="/test/run_regression_test.sh"
+```
+
+#### `AUTO_TEST=boot`
+
+追加：
+
+```text
+--init-args="/test/boot_hello.sh"
+```
+
+#### `AUTO_TEST=vsock`
+
+会设置：
+
+```make
+ENABLE_REGRESSION_TEST := true
+export VSOCK=on
+```
+
+并追加：
+
+```text
+--init-args="/test/run_vsock_test.sh"
+```
+
+### 3.4 `SCHEME` 对 OSDK 的影响
+
+如果显式设置：
+
+```bash
+make run_kernel SCHEME=microvm
+make run_kernel SCHEME=iommu
+make run_kernel SCHEME=tdx
+```
+
+根 Makefile 会追加：
+
+```text
+--scheme microvm
+```
+
+而不是 `--boot-method=...`。
+
+如果 `TARGET_ARCH=riscv64` 且 `SCHEME` 为空，Makefile 会自动设置：
+
+```make
+SCHEME = riscv
+```
+
+如果 `TARGET_ARCH=loongarch64` 且 `SCHEME` 为空，Makefile 会自动设置：
+
+```make
+SCHEME = loongarch
+```
+
+这些 scheme 的具体配置来自根目录 `OSDK.toml`。
+
+---
+
+## 4. OSDK.toml 在链路中的位置
+
+`cargo-osdk` 会读取 `OSDK.toml`。读取顺序是：
+
+```text
+当前目录 OSDK.toml
+    ↓ 如果当前目录没有
+workspace root / OSDK.toml
+```
+
+`make kernel` 和 `make run_kernel` 都会进入 `kernel/` 后执行 `cargo osdk ...`：
+
+```bash
+cd kernel && cargo osdk build ...
+cd kernel && cargo osdk run ...
+```
+
+`kernel/` 下没有单独的 `OSDK.toml`，所以 `cargo-osdk` 会回到 workspace root，读取根目录：
+
+```text
+/root/atom/asterinas/OSDK.toml
+```
+
+### 4.1 默认 OSDK 配置
+
+根 `OSDK.toml` 默认配置：
+
+```toml
+[boot]
+method = "grub-rescue-iso"
+
+[grub]
+boot_protocol = "multiboot2"
+
+[qemu]
+args = "$(./tools/qemu_args.sh normal)"
+log_file = "qemu-serial.log"
+```
+
+也就是说：
+
+- OSDK 默认通过 GRUB rescue ISO 启动；
+- GRUB 默认使用 `multiboot2`；
+- QEMU 参数来自：
+
+```bash
+./tools/qemu_args.sh normal
+```
+
+### 4.2 run 专用配置
+
+`OSDK.toml` 里还有：
+
+```toml
+[run.boot]
+kcmd_args = [
+    "SHELL=/bin/sh",
+    "LOGNAME=root",
+    "HOME=/",
+    "USER=root",
+    "PATH=/bin:/benchmark",
+    "init=/init",
+]
+init_args = ["sh", "-l"]
+initramfs = "test/initramfs/build/initramfs.cpio.gz"
+```
+
+所以 `cargo osdk run` 时还会使用：
+
+- initramfs：`test/initramfs/build/initramfs.cpio.gz`
+- 默认 init：`/init`
+- 默认用户态环境变量：`SHELL=/bin/sh`、`HOME=/`、`PATH=/bin:/benchmark` 等
+- 默认 init 参数：`sh -l`
+
+根 Makefile 通过 `--kcmd-args` 和 `--init-args` 追加的参数，会和这里的配置一起生效。
+
+### 4.3 scheme 配置
+
+`OSDK.toml` 中定义了多个 scheme：
+
+| scheme | 作用 |
+|---|---|
+| `microvm` | `boot.method = qemu-direct`，QEMU 参数来自 `tools/qemu_args.sh microvm` |
+| `iommu` | x86_64 专用，QEMU 参数来自 `tools/qemu_args.sh iommu` |
+| `tdx` | x86_64 TDX，启用 `cvm_guest` feature，使用 `grub-qcow2` 和 linux boot protocol |
+| `riscv` | riscv64，`qemu-direct`，QEMU 参数来自 `tools/qemu_args.sh riscv` |
+| `sifive_u` | riscv64 sifive_u 机器配置 |
+| `loongarch` | loongarch64 机器配置 |
+
+---
+
+## 5. initramfs 构建链路
+
+`make kernel` 和 `make run_kernel` 都依赖：
+
+```make
+initramfs: check_vdso
+	$(MAKE) -C test/initramfs
+```
+
+因此它们都会先进入：
+
+```text
+test/initramfs/Makefile
+```
+
+### 5.1 check_vdso
+
+构建 initramfs 前会检查：
+
+```bash
+VDSO_LIBRARY_DIR
+```
+
+如果这个环境变量为空，根 Makefile 会直接报错退出。
+
+它指向 Linux vDSO 文件目录，是构建 Asterinas 所需的输入。
+
+### 5.2 test/initramfs 默认产物
+
+`test/initramfs/Makefile` 默认目标是 `build`。
+
+默认 `TARGET_ARCH=x86_64`，且没有启用 xfstests 时，`build` 依赖：
+
+```text
+test/initramfs/build/initramfs.cpio.gz
+test/initramfs/build/ext2.img
+test/initramfs/build/exfat.img
+test/initramfs/build/ltp_dev.img
+test/initramfs/build/nvme0n1.img
+```
+
+具体含义：
+
+| 产物 | 作用 |
+|---|---|
+| `initramfs.cpio.gz` | Asterinas 启动时使用的 initramfs |
+| `ext2.img` | QEMU 中的 ext2 测试块设备 |
+| `exfat.img` | QEMU 中的 exFAT 测试块设备 |
+| `ltp_dev.img` | LTP 或测试用 ext2 块设备 |
+| `nvme0n1.img` | NVMe 测试镜像 |
+
+如果：
+
+```bash
+INITRAMFS_SKIP_GZIP=1
+```
+
+则 initramfs 产物变为：
+
+```text
+test/initramfs/build/initramfs.cpio
+```
+
+同时根 Makefile 会给 OSDK 追加：
+
+```text
+--initramfs=/root/atom/asterinas/test/initramfs/build/initramfs.cpio
+```
+
+### 5.3 initramfs 的 Nix 构建命令
+
+initramfs 镜像通过 Nix 构建：
+
+```bash
+nix-build \
+  --tarball-ttl 2592000 \
+  --argstr target $(TARGET_ARCH) \
+  --arg enableBenchmarkTest $(ENABLE_BENCHMARK_TEST) \
+  --arg enableConformanceTest $(ENABLE_CONFORMANCE_TEST) \
+  --arg enableRegressionTest $(ENABLE_REGRESSION_TEST) \
+  --argstr conformanceTestSuite $(CONFORMANCE_TEST_SUITE) \
+  --argstr conformanceTestWorkDir $(CONFORMANCE_TEST_WORKDIR) \
+  --argstr regressionTestPlatform $(REGRESSION_TEST_PLATFORM) \
+  --argstr dnsServer $(DNS_SERVER) \
+  --arg initramfsCompressed $(INITRAMFS_COMPRESSED) \
+  --arg smp $(SMP) \
+  --out-link test/initramfs/build/initramfs.cpio.gz \
+  nix -A initramfs-image
+```
+
+initramfs 根目录本身通过：
+
+```bash
+nix-build ... --out-link test/initramfs/build/initramfs nix -A initramfs
+```
+
+---
+
+## 6. `make kernel` 完整链路
+
+### 6.1 顶层定义
+
+```make
+kernel: initramfs $(CARGO_OSDK)
+	cd kernel && cargo osdk build $(CARGO_OSDK_BUILD_ARGS)
+```
+
+### 6.2 完整执行顺序
+
+```text
+make kernel
+│
+├── 读取根 Makefile 默认变量
+│
+├── export OSDK_TARGET_ARCH=$(TARGET_ARCH)
+│
+├── 目标依赖 1：initramfs
+│   │
+│   ├── check_vdso
+│   │   └── 检查 VDSO_LIBRARY_DIR 是否存在
+│   │
+│   └── make -C test/initramfs
+│       │
+│       ├── nix-build -A initramfs
+│       ├── nix-build -A initramfs-image
+│       ├── 生成 ext2.img
+│       ├── 生成 exfat.img
+│       ├── 生成 ltp_dev.img
+│       └── 生成 nvme0n1.img
+│
+├── 目标依赖 2：~/.cargo/bin/cargo-osdk
+│   │
+│   ├── 检查 osdk/Cargo.toml、osdk/Cargo.lock、osdk/src 是否比 cargo-osdk 新
+│   └── 如果需要，执行 make install_osdk
+│       └── OSDK_LOCAL_DEV=1 cargo install cargo-osdk --path osdk
+│
+└── 执行 kernel 构建
+    └── cd kernel && cargo osdk build $(CARGO_OSDK_BUILD_ARGS)
+```
+
+### 6.3 默认情况下最终类似命令
+
+默认 x86_64/release/KVM/multiboot2 时，最终类似：
+
+```bash
+cd kernel && cargo osdk build \
+  --kcmd-args="loglevel=error" \
+  --kcmd-args="earlycon" \
+  --kcmd-args="console=hvc0" \
+  --release \
+  --boot-method="grub-rescue-iso" \
+  --grub-boot-protocol=multiboot2 \
+  --qemu-args="-accel kvm"
+```
+
+注意：这是 Makefile 拼出来的 OSDK CLI 参数；OSDK 内部还会读取根 `OSDK.toml`，拿到默认 boot/grub/qemu 配置。
+
+### 6.4 主要产物
+
+典型产物包括：
+
+```text
+test/initramfs/build/initramfs.cpio.gz
+test/initramfs/build/ext2.img
+test/initramfs/build/exfat.img
+test/initramfs/build/ltp_dev.img
+test/initramfs/build/nvme0n1.img
+target/x86_64-unknown-none/release/aster-kernel-osdk-bin
+target/osdk/aster-kernel/aster-kernel-osdk-bin
+target/osdk/aster-kernel/aster-kernel-osdk-bin.iso
+```
+
+实际产物路径会受 OSDK、profile、boot method、arch 影响。
+
+### 6.5 它不会做什么
+
+`make kernel` 只构建，不启动 QEMU。
+
+它不会启动：
+
+```text
+qemu-system-x86_64
+```
+
+---
+
+## 7. `make run_kernel` 完整链路
+
+### 7.1 顶层定义
+
+```make
+run_kernel: initramfs $(CARGO_OSDK)
+	cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS)
+```
+
+### 7.2 完整执行顺序
+
+```text
+make run_kernel
+│
+├── 与 make kernel 一样，先构建 initramfs
+│
+├── 与 make kernel 一样，确保 cargo-osdk 可用
+│
+├── 执行：cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS)
+│   │
+│   ├── cargo-osdk 读取 workspace root 的 OSDK.toml
+│   ├── 使用 [run.boot] 中的 initramfs 和 kcmd_args
+│   ├── 使用 [qemu] 中的 args = $(./tools/qemu_args.sh normal)
+│   ├── 结合 Makefile 传入的 --kcmd-args / --release / --boot-method / --grub-boot-protocol
+│   ├── 构建 kernel
+│   └── 启动 QEMU
+│
+└── 如果 AUTO_TEST != none，则检查 qemu.log 最后 100 行
+```
+
+### 7.3 默认情况下最终类似命令
+
+```bash
+cd kernel && cargo osdk run \
+  --kcmd-args="loglevel=error" \
+  --kcmd-args="earlycon" \
+  --kcmd-args="console=hvc0" \
+  --release \
+  --boot-method="grub-rescue-iso" \
+  --grub-boot-protocol=multiboot2 \
+  --qemu-args="-accel kvm"
+```
+
+然后 `cargo-osdk` 会进一步展开为 QEMU 运行。
+
+### 7.4 QEMU 参数来源
+
+`OSDK.toml` 默认：
+
+```toml
+[qemu]
+args = "$(./tools/qemu_args.sh normal)"
+log_file = "qemu-serial.log"
+```
+
+所以 QEMU 基础参数来自：
+
+```bash
+./tools/qemu_args.sh normal
+```
+
+在 x86_64 normal 模式下，`tools/qemu_args.sh` 会生成类似：
+
+```text
+-cpu Icelake-Server,+x2apic
+-smp ${SMP:-1}
+-m ${MEM:-8G}
+--no-reboot
+-nographic
+-display vnc=0.0.0.0:${VNC_PORT:-42}
+-monitor chardev:mux
+-chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log
+-netdev user,...hostfwd...
+-device isa-debug-exit,iobase=0xf4,iosize=0x04
+-drive if=none,format=raw,id=x0,file=./test/initramfs/build/ext2.img
+-drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img
+-drive if=none,format=raw,id=x2,file=./test/initramfs/build/ltp_dev.img
+-machine q35,kernel-irqchip=split
+-device virtio-blk-pci,...drive=x0,serial=vext2...
+-device virtio-blk-pci,...drive=x1,serial=vexfat...
+-device virtio-blk-pci,...drive=x2,serial=vltpdev...
+-object rng-random,id=rng0,filename=/dev/urandom
+-device virtio-rng-pci,...
+-device virtio-net-pci,netdev=net01,...
+-device virtio-serial-pci,...
+-drive if=none,format=raw,id=nvme0n1,file=./test/initramfs/build/nvme0n1.img
+-device nvme,drive=nvme0n1,serial=nvme0n1
+-device virtconsole,chardev=mux
+-serial file:qemu-serial.log
+-bios /root/ovmf/release/OVMF.fd
+```
+
+再加上根 Makefile 传给 OSDK 的：
+
+```text
+--qemu-args="-accel kvm"
+```
+
+最终 QEMU 会启用 KVM。
+
+### 7.5 日志文件
+
+`run_kernel` 相关日志主要有：
+
+| 文件 | 来源 | 作用 |
+|---|---|---|
+| `qemu.log` | `tools/qemu_args.sh` 中的 `-chardev ... logfile=qemu.log` | QEMU 主日志，`AUTO_TEST` 会检查它 |
+| `qemu-serial.log` | `CONSOLE=hvc0` 时串口被重定向到文件 | 避免 hvc0 和 serial 重复输出 |
+
+### 7.6 AUTO_TEST 结束检查
+
+如果设置：
+
+```bash
+make run_kernel AUTO_TEST=boot
+```
+
+QEMU 退出后 Makefile 会执行：
+
+```bash
+tail --lines 100 qemu.log | grep -q "^Successfully booted."
+```
+
+其他模式检查：
+
+| `AUTO_TEST` | 成功标志 |
+|---|---|
+| `conformance` | `^All conformance tests passed.` |
+| `regression` | `^All regression tests passed.` |
+| `boot` | `^Successfully booted.` |
+| `vsock` | `^Vsock test passed.` |
+
+---
+
+## 8. `make iso` 完整链路
+
+### 8.1 顶层定义
+
+```make
+iso: BOOT_PROTOCOL = linux-efi-handover64
+iso:
+	make kernel
+	if [ -n "$(NIXOS_TEST_SUITE)" ]; then \
+	    make -C test/nixos iso; \
+	else \
+	    ./tools/nixos/build_iso.sh; \
+	fi
+```
+
+### 8.2 完整执行顺序
+
+```text
+make iso
+│
+├── 目标局部变量：BOOT_PROTOCOL=linux-efi-handover64
+│
+├── make kernel
+│   │
+│   ├── 构建 initramfs
+│   ├── 确保 cargo-osdk
+│   └── cd kernel && cargo osdk build ... --grub-boot-protocol="linux"
+│
+└── 构建 NixOS ISO
+    │
+    ├── 如果 NIXOS_TEST_SUITE 非空：make -C test/nixos iso
+    └── 否则：./tools/nixos/build_iso.sh
+```
+
+### 8.3 为什么 `iso` 强制 `BOOT_PROTOCOL=linux-efi-handover64`
+
+NixOS 相关启动链路走 UEFI/Linux EFI handover，而不是默认的 multiboot2。
+
+因此 `make iso` 会覆盖：
+
+```make
+BOOT_PROTOCOL = linux-efi-handover64
+```
+
+根 Makefile 中对这个协议有特殊处理：
+
+```text
+--grub-mkrescue=/usr/bin/grub-mkrescue
+--grub-boot-protocol="linux"
+```
+
+也就是说，OSDK 侧实际传给 GRUB 的 boot protocol 是 `linux`。
+
+### 8.4 普通模式下 build_iso.sh 做什么
+
+执行：
+
+```bash
+./tools/nixos/build_iso.sh
+```
+
+脚本内部：
+
+1. 计算仓库根目录、distro 目录、target 目录。
+2. 读取 `VERSION`。
+3. 调用：
+
+```bash
+./tools/nixos/print_target_nix_system.sh "${TARGET_ARCH}"
+```
+
+把架构转成 Nix system：
+
+| `TARGET_ARCH` | Nix system |
+|---|---|
+| `x86_64` | `x86_64-linux` |
+| `aarch64` | `aarch64-linux` |
+| `riscv64` | `riscv64-linux` |
+| `loongarch64` | `loongarch64-linux` |
+
+4. 创建：
+
+```text
+target/nixos
+```
+
+5. 执行：
+
+```bash
+nix-build distro/iso_image \
+  --argstr target_platform "${NIX_SYSTEM}" \
+  --arg autoInstall ${AUTO_INSTALL} \
+  --argstr config-file-name "configuration.nix" \
+  --argstr extra-substituters "${RELEASE_SUBSTITUTER} ${DEV_SUBSTITUTER}" \
+  --argstr extra-trusted-public-keys "${RELEASE_TRUSTED_PUBLIC_KEY} ${DEV_TRUSTED_PUBLIC_KEY}" \
+  --argstr version ${VERSION} \
+  --out-link target/nixos/iso_image
+```
+
+### 8.5 主要产物
+
+```text
+target/nixos/iso_image
+```
+
+ISO 文件通常在：
+
+```text
+target/nixos/iso_image/iso/*.iso
+```
+
+---
+
+## 9. `make run_iso` 完整链路
+
+### 9.1 顶层定义
+
+```make
+run_iso: OVMF = off
+run_iso:
+	./tools/nixos/run.sh iso
+```
+
+### 9.2 完整执行顺序
+
+```text
+make run_iso
+│
+├── 目标局部变量：OVMF=off
+│
+└── ./tools/nixos/run.sh iso
+    │
+    ├── 检查参数必须是 iso 或 nixos
+    ├── 检查 TARGET_ARCH 必须是 x86_64
+    ├── cd 到仓库根目录
+    ├── FORCE_OVMF=on tools/qemu_args.sh common
+    ├── 查找 target/nixos/iso_image/iso/*.iso
+    ├── 删除旧的 target/nixos/asterinas.img
+    ├── 创建新的 target/nixos/asterinas.img
+    ├── 加入 ISO cdrom 启动参数
+    ├── 加入 NixOS 安装目标盘参数
+    ├── 加入 Device Mapper 测试盘参数
+    ├── 根据 ENABLE_KVM 决定是否追加 -accel kvm
+    └── 执行 qemu-system-x86_64 ${QEMU_ARGS}
+```
+
+### 9.3 run_iso 会删除根磁盘
+
+`run.sh iso` 中会执行：
+
+```bash
+rm -f target/nixos/asterinas.img
+```
+
+然后重新创建：
+
+```bash
+dd if=/dev/zero of=target/nixos/asterinas.img bs=1M count=${NIXOS_DISK_SIZE_IN_MB}
+```
+
+所以：
+
+```bash
+make run_iso
+```
+
+会重建 NixOS 根磁盘镜像。旧的 `target/nixos/asterinas.img` 会被删除。
+
+### 9.4 run_iso 的 QEMU 磁盘布局
+
+ISO 模式下会加入：
+
+```text
+-cdrom target/nixos/iso_image/iso/*.iso
+-boot d
+-drive if=none,format=raw,id=u0,file=target/nixos/asterinas.img
+-device virtio-blk-pci,drive=u0,disable-legacy=on,disable-modern=off
+```
+
+当前 `tools/nixos/run.sh` 还会额外挂载 Device Mapper 测试盘：
+
+```text
+-drive if=none,format=raw,id=dmtest,file=target/nixos/test.img,cache=none
+-device virtio-blk-pci,bus=pcie.0,addr=0xc,drive=dmtest,serial=vdmtest,...
+```
+
+如果设置了：
+
+```bash
+DM_TEST_IMAGE_2=/path/to/second.img
+```
+
+还会挂第二块 DM 测试盘，PCI 地址 `0xd`，serial 为 `vdmtest2`。
+
+---
+
+## 10. `make nixos` 完整链路
+
+### 10.1 顶层定义
+
+```make
+nixos: BOOT_PROTOCOL = linux-efi-handover64
+nixos:
+	make kernel
+	if [ -n "$(NIXOS_TEST_SUITE)" ]; then \
+	    make -C test/nixos nixos; \
+	else \
+	    ./tools/nixos/build_nixos.sh; \
+	fi
+```
+
+### 10.2 完整执行顺序
+
+```text
+make nixos
+│
+├── 目标局部变量：BOOT_PROTOCOL=linux-efi-handover64
+│
+├── make kernel
+│   │
+│   ├── 构建 initramfs
+│   ├── 确保 cargo-osdk
+│   └── cd kernel && cargo osdk build ... --grub-boot-protocol="linux"
+│
+└── 构建/安装 NixOS 根磁盘
+    │
+    ├── 如果 NIXOS_TEST_SUITE 非空：make -C test/nixos nixos
+    └── 否则：./tools/nixos/build_nixos.sh
+```
+
+### 10.3 普通模式下 build_nixos.sh 做什么
+
+执行：
+
+```bash
+./tools/nixos/build_nixos.sh
+```
+
+脚本内部：
+
+1. 设置默认配置文件名：
+
+```bash
+CONFIG_FILE_NAME=${1:-"configuration.nix"}
+```
+
+普通模式下没有传参数，所以使用：
+
+```text
+distro/etc_nixos/configuration.nix
+```
+
+2. 计算路径：
+
+```text
+ASTERINAS_DIR=/root/atom/asterinas
+ASTER_IMAGE_PATH=/root/atom/asterinas/target/nixos/asterinas.img
+DISTRO_DIR=/root/atom/asterinas/distro
+CONFIG_PATH=/root/atom/asterinas/distro/etc_nixos/configuration.nix
+```
+
+3. 把 `TARGET_ARCH` 转换成 Nix system：
+
+```bash
+tools/nixos/print_target_nix_system.sh "${TARGET_ARCH}"
+```
+
+4. 进入 `distro/`，构建安装器：
+
+```bash
+nix-build aster_nixos_installer/default.nix \
+  --argstr target_platform "${NIX_SYSTEM}" \
+  --argstr disable-systemd "${NIXOS_DISABLE_SYSTEMD}" \
+  --argstr stage-2-hook "${NIXOS_STAGE_2_INIT}" \
+  --argstr log-level "${LOG_LEVEL}" \
+  --argstr console "${CONSOLE}" \
+  --argstr extra-substituters "${RELEASE_SUBSTITUTER} ${DEV_SUBSTITUTER}" \
+  --argstr extra-trusted-public-keys "${RELEASE_TRUSTED_PUBLIC_KEY} ${DEV_TRUSTED_PUBLIC_KEY}"
+```
+
+5. 创建目标目录：
+
+```bash
+mkdir -p target/nixos
+```
+
+6. 如果根磁盘不存在，则创建：
+
+```bash
+fallocate -l ${NIXOS_DISK_SIZE_IN_MB}M target/nixos/asterinas.img
+```
+
+默认大小：
+
+```text
+8192 MB
+```
+
+注意：如果 `target/nixos/asterinas.img` 已经存在，`build_nixos.sh` 不会删除它，也不会重新创建它。
+
+7. 把 raw image 绑定成 loop device：
+
+```bash
+DISK=$(losetup -fP --show target/nixos/asterinas.img)
+```
+
+8. 注册 cleanup：
+
+```bash
+trap cleanup EXIT INT TERM ERR
+```
+
+退出时自动：
+
+```bash
+losetup -d ${DISK}
+```
+
+9. 执行安装器：
+
+```bash
+distro/result/bin/aster-nixos-install \
+  --config distro/etc_nixos/configuration.nix \
+  --disk ${DISK}
+```
+
+### 10.4 主要产物
+
+```text
+target/nixos/asterinas.img
+```
+
+这是后续 `make run_nixos` 会启动的 NixOS 根磁盘。
+
+### 10.5 make nixos 不启动 QEMU
+
+`make nixos` 只是构建 kernel 并生成/安装根磁盘。
+
+它不会执行：
+
+```bash
+qemu-system-x86_64
+```
+
+---
+
+## 11. `make run_nixos` 完整链路
+
+### 11.1 顶层定义
+
+```make
+run_nixos: OVMF = off
+run_nixos:
+	if [ -n "$(NIXOS_TEST_SUITE)" ]; then \
+	    make -C test/nixos run_nixos; \
+	else \
+	    ./tools/nixos/run.sh nixos; \
+	fi
+```
+
+### 11.2 完整执行顺序
+
+```text
+make run_nixos
+│
+├── 目标局部变量：OVMF=off
+│
+└── 普通模式：./tools/nixos/run.sh nixos
+    │
+    ├── 检查参数必须是 iso 或 nixos
+    ├── 检查 TARGET_ARCH 必须是 x86_64
+    ├── cd 到仓库根目录
+    ├── FORCE_OVMF=on tools/qemu_args.sh common
+    ├── 加入 NixOS 根磁盘 target/nixos/asterinas.img
+    ├── 加入 Device Mapper 测试盘 target/nixos/test.img
+    ├── 如果 DM_TEST_IMAGE_2 非空，再加入第二块测试盘
+    ├── 如果 ENABLE_KVM=1，追加 -accel kvm
+    └── 执行 qemu-system-x86_64 ${QEMU_ARGS}
+```
+
+### 11.3 run_nixos 不会自动构建根磁盘
+
+`make run_nixos` 默认不会先执行：
+
+```bash
+make nixos
+```
+
+所以运行前必须已经有：
+
+```text
+target/nixos/asterinas.img
+```
+
+如果这个文件不存在，QEMU 会因为找不到根磁盘而失败。
+
+标准顺序通常是：
+
+```bash
+make nixos
+make run_nixos
+```
+
+或者 ISO 安装路径：
+
+```bash
+make iso
+make run_iso
+make run_nixos
+```
+
+### 11.4 run_nixos 的基础 QEMU 参数
+
+`tools/nixos/run.sh` 会执行：
+
+```bash
+QEMU_ARGS=$(FORCE_OVMF=on tools/qemu_args.sh common 2>/dev/null)
+```
+
+注意这里传给 `qemu_args.sh` 的参数是：
+
+```text
+common
+```
+
+`tools/qemu_args.sh` 没有单独的 `common` 分支，但它会走 x86_64 默认 q35 分支。因此它会生成与 normal 类似的基础 QEMU 设备集合。
+
+`FORCE_OVMF=on` 会强制加入：
+
+```text
+-bios /root/ovmf/release/OVMF.fd
+```
+
+即使 `run_nixos` 目标局部设置了：
+
+```make
+OVMF = off
+```
+
+`run.sh` 内部仍然强制 OVMF 打开，因为 NixOS 根镜像是带 ESP 的 UEFI 安装。
+
+### 11.5 run_nixos 的 NixOS 根盘参数
+
+nixos 模式下会追加：
+
+```text
+-drive if=none,format=raw,id=u0,file=target/nixos/asterinas.img
+-device virtio-blk-pci,drive=u0,bootindex=1,disable-legacy=on,disable-modern=off
+```
+
+这个盘就是 NixOS 根磁盘。
+
+### 11.6 Device Mapper 测试盘参数
+
+当前 `tools/nixos/run.sh` 总是会调用：
+
+```bash
+append_dm_test_image "${DM_TEST_IMAGE}" dmtest vdmtest 0xc
+```
+
+默认：
+
+```bash
+DM_TEST_IMAGE=target/nixos/test.img
+```
+
+如果该文件不存在，会创建：
+
+```bash
+fallocate -l 512M target/nixos/test.img
+```
+
+然后追加 QEMU 参数：
+
+```text
+-drive if=none,format=raw,id=dmtest,file=target/nixos/test.img,cache=none
+-device virtio-blk-pci,bus=pcie.0,addr=0xc,drive=dmtest,serial=vdmtest,disable-legacy=on,disable-modern=off
+```
+
+如果设置第二块盘：
+
+```bash
+DM_TEST_IMAGE_2=/root/atom/asterinas/target/nixos/test2.img make run_nixos
+```
+
+会追加第二块：
+
+```text
+-drive if=none,format=raw,id=dmtest2,file=/root/atom/asterinas/target/nixos/test2.img,cache=none
+-device virtio-blk-pci,bus=pcie.0,addr=0xd,drive=dmtest2,serial=vdmtest2,disable-legacy=on,disable-modern=off
+```
+
+`append_dm_test_image` 还会做几个保护：
+
+- 如果镜像不存在，创建 512 MiB 文件；
+- 路径必须是普通文件；
+- 路径不能包含空白字符；
+- 测试盘不能指向 NixOS 根盘 `target/nixos/asterinas.img`。
+
+### 11.7 QEMU 退出码处理
+
+`run.sh` 执行：
+
+```bash
+qemu-system-x86_64 ${QEMU_ARGS}
+```
+
+之后会处理退出码。
+
+Asterinas kernel 可通过 `isa-debug-exit` 表示成功退出：
+
+```bash
+KERNEL_SUCCESS_EXIT_CODE=16
+QEMU_SUCCESS_EXIT_CODE=$(((16 << 1) | 1))
+```
+
+也就是：
+
+```text
+QEMU_SUCCESS_EXIT_CODE=33
+```
+
+`run.sh` 认为下面两种情况都是成功：
+
+- QEMU 退出码 `0`
+- QEMU 退出码 `33`
+
+其他退出码会原样返回。
+
+---
+
+## 12. NIXOS_TEST_SUITE 模式
+
+如果执行：
+
+```bash
+make nixos NIXOS_TEST_SUITE=dm-lvm-extended-check
+make run_nixos NIXOS_TEST_SUITE=dm-lvm-extended-check
+```
+
+根 Makefile 不再直接调用 `tools/nixos/build_nixos.sh` 或 `tools/nixos/run.sh`，而是转到：
+
+```text
+test/nixos/Makefile
+```
+
+### 12.1 测试目录约定
+
+`test/nixos/Makefile` 使用：
+
+```make
+TEST_DIR := tests/$(NIXOS_TEST_SUITE)
+EXTRA_CONFIG := $(TEST_DIR)/extra_config.nix
+```
+
+所以测试目录应为：
+
+```text
+test/nixos/tests/<NIXOS_TEST_SUITE>/
+```
+
+例如：
+
+```text
+test/nixos/tests/dm-lvm-extended-check/
+```
+
+### 12.2 prepare 阶段
+
+`make -C test/nixos nixos` 和 `make -C test/nixos iso` 都会先执行：
+
+```text
+prepare
+```
+
+prepare 做：
+
+1. 检查 `NIXOS_TEST_SUITE` 是否为空；
+2. 检查测试目录是否存在；
+3. 如果存在：
+
+```text
+test/nixos/tests/<suite>/extra_config.nix
+```
+
+则把基础配置和 extra config 合并；
+
+4. 如果没有 extra config，则复制基础配置。
+
+基础配置：
+
+```text
+distro/etc_nixos/configuration.nix
+```
+
+生成的临时配置：
+
+```text
+distro/etc_nixos/_configuration_for_test.nix
+```
+
+### 12.3 配置合并逻辑
+
+合并脚本：
+
+```text
+test/nixos/common/merge_nixos_config.sh
+```
+
+调用形式：
+
+```bash
+merge_nixos_config.sh \
+  distro/etc_nixos/configuration.nix \
+  test/nixos/tests/<suite>/extra_config.nix \
+  distro/etc_nixos/_configuration_for_test.nix
+```
+
+生成的 Nix 文件会：
+
+- 内嵌 base config；
+- import extra config；
+- 用 `lib.recursiveUpdate base extra` 合并；
+- extra config 的同名 key 优先级更高。
+
+### 12.4 测试模式下 make nixos
+
+链路：
+
+```text
+make nixos NIXOS_TEST_SUITE=<suite>
+│
+├── make kernel，BOOT_PROTOCOL=linux-efi-handover64
+│
+└── make -C test/nixos nixos
+    │
+    ├── prepare
+    │   └── 生成 distro/etc_nixos/_configuration_for_test.nix
+    │
+    ├── bash tools/nixos/build_nixos.sh _configuration_for_test.nix
+    │   └── 用测试配置安装 target/nixos/asterinas.img
+    │
+    └── 删除 distro/etc_nixos/_configuration_for_test.nix
+```
+
+### 12.5 测试模式下 make iso
+
+链路：
+
+```text
+make iso NIXOS_TEST_SUITE=<suite>
+│
+├── make kernel，BOOT_PROTOCOL=linux-efi-handover64
+│
+└── make -C test/nixos iso
+    │
+    ├── prepare
+    │   └── 生成 distro/etc_nixos/_configuration_for_test.nix
+    │
+    ├── bash tools/nixos/build_iso.sh _configuration_for_test.nix
+    │   └── 用测试配置构建 target/nixos/iso_image
+    │
+    └── 删除 distro/etc_nixos/_configuration_for_test.nix
+```
+
+### 12.6 测试模式下 make run_nixos
+
+链路：
+
+```text
+make run_nixos NIXOS_TEST_SUITE=<suite>
+│
+└── make -C test/nixos run_nixos
+    │
+    ├── 检查 tests/<suite> 是否存在
+    ├── cd tests/<suite>
+    ├── 组装 QEMU_CMD="bash tools/nixos/run.sh nixos"
+    └── cargo run -- --qemu-cmd "$QEMU_CMD" [--test <NIXOS_TEST_CASE>]
+```
+
+如果设置：
+
+```bash
+NIXOS_TEST_CASE=<case>
+```
+
+则会追加：
+
+```text
+--test <case>
+```
+
+也就是说，测试模式下的 `run_nixos` 不是直接运行 QEMU，而是由测试目录里的 Rust test harness 通过 `cargo run` 驱动 QEMU。
+
+---
+
+## 13. 常用命令与实际含义
+
+### 13.1 只构建裸 kernel
+
+```bash
+make kernel
+```
+
+实际含义：
+
+```text
+构建 initramfs
+安装/更新 cargo-osdk
+用 cargo-osdk 构建 kernel
+不启动 QEMU
+```
+
+### 13.2 构建并启动裸 kernel
+
+```bash
+make run_kernel
+```
+
+实际含义：
+
+```text
+构建 initramfs
+安装/更新 cargo-osdk
+用 cargo-osdk 构建 kernel
+通过 QEMU 启动 kernel + initramfs
+```
+
+### 13.3 构建 NixOS 根盘
+
+```bash
+make nixos
+```
+
+实际含义：
+
+```text
+用 linux-efi-handover64 构建 kernel
+构建 NixOS 安装器
+创建或复用 target/nixos/asterinas.img
+通过 loop device 把 NixOS 安装进这个 raw image
+不启动 QEMU
+```
+
+### 13.4 启动 NixOS 根盘
+
+```bash
+make run_nixos
+```
+
+实际含义：
+
+```text
+使用 QEMU 启动 target/nixos/asterinas.img
+附加 target/nixos/test.img 作为 DM 测试盘
+如果设置 DM_TEST_IMAGE_2，再附加第二块测试盘
+不重新构建 kernel
+不重新构建 NixOS 根盘
+```
+
+### 13.5 构建 ISO 安装器
+
+```bash
+make iso
+```
+
+实际含义：
+
+```text
+用 linux-efi-handover64 构建 kernel
+通过 nix-build 构建 target/nixos/iso_image
+不启动 QEMU
+```
+
+### 13.6 启动 ISO 安装器
+
+```bash
+make run_iso
+```
+
+实际含义：
+
+```text
+查找 target/nixos/iso_image/iso/*.iso
+删除旧 target/nixos/asterinas.img
+创建新的空 target/nixos/asterinas.img
+用 QEMU 从 ISO 启动
+安装器把系统安装到 target/nixos/asterinas.img
+```
+
+---
+
+## 14. 产物和日志总表
+
+| 路径 | 由谁生成 | 用途 |
+|---|---|---|
+| `test/initramfs/build/initramfs` | `test/initramfs/Makefile` | initramfs root |
+| `test/initramfs/build/initramfs.cpio.gz` | `test/initramfs/Makefile` | 默认压缩 initramfs |
+| `test/initramfs/build/initramfs.cpio` | `INITRAMFS_SKIP_GZIP=1` 时 | 未压缩 initramfs |
+| `test/initramfs/build/ext2.img` | `test/initramfs/Makefile` | QEMU ext2 测试盘 |
+| `test/initramfs/build/exfat.img` | `test/initramfs/Makefile` | QEMU exFAT 测试盘 |
+| `test/initramfs/build/ltp_dev.img` | `test/initramfs/Makefile` | LTP/测试块设备 |
+| `test/initramfs/build/nvme0n1.img` | `test/initramfs/Makefile` | NVMe 测试盘 |
+| `target/osdk/aster-kernel/...` | `cargo-osdk` | OSDK kernel/ISO 产物 |
+| `target/x86_64-unknown-none/release/aster-kernel-osdk-bin` | `cargo-osdk` | release kernel ELF/bin |
+| `target/nixos/iso_image` | `tools/nixos/build_iso.sh` | NixOS ISO 构建 result link |
+| `target/nixos/iso_image/iso/*.iso` | `tools/nixos/build_iso.sh` | ISO 安装镜像 |
+| `target/nixos/asterinas.img` | `tools/nixos/build_nixos.sh` 或 `run.sh iso` | NixOS 根磁盘 |
+| `target/nixos/test.img` | `tools/nixos/run.sh` | 默认 DM 测试盘 |
+| `qemu.log` | `tools/qemu_args.sh` | QEMU 主日志，AUTO_TEST 检查它 |
+| `qemu-serial.log` | `tools/qemu_args.sh` | serial 日志，hvc0 时避免重复输出 |
+
+---
+
+## 15. 关键注意事项
+
+### 15.1 `make run_nixos` 不会先做 `make nixos`
+
+如果根盘不存在，先执行：
+
+```bash
+make nixos
+```
+
+再执行：
+
+```bash
+make run_nixos
+```
+
+### 15.2 `make run_iso` 会删除 `target/nixos/asterinas.img`
+
+`run_iso` 会重建根盘，适合重新安装。
+
+如果你要保留已有 NixOS 根盘，不要直接执行 `make run_iso`。
+
+### 15.3 NixOS 相关目标强制使用 linux-efi-handover64
+
+`make iso` 和 `make nixos` 都有：
+
+```make
+BOOT_PROTOCOL = linux-efi-handover64
+```
+
+所以它们和默认 `make kernel` 的 `multiboot2` 链路不完全一样。
+
+### 15.4 `tools/nixos/run.sh` 当前只支持 x86_64
+
+脚本中明确检查：
+
+```bash
+if [ "${TARGET_ARCH}" != "x86_64" ]; then
+    exit 1
+fi
+```
+
+所以：
+
+```bash
+make run_nixos TARGET_ARCH=riscv64
+```
+
+会失败。
+
+### 15.5 NixOS run 脚本内部强制 OVMF
+
+虽然 `make run_nixos` 和 `make run_iso` 目标局部写了：
+
+```make
+OVMF = off
+```
+
+但 `tools/nixos/run.sh` 内部实际调用：
+
+```bash
+FORCE_OVMF=on tools/qemu_args.sh common
+```
+
+所以最终仍会加入：
+
+```text
+-bios /root/ovmf/release/OVMF.fd
+```
+
+原因是 NixOS 根镜像是 UEFI 安装。
+
+### 15.6 当前 run_nixos 会自动挂 DM 测试盘
+
+`tools/nixos/run.sh` 当前默认会创建/挂载：
+
+```text
+target/nixos/test.img
+```
+
+这对 Device Mapper / LVM 持久化验证很重要：
+
+- 根盘：`target/nixos/asterinas.img`
+- DM 测试盘：`target/nixos/test.img`
+- 可选第二块 DM 测试盘：`DM_TEST_IMAGE_2`
+
+### 15.7 `ENABLE_KVM=1` 默认打开
+
+默认 x86_64 下会追加：
+
+```text
+-accel kvm
+```
+
+如果宿主机或容器没有 KVM 权限，可以用：
+
+```bash
+make run_kernel ENABLE_KVM=0
+make run_nixos ENABLE_KVM=0
+```
+
+### 15.8 `VDSO_LIBRARY_DIR` 是 kernel/initramfs 链路的硬前置条件
+
+`make kernel`、`make run_kernel`、`make iso`、`make nixos` 都会间接走 `initramfs`，因此都要求：
+
+```bash
+VDSO_LIBRARY_DIR
+```
+
+存在。
+
+---
+
+## 16. 一句话链路图
+
+```text
+make kernel
+  = initramfs + cargo-osdk build kernel
+
+make run_kernel
+  = initramfs + cargo-osdk build kernel + cargo-osdk 启动 QEMU
+
+make iso
+  = linux-efi-handover64 kernel + nix-build ISO
+
+make run_iso
+  = 删除并重建 target/nixos/asterinas.img + QEMU 从 ISO 启动安装器
+
+make nixos
+  = linux-efi-handover64 kernel + nix-build 安装器 + loop device 安装 NixOS 到 asterinas.img
+
+make run_nixos
+  = QEMU 启动已有 asterinas.img + 自动附加 DM 测试盘
+```

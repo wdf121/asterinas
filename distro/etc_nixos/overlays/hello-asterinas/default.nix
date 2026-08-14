@@ -33,7 +33,7 @@ final: prev: {
       #define ASTER_VIRTIO_BLK_ID_BYTES 20
       #define ASTER_VIRTIO_BLK_GET_ID \
         _IOR('A', 0x01, unsigned char[ASTER_VIRTIO_BLK_ID_BYTES])
-      #define EXPECTED_ID "vdmtest"
+      #define DEFAULT_ID "vdmtest"
       #define MAX_VIRTIO_DISKS 702
 
       static void format_device_name(unsigned int index, char *path,
@@ -58,10 +58,26 @@ final: prev: {
         path[written] = '\0';
       }
 
-      int main(void)
+      int main(int argc, char *argv[])
       {
+        const char *expected_id = DEFAULT_ID;
+        size_t expected_id_len;
         char matched_path[32] = { 0 };
         unsigned int matches = 0;
+
+        if (argc > 2) {
+          fprintf(stderr, "用法: %s [virtio-host-id]\n", argv[0]);
+          return 1;
+        }
+        if (argc == 2) {
+          expected_id = argv[1];
+        }
+        expected_id_len = strlen(expected_id);
+        if (expected_id_len == 0 || expected_id_len >= ASTER_VIRTIO_BLK_ID_BYTES) {
+          fprintf(stderr, "VirtIO Host ID 长度必须在 1 到 %u 字节之间\n",
+                  ASTER_VIRTIO_BLK_ID_BYTES - 1);
+          return 1;
+        }
 
         for (unsigned int index = 0; index < MAX_VIRTIO_DISKS; index++) {
           unsigned char id[ASTER_VIRTIO_BLK_ID_BYTES];
@@ -83,8 +99,8 @@ final: prev: {
             while (id_len < sizeof(id) && id[id_len] != '\0') {
               id_len++;
             }
-            if (id_len == sizeof(EXPECTED_ID) - 1 &&
-                memcmp(id, EXPECTED_ID, id_len) == 0) {
+            if (id_len == expected_id_len &&
+                memcmp(id, expected_id, expected_id_len) == 0) {
               matches++;
               snprintf(matched_path, sizeof(matched_path), "%s", path);
             }
@@ -103,7 +119,7 @@ final: prev: {
 
         if (matches != 1) {
           fprintf(stderr, "必须且只能找到一个 ID 为 %s 的 VirtIO 整盘，实际找到 %u 个\n",
-                  EXPECTED_ID, matches);
+                  expected_id, matches);
           return 1;
         }
 

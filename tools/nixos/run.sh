@@ -23,38 +23,51 @@ SCRIPT_DIR=$(dirname "$0")
 ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
 # 调用方可覆盖路径；默认测试盘与 NixOS 根盘并列但独立保存。
 DM_TEST_IMAGE=${DM_TEST_IMAGE:-"${ASTERINAS_DIR}/target/nixos/test.img"}
+DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-}
 
 append_dm_test_image() {
+    image_path=$1
+    drive_id=$2
+    serial=$3
+    pci_addr=$4
+
     # 每次 NixOS 启动均附加独立的 Device Mapper 测试盘。已有镜像必须原样
     # 复用，以便跨 QEMU 启动验证 LVM 元数据和文件数据的持久性。
-    if [ ! -e "${DM_TEST_IMAGE}" ]; then
-        echo "Creating Device Mapper test image at ${DM_TEST_IMAGE} (512 MiB)..."
-        mkdir -p "$(dirname "${DM_TEST_IMAGE}")"
-        fallocate -l 512M "${DM_TEST_IMAGE}"
+    if [ ! -e "${image_path}" ]; then
+        echo "Creating Device Mapper test image at ${image_path} (512 MiB)..."
+        mkdir -p "$(dirname "${image_path}")"
+        fallocate -l 512M "${image_path}"
     fi
 
-    if [ ! -f "${DM_TEST_IMAGE}" ]; then
-        echo "Error: DM_TEST_IMAGE 不是普通文件: ${DM_TEST_IMAGE}" >&2
+    if [ ! -f "${image_path}" ]; then
+        echo "Error: ${image_path} 不是普通文件" >&2
         exit 1
     fi
 
-    DM_TEST_IMAGE=$(realpath "${DM_TEST_IMAGE}")
-    case "${DM_TEST_IMAGE}" in
+    image_path=$(realpath "${image_path}")
+    case "${image_path}" in
         *[[:space:]]*)
-            echo "Error: DM_TEST_IMAGE 路径不能包含空白字符: ${DM_TEST_IMAGE}" >&2
+            echo "Error: 测试盘路径不能包含空白字符: ${image_path}" >&2
             exit 1
             ;;
     esac
 
-    if [ "${DM_TEST_IMAGE}" = "${ASTERINAS_DIR}/target/nixos/asterinas.img" ]; then
-        echo "Error: DM_TEST_IMAGE 不能指向 NixOS 根磁盘" >&2
+    if [ "${image_path}" = "${ASTERINAS_DIR}/target/nixos/asterinas.img" ]; then
+        echo "Error: DM 测试盘不能指向 NixOS 根磁盘" >&2
         exit 1
     fi
 
-    # 这里只附加调用方预先创建的 raw 镜像；脚本绝不创建、截断或调整它。
+    case " ${DM_TEST_IMAGE_REALPATHS:-} " in
+        *" ${image_path} "*)
+            echo "Error: 不能重复附加同一个 DM 测试盘: ${image_path}" >&2
+            exit 1
+            ;;
+    esac
+    DM_TEST_IMAGE_REALPATHS="${DM_TEST_IMAGE_REALPATHS:-} ${image_path}"
+
     QEMU_ARGS="${QEMU_ARGS} \
-        -drive if=none,format=raw,id=dmtest,file=${DM_TEST_IMAGE},cache=none \
-        -device virtio-blk-pci,bus=pcie.0,addr=0xc,drive=dmtest,serial=vdmtest,disable-legacy=on,disable-modern=off \
+        -drive if=none,format=raw,id=${drive_id},file=${image_path},cache=none \
+        -device virtio-blk-pci,bus=pcie.0,addr=${pci_addr},drive=${drive_id},serial=${serial},disable-legacy=on,disable-modern=off \
     "
 }
 
@@ -107,7 +120,10 @@ case "$MODE" in
         ;;
 esac
 
-append_dm_test_image
+append_dm_test_image "${DM_TEST_IMAGE}" dmtest vdmtest 0xc
+if [ -n "${DM_TEST_IMAGE_2}" ]; then
+    append_dm_test_image "${DM_TEST_IMAGE_2}" dmtest2 vdmtest2 0xd
+fi
 
 if [ "${ENABLE_KVM}" = "1" ]; then
     QEMU_ARGS="${QEMU_ARGS} -accel kvm"

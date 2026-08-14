@@ -2,7 +2,7 @@
 
 //! Asterinas 的 Device Mapper 核心组件。
 //!
-//! 第一版仅支持由单条 linear target 组成的映射表。Linux ioctl ABI 和
+//! 支持由一条或多条 linear target 组成的映射表。Linux ioctl ABI 和
 //! `/dev/mapper/control` 位于内核设备层，本组件只负责映射表、设备状态与 I/O 转发。
 
 #![no_std]
@@ -49,9 +49,9 @@ impl From<TableError> for DmError {
 /// 映射表验证失败的原因。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TableError {
-    /// 第一版只接受一条 target。
+    /// 映射表至少需要一条 target。
     UnsupportedTargetCount,
-    /// 第一版要求逻辑范围从扇区 0 开始。
+    /// 逻辑 target 必须从扇区 0 开始并连续排列。
     UnsupportedLogicalStart,
     /// target 长度不能为零。
     ZeroLength,
@@ -61,8 +61,8 @@ pub enum TableError {
     BackingRangeOverflow,
     /// 底层范围超过块设备容量。
     BackingRangeOutOfBounds,
-    /// 底层设备类型不受第一版支持。
+    /// 底层设备类型当前不受支持。
     UnsupportedBackingDevice,
-    /// BIO 不完整地位于唯一 target 中。
+    /// BIO 不完整地位于单个 target 中。
     BioOutOfRange,
 }
