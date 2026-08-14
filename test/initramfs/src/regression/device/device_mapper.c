@@ -34,7 +34,6 @@ static void init_ioctl(struct dm_ioctl *io)
 FN_TEST(device_mapper_tableless_status_is_linux_compatible)
 {
 	struct dm_ioctl io;
-	char name[DM_NAME_LEN];
 	int fd;
 	uint64_t dev;
 
@@ -49,12 +48,20 @@ FN_TEST(device_mapper_tableless_status_is_linux_compatible)
 	TEST_RES(io.data_size == DM_IOCTL_ENVELOPE_SIZE, _ret == 1);
 	TEST_RES(io.data_start == DM_IOCTL_ENVELOPE_SIZE, _ret == 1);
 
-	snprintf(name, sizeof(name), "dm-abi-%ld", (long)getpid());
 	init_ioctl(&io);
-	strncpy(io.name, name, sizeof(io.name) - 1);
+	snprintf(io.name, sizeof(io.name), "dm-abi-%ld", (long)getpid());
 	TEST_SUCC(ioctl(fd, DM_DEV_CREATE, &io));
 	TEST_RES(io.flags & DM_EXISTS_FLAG, _ret == 1);
+	TEST_RES(!(io.flags & DM_SUSPEND_FLAG), _ret == 1);
+	TEST_RES(io.target_count == 0, _ret == 1);
 	dev = io.dev;
+
+	init_ioctl(&io);
+	io.dev = dev;
+	TEST_SUCC(ioctl(fd, DM_DEV_STATUS, &io));
+	TEST_RES(io.flags & DM_EXISTS_FLAG, _ret == 1);
+	TEST_RES(!(io.flags & DM_SUSPEND_FLAG), _ret == 1);
+	TEST_RES(io.target_count == 0, _ret == 1);
 
 	init_ioctl(&io);
 	io.dev = dev;

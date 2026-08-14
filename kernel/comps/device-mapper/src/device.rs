@@ -56,7 +56,7 @@ impl Default for DmDeviceState {
         Self {
             active: None,
             inactive: None,
-            phase: DmDevicePhase::Suspended,
+            phase: DmDevicePhase::Running,
             event_nr: 0,
         }
     }
@@ -196,7 +196,7 @@ impl DmDevice {
     pub fn status(&self) -> DmDeviceStatus {
         let state = self.state.lock();
         DmDeviceStatus {
-            suspended: state.phase != DmDevicePhase::Running,
+            suspended: state.phase == DmDevicePhase::Suspended,
             has_active_table: state.active.is_some(),
             has_inactive_table: state.inactive.is_some(),
             event_nr: state.event_nr,
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(
             device.status(),
             DmDeviceStatus {
-                suspended: true,
+                suspended: false,
                 has_active_table: false,
                 has_inactive_table: false,
                 event_nr: 0,

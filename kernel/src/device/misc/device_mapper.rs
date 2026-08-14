@@ -361,7 +361,10 @@ fn remove_all(buffer: &mut [u8]) -> Result<()> {
 
 fn device_status(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
-    fill_device_header(buffer, &device)
+    let flags = read_u32(buffer, OFF_FLAGS)?;
+    let target_count = u32::from(selected_table(&device, flags).is_some());
+    fill_device_header(buffer, &device)?;
+    write_u32(buffer, OFF_TARGET_COUNT, target_count)
 }
 
 fn device_rename(buffer: &mut [u8]) -> Result<()> {
@@ -1028,10 +1031,7 @@ mod tests {
 
         fill_device_header(&mut buffer, &device).unwrap();
 
-        assert_eq!(
-            read_u32(&buffer, OFF_FLAGS).unwrap(),
-            DM_EXISTS_FLAG | DM_SUSPEND_FLAG
-        );
+        assert_eq!(read_u32(&buffer, OFF_FLAGS).unwrap(), DM_EXISTS_FLAG);
         assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 0);
         assert_eq!(read_u32(&buffer, OFF_EVENT_NR).unwrap(), 0);
         assert_eq!(read_u32(&buffer, OFF_OPEN_COUNT).unwrap(), 0);
@@ -1077,10 +1077,7 @@ mod tests {
         let mut status = test_buffer(DM_IOCTL_HEADER_SIZE);
         table_status_for_device(&mut status, &device).unwrap();
         assert_eq!(read_u32(&status, OFF_TARGET_COUNT).unwrap(), 0);
-        assert_eq!(
-            read_u32(&status, OFF_FLAGS).unwrap(),
-            DM_EXISTS_FLAG | DM_SUSPEND_FLAG
-        );
+        assert_eq!(read_u32(&status, OFF_FLAGS).unwrap(), DM_EXISTS_FLAG);
 
         let mut inactive_status = test_buffer(DM_IOCTL_HEADER_SIZE);
         write_u32(
@@ -1093,7 +1090,7 @@ mod tests {
         assert_eq!(read_u32(&inactive_status, OFF_TARGET_COUNT).unwrap(), 0);
         assert_eq!(
             read_u32(&inactive_status, OFF_FLAGS).unwrap(),
-            DM_EXISTS_FLAG | DM_SUSPEND_FLAG
+            DM_EXISTS_FLAG
         );
 
         let mut deps = test_buffer(DM_IOCTL_HEADER_SIZE + 16);
@@ -1102,6 +1099,19 @@ mod tests {
         assert_eq!(read_u32(&deps, DM_IOCTL_HEADER_SIZE + 4).unwrap(), 0);
     }
 
+    #[ktest]
+    fn reports_status_target_count_for_selected_table() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-device-status-test".to_string(), None, None)
+            .unwrap();
+
+        let mut fresh_status = test_buffer(DM_IOCTL_HEADER_SIZE);
+        write_u64(&mut fresh_status, OFF_DEV, device.id().as_encoded_u64()).unwrap();
+        device_status(&mut fresh_status).unwrap();
+        assert_eq!(read_u32(&fresh_status, OFF_TARGET_COUNT).unwrap(), 0);
+        assert_eq!(read_u32(&fresh_status, OFF_FLAGS).unwrap(), DM_EXISTS_FLAG);
+    }
     #[ktest]
     fn selects_uuid_then_name_then_device_id() {
         let manager = DmManager::new().unwrap();
@@ -1152,7 +1162,7 @@ mod tests {
         assert_eq!(
             device.status(),
             aster_device_mapper::DmDeviceStatus {
-                suspended: true,
+                suspended: false,
                 has_active_table: false,
                 has_inactive_table: false,
                 event_nr: 0,
