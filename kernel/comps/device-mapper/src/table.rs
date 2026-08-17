@@ -113,20 +113,58 @@ impl DmTable {
             .checked_add(length)
             .ok_or(BioEnqueueError::Refused)?;
 
-        let target = self
-            .linears
-            .iter()
-            .find(|target| {
-                range.start >= target.logical_range().start
-                    && logical_end <= target.logical_range().end.to_raw()
-            })
-            .ok_or(BioEnqueueError::Refused)?;
+        let parts = self.bio_parts(range.start, logical_end)?;
+        if parts.len() == 1 {
+            let (range, target) = parts.into_iter().next().unwrap();
+            let backing_start = target
+                .map_sector(range.start)
+                .ok_or(BioEnqueueError::Refused)?;
+            bio.remap_sid_start(backing_start)?;
+            return target.backing().enqueue(bio);
+        }
 
-        let backing_start = target
-            .map_sector(range.start)
-            .ok_or(BioEnqueueError::Refused)?;
-        bio.remap_sid_start(backing_start)?;
-        target.backing().enqueue(bio)
+        let ranges = parts
+            .iter()
+            .map(|(range, _)| range.clone())
+            .collect::<Vec<_>>();
+        let (children, completion) = bio.split(ranges)?;
+        for (mut child, (range, target)) in children.into_iter().zip(parts) {
+            let Some(backing_start) = target.map_sector(range.start) else {
+                completion.complete_child(BioStatus::IoError);
+                continue;
+            };
+            if child.remap_sid_start(backing_start).is_err() {
+                completion.complete_child(BioStatus::IoError);
+                continue;
+            }
+            if target.backing().enqueue(child).is_err() {
+                completion.complete_child(BioStatus::IoError);
+            }
+        }
+        Ok(())
+    }
+
+    fn bio_parts(
+        &self,
+        start: Sid,
+        end: u64,
+    ) -> Result<Vec<(core::ops::Range<Sid>, &LinearTarget)>, BioEnqueueError> {
+        let mut cursor = start.to_raw();
+        let mut parts = Vec::new();
+        while cursor < end {
+            let target = self
+                .linears
+                .iter()
+                .find(|target| {
+                    cursor >= target.logical_range().start.to_raw()
+                        && cursor < target.logical_range().end.to_raw()
+                })
+                .ok_or(BioEnqueueError::Refused)?;
+            let part_end = core::cmp::min(end, target.logical_range().end.to_raw());
+            parts.push((Sid::new(cursor)..Sid::new(part_end), target));
+            cursor = part_end;
+        }
+        Ok(parts)
     }
 
     fn enqueue_flush(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
@@ -164,7 +202,7 @@ mod tests {
 
     use aster_block::{
         BlockDevice, BlockDeviceMeta,
-        bio::{Bio, BioStatus},
+        bio::{BioDirection, BioSegment},
     };
     use device_id::{MajorId, MinorId};
     use ostd::{prelude::ktest, sync::Mutex};
@@ -175,6 +213,7 @@ mod tests {
     struct RecordingBlockDevice {
         id: DeviceId,
         last_range: Mutex<Option<core::ops::Range<Sid>>>,
+        submitted_ranges: Mutex<Vec<core::ops::Range<Sid>>>,
         flush_count: Mutex<usize>,
     }
 
@@ -183,6 +222,7 @@ mod tests {
             Arc::new(Self {
                 id: DeviceId::new(MajorId::new(1), MinorId::new(minor)),
                 last_range: Mutex::new(None),
+                submitted_ranges: Mutex::new(Vec::new()),
                 flush_count: Mutex::new(0),
             })
         }
@@ -194,6 +234,7 @@ mod tests {
                 *self.flush_count.lock() += 1;
             }
             *self.last_range.lock() = Some(bio.sid_range().clone());
+            self.submitted_ranges.lock().push(bio.sid_range().clone());
             bio.complete(BioStatus::Complete);
             Ok(())
         }
@@ -235,6 +276,50 @@ mod tests {
         assert_eq!(
             *backing.last_range.lock(),
             Some(Sid::new(108)..Sid::new(108))
+        );
+    }
+
+    #[ktest]
+    fn splits_bio_across_linear_target_boundary() {
+        let first = RecordingBlockDevice::new(1);
+        let second = RecordingBlockDevice::new(2);
+        let table = Arc::new(
+            DmTable::new_linear(vec![
+                LinearTarget::new(
+                    Sid::new(0),
+                    4,
+                    Sid::new(100),
+                    BlockDeviceLease::new_untracked(first.clone() as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+                LinearTarget::new(
+                    Sid::new(4),
+                    4,
+                    Sid::new(200),
+                    BlockDeviceLease::new_untracked(second.clone() as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        let read = Bio::new(
+            BioType::Read,
+            Sid::new(0),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        );
+
+        assert_eq!(
+            read.submit_and_wait(&TableDevice(table)).unwrap(),
+            BioStatus::Complete
+        );
+        assert_eq!(
+            *first.submitted_ranges.lock(),
+            vec![Sid::new(100)..Sid::new(104)]
+        );
+        assert_eq!(
+            *second.submitted_ranges.lock(),
+            vec![Sid::new(200)..Sid::new(204)]
         );
     }
 

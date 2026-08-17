@@ -245,6 +245,107 @@ impl SubmittedBio {
         self.remap_sid_start(new_start)
     }
 
+    /// 将当前 BIO 拆成覆盖同一范围的多个子 BIO。
+    pub fn split(
+        self,
+        ranges: Vec<Range<Sid>>,
+    ) -> Result<(Vec<Self>, SplitBioCompletionHandle), BioEnqueueError> {
+        self.validate_split_ranges(&ranges)?;
+
+        let type_ = self.type_();
+        let child_segments = ranges
+            .iter()
+            .map(|range| self.segments_for_child_range(range))
+            .collect::<Result<Vec<_>, _>>()?;
+        let completion = Arc::new(SplitBioCompletion {
+            remaining: AtomicUsize::new(ranges.len()),
+            status: AtomicU32::new(BioStatus::Complete as u32),
+            original: SpinLock::new(Some(self)),
+        });
+
+        let children = ranges
+            .into_iter()
+            .zip(child_segments)
+            .map(|(range, segments)| {
+                let completion = completion.clone();
+                Self {
+                    metadata: Arc::new(BioMetadata {
+                        type_,
+                        sid_range: range.clone(),
+                        status: AtomicU32::new(BioStatus::Submit as u32),
+                        wait_queue: WaitQueue::new(),
+                    }),
+                    current_sid_range: range,
+                    complete_fn: Some(Box::new(move |status| completion.complete_child(status))),
+                    segments,
+                }
+            })
+            .collect();
+        Ok((children, SplitBioCompletionHandle { inner: completion }))
+    }
+
+    fn validate_split_ranges(&self, ranges: &[Range<Sid>]) -> Result<(), BioEnqueueError> {
+        if ranges.is_empty() || ranges[0].start != self.current_sid_range.start {
+            return Err(BioEnqueueError::Refused);
+        }
+
+        let mut expected_start = self.current_sid_range.start;
+        for range in ranges {
+            if range.start != expected_start || range.start >= range.end {
+                return Err(BioEnqueueError::Refused);
+            }
+            expected_start = range.end;
+        }
+        if expected_start != self.current_sid_range.end {
+            return Err(BioEnqueueError::Refused);
+        }
+        Ok(())
+    }
+
+    fn segments_for_child_range(
+        &self,
+        range: &Range<Sid>,
+    ) -> Result<Vec<BioSegment>, BioEnqueueError> {
+        let start_sectors = range
+            .start
+            .to_raw()
+            .checked_sub(self.current_sid_range.start.to_raw())
+            .ok_or(BioEnqueueError::Refused)?;
+        let end_sectors = range
+            .end
+            .to_raw()
+            .checked_sub(self.current_sid_range.start.to_raw())
+            .ok_or(BioEnqueueError::Refused)?;
+        let start = sectors_to_bytes(start_sectors)?;
+        let end = sectors_to_bytes(end_sectors)?;
+
+        let mut segments = Vec::new();
+        let mut cursor = 0usize;
+        for segment in &self.segments {
+            let segment_start = cursor;
+            let segment_end = cursor
+                .checked_add(segment.nbytes())
+                .ok_or(BioEnqueueError::Refused)?;
+            cursor = segment_end;
+
+            let overlap_start = core::cmp::max(start, segment_start);
+            let overlap_end = core::cmp::min(end, segment_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            let relative_start = overlap_start - segment_start;
+            let relative_end = overlap_end - segment_start;
+            segments.push(segment.slice(relative_start..relative_end));
+        }
+
+        let total_len = segments.iter().map(BioSegment::nbytes).sum::<usize>();
+        if total_len != end - start {
+            return Err(BioEnqueueError::Refused);
+        }
+        Ok(segments)
+    }
+
     /// Returns the slice to the memory segments.
     pub fn segments(&self) -> &[BioSegment] {
         &self.segments
@@ -312,6 +413,54 @@ impl Debug for SubmittedBio {
             .field("segments", &self.segments)
             .finish()
     }
+}
+
+pub struct SplitBioCompletionHandle {
+    inner: Arc<SplitBioCompletion>,
+}
+
+impl SplitBioCompletionHandle {
+    pub fn complete_child(&self, status: BioStatus) {
+        self.inner.complete_child(status);
+    }
+}
+
+struct SplitBioCompletion {
+    remaining: AtomicUsize,
+    status: AtomicU32,
+    original: SpinLock<Option<SubmittedBio>, LocalIrqDisabled>,
+}
+
+impl SplitBioCompletion {
+    fn complete_child(&self, status: BioStatus) {
+        if status != BioStatus::Complete {
+            let _ = self.status.compare_exchange(
+                BioStatus::Complete as u32,
+                status as u32,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+
+        let previous = self.remaining.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        if previous == 1 {
+            let status = BioStatus::try_from(self.status.load(Ordering::Acquire)).unwrap();
+            let original = self
+                .original
+                .lock()
+                .take()
+                .expect("split BIO original must complete exactly once");
+            original.complete(status);
+        }
+    }
+}
+
+fn sectors_to_bytes(sectors: u64) -> Result<usize, BioEnqueueError> {
+    usize::try_from(sectors)
+        .ok()
+        .and_then(|sectors| sectors.checked_mul(SECTOR_SIZE))
+        .ok_or(BioEnqueueError::Refused)
 }
 
 /// The metadata and waitable state shared by submitted `Bio`s and their waiter handles.
@@ -517,6 +666,20 @@ impl BioSegment {
     /// Returns the inner DMA slice.
     pub fn inner_dma_slice(&self) -> &Slice<Arc<DmaStream>> {
         &self.inner.dma_slice
+    }
+
+    fn slice(&self, range: Range<usize>) -> Self {
+        assert!(is_sector_aligned(range.start) && is_sector_aligned(range.end - range.start));
+        if range.start == 0 && range.end == self.nbytes() {
+            return self.clone();
+        }
+        Self {
+            inner: Arc::new(BioSegmentInner {
+                dma_slice: self.inner.dma_slice.slice(range),
+                direction: self.inner.direction,
+                from_pool: false,
+            }),
+        }
     }
 
     /// Returns the inner DMA object.
