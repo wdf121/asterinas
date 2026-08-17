@@ -21,8 +21,8 @@ MODE=$1
 TARGET_ARCH=${TARGET_ARCH:-x86_64}
 SCRIPT_DIR=$(dirname "$0")
 ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
-# 调用方可覆盖路径；默认测试盘与 NixOS 根盘并列但独立保存。
-DM_TEST_IMAGE=${DM_TEST_IMAGE:-"${ASTERINAS_DIR}/target/nixos/test.img"}
+# 调用方显式设置 DM_TEST_IMAGE / DM_TEST_IMAGE_2 时才附加 Device Mapper 测试盘。
+DM_TEST_IMAGE=${DM_TEST_IMAGE:-}
 DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-}
 
 append_dm_test_image() {
@@ -64,6 +64,8 @@ append_dm_test_image() {
             ;;
     esac
     DM_TEST_IMAGE_REALPATHS="${DM_TEST_IMAGE_REALPATHS:-} ${image_path}"
+
+    echo "Attaching Device Mapper test image: path=${image_path} serial=${serial} drive_id=${drive_id}"
 
     QEMU_ARGS="${QEMU_ARGS} \
         -drive if=none,format=raw,id=${drive_id},file=${image_path},cache=none \
@@ -120,7 +122,9 @@ case "$MODE" in
         ;;
 esac
 
-append_dm_test_image "${DM_TEST_IMAGE}" dmtest vdmtest 0xc
+if [ -n "${DM_TEST_IMAGE}" ]; then
+    append_dm_test_image "${DM_TEST_IMAGE}" dmtest vdmtest 0xc
+fi
 if [ -n "${DM_TEST_IMAGE_2}" ]; then
     append_dm_test_image "${DM_TEST_IMAGE_2}" dmtest2 vdmtest2 0xd
 fi

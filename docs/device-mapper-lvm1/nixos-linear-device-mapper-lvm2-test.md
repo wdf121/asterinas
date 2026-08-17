@@ -33,7 +33,8 @@
 5. Device Mapper 能加载并使用跨 PV 的多段 linear table；
 6. 扩容和缩容前后 ext2 数据保持可读；
 7. `du -sh` 能在 DM 设备上的 ext2 中统计挂载点和文件占用；
-8. 第二台 QEMU 能从持久化 PV/VG/LV 元数据恢复跨 PV 操作后的 LV。
+8. 第二台 QEMU 能从持久化 PV/VG/LV 元数据恢复跨 PV 操作后的 LV；
+9. 补充回归能验证一个普通 4 KiB BIO 跨过两个 linear target 边界时被正确拆分、重映射和聚合完成。
 
 ---
 
@@ -179,7 +180,7 @@ rm -f target/nixos/test.img target/nixos/test2.img
 
 这两个文件都是普通 raw 镜像，使用 `rm -f` 即可。不要使用 `rm -rf`。
 
-`tools/nixos/run.sh` 会在测试盘不存在时：
+`tools/nixos/run.sh` 会在显式设置 `DM_TEST_IMAGE` / `DM_TEST_IMAGE_2` 且测试盘不存在时：
 
 1. 创建 512 MiB raw 镜像；
 2. 将 `target/nixos/test.img` 作为 VirtIO block 设备附加，serial 为 `vdmtest`；
@@ -190,10 +191,24 @@ rm -f target/nixos/test.img target/nixos/test2.img
 
 ## 5. 构建正常 NixOS 根镜像
 
-执行：
+先构建根镜像：
 
 ```bash
 make nixos
+```
+
+构建完成后，使用仓库根目录的一键入口显式附加两块测试盘并启动 NixOS：
+
+```bash
+./br.sh
+```
+
+该脚本等价于：
+
+```bash
+DM_TEST_IMAGE=target/nixos/test.img \
+DM_TEST_IMAGE_2=target/nixos/test2.img \
+make run_nixos
 ```
 
 通过标准：
@@ -207,10 +222,10 @@ make nixos
 
 ## 6. 第一台 QEMU：创建跨 PV LV、读写、扩容和缩容
 
-启动 NixOS，并显式附加第二块测试盘：
+启动 NixOS，并显式附加两块测试盘：
 
 ```bash
-DM_TEST_IMAGE_2=target/nixos/test2.img make run_nixos
+./br.sh
 ```
 
 等待系统通过正常 Stage 2 和 systemd 路径启动。串口中应出现 root 自动登录和 shell 提示符：
@@ -580,7 +595,9 @@ rm -f target/nixos/test.img target/nixos/test2.img
 在开发容器中的项目根目录重新启动，并继续附加同一块第二测试盘：
 
 ```bash
-DM_TEST_IMAGE_2=target/nixos/test2.img make run_nixos
+DM_TEST_IMAGE=target/nixos/test.img \
+DM_TEST_IMAGE_2=target/nixos/test2.img \
+make run_nixos
 ```
 
 等待第二台 guest 正常进入 root shell。以下命令均在第二台 guest 中执行。
@@ -688,13 +705,68 @@ poweroff
 
 ---
 
-## 8. 通过标准
+## 8. 补充回归：单个 BIO 跨 target 边界
+
+跨 PV 的 LVM 主线不一定稳定触发“一个普通 BIO 同时覆盖两个 linear target”的数据面路径。因此在完成跨 PV LVM 验收后，建议额外运行一个最小 DM table，强制 4 KiB BIO 跨过 target 边界。
+
+该测试默认使用和 `br.sh` 相同的两块测试盘：
+
+```text
+DM_TEST_IMAGE=target/nixos/test.img
+DM_TEST_IMAGE_2=target/nixos/test2.img
+CROSS_TARGET_BIO_LOG=/tmp/cross-target-bio-regression.log
+GUEST_INPUT_DELAY=180
+```
+
+注意：该脚本会直接写两块测试盘开头的数据区域。运行前应确保这两块盘不是要保留的 LVM 测试结果；需要全新测试时先删除：
+
+```bash
+rm -f target/nixos/test.img target/nixos/test2.img
+```
+
+执行：
+
+```bash
+docker exec myAsterinas bash -lc 'cd /root/asterinas && tools/nixos/run_cross_target_bio_regression.sh'
+```
+
+该脚本不会实时显示完整 QEMU 终端输出，而是写入容器内 `/tmp/cross-target-bio-regression.log`。脚本结束后，host 侧只打印筛选后的 summary。判断结果时看两点：
+
+1. summary 中能看到 `=== STEP ... ===`、`=== CHECK ... ===`、两行 `linear` table 和 sha256/cmp 相关检查；
+2. 最后一行出现 `HOST_PASS_CROSS_TARGET_BIO`，且 `docker exec` 退出码为 0。
+
+这里不用 `/sys/class/block/<dev>/dev` 获取 major:minor，因为当前 Asterinas NixOS 的 sysfs 块设备节点并不完整；使用 `stat -c '%t:%T'` 从 `/dev/vdX` 设备节点获取设备号更稳妥。
+
+预期 `dmsetup table cross_bio_test` 输出两段 4-sector linear target：
+
+```text
+0 4 linear <disk1-major>:<disk1-minor> 0
+4 4 linear <disk2-major>:<disk2-minor> 0
+```
+
+通过标准：
+
+- 日志包含 `=== STEP ... ===` 和 `=== CHECK ... ===` 检查点，能看到测试盘、major:minor、DM table、sha256 和 `cmp` 校验过程；
+- `dmsetup table cross_bio_test` 输出两段 4-sector linear target，且脚本用 `grep -F -x` 精确断言两行内容；
+- 向 `/dev/mapper/cross_bio_test` 写入 4096 字节成功；
+- 从 `/dev/mapper/cross_bio_test` 读回 4096 字节成功；
+- 读回内容与写入内容完全一致；
+- 第一块 backing 盘前 2048 字节等于写入内容的前半段；
+- 第二块 backing 盘前 2048 字节等于写入内容的后半段；
+- guest 日志出现 `TEST_PASS_CROSS_TARGET_BIO`；
+- host 日志出现 `HOST_PASS_CROSS_TARGET_BIO`，且 `docker exec` 退出码为 0。
+
+该测试验证的是 Device Mapper 数据面能把一个跨 target 边界的普通 BIO 拆成多个 child BIO，分别重映射到底层 backing device，并在所有 child 完成后聚合原 BIO completion。
+
+---
+
+## 9. 通过标准
 
 必须同时满足以下条件，才能认为 Linear Device Mapper 的 NixOS/LVM2 跨 PV 验收通过：
 
 1. `make nixos` 成功构建正常 NixOS 根镜像。
 2. 测试开始前删除旧 `target/nixos/test.img` 和 `target/nixos/test2.img`。
-3. `DM_TEST_IMAGE_2=target/nixos/test2.img make run_nixos` 自动创建并附加两块 512 MiB 测试盘。
+3. `DM_TEST_IMAGE=target/nixos/test.img DM_TEST_IMAGE_2=target/nixos/test2.img make run_nixos` 自动创建并附加两块 512 MiB 测试盘。
 4. 两台 QEMU 都通过正常 Stage 2 和 systemd 路径启动。
 5. 两台 QEMU 都自动登录到真实 root shell。
 6. `aster-dm-disk-locator` 每次都唯一定位到 serial 为 `vdmtest` 的测试盘。
@@ -714,10 +786,11 @@ poweroff
 20. 第二台 QEMU 重新扫描并激活后，`test_vg` 仍包含两个 PV，`test_lv` 为 300 MiB。
 21. 第二台只读挂载后，`hello.txt` 输出 `hello world`，`grow.txt` 输出 `after grow`，`du -sh` 能统计恢复后的挂载点和文件占用。
 22. 两次测试结束前都完成卸载、VG 停用和正常关机。
+23. 补充回归中的 `cross_bio_test` 两段 4-sector linear table 能成功完成一次 4 KiB 读写，读回内容一致，并且两个 backing 盘各收到 2048 字节数据。
 
 ---
 
-## 9. Expected unsupported 检查
+## 10. Expected unsupported 检查
 
 下面这些布局可以作为 expected unsupported 检查，但不能作为本轮跨 PV linear 验收的通过条件：
 
@@ -731,7 +804,7 @@ poweroff
 
 ---
 
-## 10. 常见非阻塞警告
+## 11. 常见非阻塞警告
 
 当前环境中，LVM2 可能输出：
 
@@ -755,13 +828,13 @@ Failed to find module 'unix'
 
 ---
 
-## 11. 故障排查
+## 12. 故障排查
 
-### 11.1 找不到测试盘
+### 12.1 找不到测试盘
 
 如果 `aster-dm-disk-locator` 报告匹配数量不是 1：
 
-1. 确认 `tools/nixos/run.sh` 已附加默认的 `target/nixos/test.img`；
+1. 确认 host 侧启动命令显式设置了 `DM_TEST_IMAGE=target/nixos/test.img`；
 2. 确认第一块测试盘使用 serial `vdmtest`；
 3. 确认没有额外附加另一块同 serial 的磁盘；
 4. 不要改用硬编码 `/dev/vdX` 绕过定位失败。
@@ -772,7 +845,7 @@ Failed to find module 'unix'
 2. 确认第二块测试盘使用 serial `vdmtest2`；
 3. 确认第二次 QEMU 恢复验证时仍然传入同一个 `DM_TEST_IMAGE_2`。
 
-### 11.2 `lvcreate` 报告设备不存在
+### 12.2 `lvcreate` 报告设备不存在
 
 如果出现：
 
@@ -800,7 +873,7 @@ lvcreate \
 
 不需要加入 `udev_sync=0`。
 
-### 11.3 mapper 设备不存在
+### 12.3 mapper 设备不存在
 
 执行：
 
@@ -817,7 +890,7 @@ vgchange \
     -ay test_vg
 ```
 
-### 11.4 扩容后没有跨 PV
+### 12.4 扩容后没有跨 PV
 
 如果扩容到 700 MiB 后 `lvs --segments` 仍只显示一个 PV，说明测试盘容量、PV 元数据或命令参数与预期不符。
 
@@ -836,7 +909,7 @@ lvs --segments -o lv_name,seg_start,seg_size,devices test_vg/test_lv
 - `test_lv` 目标大小确实是 700 MiB；
 - `lvextend` 命令中传入了 `$TEST_DISK2`。
 
-### 11.5 ext2 格式化成功但挂载失败
+### 12.5 ext2 格式化成功但挂载失败
 
 确认格式化命令使用 mapper 路径并显式指定 4 KiB block size：
 
@@ -846,7 +919,7 @@ mkfs.ext2 -F -b 4096 /dev/mapper/test_vg-test_lv
 
 不要使用当前环境下默认生成 1 KiB block-size 文件系统的命令作为验收方式。
 
-### 11.6 缩容顺序错误
+### 12.6 缩容顺序错误
 
 不要先执行 `lvreduce` 再缩小 ext2。
 
@@ -862,13 +935,13 @@ umount
 
 先缩小 LV 会截断文件系统后部，可能直接破坏数据。
 
-### 11.7 多 target table 被拒绝
+### 12.7 多 target table 被拒绝
 
 如果扩容到 700 MiB 时失败，并且内核日志或 LVM2 报错指向 `DM_TABLE_LOAD`、`target_count` 或 `UnsupportedTargetCount`，说明当前运行的内核仍然拒绝多段 linear table。
 
 本测试要求跨 PV LV 成为正向验收，因此需要确认当前内核已经支持一个 DM 设备加载多行 `linear` target。
 
-### 11.8 users activation 或 PAM 登录失败
+### 12.8 users activation 或 PAM 登录失败
 
 如果启动日志出现：
 
