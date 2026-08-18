@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#[cfg(ktest)]
-use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use aster_block::{
     BlockDeviceLease,
@@ -10,6 +9,7 @@ use aster_block::{
     id::Sid,
 };
 use device_id::DeviceId;
+use ostd::sync::SpinLock;
 
 use crate::{TableError, target::linear::LinearTarget};
 
@@ -169,30 +169,79 @@ impl DmTable {
 
     fn enqueue_flush(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
         let mut flushed = Vec::new();
+        let mut backings = Vec::new();
         for target in &self.linears {
             let backing_id = target.backing_id();
             if flushed.contains(&backing_id) {
                 continue;
             }
             flushed.push(backing_id);
-
-            match Bio::new(BioType::Flush, Sid::new(0), Vec::new(), None)
-                .submit_and_wait(target.backing())
-            {
-                Ok(BioStatus::Complete) => {}
-                Ok(status) => {
-                    bio.complete(status);
-                    return Ok(());
-                }
-                Err(_) => {
-                    bio.complete(BioStatus::IoError);
-                    return Ok(());
-                }
-            }
+            backings.push(target.backing());
         }
 
-        bio.complete(BioStatus::Complete);
+        if backings.is_empty() {
+            bio.complete(BioStatus::Complete);
+            return Ok(());
+        }
+
+        let completion = Arc::new(FlushCompletion::new(backings.len(), bio));
+        for backing in backings {
+            let completion = completion.clone();
+            let callback_completion = completion.clone();
+            let flush = Bio::new(
+                BioType::Flush,
+                Sid::new(0),
+                Vec::new(),
+                Some(Box::new(move |status| {
+                    callback_completion.complete_one(status)
+                })),
+            );
+            let mut io_batch = io_util::batch::IoBatch::with_capacity(1);
+            if flush.submit(backing, &mut io_batch).is_err() {
+                completion.complete_one(BioStatus::IoError);
+            }
+        }
         Ok(())
+    }
+}
+
+struct FlushCompletion {
+    remaining: AtomicUsize,
+    status: AtomicU32,
+    original: SpinLock<Option<SubmittedBio>>,
+}
+
+impl FlushCompletion {
+    fn new(remaining: usize, original: SubmittedBio) -> Self {
+        Self {
+            remaining: AtomicUsize::new(remaining),
+            status: AtomicU32::new(BioStatus::Complete as u32),
+            original: SpinLock::new(Some(original)),
+        }
+    }
+
+    fn complete_one(&self, status: BioStatus) {
+        if status != BioStatus::Complete {
+            let _ = self.status.compare_exchange(
+                BioStatus::Complete as u32,
+                status as u32,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+
+        let previous = self.remaining.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        if previous == 1 {
+            let status = BioStatus::try_from(self.status.load(Ordering::Acquire)).unwrap();
+            let original = self
+                .original
+                .disable_irq()
+                .lock()
+                .take()
+                .expect("flush BIO original must complete exactly once");
+            original.complete(status);
+        }
     }
 }
 
@@ -215,15 +264,27 @@ mod tests {
         last_range: Mutex<Option<core::ops::Range<Sid>>>,
         submitted_ranges: Mutex<Vec<core::ops::Range<Sid>>>,
         flush_count: Mutex<usize>,
+        flush_status: BioStatus,
+        fail_flush_enqueue: bool,
     }
 
     impl RecordingBlockDevice {
         fn new(minor: u32) -> Arc<Self> {
+            Self::new_with_flush(minor, BioStatus::Complete, false)
+        }
+
+        fn new_with_flush(
+            minor: u32,
+            flush_status: BioStatus,
+            fail_flush_enqueue: bool,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 id: DeviceId::new(MajorId::new(1), MinorId::new(minor)),
                 last_range: Mutex::new(None),
                 submitted_ranges: Mutex::new(Vec::new()),
                 flush_count: Mutex::new(0),
+                flush_status,
+                fail_flush_enqueue,
             })
         }
     }
@@ -231,7 +292,14 @@ mod tests {
     impl BlockDevice for RecordingBlockDevice {
         fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
             if bio.type_() == BioType::Flush {
+                if self.fail_flush_enqueue {
+                    return Err(BioEnqueueError::Refused);
+                }
                 *self.flush_count.lock() += 1;
+                *self.last_range.lock() = Some(bio.sid_range().clone());
+                self.submitted_ranges.lock().push(bio.sid_range().clone());
+                bio.complete(self.flush_status);
+                return Ok(());
             }
             *self.last_range.lock() = Some(bio.sid_range().clone());
             self.submitted_ranges.lock().push(bio.sid_range().clone());
@@ -387,6 +455,109 @@ mod tests {
         );
         assert_eq!(*first.flush_count.lock(), 1);
         assert_eq!(*second.flush_count.lock(), 1);
+    }
+
+    #[ktest]
+    fn propagates_flush_completion_failure() {
+        let first = RecordingBlockDevice::new(1);
+        let second = RecordingBlockDevice::new_with_flush(2, BioStatus::IoError, false);
+        let table = Arc::new(
+            DmTable::new_linear(vec![
+                LinearTarget::new(
+                    Sid::new(0),
+                    128,
+                    Sid::new(100),
+                    BlockDeviceLease::new_untracked(first as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+                LinearTarget::new(
+                    Sid::new(128),
+                    64,
+                    Sid::new(200),
+                    BlockDeviceLease::new_untracked(second as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        let flush = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
+
+        assert_eq!(
+            flush.submit_and_wait(&TableDevice(table)).unwrap(),
+            BioStatus::IoError
+        );
+    }
+
+    #[ktest]
+    fn completes_flush_with_error_when_backing_enqueue_fails() {
+        let backing = RecordingBlockDevice::new_with_flush(1, BioStatus::Complete, true);
+        let table = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(100),
+                BlockDeviceLease::new_untracked(backing as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+        );
+        let flush = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
+
+        assert_eq!(
+            flush.submit_and_wait(&TableDevice(table)).unwrap(),
+            BioStatus::IoError
+        );
+    }
+
+    #[ktest]
+    fn reports_capacity_and_queue_limits_from_linear_targets() {
+        let first = RecordingBlockDevice::new(1);
+        let second = RecordingBlockDevice::new(2);
+        let table = DmTable::new_linear(vec![
+            LinearTarget::new(
+                Sid::new(0),
+                128,
+                Sid::new(100),
+                BlockDeviceLease::new_untracked(first as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+            LinearTarget::new(
+                Sid::new(128),
+                64,
+                Sid::new(200),
+                BlockDeviceLease::new_untracked(second as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(table.length(), 192);
+        assert_eq!(table.metadata().nr_sectors, 192);
+        assert_eq!(table.metadata().max_nr_segments_per_bio, 8);
+    }
+
+    #[ktest]
+    fn refuses_bio_outside_linear_table_range() {
+        let backing = RecordingBlockDevice::new(1);
+        let table = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                4,
+                Sid::new(100),
+                BlockDeviceLease::new_untracked(backing as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+        );
+        let read = Bio::new(
+            BioType::Read,
+            Sid::new(4),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        );
+
+        assert_eq!(
+            read.submit_and_wait(&TableDevice(table)).unwrap_err(),
+            BioEnqueueError::Refused
+        );
     }
 
     #[ktest]
