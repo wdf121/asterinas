@@ -11,7 +11,7 @@ ENABLE_KVM ?= 1
 INTEL_TDX ?= 0
 MEM ?= 8G
 OVMF ?= on
-RELEASE ?= 1 
+RELEASE ?= 1
 RELEASE_LTO ?= 0
 LOG_LEVEL ?= error
 SCHEME ?= ""
@@ -321,6 +321,22 @@ run_nixos:
     else \
         ./tools/nixos/run.sh nixos; \
     fi
+
+.PHONY: rm_dm
+rm_dm:
+	@if [ -n "$${DM_TEST_IMAGES:-}" ]; then \
+		images=( $$DM_TEST_IMAGES ); \
+	else \
+		shopt -s nullglob; \
+		images=(target/nixos/test.img target/nixos/test[0-9]*.img); \
+	fi; \
+	if [ "$${#images[@]}" -gt 0 ]; then \
+		echo "Removing Device Mapper test images:"; \
+		printf '%s\n' "$${images[@]}"; \
+		rm -f "$${images[@]}"; \
+	else \
+		echo "No Device Mapper test images to remove"; \
+	fi
 
 # Build the Asterinas NixOS patched packages
 cachix:
