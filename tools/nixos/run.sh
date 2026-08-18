@@ -21,9 +21,20 @@ MODE=$1
 TARGET_ARCH=${TARGET_ARCH:-x86_64}
 SCRIPT_DIR=$(dirname "$0")
 ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
-# 调用方显式设置 DM_TEST_IMAGE / DM_TEST_IMAGE_2 时才附加 Device Mapper 测试盘。
+# 调用方显式设置 DM_TEST_IMAGES 时附加多个 Device Mapper 测试盘。
+# 兼容旧变量 DM_TEST_IMAGE / DM_TEST_IMAGE_2；如果 DM_TEST_IMAGES 为空，
+# 则按旧变量拼出测试盘列表。
+DM_TEST_IMAGES=${DM_TEST_IMAGES:-}
 DM_TEST_IMAGE=${DM_TEST_IMAGE:-}
 DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-}
+if [ -z "${DM_TEST_IMAGES}" ]; then
+    if [ -n "${DM_TEST_IMAGE}" ]; then
+        DM_TEST_IMAGES="${DM_TEST_IMAGE}"
+    fi
+    if [ -n "${DM_TEST_IMAGE_2}" ]; then
+        DM_TEST_IMAGES="${DM_TEST_IMAGES:+${DM_TEST_IMAGES} }${DM_TEST_IMAGE_2}"
+    fi
+fi
 
 append_dm_test_image() {
     image_path=$1
@@ -71,6 +82,22 @@ append_dm_test_image() {
         -drive if=none,format=raw,id=${drive_id},file=${image_path},cache=none \
         -device virtio-blk-pci,bus=pcie.0,addr=${pci_addr},drive=${drive_id},serial=${serial},disable-legacy=on,disable-modern=off \
     "
+}
+
+append_dm_test_images() {
+    disk_index=1
+    for image_path in ${DM_TEST_IMAGES}; do
+        if [ "${disk_index}" -eq 1 ]; then
+            drive_id=dmtest
+            serial=vdmtest
+        else
+            drive_id=dmtest${disk_index}
+            serial=vdmtest${disk_index}
+        fi
+        pci_addr=$(printf '0x%x' $((0xb + disk_index)))
+        append_dm_test_image "${image_path}" "${drive_id}" "${serial}" "${pci_addr}"
+        disk_index=$((disk_index + 1))
+    done
 }
 
 # tools/qemu_args.sh currently emits x86_64-specific arguments.
@@ -122,11 +149,8 @@ case "$MODE" in
         ;;
 esac
 
-if [ -n "${DM_TEST_IMAGE}" ]; then
-    append_dm_test_image "${DM_TEST_IMAGE}" dmtest vdmtest 0xc
-fi
-if [ -n "${DM_TEST_IMAGE_2}" ]; then
-    append_dm_test_image "${DM_TEST_IMAGE_2}" dmtest2 vdmtest2 0xd
+if [ -n "${DM_TEST_IMAGES}" ]; then
+    append_dm_test_images
 fi
 
 if [ "${ENABLE_KVM}" = "1" ]; then

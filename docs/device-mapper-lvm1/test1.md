@@ -1,0 +1,474 @@
+# Device Mapper 测试脚本使用汇总
+
+本文档汇总当前 Device Mapper / LVM2 相关一键测试脚本的用途、运行方法、日志位置和通过标准。
+
+所有自建 shell 脚本统一放在仓库根目录下的 `myshell/`：
+
+```text
+myshell/br.sh
+myshell/run_cross_target_bio_regression.sh
+myshell/run_cross_pv_large_write_test.sh
+myshell/run_lvm2_resize_test.sh
+```
+
+这些脚本都应该在 Asterinas 开发容器内的 `/root/asterinas` 目录运行。
+
+---
+
+## 1. 测试分层逻辑
+
+当前测试按从小到大分三层：
+
+```text
+第一层：raw BIO 边界回归
+  验证单个 4 KiB BIO 跨两个 DM target 时能 split/remap/complete。
+
+第二层：跨 PV 大文件数据面
+  验证 ext2 + LVM2 + DM 多段 linear table 上的大文件读写和重启恢复。
+
+第三层：完整 LVM2 扩缩容流程
+  验证 LV 创建、active 扩容、resize2fs、缩容和重启恢复。
+```
+
+推荐顺序：
+
+```bash
+myshell/run_cross_target_bio_regression.sh
+myshell/run_cross_pv_large_write_test.sh
+myshell/run_lvm2_resize_test.sh
+```
+
+这样排的原因：
+
+- BIO 回归最小，失败时能最快定位 DM split/remap/completion；
+- 大文件测试验证真实跨 PV 数据面；
+- LVM2 扩缩容测试最完整，也最慢，适合作最终验收。
+
+---
+
+## 2. 通用准备
+
+进入开发容器：
+
+```bash
+docker exec -it myAsterinas bash
+cd /root/asterinas
+```
+
+先构建 NixOS 根镜像：
+
+```bash
+make nixos
+```
+
+注意：测试脚本不会执行 `make nixos`。如果 `target/nixos/asterinas.img` 不存在，测试脚本会直接失败并提示先构建根镜像。
+
+运行测试前确认没有正在运行的 QEMU：
+
+```bash
+pgrep -af qemu-system || true
+```
+
+如果存在本项目的 QEMU，优先进入 guest 执行：
+
+```bash
+poweroff
+```
+
+不要直接删除正在使用的测试盘镜像。
+
+---
+
+## 3. 测试盘约定
+
+默认两块 Device Mapper 测试盘为：
+
+```text
+target/nixos/test.img
+target/nixos/test2.img
+```
+
+对应 VirtIO serial：
+
+```text
+vdmtest
+vdmtest2
+```
+
+删除当前已有的默认测试盘：
+
+```bash
+make rm_dm
+```
+
+它会自动删除 `target/nixos/` 下已有的：
+
+```text
+test.img
+test2.img
+test3.img
+...
+```
+
+也就是有几块测试盘就删几块。
+
+如果要删除指定测试盘，可以传入空格分隔的 `DM_TEST_IMAGES`：
+
+```bash
+DM_TEST_IMAGES="target/nixos/test.img target/nixos/test2.img target/nixos/test3.img" make rm_dm
+```
+
+`myshell/br.sh` 和 `tools/nixos/run.sh` 支持同一个 `DM_TEST_IMAGES` 列表。比如附加三块盘：
+
+```bash
+DM_TEST_IMAGES="target/nixos/test.img target/nixos/test2.img target/nixos/test3.img" myshell/br.sh
+```
+
+serial 会按顺序自动生成并显示：
+
+```text
+第 1 块：vdmtest
+第 2 块：vdmtest2
+第 3 块：vdmtest3
+第 N 块：vdmtestN
+```
+
+guest 内不要硬编码 `/dev/vdb`、`/dev/vdc` 等设备名，而是通过 serial 定位：
+
+```bash
+TEST_DISK=$(aster-dm-disk-locator)
+TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
+TEST_DISK3=$(aster-dm-disk-locator vdmtest3)
+```
+
+三个自动化测试脚本当前固定使用前两块盘，默认都会删除这两块测试盘并重新创建空盘：
+
+```text
+RESET_DM_TEST_IMAGES=1
+```
+
+如果只想复用已有测试盘，可以显式设置：
+
+```bash
+RESET_DM_TEST_IMAGES=0 myshell/<script>.sh
+```
+
+通常不建议复用旧盘，因为旧的 LVM metadata 或 DM table 测试数据可能影响结果。
+
+---
+
+## 4. 第一层：`myshell/run_cross_target_bio_regression.sh`
+
+用途：一键测试单个 4 KiB BIO 跨两个 DM linear target 边界时的拆分、重映射和 completion 聚合。
+
+运行：
+
+```bash
+myshell/run_cross_target_bio_regression.sh
+```
+
+默认日志：
+
+```text
+/tmp/cross-target-bio-regression.log
+```
+
+查看关键日志：
+
+```bash
+grep -aE 'HOST_PASS|HOST_FAIL|TEST_PASS|TEST_FAIL|CHECK_PASS|=== STEP|=== CHECK|TEST_DISK=|TEST_DISK2=|DEV1=|DEV2=|^0 4 linear |^4 4 linear |Kernel panic|panicked' /tmp/cross-target-bio-regression.log
+```
+
+脚本会动态检测 guest root shell，检测到 `root@asterinas` 后立刻注入测试命令；`GUEST_READY_TIMEOUT` 只是等待 root shell 的超时上限。
+
+测试内容：
+
+```text
+两块 512 MiB 测试盘
+→ dmsetup create cross_bio_test
+→ table 为两段 4-sector linear target
+→ target 边界在 2 KiB
+→ 向 mapper 写入一次 4 KiB payload
+→ 从 mapper 读回一次 4 KiB payload
+→ 校验 mapper 读回 md5 一致
+→ 校验第一块 backing 盘前 2048 字节 md5
+→ 校验第二块 backing 盘前 2048 字节 md5
+```
+
+通过标记：
+
+```text
+TEST_PASS_CROSS_TARGET_BIO
+HOST_PASS_CROSS_TARGET_BIO
+```
+
+这个脚本只验证最小内核边界：
+
+```text
+一个 BIO 覆盖两个 linear target
+→ SubmittedBio::split
+→ child BIO 分别 remap
+→ backing device 分别完成
+→ 原 BIO completion 聚合完成
+```
+
+它不验证 LVM2 扩缩容，也不验证 ext2 大文件路径。
+
+---
+
+## 5. 第二层：`myshell/run_cross_pv_large_write_test.sh`
+
+用途：一键测试跨 PV 大文件数据路径。
+
+运行：
+
+```bash
+myshell/run_cross_pv_large_write_test.sh
+```
+
+默认日志：
+
+```text
+/tmp/cross-pv-large-write-test.log
+```
+
+查看关键日志：
+
+```bash
+grep -aE 'HOST_PASS|HOST_FAIL|TEST_PASS|TEST_FAIL|=== STEP|=== CHECK|large_vg|large_lv|linear|file700.bin|OK|No space left|Input/output error|Kernel panic|panicked' /tmp/cross-pv-large-write-test.log
+```
+
+测试内容：
+
+```text
+两块 512 MiB 测试盘
+→ pvcreate 两块盘
+→ vgcreate large_vg
+→ lvcreate 900 MiB large_lv
+→ DM table 至少两段 linear
+→ mkfs.ext2 -b 4096
+→ 写一个 700 MiB file700.bin
+→ 保存 file700.md5
+→ 首次 md5sum -c
+→ 第二台 QEMU 重新激活 VG/LV
+→ 只读挂载后再次 md5sum -c
+```
+
+通过标记：
+
+```text
+TEST_PASS_CROSS_PV_LARGE_WRITE_FIRST
+TEST_PASS_CROSS_PV_LARGE_WRITE_SECOND
+HOST_PASS_CROSS_PV_LARGE_WRITE
+```
+
+这个脚本验证的是实际数据面：
+
+- LV 跨两块 PV；
+- ext2 大文件写入跨过第一块 PV；
+- DM 多段 linear table 读写正确；
+- 文件内容跨重启后仍正确。
+
+如果想临时调小文件大小，可以设置：
+
+```bash
+LARGE_WRITE_MIB=600 myshell/run_cross_pv_large_write_test.sh
+```
+
+默认 700 MiB 更稳，因为它大于第一块 PV 的可用空间，能确保数据进入第二块 PV。
+
+---
+
+## 6. 第三层：`myshell/run_lvm2_resize_test.sh`
+
+用途：一键测试完整 LVM2 扩容、跨 PV、ext2 resize、缩容和重启恢复路径。
+
+运行：
+
+```bash
+myshell/run_lvm2_resize_test.sh
+```
+
+默认日志：
+
+```text
+/tmp/lvm2-resize-test.log
+```
+
+查看关键日志：
+
+```bash
+grep -aE 'HOST_PASS|HOST_FAIL|TEST_PASS|TEST_FAIL|=== STEP|=== CHECK|test_vg|test_lv|linear|hello world|after grow|No space left|Input/output error|Kernel panic|panicked' /tmp/lvm2-resize-test.log
+```
+
+测试内容：
+
+```text
+两块 512 MiB 测试盘
+→ pvcreate 两块盘
+→ vgcreate test_vg
+→ lvcreate 400 MiB test_lv
+→ mkfs.ext2 -b 4096
+→ mount 后写 hello.txt
+→ lvextend 到 700 MiB，强制跨 PV
+→ 检查 dmsetup table 至少两段 linear
+→ 离线 resize2fs 扩大文件系统
+→ 写 grow.txt
+→ 离线 resize2fs 缩小文件系统
+→ lvreduce 到 300 MiB
+→ 第二台 QEMU 重新激活 VG/LV
+→ 只读挂载并读取 hello.txt / grow.txt
+```
+
+通过标记：
+
+```text
+TEST_PASS_LVM2_RESIZE_FIRST
+TEST_PASS_LVM2_RESIZE_SECOND
+HOST_PASS_LVM2_RESIZE
+```
+
+这个脚本验证的是完整 LVM2 使用路径，重点是：
+
+- DM ioctl 控制面；
+- active table reload；
+- 多段 linear table；
+- ext2 扩缩容；
+- LVM metadata 和文件数据跨重启恢复。
+
+如果失败，先看日志里的：
+
+```text
+HOST_FAIL_LVM2_RESIZE
+TEST_FAIL_LVM2_RESIZE_FIRST
+TEST_FAIL_LVM2_RESIZE_SECOND
+```
+
+---
+
+## 7. 手工入口：`myshell/br.sh`
+
+用途：手工启动 NixOS，并显式附加 DM 测试盘。默认附加两块，也可以通过 `DM_TEST_IMAGES` 附加更多块。
+
+运行：
+
+```bash
+myshell/br.sh
+```
+
+它等价于默认执行：
+
+```bash
+DM_TEST_IMAGES="target/nixos/test.img target/nixos/test2.img" make run_nixos
+```
+
+附加第三块盘时不用改脚本，直接传列表：
+
+```bash
+DM_TEST_IMAGES="target/nixos/test.img target/nixos/test2.img target/nixos/test3.img" myshell/br.sh
+```
+
+它只负责启动，不负责构建，也不会自动执行 guest 内测试命令。
+
+适合场景：
+
+- 手工调试 LVM2 / dmsetup；
+- 按手工排查文档逐步观察 `pvs`、`vgs`、`lvs`、`dmsetup table`；
+- 需要进入 guest root shell 做临时排查。
+
+---
+
+## 8. 常用环境变量
+
+三个自动化测试脚本通用：
+
+```bash
+DM_TEST_IMAGE=target/nixos/test.img
+DM_TEST_IMAGE_2=target/nixos/test2.img
+RESET_DM_TEST_IMAGES=1
+```
+
+三个自动化脚本都会动态检测 guest root shell，检测到 `root@asterinas` 后立刻注入测试命令。
+
+三个自动化脚本默认等待上限都是：
+
+```bash
+GUEST_READY_TIMEOUT=120
+```
+
+它只是等待 root shell 的超时上限，不是固定注入延迟。
+
+手工启动多块测试盘时使用：
+
+```bash
+DM_TEST_IMAGES="target/nixos/test.img target/nixos/test2.img target/nixos/test3.img"
+```
+
+日志变量分别是：
+
+```bash
+LVM2_RESIZE_LOG=/tmp/lvm2-resize-test.log
+CROSS_PV_LARGE_WRITE_LOG=/tmp/cross-pv-large-write-test.log
+CROSS_TARGET_BIO_LOG=/tmp/cross-target-bio-regression.log
+```
+
+如果 guest 自动登录较慢，可以加大 root shell 等待上限：
+
+```bash
+GUEST_READY_TIMEOUT=240 myshell/run_lvm2_resize_test.sh
+```
+
+如果要保留测试盘复查：
+
+```bash
+RESET_DM_TEST_IMAGES=0 myshell/run_cross_pv_large_write_test.sh
+```
+
+---
+
+## 9. 失败时先看什么
+
+先看 host 最终标记：
+
+```text
+HOST_PASS_...
+HOST_FAIL_...
+```
+
+再看 guest 失败标记：
+
+```text
+TEST_FAIL_...
+```
+
+常见失败点：
+
+1. `missing target/nixos/asterinas.img`
+   - 先执行 `make nixos`。
+2. `existing_qemu`
+   - 还有 QEMU 在跑，先在 guest 中 `poweroff`。
+3. `No space left on device`
+   - LV 或文件大小设置不合理。
+4. `Input/output error`
+   - 优先怀疑 DM table、BIO split/remap 或 backing I/O。
+5. 没有 `HOST_PASS_...`
+   - 看对应 `/tmp/*.log` 中最后一个 `=== STEP` 或 `=== CHECK`。
+
+---
+
+## 10. 和手工排查文档的关系
+
+LVM2 扩缩容的手工排查步骤保留在：
+
+```text
+docs/device-mapper-lvm1/nixos-linear-device-mapper-lvm2-test.md
+```
+
+大文件跨 PV 和 raw BIO 跨 target 测试已经脚本化，日常入口就是：
+
+```text
+myshell/run_cross_pv_large_write_test.sh
+myshell/run_cross_target_bio_regression.sh
+```
+
+日常测试优先使用 `myshell/` 下的一键脚本；只有需要逐步排查 LVM2 扩缩容流程时，再看手工排查文档。
