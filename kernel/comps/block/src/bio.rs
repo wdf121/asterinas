@@ -897,6 +897,8 @@ pub fn is_sector_aligned(offset: usize) -> bool {
 
 #[cfg(ktest)]
 mod tests {
+    use alloc::vec;
+
     use ostd::prelude::ktest;
 
     use super::*;
@@ -955,6 +957,39 @@ mod tests {
 
         assert_eq!(bio.add_sid_offset(9), Err(BioEnqueueError::Refused));
         assert_eq!(bio.sid_range(), &original);
+    }
+
+    #[ktest]
+    fn split_child_segments_can_cross_original_segment_boundary() {
+        let sid_range = Sid::new(0)..Sid::new(16);
+        let bio = SubmittedBio {
+            metadata: Arc::new(BioMetadata {
+                type_: BioType::Read,
+                sid_range: sid_range.clone(),
+                status: AtomicU32::new(BioStatus::Submit as u32),
+                wait_queue: WaitQueue::new(),
+            }),
+            current_sid_range: sid_range,
+            complete_fn: None,
+            segments: vec![
+                BioSegment::alloc(1, BioDirection::FromDevice),
+                BioSegment::alloc(1, BioDirection::FromDevice),
+            ],
+        };
+
+        let (children, _) = bio
+            .split(vec![
+                Sid::new(0)..Sid::new(4),
+                Sid::new(4)..Sid::new(12),
+                Sid::new(12)..Sid::new(16),
+            ])
+            .unwrap();
+
+        assert_eq!(children[1].segments().len(), 2);
+        assert_eq!(children[1].segments()[0].nsectors(), Sid::new(4));
+        assert_eq!(children[1].segments()[0].offset_within_first_block(), 2_048);
+        assert_eq!(children[1].segments()[1].nsectors(), Sid::new(4));
+        assert_eq!(children[1].segments()[1].offset_within_first_block(), 0);
     }
 }
 

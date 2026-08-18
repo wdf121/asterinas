@@ -138,7 +138,9 @@ impl DmDevice {
                 DmDevicePhase::Suspending => return Err(DmError::InvalidState),
                 DmDevicePhase::Running => {
                     state.phase = DmDevicePhase::Suspending;
-                    state.event_nr = state.event_nr.wrapping_add(1);
+                    if state.active.is_some() {
+                        state.event_nr = state.event_nr.wrapping_add(1);
+                    }
                 }
             }
         }
@@ -196,7 +198,7 @@ impl DmDevice {
     pub fn status(&self) -> DmDeviceStatus {
         let state = self.state.lock();
         DmDeviceStatus {
-            suspended: state.phase == DmDevicePhase::Suspended,
+            suspended: state.phase != DmDevicePhase::Running,
             has_active_table: state.active.is_some(),
             has_inactive_table: state.inactive.is_some(),
             event_nr: state.event_nr,

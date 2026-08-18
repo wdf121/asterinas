@@ -1,857 +1,894 @@
-# Asterinas Device Mapper 技术维护文档
+# Asterinas Device Mapper 技术与设计文档
 
-本文档面向没有参与本阶段开发的人，目标是让维护者能快速理解 Asterinas Device Mapper 当前做到哪里、为什么要这么做、代码从哪里入手、测试该怎么跑，以及后续扩展时哪些地方必须同步修改。
+本文档面向后续继续开发、审查和维护 Asterinas Device Mapper 的开发者。它不是简单的维护清单，而是说明当前 Asterinas DM 做到了什么程度、为什么这样设计、如何验证、各个文件在整体中的作用，以及下一阶段应该优先补什么。
 
-本文档基线：`c6c61ed828a58b80e28e0659dc6a598d13c9fb11` 之后到当前工作树。这里的“当前工作树”包括已经提交的改动和当前尚未提交的改动。
-
----
-
-## 1. 阅读路线
-
-如果你只是想确认功能能不能跑，先看：
-
-```text
-docs/device-mapper-lvm1/test1.md
-```
-
-如果你要维护或继续开发 DM，推荐按这个顺序读本文：
-
-```text
-1. 当前能力和边界
-2. 测试体系
-3. 一次 LVM2 创建 LV 的完整控制面流程
-4. 一次文件读写的完整数据面流程
-5. 代码模块职责
-6. 逐文件变更地图
-7. 常见维护任务和易错点
-```
-
-这样先建立整体路径，再进入具体文件，不会在 ioctl、block registry、BIO split、NixOS 测试脚本之间来回跳。
+当前目标不是完整复刻 Linux Device Mapper 生态，而是先实现一个 **kernel-only、linear-only、尽量对齐 Linux DM 核心语义、但避免 udev/sysfs 等成熟用户态框架依赖** 的最小可用版本。
 
 ---
 
-## 2. 当前能力和边界
+## 1. 目标与边界
 
-当前实现目标是让标准、未经修改的 LVM2 能在 Asterinas NixOS guest 中使用 linear Device Mapper。
+### 1.1 对标对象
 
-已经支持：
+对标的是标准 Linux 内核中的 Device Mapper，尤其是这些核心语义：
+
+- `/dev/mapper/control` 控制设备；
+- Linux DM ioctl envelope；
+- DM device create/remove/rename/status；
+- active table / inactive table；
+- table load；
+- suspend / resume；
+- table status / table deps；
+- target version 查询；
+- linear target 的 sector 映射；
+- BIO remap、split 和 completion 聚合；
+- flush 向底层 backing device 转发。
+
+### 1.2 当前明确不做的内容
+
+Asterinas 当前设备、udev、sysfs、devtmpfs、块层生态还没有 Linux 那么成熟，所以本阶段避免把 Linux DM 周边生态照搬进来。
+
+当前不做或只做最小兼容：
+
+- 不依赖 udev；
+- 不实现完整 sysfs DM 层级；
+- 不实现完整 dmsetup 生态；
+- 不实现 target registry 泛化框架；
+- 不实现 crypt、snapshot、thin、mirror、multipath 等 target；
+- 不做复杂 queue stacking；
+- 不做完整 event polling/wait 语义；
+- `striped` 只用于回应 LVM2 target version 预检，不支持实际 table load。
+
+### 1.3 当前实现策略
+
+当前策略是：
+
+1. 内核里先做好 DM core；
+2. 只支持 linear target；
+3. 尽量保持 Linux DM 控制面和 table 语义；
+4. 通过 Asterinas 当前已有 misc device、block registry、devtmpfs runtime node 能力对接用户态；
+5. LVM2 侧使用 `activation { udev_rules=0 }`，显式避开 udev 依赖；
+6. 用 ktest 锁住内核语义，用 NixOS + LVM2 实测验证真实系统路径。
+
+---
+
+## 2. 当前做到什么地步
+
+### 2.1 已支持的功能
+
+当前 Asterinas DM 已支持：
 
 1. `/dev/mapper/control` 字符设备；
-2. Linux DM ioctl envelope 的基本解析和写回；
-3. DM device create/remove/rename/status；
-4. active table / inactive table；
-5. suspend/resume 和 table reload；
-6. 一段或多段 `linear` target；
-7. `/dev/dm-N` 和 `/dev/mapper/<name>` 运行时节点；
-8. `/proc/devices` 中暴露 `virtblk`、`nvme`、`device-mapper`；
-9. LVM2 依赖的 legacy block ioctl；
-10. VirtIO block serial 查询，用于稳定定位测试盘；
-11. BIO remap；
-12. 单个 BIO 跨多个 linear target 时 split 成多个 child BIO；
-13. child BIO completion 聚合成原始 BIO completion；
-14. NixOS + LVM2 双 PV、跨 PV、大文件写入、扩缩容和重启恢复测试。
+2. Linux `struct dm_ioctl` 固定 header 解析和响应写回；
+3. ioctl 命令分发；
+4. DM device create/remove/remove_all/rename/status；
+5. name、uuid、dev selector 查询；
+6. selector 优先级：UUID 优先于 name，name 优先于 dev；
+7. active table / inactive table；
+8. table load；
+9. table clear；
+10. suspend / resume；
+11. `event_nr` 状态变化计数；
+12. table status；
+13. table deps；
+14. list devices；
+15. list target versions；
+16. get target version；
+17. linear target 参数解析；
+18. 一段或多段连续 linear target；
+19. logical sector 到 backing sector 的映射；
+20. BIO remap；
+21. 跨 linear target 边界的 BIO split；
+22. child BIO completion 聚合；
+23. flush 按 backing device 去重后异步 fan-out；
+24. `/dev/dm-N` 和 `/dev/mapper/<name>` runtime 节点；
+25. `/proc/devices` 暴露 block major；
+26. LVM2 依赖的 legacy block ioctl；
+27. VirtIO block serial 查询，用于稳定定位测试盘；
+28. NixOS guest 中 LVM2 创建、扩容、缩容、重启恢复测试脚本。
 
-当前边界：
+### 2.2 当前 linear target 语义
 
-- 实际 table load 只支持 `linear` target；
-- `striped` 只用于回应 LVM2 target version 查询，不支持实际数据面；
-- 当前 NixOS 测试主线是 x86_64 + VirtIO block；
-- 三盘以上测试盘可以通过 `DM_TEST_IMAGES` 启动，但自动化脚本当前仍固定验证前两块盘；
-- raw BIO 回归会覆盖测试盘开头，不能和需要保留的 LVM 结果混跑。
+当前只支持 Linux DM 的 linear target 子集，table 行为按以下格式理解：
+
+```text
+<logical_start> <length> linear <major>:<minor> <backing_start>
+```
+
+语义：
+
+- `DM_TABLE_STATUS` 不带 `DM_STATUS_TABLE_FLAG` 时，对齐 Linux `linear_status(STATUSTYPE_INFO)`，linear target 参数为空；
+- `DM_TABLE_STATUS` 带 `DM_STATUS_TABLE_FLAG` 时，对齐 Linux `linear_status(STATUSTYPE_TABLE)`，linear target 参数为 `<major>:<minor> <backing_start>`；
+- 所有 sector 均为 512 字节扇区；
+- 每条 target 的 `length` 不能为 0；
+- 第一条 target 必须从 logical sector 0 开始；
+- 多条 target 必须连续排列，不允许空洞；
+- logical range 是 end-exclusive；
+- backing range 不能整数溢出；
+- backing range 不能超过 backing device capacity；
+- 同一 backing device 可以被多条 linear target 引用；
+- table deps 按 backing device 去重；
+- flush 也按 backing device 去重；
+- 当前拒绝 DM-on-DM backing，避免递归 mapper 语义尚未成熟时引入复杂生命周期问题。
+
+### 2.3 当前 suspend/resume 语义
+
+当前状态机核心语义：
+
+- `load_table()` 只更新 inactive table；
+- `resume()` 才把 inactive table 切换成 active table；
+- `suspend()` 阻止新 I/O；
+- `suspend()` 等待已进入 DM 的 in-flight I/O drain；
+- `Suspending` 阶段对 control/status 语义也表现为 suspended；
+- fresh device 上没有 active table 时，`suspend()` 不应错误增加 `event_nr`；
+- running device reload 后再次 `resume()` 会用 inactive table 替换 active table。
 
 ---
 
-## 3. 测试体系
+## 3. 如何验证
 
-测试分三层，从小到大：
+当前验证分两类：**ktest 内核语义验证** 和 **NixOS + LVM2 系统实测**。
 
-```text
-第一层：raw BIO 跨 target 边界
-第二层：跨 PV 大文件数据面
-第三层：完整 LVM2 扩缩容流程
-```
+### 3.1 ktest 验证
 
-日常入口见：
+ktest 用于锁住内核内部语义，尤其是普通用户态实测不容易稳定覆盖的边界条件。
 
-```text
-docs/device-mapper-lvm1/test1.md
-```
-
-### 3.1 第一层：raw BIO 跨 target 边界
-
-脚本：
+本阶段已在容器 `myAsterinas` 内跑过并通过：
 
 ```bash
-myshell/run_cross_target_bio_regression.sh
+docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --all --check && timeout 1200 cargo osdk test device_mapper'
 ```
 
-验证：
+最近一次复核时，为了避免 `cargo osdk test` 遍历所有 workspace default-members 造成大量 QEMU 并发和 `ext2.img` 锁冲突，ktest 阶段临时把根 [Cargo.toml](file:///root/atom/asterinas/Cargo.toml) 的 `default-members` 缩小为：
 
-```text
-一个 4 KiB BIO 覆盖两个 4-sector linear target
-→ DmTable::bio_parts 找出两个 part
-→ SubmittedBio::split 拆成两个 child BIO
-→ child BIO 分别 remap 到两块 backing device
-→ mapper 读回和 backing 半段数据通过 md5sum 校验
-→ 两个 child 完成后原 BIO completion 聚合完成
+```toml
+default-members = [
+    "kernel",
+    "kernel/comps/device-mapper",
+]
 ```
 
-这是定位 DM 数据面 split/remap 问题最快的测试。
+验证完成后必须恢复 [Cargo.toml](file:///root/atom/asterinas/Cargo.toml)。这个改动只是测试提速手段，不属于功能改动。
 
-### 3.2 第二层：跨 PV 大文件数据面
+重点 ktest 覆盖：
 
-脚本：
+- ioctl buffer layout；
+- C 字符串解析；
+- dm_ioctl header 写回；
+- selector 优先级；
+- tableless device status；
+- zero target table load 拒绝；
+- multi-target `dm_target_spec.next` 解析；
+- table status 的 Linux-style `next` offset；
+- linear info status 输出空参数；
+- linear table status 输出 `<major>:<minor> <backing_start>`；
+- table deps backing 去重；
+- table status/deps buffer-full 语义；
+- resume 激活 inactive table；
+- running 状态下 reload + resume 替换 active table；
+- linear 参数精确解析；
+- linear target range 校验；
+- logical range end-exclusive；
+- table 从 0 开始且连续；
+- mapper capacity 和 queue limit 汇总；
+- BIO 越过 table 范围时拒绝；
+- 单 target BIO remap；
+- 跨 target BIO split；
+- flush 每个 backing device 只转发一次；
+- flush child completion 失败传播；
+- backing enqueue 同步失败时原始 flush BIO 完成；
+- suspend 等待 submitted I/O drain 并阻止新 I/O。
 
-```bash
-myshell/run_cross_pv_large_write_test.sh
-```
+### 3.2 NixOS + LVM2 实测
 
-验证：
+NixOS 实测用于验证真实用户态路径：LVM2、dmsetup、ext2、block registry、devtmpfs、procfs、VirtIO block、QEMU raw image 一起工作。
 
-```text
-两块 512 MiB 测试盘
-→ 900 MiB linear LV
-→ ext2
-→ 写一个 700 MiB 随机文件
-→ 保存 file700.md5
-→ 首次 md5sum -c
-→ 第二台 QEMU 重启恢复后再次 md5sum -c
-```
+当前已有脚本入口集中在：
 
-这是验证真实 ext2 + LVM2 + DM 多段 linear table 数据路径的测试。
+- [test1.md](file:///root/atom/asterinas/docs/device-mapper-lvm1/test1.md)
+- [run_cross_target_bio_regression.sh](file:///root/atom/asterinas/myshell/run_cross_target_bio_regression.sh)
+- [run_cross_pv_large_write_test.sh](file:///root/atom/asterinas/myshell/run_cross_pv_large_write_test.sh)
+- [run_lvm2_resize_test.sh](file:///root/atom/asterinas/myshell/run_lvm2_resize_test.sh)
 
-### 3.3 第三层：完整 LVM2 扩缩容流程
+三层系统验证：
 
-脚本：
+1. raw BIO 跨 target 回归；
+2. 跨 PV 大文件写入和重启 hash 校验；
+3. LVM2 创建 LV、扩容、缩容、ext2 resize、重启恢复。
 
-```bash
-myshell/run_lvm2_resize_test.sh
-```
+这些测试说明 DM 不只是 ktest 能过，也能在 NixOS guest 里承载标准 LVM2 的 linear LV 使用场景。
 
-验证：
-
-```text
-400 MiB LV
-→ ext2 挂载写 hello.txt
-→ lvextend 到 700 MiB，强制跨 PV
-→ resize2fs 扩大文件系统
-→ 写 grow.txt
-→ resize2fs 缩小文件系统
-→ lvreduce 到 300 MiB
-→ 第二台 QEMU 重启恢复后只读挂载读取两个文件
-```
-
-这是完整功能验收，最慢，但覆盖面最全。
-
-### 3.4 手工排查文档
-
-只在脚本失败、需要逐步看状态时使用：
-
-```text
-docs/device-mapper-lvm1/nixos-linear-device-mapper-lvm2-test.md
-```
+本轮代码修复后主要重跑的是 ktest；NixOS 脚本属于已有系统级验证路径，后续若修改 ioctl ABI、block registry、devtmpfs 或 LVM2 交互，应重新跑 NixOS 实测。
 
 ---
 
-## 4. 一次 LVM2 创建 LV 的控制面流程
+## 4. 整体设计
 
-用户态命令：
+### 4.1 分层结构
 
-```bash
-lvcreate --config 'activation { udev_rules=0 }' --type linear -L 400M -n test_lv test_vg <pv>
-```
-
-大致进入内核路径：
+当前 DM 设计分为四层：
 
 ```text
-LVM2 / dmsetup
+用户态 LVM2 / dmsetup
         ↓ ioctl
 /dev/mapper/control
         ↓
 kernel/src/device/misc/device_mapper.rs
         ↓
-DmManager 创建 DmDevice
+aster-device-mapper crate
         ↓
-block registry 创建 /dev/dm-N
+DmManager / DmDevice / DmTable / LinearTarget
         ↓
-devtmpfs 创建 /dev/mapper/<name>
+aster-block BlockDevice / BIO
         ↓
-DM_TABLE_LOAD 解析 linear target
-        ↓
-lookup_lease 找 backing PV
-        ↓
-LinearTarget + DmTable
-        ↓
-load inactive table
-        ↓
-DM_DEV_SUSPEND / resume
-        ↓
-inactive table 切换为 active table
+VirtIO block / NVMe / raw disk
 ```
 
-这条路径依赖以下模块一起正确工作：
+### 4.2 控制面路径
 
-- DM ioctl envelope 解析；
-- DM manager name/uuid/minor 管理；
-- block mapper 注册；
-- devtmpfs runtime node/symlink；
-- backing block device lease；
-- table load/status/deps；
-- suspend/resume 状态机。
+典型 LVM2 创建 linear LV 的控制面路径：
 
----
+```text
+lvcreate --type linear ...
+        ↓
+DM_DEV_CREATE
+        ↓
+DmManager::create
+        ↓
+register_block_mapper
+        ↓
+/dev/dm-N + /dev/mapper/<name>
+        ↓
+DM_TABLE_LOAD
+        ↓
+parse dm_target_spec + linear params
+        ↓
+lookup_lease(backing major:minor)
+        ↓
+LinearTarget::new
+        ↓
+DmTable::new_linear
+        ↓
+DmDevice::load_table(inactive)
+        ↓
+DM_DEV_SUSPEND without suspend flag
+        ↓
+DmDevice::resume
+        ↓
+inactive table becomes active table
+```
 
-## 5. 一次文件读写的数据面流程
+关键点：
 
-用户态读写：
+- table load 不直接改变 active table；
+- active 切换由 resume 完成；
+- 这与 Linux DM 的 inactive/active table 模型对齐；
+- LVM2 可以先 load table，再 resume 激活；
+- reload 时可以在 running device 上准备新的 inactive table，再 resume 替换 active table。
+
+### 4.3 数据面路径
+
+普通文件 I/O 的数据面路径：
 
 ```text
 ext2 file I/O
         ↓
-page cache / filesystem block I/O
+filesystem block I/O
         ↓
 /dev/mapper/<vg>-<lv>
         ↓
 DmDevice::enqueue
         ↓
-DmTable::enqueue
+active DmTable::enqueue
         ↓
 LinearTarget::map_sector
         ↓
-backing BlockDevice::enqueue
+SubmittedBio::remap_sid_start
         ↓
-VirtIO block / raw image
+backing BlockDevice::enqueue
 ```
 
-如果一个 BIO 完整落在一个 target 内：
+如果 BIO 完整位于一个 target：
 
 ```text
-BIO logical range
-→ target.map_sector(start)
-→ bio.remap_sid_start(backing_start)
-→ backing.enqueue(bio)
+logical range
+        ↓
+找到唯一 LinearTarget
+        ↓
+计算 backing_start + logical_offset
+        ↓
+remap 原 BIO
+        ↓
+提交到底层 backing device
 ```
 
-如果一个 BIO 跨 target 边界：
+如果 BIO 跨 target：
 
 ```text
-BIO logical range
-→ DmTable::bio_parts 拆出多个 logical part
-→ SubmittedBio::split 生成多个 child BIO
-→ 每个 child remap 到对应 backing sector
-→ 分别 enqueue
-→ SplitBioCompletion 聚合 child completion
-→ 原 BIO complete
+logical range
+        ↓
+DmTable::bio_parts 拆成多个连续 part
+        ↓
+SubmittedBio::split 生成 child BIO
+        ↓
+每个 child 独立 remap
+        ↓
+分别提交到底层 backing device
+        ↓
+SplitBioCompletion 聚合所有 child 结果
+        ↓
+完成原始 BIO
 ```
 
-这就是本阶段最后补齐的关键数据面能力。
+### 4.4 Flush 路径
+
+flush 是特殊 BIO，不按普通 sector remap 处理。
+
+当前策略：
+
+```text
+Flush BIO 到达 DmTable
+        ↓
+遍历所有 linear target
+        ↓
+按 backing DeviceId 去重
+        ↓
+给每个 backing 异步提交一个 Flush BIO
+        ↓
+FlushCompletion 等待所有 backing flush 完成
+        ↓
+任意 backing 失败则原 flush 失败
+        ↓
+全部成功则原 flush 成功
+```
+
+这里刻意避免在 DM enqueue 路径里调用同步 `submit_and_wait()`。原因是 suspend/drain 场景里底层 BIO 可能被测试设备或真实设备延迟完成，同步等待会导致 DM 路径卡死。当前使用异步 fan-out + 聚合完成，更符合 stacked block device 的 I/O 模型。
 
 ---
 
-## 6. 核心实现模块
+## 5. 主要模块和文件作用
 
-### 6.1 `kernel/src/device/misc/device_mapper.rs`
+### 5.1 Device Mapper 核心 crate
 
-这是 `/dev/mapper/control` 控制面。
+#### [Cargo.toml](file:///root/atom/asterinas/kernel/comps/device-mapper/Cargo.toml)
 
-职责：
+定义 `aster-device-mapper` crate。
 
-- 注册 DM control misc 设备；
-- 校验 Linux DM ioctl buffer layout；
-- 解析 `dm_ioctl`；
-- 分发 DM command；
-- 创建、删除、重命名、查询 DM device；
-- 解析 `DM_TABLE_LOAD` 的 `dm_target_spec`；
-- 写回 `DM_TABLE_STATUS`、`DM_TABLE_DEPS`、`DM_LIST_DEVICES`、target version 等结果。
+它把 DM core 做成 kernel component，依赖：
 
-维护重点：
+- `aster-block`：BlockDevice、BIO、BlockDeviceLease；
+- `device-id`：major/minor/device id；
+- `id-alloc`：minor 分配；
+- `io-util`：I/O batch；
+- `ostd`：同步原语和 no_std 支撑。
 
-- `DM_IOCTL_HEADER_SIZE = 312` 不能随意改；
-- `DM_TABLE_LOAD` 输入里的 `next` 和 `DM_TABLE_STATUS` 输出里的 `next` 语义不同；
-- 当前 table load 只接受 `linear`；
-- `striped` 只是 target version 兼容项，不是实际支持；
-- 多 target status/deps 必须按 Linux ABI 写回。
+#### [lib.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/lib.rs)
 
-### 6.2 `kernel/comps/device-mapper/src/manager.rs`
+DM core 的公开入口。
 
-这是 DM device 索引和设备号管理层。
+作用：
 
-职责：
+- 声明 `device`、`manager`、`table`、`target` 模块；
+- 导出 `DmDevice`、`DmDeviceStatus`、`DmManager`、`DmTable`；
+- 定义 `DmError` 和 `TableError`；
+- 明确 kernel device layer 和 DM core 的边界。
 
-- 动态申请 `device-mapper` block major；
+这里不处理 Linux ioctl ABI。ABI 解析放在 [device_mapper.rs](file:///root/atom/asterinas/kernel/src/device/misc/device_mapper.rs)，core crate 只处理已经解析好的内核对象。
+
+#### [manager.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/manager.rs)
+
+DM device 管理层。
+
+作用：
+
+- 分配 device-mapper block major；
 - 分配 minor；
-- 维护 name → device；
-- 维护 uuid → name；
+- 管理 name → device；
+- 管理 uuid → name；
 - 支持指定 minor；
-- 支持 lookup/remove/rename/remove_all。
+- 支持 create、lookup、rename、remove、remove_all；
+- 维护 `DmDeviceIdOwner`，保证 minor 生命周期。
 
-维护重点：
+它对应 Linux DM 中“控制面对象索引”的一部分，但不绑定 udev。
 
-- `DmDeviceIdOwner` 决定 minor 生命周期；
-- remove 只从 manager 索引移除，不等于 block registry 和 devtmpfs 已清理；
-- rename 必须同步 manager、device name、mapper symlink。
+#### [device.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/device.rs)
 
-### 6.3 `kernel/comps/device-mapper/src/device.rs`
+运行期 DM block device。
 
-这是运行期 DM block device。
-
-职责：
+作用：
 
 - 保存 active table；
 - 保存 inactive table；
 - 管理 Running / Suspending / Suspended；
-- suspend 时阻止新 I/O 并等待 in-flight I/O drain；
-- resume 时把 inactive table 切换成 active table；
-- 实现 `BlockDevice`。
+- 提供 `load_table()` / `clear_inactive_table()` / `suspend()` / `resume()`；
+- 实现 `BlockDevice`；
+- 在 enqueue 路径维护 in-flight I/O；
+- suspend 时阻止新 I/O 并等待旧 I/O 完成。
 
-维护重点：
+本阶段修正点：
 
-- `load_table()` 只加载 inactive table；
-- `resume()` 才切换 active table；
-- `suspend()` 必须等所有旧 I/O 完成；
-- `enqueue()` 必须 chain completion，确保 in-flight 计数能释放。
+- 没有 active table 的 fresh device 执行 suspend 时，不再错误递增 `event_nr`；
+- `status().suspended` 在 `Suspending` 阶段也为 true，控制面能观察到设备已经进入暂停屏障。
 
-### 6.4 `kernel/comps/device-mapper/src/table.rs`
+#### [table.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/table.rs)
 
-这是 DM table 和数据面转发层。
+DM table 和数据面转发层。
 
-职责：
+作用：
 
-- 保存一组连续 linear target；
-- 验证 table 从 logical sector 0 开始且无空洞；
+- 保存一组 linear target；
+- 验证 table 从 logical sector 0 开始；
+- 验证 target 连续无空洞；
 - 计算 mapper capacity；
-- 返回 backing device 依赖；
-- remap 并转发普通 BIO；
-- 去重转发 flush；
-- 跨 target 时 split BIO。
+- 聚合 backing queue limit；
+- 返回 backing deps；
+- 普通 BIO remap；
+- 跨 target BIO split；
+- flush 去重并异步 fan-out。
 
-维护重点：
+本阶段修正点：
 
-- `DmTable::new_linear()` 要保持 table 连续性约束；
-- `DmTable::bio_parts()` 是跨 target BIO 的边界划分逻辑；
-- child BIO remap/enqueue 失败时必须调用 `completion.complete_child(IoError)`；
-- `enqueue_flush()` 应按 backing device 去重。
+- flush 从同步 `submit_and_wait()` 改成异步提交；
+- 新增 `FlushCompletion` 聚合多个 backing flush 的完成状态；
+- 补充 ktest 锁住 mapper capacity、queue limit、out-of-range BIO 拒绝、flush 失败传播，以及 backing enqueue 失败时原始 flush BIO 的完成语义。
 
-### 6.5 `kernel/comps/device-mapper/src/target/linear.rs`
+#### [target/mod.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/target/mod.rs)
 
-这是 linear target。
+target 模块入口。
 
-职责：
+当前只声明 linear target。后续新增 target 时，不能只在这里加模块，还必须同步修改 table 表示、ioctl parser、target version、status/deps 和测试。
+
+#### [linear.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/target/linear.rs)
+
+linear target 实现。
+
+作用：
 
 - 保存 logical range；
 - 保存 backing start；
-- 持有 backing `BlockDeviceLease`；
-- 把 logical sector 映射到 backing sector。
+- 保存 backing device id；
+- 持有 `BlockDeviceLease`；
+- 校验 length、logical overflow、backing overflow、backing capacity；
+- 把 logical sector 映射成 backing sector。
 
-维护重点：
+它是当前唯一真正支持的数据面 target。
 
-- length 不能为 0；
-- logical/backing range 不能溢出；
-- backing range 不能超过 backing capacity；
-- range 是 end-exclusive。
+### 5.2 Linux DM ioctl 控制面
 
-### 6.6 `kernel/comps/block/src/bio.rs`
+#### [device_mapper.rs](file:///root/atom/asterinas/kernel/src/device/misc/device_mapper.rs)
 
-这是 BIO remap/split 的核心支撑。
+实现 `/dev/mapper/control`。
 
-职责：
+作用：
 
-- 区分原始 BIO metadata range 和当前层 sector range；
-- `remap_sid_start()` 支持 mapper 改写当前 sector；
-- `SubmittedBio::split()` 支持 child BIO；
-- `BioSegment::slice()` 让 child BIO 共享原 DMA buffer slice；
-- `SplitBioCompletion` 聚合 completion；
-- `chain_complete_fn()` 支持 stacked block device 在底层完成后做清理。
+- 注册 DM control misc device；
+- 实现 `ioctl()`；
+- 解析 Linux DM ioctl command；
+- 读取和校验 `dm_ioctl` buffer；
+- 写回 response header；
+- 分发 create/remove/rename/status/table_load/table_status/table_deps/list_versions；
+- 解析 `dm_target_spec`；
+- 解析 linear 参数；
+- 查找 backing `BlockDeviceLease`；
+- 调用 DM core。
 
-维护重点：
+重要 ABI 点：
 
-- remap 失败不能破坏原 range；
-- split ranges 必须连续覆盖原 BIO；
-- DMA slice 必须 sector aligned；
-- 原 BIO 只能 complete 一次；
-- 任意 child 失败时最终原 BIO 应失败。
+- `DM_IOCTL_HEADER_SIZE = 312`；
+- `DM_IOCTL_FIXED_PREFIX_SIZE = 305`；
+- `data_size` 必须在合理范围；
+- `data_start` 必须至少为 header size，并且 8 字节对齐；
+- `dm_target_spec.next` 在 table load 输入和 table status 输出中的含义不同；
+- table load 当前只接受 `linear`；
+- target version 可以声明 `striped`，但 table load 不允许 striped。
 
-### 6.7 block registry、devtmpfs、procfs
+### 5.3 block crate 和 BIO 支撑
+
+#### [lib.rs](file:///root/atom/asterinas/kernel/comps/block/src/lib.rs)
+
+block 抽象入口。
+
+与 DM 相关的作用：
+
+- 定义 `BlockDevice` trait；
+- 提供 block device registry；
+- 提供 `BlockDeviceLease`；
+- 提供 `lookup_lease()`；
+- 支撑 DM table 持有 backing device 引用，并避免 backing 正在卸载时被错误使用。
+
+#### [bio.rs](file:///root/atom/asterinas/kernel/comps/block/src/bio.rs)
+
+BIO remap/split/completion 的核心支撑。
+
+与 DM 相关的作用：
+
+- 区分原始 BIO metadata range 和当前层 sid range；
+- `remap_sid_start()` 支持 mapper 改写 BIO 当前 sector；
+- `SubmittedBio::split()` 支持跨 target BIO 拆分；
+- `BioSegment::slice()` 支持 child BIO 共享原 buffer 子区间；
+- `SplitBioCompletion` 聚合 child completion；
+- `chain_complete_fn()` 支持 stacked block device 在底层完成后释放 in-flight 计数。
+
+DM 数据面能支持跨 PV linear LV，关键依赖这里的 split/remap 能力。
+
+### 5.4 block registry、devtmpfs、procfs
 
 相关文件：
 
-```text
-kernel/src/device/registry/block.rs
-kernel/src/device/mod.rs
-kernel/src/fs/fs_impls/procfs/devices.rs
-```
+- [block.rs](file:///root/atom/asterinas/kernel/src/device/registry/block.rs)
+- [mod.rs](file:///root/atom/asterinas/kernel/src/device/mod.rs)
+- [devices.rs](file:///root/atom/asterinas/kernel/src/fs/fs_impls/procfs/devices.rs)
 
-它们解决的问题：标准 LVM2 不只需要 `/dev/mapper/control`，还需要完整的 Linux 设备生态。
+整体作用：
 
-职责：
-
-- 运行时创建 `/dev/dm-N`；
-- 运行时创建 `/dev/mapper/<name>`；
+- 运行时注册 `/dev/dm-N`；
+- 创建 `/dev/mapper/<name>` alias/symlink；
+- rename 时同步 runtime node；
+- unregister 时清理 runtime node；
 - 维护 block open count；
-- 支持 mapper register/rename/unregister；
-- 支持 legacy block ioctl；
-- 输出 `/proc/devices`。
+- 提供 legacy block ioctl；
+- 让 `/proc/devices` 暴露 `virtblk`、`nvme`、`device-mapper`。
 
-维护重点：
+这些不是 DM core，但是真实 LVM2 能跑起来必须依赖它们。
 
-- remove/rename 失败路径必须避免误删节点；
-- open_count 会影响 DM remove 行为；
-- `/proc/devices` 缺失 `device-mapper` 或 `virtblk` 会影响 LVM2 扫描。
-
-### 6.8 NixOS 和测试盘定位
+### 5.5 block driver 适配
 
 相关文件：
 
-```text
-distro/etc_nixos/configuration.nix
-distro/etc_nixos/overlays/hello-asterinas/default.nix
-tools/nixos/run.sh
-myshell/br.sh
+- [virtio lib.rs](file:///root/atom/asterinas/kernel/comps/virtio/src/lib.rs)
+- [virtio block mod.rs](file:///root/atom/asterinas/kernel/comps/virtio/src/device/block/mod.rs)
+- [virtio block device.rs](file:///root/atom/asterinas/kernel/comps/virtio/src/device/block/device.rs)
+- [nvme lib.rs](file:///root/atom/asterinas/kernel/comps/nvme/src/lib.rs)
+- [nvme block_device.rs](file:///root/atom/asterinas/kernel/comps/nvme/src/device/block_device.rs)
+
+整体作用：
+
+- 给 block major 命名，供 `/proc/devices` 和 LVM2 扫描；
+- VirtIO block 暴露 host serial/id，供测试盘稳定定位；
+- 适配 `BlockDevice::name() -> String`；
+- 让 DM backing 可以是真实块设备。
+
+### 5.6 文件系统和 mount 适配
+
+相关文件：
+
+- [registry.rs](file:///root/atom/asterinas/kernel/src/fs/vfs/fs_apis/registry.rs)
+- [ext2/fs.rs](file:///root/atom/asterinas/kernel/src/fs/fs_impls/ext2/fs.rs)
+- [ext2/fs_type.rs](file:///root/atom/asterinas/kernel/src/fs/fs_impls/ext2/fs_type.rs)
+- [exfat/fs.rs](file:///root/atom/asterinas/kernel/src/fs/fs_impls/exfat/fs.rs)
+
+整体作用：
+
+- mount 后持有 `BlockDeviceLease`；
+- 避免 mounted filesystem 只保存裸 block device 引用；
+- 支撑 DM device 被 ext2 挂载后仍能正确维持生命周期。
+
+### 5.7 NixOS、QEMU 和测试脚本
+
+相关文件：
+
+- [configuration.nix](file:///root/atom/asterinas/distro/etc_nixos/configuration.nix)
+- [default.nix](file:///root/atom/asterinas/distro/etc_nixos/overlays/hello-asterinas/default.nix)
+- [run.sh](file:///root/atom/asterinas/tools/nixos/run.sh)
+- [br.sh](file:///root/atom/asterinas/myshell/br.sh)
+- [test1.md](file:///root/atom/asterinas/docs/device-mapper-lvm1/test1.md)
+
+整体作用：
+
+- NixOS guest 内提供 LVM2、e2fsprogs、dmsetup、strace；
+- host 侧附加一块或多块 raw 测试盘；
+- 通过 `DM_TEST_IMAGES` 控制测试盘列表；
+- 为测试盘设置 VirtIO serial；
+- guest 内用 locator 稳定找到测试盘；
+- 提供 raw BIO、跨 PV、大文件、resize 等系统验证入口。
+
+---
+
+## 6. 配置说明
+
+### 6.1 根 Cargo workspace
+
+[Cargo.toml](file:///root/atom/asterinas/Cargo.toml) 里与 DM 相关的配置包括：
+
+- workspace members 加入 `kernel/comps/device-mapper`；
+- workspace dependencies 加入 `aster-device-mapper`；
+- `default-members` 包含 `kernel/comps/device-mapper`。
+
+注意：
+
+- 日常开发不要长期修改 `default-members`；
+- 为了定向跑 DM ktest，可以临时缩小 `default-members`；
+- 测试结束必须恢复。
+
+### 6.2 kernel crate 依赖
+
+[kernel/Cargo.toml](file:///root/atom/asterinas/kernel/Cargo.toml) 中内核 crate 依赖 `aster-device-mapper`，使 `/dev/mapper/control` 和 block mapper 能调用 DM core。
+
+### 6.3 NixOS 配置
+
+[configuration.nix](file:///root/atom/asterinas/distro/etc_nixos/configuration.nix) 的作用是让 guest 环境具备真实 LVM2 测试能力。
+
+关键包：
+
+- lvm2；
+- e2fsprogs；
+- util-linux；
+- dmsetup；
+- strace；
+- 测试盘 locator。
+
+### 6.4 测试盘配置
+
+[run.sh](file:///root/atom/asterinas/tools/nixos/run.sh) 支持：
+
+```bash
+DM_TEST_IMAGES="test.img test2.img" make run_nixos
 ```
 
-职责：
+旧变量兼容：
 
-- 在 guest 中提供 LVM2、e2fsprogs、dmsetup、strace；
-- 通过 VirtIO serial 稳定定位测试盘；
-- host 侧按 `DM_TEST_IMAGES` 附加多块测试盘；
-- 提供 `make rm_dm` 清理已有测试盘。
+```bash
+DM_TEST_IMAGE=test.img
+DM_TEST_IMAGE_2=test2.img
+```
+
+测试盘 serial 约定：
+
+```text
+vdmtest
+vdmtest2
+vdmtest3
+...
+```
+
+### 6.5 清理测试盘
+
+[Makefile](file:///root/atom/asterinas/Makefile) 中的 `make rm_dm` 用于删除 DM 测试盘。
+
+注意：
+
+- 它清理的是测试盘 raw image；
+- 不应删除 NixOS root image；
+- raw BIO 回归会覆盖测试盘开头，不能和需要保留的 LVM2 结果混跑。
 
 ---
 
 ## 7. 逐文件变更地图
 
-这一节按职责分组列出从基线提交到当前工作树的增改文件。它不是阅读顺序，而是排查时查文件用的地图。
-
-### 7.1 构建和入口
-
-#### `.gitignore` — 修改
-
-- 将 `target/` 调整为 `/target/`。
-- 只忽略仓库根目录 target，避免误忽略其他目录同名文件夹。
-
-#### `Cargo.toml` — 修改
-
-- workspace 成员加入 `kernel/comps/device-mapper`。
-- workspace dependency 加入 `aster-device-mapper`。
-
-#### `Cargo.lock` — 修改
-
-- 增加 `aster-device-mapper` package。
-- `aster-kernel` 依赖链包含 `aster-device-mapper`。
-
-#### `kernel/Cargo.toml` — 修改
-
-- 内核 crate 新增 `aster-device-mapper.workspace = true`。
-
-#### `Makefile` — 修改
-
-- `ENABLE_KVM` 默认值为 `1`。
-- 新增 `make rm_dm`，用于删除当前已有的 DM 测试盘：`test.img`、`test2.img`、`test3.img` 等。
-- `DM_TEST_IMAGES=... make rm_dm` 可以删除指定测试盘列表。
-
-#### `MAKE_TARGETS_CHAIN.md` — 新增
-
-- 记录 Makefile / OSDK / NixOS 构建运行链路。
-- 属于构建链路说明，不是 DM 核心实现。
-
-#### `rustc-ice-2026-08-12T04_09_40-8081.txt` — 新增
-
-- Rust 编译器 ICE 日志。
-- 与 DM 功能无直接关系；是否保留应由维护者决定。
-
-### 7.2 Device Mapper 核心 crate
-
-#### `kernel/comps/device-mapper/Cargo.toml` — 新增
-
-- 定义 `aster-device-mapper` crate。
-- 依赖 block、device-id、id-alloc、io-util、ostd。
-
-#### `kernel/comps/device-mapper/src/lib.rs` — 新增
-
-- 声明 `device`、`manager`、`table`、`target` 模块。
-- 导出 `DmDevice`、`DmDeviceStatus`、`DmManager`、`DmTable`。
-- 定义 `DmError` 和 `TableError`。
-
-#### `kernel/comps/device-mapper/src/manager.rs` — 新增
-
-- 实现 DM manager。
-- 管理 major/minor、name、uuid、device id。
-- 支持 create、lookup、rename、remove、remove_all。
-
-#### `kernel/comps/device-mapper/src/device.rs` — 新增
-
-- 实现运行期 DM block device。
-- 管理 active/inactive table、suspend/resume、event number、in-flight I/O。
-
-#### `kernel/comps/device-mapper/src/table.rs` — 新增
-
-- 实现 `DmTable`。
-- 支持多段连续 linear target。
-- 实现 BIO remap、flush 去重、跨 target BIO split。
-
-#### `kernel/comps/device-mapper/src/target/mod.rs` — 新增
-
-- 声明 target 模块。
-
-#### `kernel/comps/device-mapper/src/target/linear.rs` — 新增
-
-- 实现 `LinearTarget`。
-- 验证 range，执行 logical sector 到 backing sector 的映射。
-
-### 7.3 DM ioctl 控制面
-
-#### `kernel/src/device/misc/device_mapper.rs` — 新增
-
-- 实现 `/dev/mapper/control`。
-- 支持 LVM2 所需主要 ioctl。
-- 解析多条 linear target。
-- 写回 table status、deps、device list、target version。
-
-#### `kernel/src/device/misc/mod.rs` — 修改
-
-- 初始化 DM control misc 设备。
-
-### 7.4 block crate 和 BIO
-
-#### `kernel/comps/block/src/lib.rs` — 修改
-
-- `BlockDevice::name()` 改为返回 `String`。
-- 新增 `BlockDeviceLease`。
-- 新增 pending registration / unregistration 生命周期。
-- 新增 `lookup_lease()`。
-
-#### `kernel/comps/block/src/bio.rs` — 修改
-
-- 支持 current sector range。
-- 新增 remap、split、segment slice、completion 聚合和 chained completion。
-
-#### `kernel/comps/block/src/device_id.rs` — 修改
-
-- 支持带名称的 major 分配。
-- 新增 `major_devices()`，供 `/proc/devices` 使用。
-
-#### `kernel/comps/block/src/partition.rs` — 修改
-
-- 适配 `BlockDevice::name() -> String`。
-
-#### `kernel/comps/block/src/request_queue.rs` — 修改
-
-- 使用 remap 后的 current `sid_range()` 建 request。
-
-### 7.5 block driver 适配
-
-#### `kernel/comps/virtio/src/lib.rs` — 修改
-
-- VirtIO block major 命名为 `virtblk`。
-
-#### `kernel/comps/virtio/src/device/block/mod.rs` — 修改
-
-- 新增 VirtIO block GET_ID 类型和 ID 长度。
-
-#### `kernel/comps/virtio/src/device/block/device.rs` — 修改
-
-- 初始化时读取 host id。
-- 暴露 `host_id()`，用于测试盘定位。
-- 适配 `name() -> String`。
-
-#### `kernel/comps/nvme/src/lib.rs` — 修改
-
-- NVMe major 命名为 `nvme`。
-
-#### `kernel/comps/nvme/src/device/block_device.rs` — 修改
-
-- 适配 `BlockDevice::name() -> String`。
-
-#### `kernel/comps/mlsdisk/src/lib.rs` — 修改
-
-- RawDisk 持有 `BlockDeviceLease`。
-
-#### `kernel/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs` — 修改
-
-- 适配 `BlockDevice::name() -> String`。
-
-### 7.6 device registry、VFS、procfs、文件系统
-
-#### `kernel/src/device/mod.rs` — 修改
-
-- 支持运行时 devtmpfs node/symlink 创建、删除、rename。
-
-#### `kernel/src/device/registry/mod.rs` — 修改
-
-- 导出 mapper register/rename/unregister/open_count 接口。
-
-#### `kernel/src/device/registry/block.rs` — 修改
-
-- 支持 mapper block file 生命周期。
-- 支持 `/dev/dm-N` 和 mapper alias。
-- 支持 legacy block ioctl 和 VirtIO ID ioctl。
-
-#### `kernel/src/fs/fs_impls/procfs/devices.rs` — 新增
-
-- 实现 `/proc/devices`。
-- 输出 block major 名称，供 LVM2 扫描。
-
-#### `kernel/src/fs/fs_impls/procfs/mod.rs` — 修改
-
-- 注册 `/proc/devices`。
-
-#### `kernel/src/fs/vfs/fs_apis/registry.rs` — 修改
-
-- mount source 解析后持有 `BlockDeviceLease`。
-
-#### `kernel/src/fs/fs_impls/ext2/fs.rs` — 修改
-
-- ext2 持有 `BlockDeviceLease`。
-
-#### `kernel/src/fs/fs_impls/ext2/fs_type.rs` — 修改
-
-- ext2 mount cache key 通过 lease 的 device id 获取。
-
-#### `kernel/src/fs/fs_impls/ext2/test_utils.rs` — 修改
-
-- 测试工具适配 block lease 和 `name() -> String`。
-
-#### `kernel/src/fs/fs_impls/exfat/fs.rs` — 修改
-
-- exfat 持有 `BlockDeviceLease`。
-
-#### `kernel/src/fs/vfs/path/dentry.rs` — 修改
-
-- 新增只在 inode 匹配时删除目录项的接口。
-
-#### `kernel/src/fs/vfs/path/mod.rs` — 修改
-
-- 新增 `unlink_if_matches()` / `rmdir_if_matches()`，供 runtime devtmpfs 清理使用。
-
-#### `kernel/src/vm/page_cache/tests/utils.rs` — 修改
-
-- 测试 mock 适配 `BlockDevice::name() -> String`。
-
-### 7.7 NixOS、脚本和测试文档
-
-#### `distro/etc_nixos/configuration.nix` — 修改
-
-- guest 包加入 LVM2、e2fsprogs、util-linux、strace、测试盘定位工具。
-
-#### `distro/etc_nixos/overlays/hello-asterinas/default.nix` — 修改
-
-- 新增 `aster-dm-disk-locator`。
-
-#### `tools/nixos/build_nixos.sh` — 修改
-
-- 包含构建调试相关改动；与 DM 功能无直接关系。
-
-#### `tools/nixos/run.sh` — 修改
-
-- 支持 `DM_TEST_IMAGES` 动态多盘列表。
-- 兼容旧的 `DM_TEST_IMAGE` / `DM_TEST_IMAGE_2`。
-- 自动生成 serial：`vdmtest`、`vdmtest2`、`vdmtest3` 等。
-- 创建 512 MiB raw 测试盘并打印附加信息。
-
-#### `tools/qemu_args.sh` — 修改
-
-- 支持 `FORCE_OVMF=on`，稳定 NixOS UEFI 启动。
-
-#### `myshell/br.sh` — 新增
-
-- 手工启动入口。
-- 默认附加两块测试盘，也支持 `DM_TEST_IMAGES` 多盘列表。
-
-#### `myshell/run_cross_target_bio_regression.sh` — 新增
-
-- 一键 raw BIO 跨 target 回归，动态检测 guest root shell 后注入测试命令。
-
-#### `myshell/run_cross_pv_large_write_test.sh` — 新增
-
-- 一键跨 PV 大文件数据面测试。
-
-#### `myshell/run_lvm2_resize_test.sh` — 新增
-
-- 一键完整 LVM2 扩缩容测试。
-
-#### `docs/device-mapper-lvm1/test1.md` — 新增
-
-- 测试脚本使用汇总。
-- 按三层测试逻辑组织。
-
-#### `docs/device-mapper-lvm1/nixos-linear-device-mapper-lvm2-test.md` — 修改
-
-- 精简为 LVM2 扩缩容手工排查文档。
-
-#### `docs/device-mapper-lvm1/nixos-cross-pv-large-write-test.md` — 删除
-
-- 大文件跨 PV 详细文档已删除。
-- 对应内容由 `myshell/run_cross_pv_large_write_test.sh` 和 `test1.md` 承接。
-
-#### `docs/device-mapper-technical-maintenance.md` — 新增
-
-- 即本文档。
-
-### 7.8 initramfs 回归
-
-#### `test/initramfs/src/regression/device/device_mapper.c` — 新增
-
-- 回归 `/dev/mapper/control` 基础 ABI。
-- 验证 `dm_ioctl` 大小和 tableless device status。
-
-#### `test/initramfs/src/regression/device/run_test.sh` — 修改
-
-- 加入 `./device_mapper`。
-
-#### `test/initramfs/src/regression/fs/procfs/devices.c` — 新增
-
-- 回归 `/proc/devices`。
-- 检查 `virtblk` 和 `device-mapper`。
-
-#### `test/initramfs/src/regression/fs/run_test.sh` — 修改
-
-- 加入 `./procfs/devices`。
-
-#### `test/initramfs/src/regression/io/file_io/block_device.c` — 修改
-
-- 回归 `BLKGETSIZE`、`BLKGETSIZE64`、`BLKRAGET`。
+这一节按整体职责说明文件，不只是列出“改了什么”。
+
+### 7.1 DM core 新增/修改文件
+
+- [kernel/comps/device-mapper/Cargo.toml](file:///root/atom/asterinas/kernel/comps/device-mapper/Cargo.toml)：定义独立 DM core crate。
+- [lib.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/lib.rs)：暴露 DM core API 和错误类型。
+- [manager.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/manager.rs)：管理 DM 设备索引和 minor 生命周期。
+- [device.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/device.rs)：运行期 block device、table 状态机、suspend/resume、in-flight drain。
+- [table.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/table.rs)：table 校验、BIO remap/split、flush 异步聚合。
+- [target/mod.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/target/mod.rs)：target 模块入口。
+- [linear.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/target/linear.rs)：linear target range 校验和 sector 映射。
+
+### 7.2 控制面文件
+
+- [device_mapper.rs](file:///root/atom/asterinas/kernel/src/device/misc/device_mapper.rs)：Linux DM ioctl 控制面，连接用户态 ABI 和 DM core。
+- [misc/mod.rs](file:///root/atom/asterinas/kernel/src/device/misc/mod.rs)：初始化 DM control misc device。
+
+### 7.3 block/BIO 支撑文件
+
+- [block lib.rs](file:///root/atom/asterinas/kernel/comps/block/src/lib.rs)：BlockDevice、registry、lease、lookup。
+- [bio.rs](file:///root/atom/asterinas/kernel/comps/block/src/bio.rs)：remap、split、completion 聚合、chained completion。
+- [device_id.rs](file:///root/atom/asterinas/kernel/comps/block/src/device_id.rs)：major 命名和 `/proc/devices` 支撑。
+- [request_queue.rs](file:///root/atom/asterinas/kernel/comps/block/src/request_queue.rs)：使用 remap 后的 BIO sector 构建 request。
+- [partition.rs](file:///root/atom/asterinas/kernel/comps/block/src/partition.rs)：适配 block device name/lease 相关改动。
+
+### 7.4 设备注册和 VFS 支撑文件
+
+- [registry/block.rs](file:///root/atom/asterinas/kernel/src/device/registry/block.rs)：mapper block device 注册、open count、legacy block ioctl。
+- [device/mod.rs](file:///root/atom/asterinas/kernel/src/device/mod.rs)：runtime devtmpfs node/symlink 创建、删除、rename。
+- [dentry.rs](file:///root/atom/asterinas/kernel/src/fs/vfs/path/dentry.rs)：按 inode 匹配删除 runtime node。
+- [path/mod.rs](file:///root/atom/asterinas/kernel/src/fs/vfs/path/mod.rs)：提供 runtime devtmpfs 清理需要的路径操作。
+- [procfs/devices.rs](file:///root/atom/asterinas/kernel/src/fs/fs_impls/procfs/devices.rs)：实现 `/proc/devices`。
+- [procfs/mod.rs](file:///root/atom/asterinas/kernel/src/fs/fs_impls/procfs/mod.rs)：注册 `/proc/devices`。
+
+### 7.5 block driver 和文件系统适配文件
+
+- [virtio/src/lib.rs](file:///root/atom/asterinas/kernel/comps/virtio/src/lib.rs)：VirtIO block major 命名。
+- [virtio block mod.rs](file:///root/atom/asterinas/kernel/comps/virtio/src/device/block/mod.rs)：VirtIO block GET_ID 支撑。
+- [virtio block device.rs](file:///root/atom/asterinas/kernel/comps/virtio/src/device/block/device.rs)：读取 host id/serial。
+- [nvme/src/lib.rs](file:///root/atom/asterinas/kernel/comps/nvme/src/lib.rs)：NVMe major 命名。
+- [nvme block_device.rs](file:///root/atom/asterinas/kernel/comps/nvme/src/device/block_device.rs)：适配 block device name。
+- [mlsdisk/lib.rs](file:///root/atom/asterinas/kernel/comps/mlsdisk/src/lib.rs)：RawDisk 持有 BlockDeviceLease。
+- [mlsdisk.rs](file:///root/atom/asterinas/kernel/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs)：适配 block device name。
+- [ext2/fs.rs](file:///root/atom/asterinas/kernel/src/fs/fs_impls/ext2/fs.rs)：ext2 持有 BlockDeviceLease。
+- [ext2/fs_type.rs](file:///root/atom/asterinas/kernel/src/fs/fs_impls/ext2/fs_type.rs)：ext2 mount cache key 使用 lease device id。
+- [exfat/fs.rs](file:///root/atom/asterinas/kernel/src/fs/fs_impls/exfat/fs.rs)：exfat 持有 BlockDeviceLease。
+
+### 7.6 测试和文档文件
+
+- [device_mapper.c](file:///root/atom/asterinas/test/initramfs/src/regression/device/device_mapper.c)：回归 `/dev/mapper/control` 基础 ABI。
+- [device run_test.sh](file:///root/atom/asterinas/test/initramfs/src/regression/device/run_test.sh)：加入 DM control regression。
+- [procfs devices.c](file:///root/atom/asterinas/test/initramfs/src/regression/fs/procfs/devices.c)：回归 `/proc/devices`。
+- [fs run_test.sh](file:///root/atom/asterinas/test/initramfs/src/regression/fs/run_test.sh)：加入 procfs devices regression。
+- [block_device.c](file:///root/atom/asterinas/test/initramfs/src/regression/io/file_io/block_device.c)：回归 legacy block ioctl。
+- [test1.md](file:///root/atom/asterinas/docs/device-mapper-lvm1/test1.md)：系统实测脚本总入口。
+- [nixos-linear-device-mapper-lvm2-test.md](file:///root/atom/asterinas/docs/device-mapper-lvm1/nixos-linear-device-mapper-lvm2-test.md)：手工排查流程。
+- [device-mapper-technical-maintenance.md](file:///root/atom/asterinas/docs/device-mapper-technical-maintenance.md)：本文档，当前实际作为技术与设计文档使用。
 
 ---
 
-## 8. 典型维护任务
+## 8. 当前阶段刚完成的改动
 
-### 8.1 新增 target 类型
+本阶段围绕第一优先级“收紧 linear target 核心语义”完成了以下工作。
 
-需要同步修改：
+### 8.1 修复 suspend 状态机边界
 
-1. `kernel/comps/device-mapper/src/target/`；
-2. `kernel/comps/device-mapper/src/table.rs` table 表示和 enqueue；
-3. `kernel/src/device/misc/device_mapper.rs` table load params 解析；
-4. `DM_TABLE_STATUS` 输出；
-5. `DM_LIST_VERSIONS` / `DM_GET_TARGET_VERSION`；
-6. ktest 和 NixOS guest 测试。
+修改 [device.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/device.rs)：
 
-不要只在 target version 中声明支持，除非明确只是兼容用户态预检。
+- fresh device 没有 active table 时，`suspend()` 不增加 `event_nr`；
+- `Suspending` 阶段 `status().suspended == true`。
 
-### 8.2 修改 table reload / suspend / resume
+对应修复：
 
-重点检查：
+- `enforces_suspend_load_resume_state_machine`；
+- `suspend_waits_for_submitted_io_and_blocks_new_io`。
 
-- inactive table 是否只在 resume 时切换；
-- suspend 是否阻止新 I/O；
-- in-flight I/O 是否 drain；
-- event number 是否合理更新；
-- active LV 挂载状态下 `lvextend` 是否仍可用。
+### 8.2 修复 flush 转发模型
 
-### 8.3 修改 BIO split/remap
+修改 [table.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/table.rs)：
 
-重点检查：
+- 旧逻辑同步 `submit_and_wait()`；
+- 新逻辑异步提交到底层 backing；
+- `FlushCompletion` 聚合完成状态；
+- 避免 suspend/drain 场景中 DM enqueue 路径被底层 deferred BIO 卡死。
 
-- child ranges 是否完整覆盖原 BIO；
-- ranges 是否连续无空洞；
-- segment slice 是否 sector aligned；
-- child enqueue 失败是否通知 completion；
-- 原 BIO 是否只 complete 一次；
-- request queue 是否看到 remap 后 sector。
+### 8.3 补 linear/table 语义测试
 
-### 8.4 修改 remove/rename
+修改 [table.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/table.rs)：
 
-重点检查：
+- 新增 mapper capacity 和 queue limit 汇总测试；
+- 新增 out-of-range BIO 拒绝测试；
+- 新增 flush completion 失败传播测试；
+- 新增 backing enqueue 失败时原始 flush BIO 完成测试；
+- 保留已有 remap、split、flush 去重、table 连续性测试。
 
-- manager name/uuid 索引；
-- block registry accepting opens；
-- open_count；
-- `/dev/dm-N`；
-- `/dev/mapper/<name>` symlink；
-- 失败路径回滚。
+### 8.4 补 ioctl/table 行为测试
 
-### 8.5 修改测试盘逻辑
+修改 [device_mapper.rs](file:///root/atom/asterinas/kernel/src/device/misc/device_mapper.rs)：
 
-重点检查：
+- table status 多 target `next` offset；
+- table deps backing 去重；
+- table status/deps buffer-full；
+- resume 激活 inactive table；
+- running reload + resume 替换 active table；
+- multi-target table load；
+- linear 参数精确解析。
 
-- `DM_TEST_IMAGES` 顺序和 serial 是否一致；
-- `aster-dm-disk-locator` 是否能找到对应 serial；
-- 测试盘不能指向 NixOS root image；
-- 不允许重复附加同一个 image；
-- `make rm_dm` 是否不会误删 root image；
-- raw BIO 回归是否提醒会覆盖测试盘开头。
+### 8.5 复跑格式检查和 DM ktest
 
----
-
-## 9. 推荐验证顺序
-
-代码修改后建议先跑静态/构建：
+在容器 `myAsterinas` 内复跑：
 
 ```bash
 cargo fmt --all --check
-make kernel
+cargo osdk test device_mapper
 ```
 
-再按改动范围选择：
+结果通过，退出码为 0。ktest 期间临时缩小过根 [Cargo.toml](file:///root/atom/asterinas/Cargo.toml) 的 `default-members`，结束后已恢复，当前没有 Cargo.toml 残留 diff。
+
+### 8.6 对齐 linear status 输出语义
+
+审查 Linux `dm-linear` 后确认：
+
+- `STATUSTYPE_INFO` 下 linear target status 不输出参数；
+- `STATUSTYPE_TABLE` 下输出 backing 设备和起始 sector。
+
+当前 Asterinas 对应为：
+
+- `DM_TABLE_STATUS` 不带 `DM_STATUS_TABLE_FLAG` 时参数为空；
+- `DM_TABLE_STATUS` 带 `DM_STATUS_TABLE_FLAG` 时输出 `<major>:<minor> <backing_start>`。
+
+已补 ktest 锁住 info/table 两种输出差异，并复跑 `cargo fmt --all --check` 与 `cargo osdk test device_mapper`，结果通过，退出码为 0。
+
+---
+
+## 9. 后续优先级
+
+### 第一优先级：继续收紧 linear target 与 Linux DM 行为
+
+下一步最需要做：
+
+1. 明确是否需要支持 `<dev> <offset> [sectors]` 之外的兼容格式；
+2. 明确 discard/write zeroes 当前是拒绝还是透传；
+3. 检查 queue limits 是否需要更接近 Linux stacking 规则。
+
+### 第二优先级：补最小 ioctl/control 语义
+
+重点：
+
+1. remove 时 open_count 行为；
+2. rename 的失败回滚；
+3. inactive/active table query flags；
+4. event_nr 和 wait/event 相关最小语义；
+5. DM flags 的兼容处理。
+
+### 第三优先级：系统实测回归常态化
+
+重点：
+
+1. 把 NixOS + LVM2 三层测试结果变成稳定可复跑流程；
+2. 每次修改 ioctl ABI、block registry、devtmpfs、BIO split/remap 后跑系统实测；
+3. 明确哪些测试会破坏测试盘数据；
+4. 把 raw BIO、跨 PV、大文件、resize 的通过标准写清楚。
+
+---
+
+## 10. 维护注意事项
+
+1. 不要把 udev 当成当前 DM 的必要依赖。
+2. LVM2 命令应显式使用 `activation { udev_rules=0 }`。
+3. `striped` 目前只是 target version 预检兼容，不能 table load。
+4. `DM_TABLE_LOAD` 的 `next` 和 `DM_TABLE_STATUS` 输出里的 `next` 语义不同。
+5. `load_table()` 只加载 inactive table，不应直接替换 active table。
+6. `resume()` 才能激活 inactive table。
+7. suspend 必须阻止新 I/O，并等待旧 I/O drain。
+8. DM enqueue 路径不能同步等待底层 I/O 完成。
+9. BIO split 后任何 child remap/enqueue 失败都必须通知 completion。
+10. original BIO 只能 complete 一次。
+11. `BlockDeviceLease` 不要退回裸 `Arc<dyn BlockDevice>`。
+12. 测试时临时缩小 `default-members` 后必须恢复 [Cargo.toml](file:///root/atom/asterinas/Cargo.toml)。
+13. raw BIO 回归会覆盖测试盘开头，不能和保留 LVM2 结果的测试混跑。
+14. QEMU 测试要串行跑，避免 `test/initramfs/build/ext2.img` write lock 冲突。
+
+---
+
+## 11. 推荐验证顺序
+
+修改 DM core 或 table/linear target 后：
 
 ```bash
-make ktest CARGO_OSDK_TEST_ARGS="splits_bio_across_linear_target_boundary"
+cargo fmt --all --check
+cargo osdk test device_mapper
 ```
 
+修改 BIO split/remap 后：
+
 ```bash
+cargo osdk test device_mapper
 myshell/run_cross_target_bio_regression.sh
 ```
 
-```bash
-myshell/run_cross_pv_large_write_test.sh
-```
+修改 ioctl、block registry、devtmpfs、procfs 后：
 
 ```bash
+cargo osdk test device_mapper
+make test
+```
+
+并按需跑：
+
+```bash
+myshell/run_cross_pv_large_write_test.sh
 myshell/run_lvm2_resize_test.sh
 ```
 
-如果改动涉及 ioctl ABI、block registry、procfs 或 legacy block ioctl，还应跑 initramfs regression。
+修改 NixOS 测试盘逻辑后：
 
----
-
-## 10. 已知易错点
-
-1. `/sys/class/block/<dev>/dev` 当前不可靠，测试脚本用 `stat -c '%t'/'%T' /dev/vdX` 获取 major/minor。
-2. LVM2 在无 udev 环境下需要命令级配置：`activation { udev_rules=0 }`。
-3. `DM_TABLE_STATUS` 的 `next` 偏移和 `DM_TABLE_LOAD` 输入中的 `next` 语义不同。
-4. 大文件测试不要只看 `dd` 成功，还要保存 hash 并重启后校验。
-5. raw BIO 回归会写测试盘开头，不能和需要保留的 LVM 结果混跑。
-6. BIO split 后任何 child remap/enqueue 失败都必须通知 completion handle，否则原始 BIO 会永久等待。
-7. DM table 依赖 backing `BlockDeviceLease`，不要退回裸 `Arc<dyn BlockDevice>`。
-8. `/proc/devices` 缺少正确 major 名称会导致 LVM2 不扫描对应设备。
-9. `striped` 当前不是实际数据面支持，只是 target version 兼容项。
-10. `myshell/br.sh` 不构建根镜像，只启动 NixOS；根镜像缺失时先跑 `make nixos`。
-11. `make rm_dm` 删除的是测试盘，不删除 NixOS root image。
-
----
-
-## 11. 提交时间线
-
-从基线提交之后，相关提交大致如下：
-
-```text
-f16adb151 修改 Makefile ENABLE_KVM = 1
-c3c60c31b PV/VG 成功，但 lvcreate 阶段仍有问题
-802115f87 最小 device-mapper-linear 验证成功
-79ab2c4b2 LV 可以跨 PV，但 BIO 还不能跨 target 边界
-e0fec499d 跨多块盘 PV 测试成功
+```bash
+DM_TEST_IMAGES="test.img test2.img" make run_nixos
 ```
 
-建议按这个顺序理解历史：
-
-1. 先补 block registry、DM 控制面、linear target；
-2. 让 LVM2 能创建 PV/VG 并开始创建 LV；
-3. 让最小 DM linear 路径跑通；
-4. 让 LVM 跨 PV table load/status/deps 跑通；
-5. 补跨 target BIO split；
-6. 把 NixOS 测试逐步脚本化。
-
 ---
 
-## 12. 后续更新要求
+## 12. 阶段结论
 
-后续每次补 DM 功能时，应同步更新本文档：
+当前 Asterinas DM 已经不是只有孤立 ktest 的原型，而是具备：
 
-1. 新增或修改的 ioctl；
-2. 新增 target 类型；
-3. table status/deps/list version 行为变化；
-4. BIO 数据面行为变化；
-5. block registry 生命周期变化；
-6. NixOS 测试步骤或通过标准；
-7. 已知限制和未覆盖场景；
-8. 每个新增/修改文件的维护说明。
+- kernel DM core；
+- Linux ioctl 控制面子集；
+- linear target 数据面；
+- BIO remap/split/completion；
+- block registry/devtmpfs/procfs 对接；
+- ktest 内核语义验证；
+- NixOS + LVM2 系统实测路径。
+
+但它仍然是 **linear-only、无 udev 依赖、最小 Linux DM 兼容子集**。
+
+下一阶段最重要的是继续围绕 linear target 和最小 ioctl/control 语义补齐 Linux 行为，而不是扩展新 target 或引入 udev/sysfs 等外部框架。

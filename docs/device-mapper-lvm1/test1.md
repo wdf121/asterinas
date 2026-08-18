@@ -370,6 +370,37 @@ DM_TEST_IMAGES="target/nixos/test.img target/nixos/test2.img target/nixos/test3.
 
 它只负责启动，不负责构建，也不会自动执行 guest 内测试命令。
 
+进入 guest root shell 后，如果想复用原来的测试盘和 LVM metadata，不要 `pvremove` / `vgremove`，直接扫描并激活：
+
+```bash
+TEST_DISK=$(aster-dm-disk-locator)
+TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
+printf 'TEST_DISK=%s\nTEST_DISK2=%s\n' "$TEST_DISK" "$TEST_DISK2"
+test "$TEST_DISK" != "$TEST_DISK2"
+
+pvscan
+vgscan
+vgchange --config 'activation { udev_rules=0 }' -ay test_vg
+
+pvs -o pv_name,pv_size,vg_name
+vgs -o vg_name,vg_size,vg_free,pv_count,lv_count
+lvs --segments -o lv_name,seg_start,seg_size,devices test_vg/test_lv
+dmsetup table test_vg-test_lv
+```
+
+如果要继续检查文件系统数据，可以只读挂载已有 LV，并在检查完成后停用 VG、关机：
+
+```bash
+mkdir -p /mnt/dmtest
+mount -t ext2 -o ro /dev/mapper/test_vg-test_lv /mnt/dmtest
+cat /mnt/dmtest/hello.txt
+cat /mnt/dmtest/grow.txt
+umount /mnt/dmtest
+vgchange --config 'activation { udev_rules=0 }' -an test_vg
+sync
+poweroff
+```
+
 适合场景：
 
 - 手工调试 LVM2 / dmsetup；

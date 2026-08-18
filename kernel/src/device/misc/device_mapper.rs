@@ -963,6 +963,9 @@ pub(super) fn init_in_first_kthread() {
 
 #[cfg(ktest)]
 mod tests {
+    use alloc::format;
+
+    use aster_block::{BlockDeviceLease, BlockDeviceMeta, register, unregister};
     use ostd::prelude::ktest;
 
     use super::*;
@@ -972,6 +975,83 @@ mod tests {
         write_u32(&mut buffer, OFF_DATA_SIZE, size).unwrap();
         write_u32(&mut buffer, OFF_DATA_START, DM_IOCTL_HEADER_SIZE).unwrap();
         buffer
+    }
+
+    #[derive(Debug)]
+    struct StatusBacking {
+        id: DeviceId,
+    }
+
+    impl StatusBacking {
+        fn new(minor: u32) -> Arc<Self> {
+            Self::new_with_major(1, minor)
+        }
+
+        fn new_with_major(major: u16, minor: u32) -> Arc<Self> {
+            Arc::new(Self {
+                id: DeviceId::new(MajorId::new(major), MinorId::new(minor)),
+            })
+        }
+    }
+
+    impl BlockDevice for StatusBacking {
+        fn enqueue(
+            &self,
+            bio: aster_block::bio::SubmittedBio,
+        ) -> core::result::Result<(), aster_block::bio::BioEnqueueError> {
+            bio.complete(aster_block::bio::BioStatus::Complete);
+            Ok(())
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: 8,
+                nr_sectors: 1_024,
+            }
+        }
+
+        fn name(&self) -> String {
+            String::from("dm-status-test-backing")
+        }
+
+        fn id(&self) -> DeviceId {
+            self.id
+        }
+    }
+
+    fn status_backing_lease(minor: u32) -> BlockDeviceLease {
+        BlockDeviceLease::new_untracked(StatusBacking::new(minor) as Arc<dyn BlockDevice>)
+    }
+
+    fn write_linear_target_spec(
+        buffer: &mut [u8],
+        record: usize,
+        start: u64,
+        length: u64,
+        next: u32,
+        params: &str,
+    ) {
+        write_u64(buffer, record, start).unwrap();
+        write_u64(buffer, record + 8, length).unwrap();
+        write_u32(buffer, record + 16, 0).unwrap();
+        write_u32(buffer, record + 20, next).unwrap();
+        write_c_string_fixed(buffer, record + 24, DM_TARGET_TYPE_LEN, "linear").unwrap();
+        write_c_string(buffer, record + DM_TARGET_SPEC_SIZE, params).unwrap();
+    }
+
+    fn single_linear_table(length: u64, backing_start: u64, backing_minor: u32) -> Arc<DmTable> {
+        Arc::new(
+            DmTable::new_linear(vec![
+                LinearTarget::new(
+                    Sid::new(0),
+                    length,
+                    Sid::new(backing_start),
+                    status_backing_lease(backing_minor),
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        )
     }
 
     #[ktest]
@@ -1121,6 +1201,172 @@ mod tests {
     }
 
     #[ktest]
+    fn reports_three_table_status_records_with_linux_next_offsets() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-three-target-status-test".to_string(), None, None)
+            .unwrap();
+        let table = DmTable::new_linear(vec![
+            LinearTarget::new(Sid::new(0), 4, Sid::new(100), status_backing_lease(1)).unwrap(),
+            LinearTarget::new(Sid::new(4), 4, Sid::new(200), status_backing_lease(2)).unwrap(),
+            LinearTarget::new(Sid::new(8), 4, Sid::new(300), status_backing_lease(3)).unwrap(),
+        ])
+        .unwrap();
+        device.load_table(Arc::new(table));
+
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 3 * 48);
+        write_u32(
+            &mut buffer,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG | DM_STATUS_TABLE_FLAG,
+        )
+        .unwrap();
+        table_status_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 3);
+        for (index, (record, start, backing_minor, backing_start, next)) in [
+            (DM_IOCTL_HEADER_SIZE, 0, 1, 100, 48),
+            (DM_IOCTL_HEADER_SIZE + 48, 4, 2, 200, 96),
+            (DM_IOCTL_HEADER_SIZE + 96, 8, 3, 300, 144),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(read_u64(&buffer, record).unwrap(), start);
+            assert_eq!(read_u64(&buffer, record + 8).unwrap(), 4);
+            assert_eq!(read_u32(&buffer, record + 16).unwrap(), 0);
+            assert_eq!(read_u32(&buffer, record + 20).unwrap(), next);
+            assert_eq!(
+                c_string_until(&buffer, record + 24, record + 40, "target 类型").unwrap(),
+                "linear"
+            );
+            assert_eq!(
+                c_string_until(&buffer, record + 40, record + 48, "target 参数").unwrap(),
+                format!("1:{} {}", backing_minor, backing_start)
+            );
+            assert_eq!(record, DM_IOCTL_HEADER_SIZE + index * 48);
+        }
+    }
+
+    #[ktest]
+    fn reports_linear_info_status_with_empty_params() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-linear-info-status-test".to_string(), None, None)
+            .unwrap();
+        device.load_table(single_linear_table(4, 100, 1));
+
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        write_u32(&mut buffer, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        table_status_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 1);
+        assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
+        assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 8).unwrap(), 4);
+        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 20).unwrap(), 48);
+        assert_eq!(
+            c_string_until(
+                &buffer,
+                DM_IOCTL_HEADER_SIZE + 24,
+                DM_IOCTL_HEADER_SIZE + 40,
+                "target 类型"
+            )
+            .unwrap(),
+            "linear"
+        );
+        assert_eq!(
+            c_string_until(
+                &buffer,
+                DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + 48,
+                "target 参数"
+            )
+            .unwrap(),
+            ""
+        );
+    }
+
+    #[ktest]
+    fn reports_table_deps_with_duplicate_backing_devices_deduplicated() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-dedup-deps-test".to_string(), None, None)
+            .unwrap();
+        let first = status_backing_lease(1);
+        let second = status_backing_lease(2);
+        let table = DmTable::new_linear(vec![
+            LinearTarget::new(Sid::new(0), 4, Sid::new(100), first.clone()).unwrap(),
+            LinearTarget::new(Sid::new(4), 4, Sid::new(104), first.clone()).unwrap(),
+            LinearTarget::new(Sid::new(8), 4, Sid::new(200), second.clone()).unwrap(),
+        ])
+        .unwrap();
+        device.load_table(Arc::new(table));
+
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 24);
+        write_u32(&mut buffer, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        table_deps_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE).unwrap(), 2);
+        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 4).unwrap(), 0);
+        assert_eq!(
+            read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 8).unwrap(),
+            first.id().as_encoded_u64()
+        );
+        assert_eq!(
+            read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 16).unwrap(),
+            second.id().as_encoded_u64()
+        );
+    }
+
+    #[ktest]
+    fn marks_table_status_buffer_full_when_first_record_does_not_fit() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-status-buffer-full-test".to_string(), None, None)
+            .unwrap();
+        let table = DmTable::new_linear(vec![
+            LinearTarget::new(Sid::new(0), 4, Sid::new(100), status_backing_lease(1)).unwrap(),
+            LinearTarget::new(Sid::new(4), 4, Sid::new(200), status_backing_lease(2)).unwrap(),
+        ])
+        .unwrap();
+        device.load_table(Arc::new(table));
+
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE - 1);
+        write_u32(&mut buffer, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        table_status_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 2);
+        assert_ne!(
+            read_u32(&buffer, OFF_FLAGS).unwrap() & DM_BUFFER_FULL_FLAG,
+            0
+        );
+    }
+
+    #[ktest]
+    fn marks_table_deps_buffer_full_when_deps_do_not_fit() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-deps-buffer-full-test".to_string(), None, None)
+            .unwrap();
+        let table = DmTable::new_linear(vec![
+            LinearTarget::new(Sid::new(0), 4, Sid::new(100), status_backing_lease(1)).unwrap(),
+            LinearTarget::new(Sid::new(4), 4, Sid::new(200), status_backing_lease(2)).unwrap(),
+        ])
+        .unwrap();
+        device.load_table(Arc::new(table));
+
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 16);
+        write_u32(&mut buffer, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        table_deps_for_device(&mut buffer, &device).unwrap();
+
+        assert_ne!(
+            read_u32(&buffer, OFF_FLAGS).unwrap() & DM_BUFFER_FULL_FLAG,
+            0
+        );
+        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
+    }
+
+    #[ktest]
     fn reports_status_target_count_for_selected_table() {
         let manager = DmManager::new().unwrap();
         let device = manager
@@ -1133,6 +1379,84 @@ mod tests {
         assert_eq!(read_u32(&fresh_status, OFF_TARGET_COUNT).unwrap(), 0);
         assert_eq!(read_u32(&fresh_status, OFF_FLAGS).unwrap(), DM_EXISTS_FLAG);
     }
+
+    #[ktest]
+    fn resume_ioctl_activates_inactive_table_for_active_queries() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-resume-activates-table-test".to_string(), None, None)
+            .unwrap();
+        device.load_table(single_linear_table(4, 100, 1));
+
+        let mut active_before = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        table_status_for_device(&mut active_before, &device).unwrap();
+        assert_eq!(read_u32(&active_before, OFF_TARGET_COUNT).unwrap(), 0);
+
+        let mut inactive_before = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        write_u32(
+            &mut inactive_before,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG,
+        )
+        .unwrap();
+        table_status_for_device(&mut inactive_before, &device).unwrap();
+        assert_eq!(read_u32(&inactive_before, OFF_TARGET_COUNT).unwrap(), 1);
+
+        device.resume().unwrap();
+        assert!(device.active_table().is_some());
+        assert!(device.inactive_table().is_none());
+
+        let mut active_after = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        table_status_for_device(&mut active_after, &device).unwrap();
+        assert_eq!(read_u32(&active_after, OFF_TARGET_COUNT).unwrap(), 1);
+        assert_eq!(
+            read_u64(&active_after, DM_IOCTL_HEADER_SIZE + 8).unwrap(),
+            4
+        );
+
+        let mut inactive_after = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        write_u32(&mut inactive_after, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        table_status_for_device(&mut inactive_after, &device).unwrap();
+        assert_eq!(read_u32(&inactive_after, OFF_TARGET_COUNT).unwrap(), 0);
+    }
+
+    #[ktest]
+    fn resume_ioctl_replaces_active_table_while_running() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-resume-replaces-table-test".to_string(), None, None)
+            .unwrap();
+        device.load_table(single_linear_table(4, 100, 1));
+        device.resume().unwrap();
+
+        device.load_table(single_linear_table(8, 200, 2));
+        let mut inactive = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        write_u32(&mut inactive, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        table_status_for_device(&mut inactive, &device).unwrap();
+        assert_eq!(read_u32(&inactive, OFF_TARGET_COUNT).unwrap(), 1);
+        assert_eq!(read_u64(&inactive, DM_IOCTL_HEADER_SIZE + 8).unwrap(), 8);
+
+        device.resume().unwrap();
+        assert!(device.active_table().is_some());
+        assert!(device.inactive_table().is_none());
+
+        let mut active = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        write_u32(&mut active, OFF_FLAGS, DM_STATUS_TABLE_FLAG).unwrap();
+        table_status_for_device(&mut active, &device).unwrap();
+        assert_eq!(read_u32(&active, OFF_TARGET_COUNT).unwrap(), 1);
+        assert_eq!(read_u64(&active, DM_IOCTL_HEADER_SIZE + 8).unwrap(), 8);
+        assert_eq!(
+            c_string_until(
+                &active,
+                DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + 48,
+                "target 参数"
+            )
+            .unwrap(),
+            "1:2 200"
+        );
+    }
+
     #[ktest]
     fn selects_uuid_then_name_then_device_id() {
         let manager = DmManager::new().unwrap();
@@ -1189,6 +1513,62 @@ mod tests {
                 event_nr: 0,
             }
         );
+    }
+
+    #[ktest]
+    fn loads_multiple_targets_using_dm_target_spec_next_offsets() {
+        let first = StatusBacking::new_with_major(510, 101);
+        let second = StatusBacking::new_with_major(510, 102);
+        let first_id = first.id();
+        let second_id = second.id();
+        register(first as Arc<dyn BlockDevice>).unwrap();
+        register(second as Arc<dyn BlockDevice>).unwrap();
+
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-table-load-next-test".to_string(), None, None)
+            .unwrap();
+        let first_next = table_status_record_len("510:101 100".len()).unwrap();
+        let total_len = first_next + table_status_record_len("510:102 200".len()).unwrap();
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + total_len);
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 2).unwrap();
+        write_linear_target_spec(
+            &mut buffer,
+            DM_IOCTL_HEADER_SIZE,
+            0,
+            4,
+            first_next as u32,
+            "510:101 100",
+        );
+        write_linear_target_spec(
+            &mut buffer,
+            DM_IOCTL_HEADER_SIZE + first_next,
+            4,
+            8,
+            0,
+            "510:102 200",
+        );
+
+        table_load_for_device(&mut buffer, &device).unwrap();
+        let table = device.inactive_table().unwrap();
+        assert_eq!(table.linears().len(), 2);
+        assert_eq!(
+            table.linears()[0].logical_range(),
+            &(Sid::new(0)..Sid::new(4))
+        );
+        assert_eq!(table.linears()[0].backing_id(), first_id);
+        assert_eq!(table.linears()[0].backing_start(), Sid::new(100));
+        assert_eq!(
+            table.linears()[1].logical_range(),
+            &(Sid::new(4)..Sid::new(12))
+        );
+        assert_eq!(table.linears()[1].backing_id(), second_id);
+        assert_eq!(table.linears()[1].backing_start(), Sid::new(200));
+
+        drop(table);
+        device.clear_inactive_table().unwrap();
+        unregister(first_id).unwrap();
+        unregister(second_id).unwrap();
     }
 
     #[ktest]
