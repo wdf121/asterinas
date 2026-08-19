@@ -1167,6 +1167,23 @@ mod tests {
         BlockDeviceLease::new_untracked(StatusBacking::new(minor) as Arc<dyn BlockDevice>)
     }
 
+    fn write_target_spec(
+        buffer: &mut [u8],
+        record: usize,
+        start: u64,
+        length: u64,
+        next: u32,
+        target_type: &str,
+        params: &str,
+    ) {
+        write_u64(buffer, record, start).unwrap();
+        write_u64(buffer, record + 8, length).unwrap();
+        write_u32(buffer, record + 16, 0).unwrap();
+        write_u32(buffer, record + 20, next).unwrap();
+        write_c_string_fixed(buffer, record + 24, DM_TARGET_TYPE_LEN, target_type).unwrap();
+        write_c_string(buffer, record + DM_TARGET_SPEC_SIZE, params).unwrap();
+    }
+
     fn write_linear_target_spec(
         buffer: &mut [u8],
         record: usize,
@@ -1175,12 +1192,7 @@ mod tests {
         next: u32,
         params: &str,
     ) {
-        write_u64(buffer, record, start).unwrap();
-        write_u64(buffer, record + 8, length).unwrap();
-        write_u32(buffer, record + 16, 0).unwrap();
-        write_u32(buffer, record + 20, next).unwrap();
-        write_c_string_fixed(buffer, record + 24, DM_TARGET_TYPE_LEN, "linear").unwrap();
-        write_c_string(buffer, record + DM_TARGET_SPEC_SIZE, params).unwrap();
+        write_target_spec(buffer, record, start, length, next, "linear", params);
     }
 
     fn single_linear_table(length: u64, backing_start: u64, backing_minor: u32) -> Arc<DmTable> {
@@ -1196,6 +1208,33 @@ mod tests {
             ])
             .unwrap(),
         )
+    }
+
+    fn assert_failed_table_load_preserves_state(
+        buffer: &mut [u8],
+        device: &DmDevice,
+        errno: Errno,
+    ) {
+        let status_before = device.status();
+        let active_before = device.active_table();
+        let inactive_before = device.inactive_table();
+
+        assert_eq!(
+            table_load_for_device(buffer, device).unwrap_err().error(),
+            errno
+        );
+
+        assert_eq!(device.status(), status_before);
+        match (active_before, device.active_table()) {
+            (Some(before), Some(after)) => assert!(Arc::ptr_eq(&before, &after)),
+            (None, None) => {}
+            _ => panic!("active table changed after failed table load"),
+        }
+        match (inactive_before, device.inactive_table()) {
+            (Some(before), Some(after)) => assert!(Arc::ptr_eq(&before, &after)),
+            (None, None) => {}
+            _ => panic!("inactive table changed after failed table load"),
+        }
     }
 
     #[ktest]
@@ -1546,6 +1585,151 @@ mod tests {
             0
         );
         assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
+    }
+
+    #[ktest]
+    fn reports_table_status_without_buffer_full_on_exact_fit() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-status-exact-fit-test".to_string(), None, None)
+            .unwrap();
+        let table = DmTable::new_linear(vec![
+            LinearTarget::new(Sid::new(0), 4, Sid::new(100), status_backing_lease(1)).unwrap(),
+            LinearTarget::new(Sid::new(4), 4, Sid::new(200), status_backing_lease(2)).unwrap(),
+        ])
+        .unwrap();
+        device.load_table(Arc::new(table));
+
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 96);
+        write_u32(
+            &mut buffer,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG | DM_STATUS_TABLE_FLAG,
+        )
+        .unwrap();
+        table_status_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 2);
+        assert_eq!(
+            read_u32(&buffer, OFF_FLAGS).unwrap() & DM_BUFFER_FULL_FLAG,
+            0
+        );
+        assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
+        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 20).unwrap(), 48);
+        assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 48).unwrap(), 4);
+        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 68).unwrap(), 96);
+        assert_eq!(
+            c_string_until(
+                &buffer,
+                DM_IOCTL_HEADER_SIZE + 88,
+                DM_IOCTL_HEADER_SIZE + 96,
+                "target 参数"
+            )
+            .unwrap(),
+            "1:2 200"
+        );
+    }
+
+    #[ktest]
+    fn marks_table_status_buffer_full_after_complete_record() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-status-partial-record-test".to_string(), None, None)
+            .unwrap();
+        let table = DmTable::new_linear(vec![
+            LinearTarget::new(Sid::new(0), 4, Sid::new(100), status_backing_lease(1)).unwrap(),
+            LinearTarget::new(Sid::new(4), 4, Sid::new(200), status_backing_lease(2)).unwrap(),
+        ])
+        .unwrap();
+        device.load_table(Arc::new(table));
+
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        write_u32(
+            &mut buffer,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG | DM_STATUS_TABLE_FLAG,
+        )
+        .unwrap();
+        table_status_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 2);
+        assert_ne!(
+            read_u32(&buffer, OFF_FLAGS).unwrap() & DM_BUFFER_FULL_FLAG,
+            0
+        );
+        assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
+        assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 8).unwrap(), 4);
+        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 20).unwrap(), 48);
+        assert_eq!(
+            c_string_until(
+                &buffer,
+                DM_IOCTL_HEADER_SIZE + 40,
+                DM_IOCTL_HEADER_SIZE + 48,
+                "target 参数"
+            )
+            .unwrap(),
+            "1:1 100"
+        );
+    }
+
+    #[ktest]
+    fn reports_table_deps_without_buffer_full_on_exact_fit() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-deps-exact-fit-test".to_string(), None, None)
+            .unwrap();
+        let first = status_backing_lease(1);
+        let second = status_backing_lease(2);
+        let table = DmTable::new_linear(vec![
+            LinearTarget::new(Sid::new(0), 4, Sid::new(100), first.clone()).unwrap(),
+            LinearTarget::new(Sid::new(4), 4, Sid::new(200), second.clone()).unwrap(),
+        ])
+        .unwrap();
+        device.load_table(Arc::new(table));
+
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 24);
+        write_u32(&mut buffer, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        table_deps_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(
+            read_u32(&buffer, OFF_FLAGS).unwrap() & DM_BUFFER_FULL_FLAG,
+            0
+        );
+        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE).unwrap(), 2);
+        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 4).unwrap(), 0);
+        assert_eq!(
+            read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 8).unwrap(),
+            first.id().as_encoded_u64()
+        );
+        assert_eq!(
+            read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 16).unwrap(),
+            second.id().as_encoded_u64()
+        );
+    }
+
+    #[ktest]
+    fn rejects_invalid_deps_data_start_before_output_writes() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-invalid-deps-start-test".to_string(), None, None)
+            .unwrap();
+        device.load_table(single_linear_table(4, 100, 1));
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 24);
+        write_u32(&mut buffer, OFF_DATA_START, DM_IOCTL_HEADER_SIZE + 1).unwrap();
+        write_u32(&mut buffer, OFF_TARGET_COUNT, u32::MAX).unwrap();
+        write_u32(&mut buffer, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+
+        assert_eq!(
+            table_deps_for_device(&mut buffer, &device)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+        assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), u32::MAX);
+        assert_eq!(
+            read_u32(&buffer, OFF_FLAGS).unwrap(),
+            DM_QUERY_INACTIVE_TABLE_FLAG
+        );
     }
 
     #[ktest]
@@ -2107,6 +2291,138 @@ mod tests {
         device.clear_inactive_table().unwrap();
         unregister(first_id).unwrap();
         unregister(second_id).unwrap();
+    }
+
+    #[ktest]
+    fn rejects_unsupported_table_targets_without_changing_device_state() {
+        for target_type in ["striped", "unknown"] {
+            let manager = DmManager::new().unwrap();
+            let device = manager
+                .create(format!("dm-unsupported-{target_type}-test"), None, None)
+                .unwrap();
+            let params = "2 128 510:220 0 510:221 0";
+            let mut buffer =
+                test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+            write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+            write_target_spec(
+                &mut buffer,
+                DM_IOCTL_HEADER_SIZE,
+                0,
+                8,
+                0,
+                target_type,
+                params,
+            );
+
+            assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
+        }
+    }
+
+    #[ktest]
+    fn rejects_missing_backing_without_setting_readonly_or_table() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-missing-backing-test".to_string(), None, None)
+            .unwrap();
+        let params = "510:230 0";
+        let mut buffer =
+            test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+        write_u32(&mut buffer, OFF_FLAGS, DM_READONLY_FLAG).unwrap();
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+        write_linear_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 4, 0, params);
+
+        assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::ENODEV);
+        assert!(!device.is_readonly());
+    }
+
+    #[ktest]
+    fn rejects_linear_range_errors_through_ioctl_without_changing_device_state() {
+        let backing = StatusBacking::new_with_major(510, 231);
+        let backing_id = backing.id();
+        register(backing as Arc<dyn BlockDevice>).unwrap();
+
+        for (name, start, length, backing_start) in [
+            ("zero", 0, 0, 0),
+            ("logical-overflow", u64::MAX, 1, 0),
+            ("backing-overflow", 0, 2, u64::MAX),
+            ("backing-out-of-bounds", 0, 8, 1_020),
+        ] {
+            let manager = DmManager::new().unwrap();
+            let device = manager
+                .create(format!("dm-range-{name}-test"), None, None)
+                .unwrap();
+            let params = format!("510:231 {backing_start}");
+            let mut buffer =
+                test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+            write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+            write_linear_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, start, length, 0, &params);
+
+            assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
+        }
+
+        unregister(backing_id).unwrap();
+    }
+
+    #[ktest]
+    fn rejects_non_contiguous_linear_tables_through_ioctl_without_changing_device_state() {
+        let backing = StatusBacking::new_with_major(510, 232);
+        let backing_id = backing.id();
+        register(backing as Arc<dyn BlockDevice>).unwrap();
+        let params = "510:232 0";
+        let first_next = table_status_record_len(params.len()).unwrap();
+
+        for (name, first_start, first_len, second_start, second_len) in [
+            ("nonzero-first", 1, 4, 5, 4),
+            ("gap", 0, 4, 5, 4),
+            ("overlap", 0, 8, 4, 4),
+        ] {
+            let manager = DmManager::new().unwrap();
+            let device = manager
+                .create(format!("dm-layout-{name}-test"), None, None)
+                .unwrap();
+            let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + first_next * 2);
+            write_u32(&mut buffer, OFF_TARGET_COUNT, 2).unwrap();
+            write_linear_target_spec(
+                &mut buffer,
+                DM_IOCTL_HEADER_SIZE,
+                first_start,
+                first_len,
+                first_next as u32,
+                params,
+            );
+            write_linear_target_spec(
+                &mut buffer,
+                DM_IOCTL_HEADER_SIZE + first_next,
+                second_start,
+                second_len,
+                0,
+                params,
+            );
+
+            assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
+        }
+
+        unregister(backing_id).unwrap();
+    }
+
+    #[ktest]
+    fn rejects_invalid_target_next_through_table_load_without_changing_device_state() {
+        for (name, target_count, next, buffer_len) in [
+            ("non-final-zero", 2, 0, DM_IOCTL_HEADER_SIZE + 48),
+            ("too-small", 2, 39, DM_IOCTL_HEADER_SIZE + 48),
+            ("unaligned", 2, 41, DM_IOCTL_HEADER_SIZE + 48),
+            ("out-of-bounds", 2, 56, DM_IOCTL_HEADER_SIZE + 48),
+        ] {
+            let manager = DmManager::new().unwrap();
+            let device = manager
+                .create(format!("dm-next-{name}-test"), None, None)
+                .unwrap();
+            let mut buffer = test_buffer(buffer_len);
+            write_u32(&mut buffer, OFF_TARGET_COUNT, target_count).unwrap();
+            write_linear_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 4, next, "");
+
+            assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
+        }
     }
 
     #[ktest]

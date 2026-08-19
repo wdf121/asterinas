@@ -233,6 +233,8 @@ default-members = [
 - linear table status 输出 `<major>:<minor> <backing_start>`；
 - table deps backing 去重；
 - table status/deps buffer-full 语义；
+- table status/deps exact-fit、部分 record 后 buffer-full、畸形 `data_start` 不写 header；
+- table load 对 unsupported target、缺失 backing、range/layout/next 错误的失败不改状态；
 - list devices、list target versions、get target version 的短输出 buffer 语义；
 - 输出类 helper 对畸形 `data_start` 的自校验；
 - device/table status/deps 按 `DM_QUERY_INACTIVE_TABLE_FLAG` 一致选择 active 或 inactive table；
@@ -1000,20 +1002,21 @@ linear target 当前已明确：
 2. LVM2 命令应显式使用 `activation { udev_rules=0 }`。
 3. `striped` 目前只是 target version 预检兼容，不能 table load。
 4. `DM_TABLE_LOAD` 的 `next` 和 `DM_TABLE_STATUS` 输出里的 `next` 语义不同。
-5. `load_table()` 只加载 inactive table，不应直接替换 active table。
-6. `resume()` 才能激活 inactive table。
-7. suspend 必须阻止新 I/O，并等待旧 I/O drain。
-8. DM enqueue 路径不能同步等待底层 I/O 完成。
-9. `DM_DEV_WAIT` 等待期间不能持有全局 control lock，否则会阻塞后续改变 `event_nr` 的 ioctl。
-10. DM ioctl 输入 flag 必须先归类为已支持、无害忽略或显式拒绝，不能静默吞掉未知位。
-11. 当前块层没有 discard / write zeroes BIO 类型，DM 不应提前伪造这两类语义。
-12. 当前 queue limits 只做 capacity 和 `max_nr_segments_per_bio` 保守汇总，不应提前复制 Linux 完整 stacking 规则。
-13. BIO split 后任何 child remap/enqueue 失败都必须通知 completion。
-14. original BIO 只能 complete 一次。
-15. `BlockDeviceLease` 不要退回裸 `Arc<dyn BlockDevice>`。
-16. 测试时临时缩小 `default-members` 后必须恢复 [Cargo.toml](file:///root/atom/asterinas/Cargo.toml)。
-17. raw BIO 回归会覆盖测试盘开头，不能和保留 LVM2 结果的测试混跑。
-18. QEMU 测试要串行跑，避免 `test/initramfs/build/ext2.img` write lock 冲突。
+5. failed `DM_TABLE_LOAD` 不能改变 active/inactive table、`event_nr` 或 readonly 状态。
+6. `load_table()` 只加载 inactive table，不应直接替换 active table。
+7. `resume()` 才能激活 inactive table。
+8. suspend 必须阻止新 I/O，并等待旧 I/O drain。
+9. DM enqueue 路径不能同步等待底层 I/O 完成。
+10. `DM_DEV_WAIT` 等待期间不能持有全局 control lock，否则会阻塞后续改变 `event_nr` 的 ioctl。
+11. DM ioctl 输入 flag 必须先归类为已支持、无害忽略或显式拒绝，不能静默吞掉未知位。
+12. 当前块层没有 discard / write zeroes BIO 类型，DM 不应提前伪造这两类语义。
+13. 当前 queue limits 只做 capacity 和 `max_nr_segments_per_bio` 保守汇总，不应提前复制 Linux 完整 stacking 规则。
+14. BIO split 后任何 child remap/enqueue 失败都必须通知 completion。
+15. original BIO 只能 complete 一次。
+16. `BlockDeviceLease` 不要退回裸 `Arc<dyn BlockDevice>`。
+17. 测试时临时缩小 `default-members` 后必须恢复 [Cargo.toml](file:///root/atom/asterinas/Cargo.toml)。
+18. raw BIO 回归会覆盖测试盘开头，不能和保留 LVM2 结果的测试混跑。
+19. QEMU 测试要串行跑，避免 `test/initramfs/build/ext2.img` write lock 冲突。
 
 ---
 
