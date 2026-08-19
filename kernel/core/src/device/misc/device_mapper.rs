@@ -738,11 +738,8 @@ fn parse_linear_params(params: &str) -> Result<(DeviceId, u64)> {
         .next()
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "linear 参数缺少起始扇区"))?;
 
-    // 可选的 "sectors" 后缀（某些 LVM2 版本添加）
-    if let Some(unit) = fields.next() {
-        if unit != "sectors" || fields.next().is_some() {
-            return_errno_with_message!(Errno::EINVAL, "linear 参数中的单位字段无效");
-        }
+    if fields.next().is_some() {
+        return_errno_with_message!(Errno::EINVAL, "linear 参数字段数量无效");
     }
 
     let (major, minor) = dev
@@ -1577,18 +1574,59 @@ mod tests {
         assert_eq!(id.major().get(), 8);
         assert_eq!(id.minor().get(), 1);
         assert_eq!(start, 2048);
+        let (id, start) = parse_linear_params("  510:4294967295\t0\n").unwrap();
+        assert_eq!(id.major().get(), 510);
+        assert_eq!(id.minor().get(), u32::MAX);
+        assert_eq!(start, 0);
+
         for params in [
             "8:1",
             "8:1 x",
             "8:1 0 extra",
+            "8:1 0 sectors",
             "8:1 0 sectors trailing",
             "bad 0",
+            ":1 0",
+            "8: 0",
+            "8:1:2 0",
+            "65536:1 0",
+            "8:4294967296 0",
+            "8:1 18446744073709551616",
+            "8:1 -1",
         ] {
             assert_eq!(
                 parse_linear_params(params).unwrap_err().error(),
-                Errno::EINVAL
+                Errno::EINVAL,
+                "params={params:?}"
             );
         }
+    }
+
+    #[ktest]
+    fn rejects_invalid_linear_params_without_changing_device_state() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-invalid-linear-params-test".to_string(), None, None)
+            .unwrap();
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+        write_linear_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 4, 0, "8:1 0 sectors");
+
+        assert_eq!(
+            table_load_for_device(&mut buffer, &device)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            device.status(),
+            aster_device_mapper::DmDeviceStatus {
+                suspended: false,
+                has_active_table: false,
+                has_inactive_table: false,
+                event_nr: 0,
+            }
+        );
     }
 
     #[ktest]

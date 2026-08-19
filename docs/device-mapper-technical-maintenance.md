@@ -97,6 +97,7 @@ Asterinas 当前设备、udev、sysfs、devtmpfs、块层生态还没有 Linux �
 
 语义：
 
+- linear 参数严格为 `<major>:<minor> <backing_start>` 两个字段，不接受额外单位或兼容后缀；
 - `DM_TABLE_STATUS` 不带 `DM_STATUS_TABLE_FLAG` 时，对齐 Linux `linear_status(STATUSTYPE_INFO)`，linear target 参数为空；
 - `DM_TABLE_STATUS` 带 `DM_STATUS_TABLE_FLAG` 时，对齐 Linux `linear_status(STATUSTYPE_TABLE)`，linear target 参数为 `<major>:<minor> <backing_start>`；
 - 所有 sector 均为 512 字节扇区；
@@ -166,7 +167,7 @@ default-members = [
 - table status/deps buffer-full 语义；
 - resume 激活 inactive table；
 - running 状态下 reload + resume 替换 active table；
-- linear 参数精确解析；
+- linear 参数精确解析，严格接受 `<major>:<minor> <backing_start>` 两字段格式；
 - linear target range 校验；
 - logical range end-exclusive；
 - table 从 0 开始且连续；
@@ -787,6 +788,14 @@ cargo osdk test device_mapper
 
 已补 ktest 锁住 info/table 两种输出差异，并复跑 `cargo fmt --all --check` 与 `cargo osdk test device_mapper`，结果通过，退出码为 0。
 
+### 8.7 收紧 linear 参数解析格式
+
+修改 [device_mapper.rs](file:///root/atom/asterinas/kernel/src/device/misc/device_mapper.rs)：
+
+- `DM_TABLE_LOAD` 的 linear 参数严格接受 `<major>:<minor> <backing_start>`；
+- 不再接受 `sectors` 等额外后缀；
+- 补 ktest 覆盖字段缺失、额外字段、畸形 `major:minor`、数值溢出，以及 table load 失败不改变 device state。
+
 ---
 
 ## 9. 后续优先级
@@ -795,9 +804,8 @@ cargo osdk test device_mapper
 
 下一步最需要做：
 
-1. 明确是否需要支持 `<dev> <offset> [sectors]` 之外的兼容格式；
-2. 明确 discard/write zeroes 当前是拒绝还是透传；
-3. 检查 queue limits 是否需要更接近 Linux stacking 规则。
+1. 明确 discard/write zeroes 当前是拒绝还是透传；
+2. 检查 queue limits 是否需要更接近 Linux stacking 规则。
 
 ### 第二优先级：补最小 ioctl/control 语义
 
