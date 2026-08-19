@@ -68,28 +68,29 @@ Asterinas 当前设备、udev、sysfs、devtmpfs、块层生态还没有 Linux �
 7. remove 时通过 block registry open count 阻止删除 busy mapper；
 8. remove_all best-effort 删除非 busy mapper，跳过 busy mapper；
 9. active table / inactive table；
-8. table load；
-9. table clear；
-10. suspend / resume；
-11. `event_nr` 状态变化计数和 `DM_DEV_WAIT` 最小等待语义；
-12. table status；
-13. table deps；
-14. list devices；
-15. list target versions；
-16. get target version；
-17. DM ioctl flags 最小兼容校验；
-18. linear target 参数解析；
-18. 一段或多段连续 linear target；
-19. logical sector 到 backing sector 的映射；
-20. BIO remap；
-21. 跨 linear target 边界的 BIO split；
-22. child BIO completion 聚合；
-23. flush 按 backing device 去重后异步 fan-out；
-24. `/dev/dm-N` 和 `/dev/mapper/<name>` runtime 节点；
-25. `/proc/devices` 暴露 block major；
-26. LVM2 依赖的 legacy block ioctl；
-27. VirtIO block serial 查询，用于稳定定位测试盘；
-28. NixOS guest 中 LVM2 创建、扩容、缩容、重启恢复测试脚本。
+10. table load；
+11. table clear；
+12. suspend / resume；
+13. `event_nr` 状态变化计数和 `DM_DEV_WAIT` 最小等待语义；
+14. table status；
+15. table deps；
+16. list devices；
+17. list target versions；
+18. get target version；
+19. DM ioctl flags 最小兼容校验；
+20. 输出类 ioctl 的 `data_start` / `DM_BUFFER_FULL_FLAG` 边界处理；
+21. linear target 参数解析；
+22. 一段或多段连续 linear target；
+23. logical sector 到 backing sector 的映射；
+24. BIO remap；
+25. 跨 linear target 边界的 BIO split；
+26. child BIO completion 聚合；
+27. flush 按 backing device 去重后异步 fan-out；
+28. `/dev/dm-N` 和 `/dev/mapper/<name>` runtime 节点；
+29. `/proc/devices` 暴露 block major；
+30. LVM2 依赖的 legacy block ioctl；
+31. VirtIO block serial 查询，用于稳定定位测试盘；
+32. NixOS guest 中 LVM2 创建、扩容、缩容、重启恢复测试脚本。
 
 ### 2.2 当前 linear target 语义
 
@@ -140,11 +141,12 @@ Asterinas 当前设备、udev、sysfs、devtmpfs、块层生态还没有 Linux �
 
 已实现或参与当前语义的输入 flag：
 
+- `DM_READONLY_FLAG`：`DM_DEV_CREATE` 创建只读 mapper；真实 libdevmapper 也可能在 `DM_TABLE_LOAD` 等后续 ioctl 中携带该位，当前在 table load 成功后将设备置为只读，其它查询类命令上兼容忽略；
 - `DM_SUSPEND_FLAG`：`DM_DEV_SUSPEND` 中选择 suspend/resume，status 输出中也反映 suspended 状态；
 - `DM_PERSISTENT_DEV_FLAG`：`DM_DEV_CREATE` 中指定 persistent minor；其它命令上可能由 libdevmapper 携带为陈旧输出位，当前兼容忽略；
 - `DM_STATUS_TABLE_FLAG`：仅允许 `DM_TABLE_STATUS` 输出 table 格式参数；
 - `DM_QUERY_INACTIVE_TABLE_FLAG`：仅允许 `DM_DEV_STATUS`、`DM_TABLE_DEPS`、`DM_TABLE_STATUS` 查询 inactive table；
-- `DM_UUID_FLAG`：仅允许 `DM_DEV_RENAME`，但第一版仍返回 `EOPNOTSUPP`，不支持修改 UUID。
+- `DM_UUID_FLAG`：仅允许 `DM_DEV_RENAME`，data 区字符串解释为新 UUID；成功时只更新 UUID 索引和设备 UUID，name/dev/table 状态保持不变。
 
 显式允许并按当前实现视为无害兼容的 flag：
 
@@ -155,7 +157,6 @@ Asterinas 当前设备、udev、sysfs、devtmpfs、块层生态还没有 Linux �
 
 显式拒绝的 flag：
 
-- `DM_READONLY_FLAG`：当前没有只读 mapper 数据面语义，返回 `EOPNOTSUPP`；
 - `DM_DEFERRED_REMOVE`：当前 remove/open_count 只支持立即删除或 `EBUSY`，返回 `EOPNOTSUPP`；
 - `DM_IMA_MEASUREMENT_FLAG`：当前不支持返回 IMA measurement 原始 table 信息，返回 `EOPNOTSUPP`；
 - 任何 Linux 6.6 已知范围外的未知 flag 位：返回 `EINVAL`。
@@ -171,9 +172,9 @@ Linux 6.6 `dm-ioctl.h` 中标准命令编号如下。Asterinas 的扩展原则�
 | 0 | `DM_VERSION` | 已支持 | 保持返回 Linux DM ioctl 版本兼容信息。 |
 | 1 | `DM_REMOVE_ALL` | 已支持 | 保持 best-effort：busy mapper 跳过，非 busy mapper 删除。 |
 | 2 | `DM_LIST_DEVICES` | 已支持 | 保持输出 device list、event number 和 UUID 标记。 |
-| 3 | `DM_DEV_CREATE` | 已支持 | 保持 name/uuid/persistent minor 创建语义。 |
+| 3 | `DM_DEV_CREATE` | 已支持 | 保持 name/uuid/persistent minor/readonly 创建语义。 |
 | 4 | `DM_DEV_REMOVE` | 已支持 | 保持 open count gate；暂不支持 deferred remove。 |
-| 5 | `DM_DEV_RENAME` | 已支持 name rename | UUID rename 当前明确 `EOPNOTSUPP`；若需要对齐 Linux，可作为独立小阶段实现。 |
+| 5 | `DM_DEV_RENAME` | 已支持 name rename 和 UUID rename | UUID rename 只更新 UUID 索引与设备 UUID，不移动 `/dev/mapper/<name>` alias。 |
 | 6 | `DM_DEV_SUSPEND` | 已支持 | 保持 suspend/resume 与 in-flight I/O drain；不引入 lockfs/udev。 |
 | 7 | `DM_DEV_STATUS` | 已支持 | 保持 header/status flags/open count/table presence/event number。 |
 | 8 | `DM_DEV_WAIT` | 已支持最小 event 等待 | 保持不持有全局 control lock；不扩展完整 uevent/poll 生态。 |
@@ -222,6 +223,8 @@ default-members = [
 - C 字符串解析；
 - dm_ioctl header 写回；
 - selector 优先级；
+- name rename 与 UUID rename 的索引一致性、重复 UUID 拒绝和失败不改状态；
+- readonly create/header 输出、table load 携带 readonly flag 时置位，以及只读 mapper 允许 read/flush、拒绝 write；
 - tableless device status；
 - zero target table load 拒绝；
 - multi-target `dm_target_spec.next` 解析；
@@ -230,6 +233,8 @@ default-members = [
 - linear table status 输出 `<major>:<minor> <backing_start>`；
 - table deps backing 去重；
 - table status/deps buffer-full 语义；
+- list devices、list target versions、get target version 的短输出 buffer 语义；
+- 输出类 helper 对畸形 `data_start` 的自校验；
 - device/table status/deps 按 `DM_QUERY_INACTIVE_TABLE_FLAG` 一致选择 active 或 inactive table；
 - resume 激活 inactive table；
 - running 状态下 reload + resume 替换 active table；
@@ -252,7 +257,7 @@ default-members = [
 
 当前系统测试脚本按分层套件维护：
 
-- [run_dm_control_abi_test.sh](file:///root/atom/asterinas/myshell/run_dm_control_abi_test.sh)：轻量 control ABI smoke，覆盖 `/dev/mapper/control`、`dmsetup version/targets/create/table/status/deps/info/wait`、`--noflush` suspend/resume；
+- [run_dm_control_abi_test.sh](file:///root/atom/asterinas/myshell/run_dm_control_abi_test.sh)：轻量 control ABI smoke，覆盖 `/dev/mapper/control`、`dmsetup version/targets/create/table/status/deps/info/wait`、name rename、多 target table/status/deps、多设备 list、readonly mapper 读写拒绝、busy remove、remove_all、`--noflush` suspend/resume；
 - [run_cross_target_bio_regression.sh](file:///root/atom/asterinas/myshell/run_cross_target_bio_regression.sh)：raw DM 数据面回归，验证单个 4KiB BIO 跨两个 linear target 后能正确 split/remap/聚合 completion；
 - [run_cross_pv_large_write_test.sh](file:///root/atom/asterinas/myshell/run_cross_pv_large_write_test.sh)：LVM2 跨 PV 大文件回归，验证 900MiB LV 跨两块 PV、700MiB 文件写入和重启后 md5 校验；
 - [run_lvm2_resize_test.sh](file:///root/atom/asterinas/myshell/run_lvm2_resize_test.sh)：LVM2 扩缩容回归，验证 400MiB 创建、700MiB 跨 PV 扩容、300MiB 缩容、ext2 resize、重启恢复和只读挂载读文件；
@@ -273,12 +278,14 @@ default-members = [
 
 本轮 ioctl/control 收紧后已重新跑过系统级验收：
 
-- `myshell/run_dm_system_tests.sh --quick`：通过，输出 `HOST_PASS_DM_SYSTEM_TESTS --quick`；其中 `run_dm_control_abi_test.sh` 输出 `TEST_PASS_DM_CONTROL_ABI`，`run_cross_target_bio_regression.sh` 输出 `TEST_PASS_CROSS_TARGET_BIO`；
+- `myshell/run_dm_system_tests.sh --quick`：通过，输出 `HOST_PASS_DM_SYSTEM_TESTS --quick`；其中 `run_dm_control_abi_test.sh` 输出 `TEST_PASS_DM_CONTROL_ABI`，覆盖 create/status/deps/info、name rename、多 target table/status/deps、多设备 list、readonly mapper 读成功且写失败、busy remove/remove_all、wait/noflush；`run_cross_target_bio_regression.sh` 输出 `TEST_PASS_CROSS_TARGET_BIO`；
 - `myshell/run_dm_system_tests.sh --lvm2`：通过，输出 `HOST_PASS_DM_SYSTEM_TESTS --lvm2`；其中跨 PV 大文件和 LVM2 扩缩容两个子场景均输出对应 `TEST_PASS_*`；
 - `myshell/run_cross_pv_large_write_test.sh`：验证 900MiB LV 跨两块 PV，重启后 md5 校验通过；
 - `myshell/run_lvm2_resize_test.sh`：验证 400MiB 创建、700MiB 跨 PV 扩容、300MiB 缩容、重启恢复和只读挂载读文件均通过。
 
 系统测试曾暴露 `DM_TABLE_LOAD` 上 libdevmapper 会携带 `DM_PERSISTENT_DEV_FLAG` 陈旧位；当前已修正为 create 时使用该 flag，create 之外兼容忽略该陈旧位。
+
+系统测试也暴露 `dmsetup --readonly create` 会在后续 reload/table load 路径携带 `DM_READONLY_FLAG`；当前 create 可直接创建只读设备，table load 成功后如果看到 readonly flag 也会把设备置为只读，查询类 ioctl 上的旧 readonly 位则不改变状态。
 
 系统实测中 `mkfs.ext2`/`blkid` 会打印 `Unable to get device geometry` 警告，但不影响 linear LV 创建、挂载、读写、扩缩容和恢复。这说明 `DM_DEV_SET_GEOMETRY` 暂不补入口不会阻断当前 LVM2 linear 路径。
 
@@ -935,12 +942,27 @@ cargo osdk test device_mapper
 - 补齐 Linux 6.6 `dm-ioctl.h` 中 0..19 位的 DM flag 常量；
 - 新增统一 `validate_input_flags()`，所有 ioctl 命令执行前先检查输入 flags；
 - 未知 flag 位返回 `EINVAL`；
-- `DM_READONLY_FLAG`、`DM_DEFERRED_REMOVE`、`DM_IMA_MEASUREMENT_FLAG` 因当前语义未实现而返回 `EOPNOTSUPP`；
+- `DM_READONLY_FLAG` 在 `DM_DEV_CREATE` 和成功的 `DM_TABLE_LOAD` 中可把 mapper 标记为只读，后续写 BIO 返回拒绝；
+- `DM_DEFERRED_REMOVE`、`DM_IMA_MEASUREMENT_FLAG` 因当前语义未实现而返回 `EOPNOTSUPP`；
 - `DM_SKIP_BDGET_FLAG`、`DM_SKIP_LOCKFS_FLAG`、`DM_NOFLUSH_FLAG` 显式允许并按当前实现忽略；
 - `DM_SECURE_DATA_FLAG` 显式允许，ioctl 结束后清零内核临时 buffer；
 - `DM_PERSISTENT_DEV_FLAG` 在 `DM_DEV_CREATE` 中用于 persistent minor；在其它命令上作为 libdevmapper 可能携带的陈旧位兼容忽略；
 - `DM_STATUS_TABLE_FLAG`、`DM_QUERY_INACTIVE_TABLE_FLAG`、`DM_UUID_FLAG` 限制在对应命令上使用；
 - 补 ktest 覆盖无害兼容 flag、输出-only 旧 flag、未知位、危险未实现位和命令专用 flag。
+
+### 8.15 支持 linear-only readonly mapper
+
+修改 [device.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/device.rs)、[manager.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/manager.rs)、[device_mapper.rs](file:///root/atom/asterinas/kernel/src/device/misc/device_mapper.rs) 和 [run_dm_control_abi_test.sh](file:///root/atom/asterinas/myshell/run_dm_control_abi_test.sh)：
+
+- `DmDeviceStatus` 增加 readonly 状态，control header 对 readonly mapper 写回 `DM_READONLY_FLAG`；
+- `DmManager::create_with_readonly()` 支持创建只读设备，原 `create()` 保持默认可写；
+- `DM_DEV_CREATE + DM_READONLY_FLAG` 创建 readonly mapper；
+- `DM_TABLE_LOAD` 成功且输入携带 `DM_READONLY_FLAG` 时，也把设备置为 readonly，用于兼容真实 `dmsetup --readonly create` 的 reload/table load 序列；
+- readonly mapper 的 `Read` 和 `Flush` BIO 继续允许，`Write` BIO 返回 `BioEnqueueError::Refused`；
+- 查询类 ioctl 上携带的旧 `DM_READONLY_FLAG` 不改变状态；
+- 系统测试新增 `dmsetup --readonly create` 后读成功、写失败的真实路径验证。
+
+真实 quick 测试曾暴露只在 create 路径消费 readonly flag 不够：当 `dmsetup --readonly create` 后续 table load 携带该 flag 但设备未置只读时，写 `/dev/mapper/<name>` 会成功。当前已用 ktest 和 quick 系统测试锁住该行为。
 
 ---
 
