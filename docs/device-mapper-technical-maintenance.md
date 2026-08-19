@@ -2,7 +2,7 @@
 
 本文档面向后续继续开发、审查和维护 Asterinas Device Mapper 的开发者。它不是简单的维护清单，而是说明当前 Asterinas DM 做到了什么程度、为什么这样设计、如何验证、各个文件在整体中的作用，以及下一阶段应该优先补什么。
 
-当前目标不是完整复刻 Linux Device Mapper 生态，而是先实现一个 **kernel-only、linear-only、尽量对齐 Linux DM 核心语义、但避免 udev/sysfs 等成熟用户态框架依赖** 的最小可用版本。
+当前目标不是完整复刻 Linux Device Mapper 生态，而是先实现一个 **kernel-only、linear-only、尽量对齐 Linux DM ioctl/control 核心 ABI、但避免 udev/sysfs 等成熟用户态框架依赖** 的最小可用版本。
 
 ---
 
@@ -36,7 +36,8 @@ Asterinas 当前设备、udev、sysfs、devtmpfs、块层生态还没有 Linux �
 - 不实现 target registry 泛化框架；
 - 不实现 crypt、snapshot、thin、mirror、multipath 等 target；
 - 不做复杂 queue stacking；
-- 不做完整 event polling/wait 语义；
+- 当前不支持 discard / write zeroes BIO 语义；
+- 不做完整 uevent、udev 和 poll/select 事件生态；
 - `striped` 只用于回应 LVM2 target version 预检，不支持实际 table load。
 
 ### 1.3 当前实现策略
@@ -64,17 +65,20 @@ Asterinas 当前设备、udev、sysfs、devtmpfs、块层生态还没有 Linux �
 4. DM device create/remove/remove_all/rename/status；
 5. name、uuid、dev selector 查询；
 6. selector 优先级：UUID 优先于 name，name 优先于 dev；
-7. active table / inactive table；
+7. remove 时通过 block registry open count 阻止删除 busy mapper；
+8. remove_all best-effort 删除非 busy mapper，跳过 busy mapper；
+9. active table / inactive table；
 8. table load；
 9. table clear；
 10. suspend / resume；
-11. `event_nr` 状态变化计数；
+11. `event_nr` 状态变化计数和 `DM_DEV_WAIT` 最小等待语义；
 12. table status；
 13. table deps；
 14. list devices；
 15. list target versions；
 16. get target version；
-17. linear target 参数解析；
+17. DM ioctl flags 最小兼容校验；
+18. linear target 参数解析；
 18. 一段或多段连续 linear target；
 19. logical sector 到 backing sector 的映射；
 20. BIO remap；
@@ -110,6 +114,10 @@ Asterinas 当前设备、udev、sysfs、devtmpfs、块层生态还没有 Linux �
 - 同一 backing device 可以被多条 linear target 引用；
 - table deps 按 backing device 去重；
 - flush 也按 backing device 去重；
+- 当前 DM 只处理 Read / Write / Flush；
+- mapper capacity 来自所有 linear target 的连续 logical range 总长度；
+- queue limits 当前只汇总 `max_nr_segments_per_bio`，取所有 backing device 的最小值；
+- 暂不建模 Linux DM 更完整的 queue stacking 能力，例如 alignment、discard、write zeroes、optimal I/O size 等；
 - 当前拒绝 DM-on-DM backing，避免递归 mapper 语义尚未成熟时引入复杂生命周期问题。
 
 ### 2.3 当前 suspend/resume 语义
@@ -122,7 +130,64 @@ Asterinas 当前设备、udev、sysfs、devtmpfs、块层生态还没有 Linux �
 - `suspend()` 等待已进入 DM 的 in-flight I/O drain；
 - `Suspending` 阶段对 control/status 语义也表现为 suspended；
 - fresh device 上没有 active table 时，`suspend()` 不应错误增加 `event_nr`；
+- `load_table()`、`clear_inactive_table()`、`suspend()`、`resume()`、remove 成功路径会在实际状态变化时唤醒 `DM_DEV_WAIT` 等待者；
+- `DM_DEV_WAIT` 只等待 `event_nr` 不同于输入 header 中的 `event_nr`，不实现完整 uevent/udev 机制；
 - running device reload 后再次 `resume()` 会用 inactive table 替换 active table。
+
+### 2.4 当前 DM ioctl flags 策略
+
+当前 flags 策略是最小兼容子集：已实现语义的 flag 正常处理，无害兼容 flag 显式允许，可能造成语义误导的未实现 flag 显式拒绝，未知位拒绝。
+
+已实现或参与当前语义的输入 flag：
+
+- `DM_SUSPEND_FLAG`：`DM_DEV_SUSPEND` 中选择 suspend/resume，status 输出中也反映 suspended 状态；
+- `DM_PERSISTENT_DEV_FLAG`：`DM_DEV_CREATE` 中指定 persistent minor；其它命令上可能由 libdevmapper 携带为陈旧输出位，当前兼容忽略；
+- `DM_STATUS_TABLE_FLAG`：仅允许 `DM_TABLE_STATUS` 输出 table 格式参数；
+- `DM_QUERY_INACTIVE_TABLE_FLAG`：仅允许 `DM_DEV_STATUS`、`DM_TABLE_DEPS`、`DM_TABLE_STATUS` 查询 inactive table；
+- `DM_UUID_FLAG`：仅允许 `DM_DEV_RENAME`，但第一版仍返回 `EOPNOTSUPP`，不支持修改 UUID。
+
+显式允许并按当前实现视为无害兼容的 flag：
+
+- `DM_SKIP_BDGET_FLAG`：Linux 已忽略，Asterinas 也忽略；
+- `DM_SKIP_LOCKFS_FLAG`：当前 suspend 不冻结文件系统，因此忽略；
+- `DM_NOFLUSH_FLAG`：当前 suspend/table status/wait 不主动 flush thin 或底层队列，因此忽略；
+- `DM_SECURE_DATA_FLAG`：当前只支持 linear target，没有 crypt key 等敏感 target 参数；ioctl 结束后会清零内核临时 buffer。
+
+显式拒绝的 flag：
+
+- `DM_READONLY_FLAG`：当前没有只读 mapper 数据面语义，返回 `EOPNOTSUPP`；
+- `DM_DEFERRED_REMOVE`：当前 remove/open_count 只支持立即删除或 `EBUSY`，返回 `EOPNOTSUPP`；
+- `DM_IMA_MEASUREMENT_FLAG`：当前不支持返回 IMA measurement 原始 table 信息，返回 `EOPNOTSUPP`；
+- 任何 Linux 6.6 已知范围外的未知 flag 位：返回 `EINVAL`。
+
+输出-only flag 由内核写回，用户输入中的旧输出位不决定最终状态。
+
+### 2.5 标准 Linux DM ioctl 对标矩阵
+
+Linux 6.6 `dm-ioctl.h` 中标准命令编号如下。Asterinas 的扩展原则是：**命令表和 header 行为尽量对齐 Linux；如果功能依赖 Asterinas 当前没有的框架或非 linear target 语义，则做兼容 stub 或明确拒绝，不为了 ioctl 表面完整而引入 udev/sysfs/新 target 框架。**
+
+| 编号 | Linux ioctl | 当前 Asterinas 状态 | 后续策略 |
+|---:|---|---|---|
+| 0 | `DM_VERSION` | 已支持 | 保持返回 Linux DM ioctl 版本兼容信息。 |
+| 1 | `DM_REMOVE_ALL` | 已支持 | 保持 best-effort：busy mapper 跳过，非 busy mapper 删除。 |
+| 2 | `DM_LIST_DEVICES` | 已支持 | 保持输出 device list、event number 和 UUID 标记。 |
+| 3 | `DM_DEV_CREATE` | 已支持 | 保持 name/uuid/persistent minor 创建语义。 |
+| 4 | `DM_DEV_REMOVE` | 已支持 | 保持 open count gate；暂不支持 deferred remove。 |
+| 5 | `DM_DEV_RENAME` | 已支持 name rename | UUID rename 当前明确 `EOPNOTSUPP`；若需要对齐 Linux，可作为独立小阶段实现。 |
+| 6 | `DM_DEV_SUSPEND` | 已支持 | 保持 suspend/resume 与 in-flight I/O drain；不引入 lockfs/udev。 |
+| 7 | `DM_DEV_STATUS` | 已支持 | 保持 header/status flags/open count/table presence/event number。 |
+| 8 | `DM_DEV_WAIT` | 已支持最小 event 等待 | 保持不持有全局 control lock；不扩展完整 uevent/poll 生态。 |
+| 9 | `DM_TABLE_LOAD` | 已支持 linear-only | 继续只接受 linear target；其它 target table load 返回错误。 |
+| 10 | `DM_TABLE_CLEAR` | 已支持 | 保持清理 inactive table 的幂等语义。 |
+| 11 | `DM_TABLE_DEPS` | 已支持 | 保持 active/inactive selector 与 backing deps 去重。 |
+| 12 | `DM_TABLE_STATUS` | 已支持 | 保持 info/table 两种 linear status 输出。 |
+| 13 | `DM_LIST_VERSIONS` | 已支持 | `linear` 真实支持；`striped` 仅用于 LVM2 预检兼容。 |
+| 14 | `DM_TARGET_MSG` | 未支持，当前命令解码拒绝 | 待定；linear target 没有真实 message 语义，单补入口价值低。 |
+| 15 | `DM_DEV_SET_GEOMETRY` | 未支持，当前命令解码拒绝 | 待定；Asterinas 当前不消费 legacy geometry，no-op 容易形成假支持。 |
+| 16 | `DM_DEV_ARM_POLL` | 未支持，当前命令解码拒绝 | 待定；没有完整 poll/uevent 生态前，单补入口不解决实际能力。 |
+| 17 | `DM_GET_TARGET_VERSION` | 已支持 | 保持单 target version 查询。 |
+
+因此，当前不为了覆盖 ioctl 编号而硬补入口。`DM_TARGET_MSG`、`DM_DEV_SET_GEOMETRY`、`DM_DEV_ARM_POLL` 先保持待定；只有当真实 dmsetup/LVM2 路径需要，或 Asterinas 后续具备对应框架能力时，再作为独立小阶段评估。
 
 ---
 
@@ -165,6 +230,7 @@ default-members = [
 - linear table status 输出 `<major>:<minor> <backing_start>`；
 - table deps backing 去重；
 - table status/deps buffer-full 语义；
+- device/table status/deps 按 `DM_QUERY_INACTIVE_TABLE_FLAG` 一致选择 active 或 inactive table；
 - resume 激活 inactive table；
 - running 状态下 reload + resume 替换 active table；
 - linear 参数精确解析，严格接受 `<major>:<minor> <backing_start>` 两字段格式；
@@ -180,26 +246,43 @@ default-members = [
 - backing enqueue 同步失败时原始 flush BIO 完成；
 - suspend 等待 submitted I/O drain 并阻止新 I/O。
 
-### 3.2 NixOS + LVM2 实测
+### 3.2 NixOS + LVM2 系统实测
 
-NixOS 实测用于验证真实用户态路径：LVM2、dmsetup、ext2、block registry、devtmpfs、procfs、VirtIO block、QEMU raw image 一起工作。
+系统实测用于验证真实用户态路径：dmsetup、LVM2、ext2、block registry、devtmpfs、procfs、VirtIO block、QEMU raw image 一起工作。
 
-当前已有脚本入口集中在：
+当前系统测试脚本按分层套件维护：
 
-- [test1.md](file:///root/atom/asterinas/docs/device-mapper-lvm1/test1.md)
-- [run_cross_target_bio_regression.sh](file:///root/atom/asterinas/myshell/run_cross_target_bio_regression.sh)
-- [run_cross_pv_large_write_test.sh](file:///root/atom/asterinas/myshell/run_cross_pv_large_write_test.sh)
-- [run_lvm2_resize_test.sh](file:///root/atom/asterinas/myshell/run_lvm2_resize_test.sh)
+- [run_dm_control_abi_test.sh](file:///root/atom/asterinas/myshell/run_dm_control_abi_test.sh)：轻量 control ABI smoke，覆盖 `/dev/mapper/control`、`dmsetup version/targets/create/table/status/deps/info/wait`、`--noflush` suspend/resume；
+- [run_cross_target_bio_regression.sh](file:///root/atom/asterinas/myshell/run_cross_target_bio_regression.sh)：raw DM 数据面回归，验证单个 4KiB BIO 跨两个 linear target 后能正确 split/remap/聚合 completion；
+- [run_cross_pv_large_write_test.sh](file:///root/atom/asterinas/myshell/run_cross_pv_large_write_test.sh)：LVM2 跨 PV 大文件回归，验证 900MiB LV 跨两块 PV、700MiB 文件写入和重启后 md5 校验；
+- [run_lvm2_resize_test.sh](file:///root/atom/asterinas/myshell/run_lvm2_resize_test.sh)：LVM2 扩缩容回归，验证 400MiB 创建、700MiB 跨 PV 扩容、300MiB 缩容、ext2 resize、重启恢复和只读挂载读文件；
+- [run_dm_system_tests.sh](file:///root/atom/asterinas/myshell/run_dm_system_tests.sh)：组合入口，支持 `--quick`、`--data`、`--lvm2`、`--full`。
 
-三层系统验证：
+这些脚本共享 [dm_nixos_test.sh](file:///root/atom/asterinas/myshell/lib/dm_nixos_test.sh) 中的 host-side 公共逻辑，包括 QEMU 占用检查、NixOS 镜像检查、测试盘重置、guest shell 等待、FIFO 注入、summary 和失败上下文输出。
 
-1. raw BIO 跨 target 回归；
-2. 跨 PV 大文件写入和重启 hash 校验；
-3. LVM2 创建 LV、扩容、缩容、ext2 resize、重启恢复。
+推荐按改动范围选择系统测试：
 
-这些测试说明 DM 不只是 ktest 能过，也能在 NixOS guest 里承载标准 LVM2 的 linear LV 使用场景。
+| 改动范围 | 推荐脚本 |
+|---|---|
+| ioctl/control、flags、event/wait | `myshell/run_dm_system_tests.sh --quick` |
+| BIO split/remap、linear target 数据面 | `myshell/run_dm_system_tests.sh --data` |
+| LVM2 交互、table/status/deps、resize | `myshell/run_dm_system_tests.sh --lvm2` |
+| 阶段验收或发版前验收 | `myshell/run_dm_system_tests.sh --full` |
 
-本轮代码修复后主要重跑的是 ktest；NixOS 脚本属于已有系统级验证路径，后续若修改 ioctl ABI、block registry、devtmpfs 或 LVM2 交互，应重新跑 NixOS 实测。
+系统测试和 ktest 的职责不同：ktest 精确覆盖内核内部语义；系统测试确认这些语义能通过真实用户态 ABI 和工具链走通，或至少没有破坏真实 LVM2 linear 路径。
+
+本轮 ioctl/control 收紧后已重新跑过系统级验收：
+
+- `myshell/run_dm_system_tests.sh --quick`：通过，输出 `HOST_PASS_DM_SYSTEM_TESTS --quick`；其中 `run_dm_control_abi_test.sh` 输出 `TEST_PASS_DM_CONTROL_ABI`，`run_cross_target_bio_regression.sh` 输出 `TEST_PASS_CROSS_TARGET_BIO`；
+- `myshell/run_dm_system_tests.sh --lvm2`：通过，输出 `HOST_PASS_DM_SYSTEM_TESTS --lvm2`；其中跨 PV 大文件和 LVM2 扩缩容两个子场景均输出对应 `TEST_PASS_*`；
+- `myshell/run_cross_pv_large_write_test.sh`：验证 900MiB LV 跨两块 PV，重启后 md5 校验通过；
+- `myshell/run_lvm2_resize_test.sh`：验证 400MiB 创建、700MiB 跨 PV 扩容、300MiB 缩容、重启恢复和只读挂载读文件均通过。
+
+系统测试曾暴露 `DM_TABLE_LOAD` 上 libdevmapper 会携带 `DM_PERSISTENT_DEV_FLAG` 陈旧位；当前已修正为 create 时使用该 flag，create 之外兼容忽略该陈旧位。
+
+系统实测中 `mkfs.ext2`/`blkid` 会打印 `Unable to get device geometry` 警告，但不影响 linear LV 创建、挂载、读写、扩缩容和恢复。这说明 `DM_DEV_SET_GEOMETRY` 暂不补入口不会阻断当前 LVM2 linear 路径。
+
+后续若继续修改 ioctl ABI、block registry、devtmpfs、BIO split/remap 或 LVM2 交互，应按上表重新跑对应系统测试。
 
 ---
 
@@ -388,6 +471,8 @@ DM device 管理层。
 - 管理 uuid → name；
 - 支持指定 minor；
 - 支持 create、lookup、rename、remove、remove_all；
+- remove 通过 block registry 的 open count gate 拒绝 busy mapper；
+- remove_all 采用 best-effort 语义，busy mapper 保留，其余 mapper 继续删除；
 - 维护 `DmDeviceIdOwner`，保证 minor 生命周期。
 
 它对应 Linux DM 中“控制面对象索引”的一部分，但不绑定 udev。
@@ -420,8 +505,8 @@ DM table 和数据面转发层。
 - 保存一组 linear target；
 - 验证 table 从 logical sector 0 开始；
 - 验证 target 连续无空洞；
-- 计算 mapper capacity；
-- 聚合 backing queue limit；
+- 计算 mapper capacity，结果等于所有连续 linear target 的总 logical sector 数；
+- 聚合 backing queue limit，目前只取 `max_nr_segments_per_bio` 的最小值；
 - 返回 backing deps；
 - 普通 BIO remap；
 - 跨 target BIO split；
@@ -481,7 +566,9 @@ linear target 实现。
 - `data_start` 必须至少为 header size，并且 8 字节对齐；
 - `dm_target_spec.next` 在 table load 输入和 table status 输出中的含义不同；
 - table load 当前只接受 `linear`；
-- target version 可以声明 `striped`，但 table load 不允许 striped。
+- target version 可以声明 `striped`，但 table load 不允许 striped；
+- 单个 `DM_DEV_REMOVE` 遇到 open mapper 时返回 `EBUSY`，并保留 manager 索引和 runtime 节点；
+- `DM_REMOVE_ALL` 遇到 busy mapper 时跳过该设备，继续删除其它 mapper，ioctl 本身保持 best-effort 成功。
 
 ### 5.3 block crate 和 BIO 支撑
 
@@ -796,26 +883,83 @@ cargo osdk test device_mapper
 - 不再接受 `sectors` 等额外后缀；
 - 补 ktest 覆盖字段缺失、额外字段、畸形 `major:minor`、数值溢出，以及 table load 失败不改变 device state。
 
+### 8.8 明确 discard / write zeroes 当前边界
+
+当前 Asterinas 块层 `BioType` 只有 Read / Write / Flush，还没有 discard / write zeroes 类型。因此 DM 当前不实现这两类语义，也不在 DM 层伪造透传或拒绝路径。
+
+后续如果块层新增 discard / write zeroes BIO 类型，再按 backing device 能力决定 DM 是透传、拆分后透传，还是返回 not supported。
+
+### 8.9 明确 queue limits 当前边界
+
+当前 DM table 的 capacity 来自 linear table 的总 logical sector 数；queue limits 只汇总 Asterinas 当前块层已有的 `max_nr_segments_per_bio`，并取所有 backing device 的最小值。
+
+这能保证跨 backing 的 BIO 不超过任一底层设备的 segment 限制，但暂不对齐 Linux DM 更完整的 queue stacking 规则。alignment、discard、write zeroes、optimal I/O size 等能力需要等块层抽象补齐后再统一建模。
+
+### 8.10 复核 remove/open_count control 语义
+
+单个 `DM_DEV_REMOVE` 当前先调用 block registry 的 `unregister_mapper()`。该路径会在删除 `/dev/dm-N` 和 `/dev/mapper/<name>` 前检查 open count；如果 mapper 仍被打开，返回 `EBUSY`，并保持 manager 索引和 runtime 节点不变。
+
+`DM_REMOVE_ALL` 当前是 best-effort：busy mapper 删除失败时会被跳过，其它 mapper 继续删除，整个 ioctl 不因为单个 busy 设备失败而失败。
+
+### 8.11 钉住 rename 失败回滚语义
+
+修改 [device_mapper.rs](file:///root/atom/asterinas/kernel/src/device/misc/device_mapper.rs)：
+
+- 将 `device_rename()` 中“先更新 manager，再 rename `/dev/mapper/<name>` alias，alias 失败后回滚 manager”的路径抽成 `rename_device_runtime()`；
+- runtime 行为保持不变，但失败回滚路径可以直接用 ktest 注入 alias rename 失败；
+- 补 ktest 覆盖 rename 成功、同名 rename no-op、alias rename 失败时 manager/name/uuid/status 回滚。
+
+### 8.12 钉住 active/inactive query flags 语义
+
+修改 [device_mapper.rs](file:///root/atom/asterinas/kernel/src/device/misc/device_mapper.rs)：
+
+- 将 `DM_DEV_STATUS` 的 table 选择路径抽成 `device_status_for_device()`，便于直接测试 active/inactive table selector；
+- 补 ktest 覆盖 `DM_DEV_STATUS`、`DM_TABLE_STATUS`、`DM_TABLE_DEPS` 都按 `DM_QUERY_INACTIVE_TABLE_FLAG` 一致选择 table；
+- 不带 flag 查询 active table，带 flag 查询 inactive table，active/inactive 同时存在时不能串表。
+
+### 8.13 补齐 DM_DEV_WAIT 最小 event 语义
+
+修改 [device.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/device.rs) 和 [device_mapper.rs](file:///root/atom/asterinas/kernel/src/device/misc/device_mapper.rs)：
+
+- `DmDevice` 增加 event wait queue；
+- `load_table()`、`clear_inactive_table()`、`suspend()`、`resume()`、remove 成功路径在 `event_nr` 真实变化后唤醒等待者；
+- ioctl 解码接受 Linux ABI 里的 `DM_DEV_WAIT_CMD = 8`；
+- `DM_DEV_WAIT` 等待期间不持有全局 `DM_CONTROL_LOCK`，避免阻塞后续能改变 `event_nr` 的 control ioctl；
+- 返回前重新确认设备仍在 manager 中，避免 remove 后返回陈旧 device header；
+- 补 ktest 覆盖 wait 已变化立即返回、未变化时阻塞到 event 变化、控制面 wait header 更新，以及 ioctl 编码接受 8 号命令。
+
+### 8.14 收口 DM ioctl flags 兼容边界
+
+修改 [device_mapper.rs](file:///root/atom/asterinas/kernel/src/device/misc/device_mapper.rs)：
+
+- 补齐 Linux 6.6 `dm-ioctl.h` 中 0..19 位的 DM flag 常量；
+- 新增统一 `validate_input_flags()`，所有 ioctl 命令执行前先检查输入 flags；
+- 未知 flag 位返回 `EINVAL`；
+- `DM_READONLY_FLAG`、`DM_DEFERRED_REMOVE`、`DM_IMA_MEASUREMENT_FLAG` 因当前语义未实现而返回 `EOPNOTSUPP`；
+- `DM_SKIP_BDGET_FLAG`、`DM_SKIP_LOCKFS_FLAG`、`DM_NOFLUSH_FLAG` 显式允许并按当前实现忽略；
+- `DM_SECURE_DATA_FLAG` 显式允许，ioctl 结束后清零内核临时 buffer；
+- `DM_PERSISTENT_DEV_FLAG` 在 `DM_DEV_CREATE` 中用于 persistent minor；在其它命令上作为 libdevmapper 可能携带的陈旧位兼容忽略；
+- `DM_STATUS_TABLE_FLAG`、`DM_QUERY_INACTIVE_TABLE_FLAG`、`DM_UUID_FLAG` 限制在对应命令上使用；
+- 补 ktest 覆盖无害兼容 flag、输出-only 旧 flag、未知位、危险未实现位和命令专用 flag。
+
 ---
 
 ## 9. 后续优先级
 
-### 第一优先级：继续收紧 linear target 与 Linux DM 行为
+### 第一优先级：linear target 与 Linux DM 行为当前收口
 
-下一步最需要做：
+linear target 当前已明确：
 
-1. 明确 discard/write zeroes 当前是拒绝还是透传；
-2. 检查 queue limits 是否需要更接近 Linux stacking 规则。
+1. table 参数严格接受 `<major>:<minor> <backing_start>`；
+2. table status 区分 info/table 两种输出；
+3. discard/write zeroes 当前不支持；
+4. queue limits 当前只建模 capacity 和 `max_nr_segments_per_bio` 保守汇总。
 
-### 第二优先级：补最小 ioctl/control 语义
+下一步应转入最小 ioctl/control 语义补齐。
 
-重点：
+### 第二优先级：系统级回归验收
 
-1. remove 时 open_count 行为；
-2. rename 的失败回滚；
-3. inactive/active table query flags；
-4. event_nr 和 wait/event 相关最小语义；
-5. DM flags 的兼容处理。
+当前标准 Linux DM ioctl 中，`DM_TARGET_MSG`、`DM_DEV_SET_GEOMETRY`、`DM_DEV_ARM_POLL` 暂不补入口。下一阶段重点转为系统级回归验收，确认已有 ioctl/control 收紧没有破坏真实 LVM2 linear 路径。
 
 ### 第三优先级：系统实测回归常态化
 
@@ -838,12 +982,16 @@ cargo osdk test device_mapper
 6. `resume()` 才能激活 inactive table。
 7. suspend 必须阻止新 I/O，并等待旧 I/O drain。
 8. DM enqueue 路径不能同步等待底层 I/O 完成。
-9. BIO split 后任何 child remap/enqueue 失败都必须通知 completion。
-10. original BIO 只能 complete 一次。
-11. `BlockDeviceLease` 不要退回裸 `Arc<dyn BlockDevice>`。
-12. 测试时临时缩小 `default-members` 后必须恢复 [Cargo.toml](file:///root/atom/asterinas/Cargo.toml)。
-13. raw BIO 回归会覆盖测试盘开头，不能和保留 LVM2 结果的测试混跑。
-14. QEMU 测试要串行跑，避免 `test/initramfs/build/ext2.img` write lock 冲突。
+9. `DM_DEV_WAIT` 等待期间不能持有全局 control lock，否则会阻塞后续改变 `event_nr` 的 ioctl。
+10. DM ioctl 输入 flag 必须先归类为已支持、无害忽略或显式拒绝，不能静默吞掉未知位。
+11. 当前块层没有 discard / write zeroes BIO 类型，DM 不应提前伪造这两类语义。
+12. 当前 queue limits 只做 capacity 和 `max_nr_segments_per_bio` 保守汇总，不应提前复制 Linux 完整 stacking 规则。
+13. BIO split 后任何 child remap/enqueue 失败都必须通知 completion。
+14. original BIO 只能 complete 一次。
+15. `BlockDeviceLease` 不要退回裸 `Arc<dyn BlockDevice>`。
+16. 测试时临时缩小 `default-members` 后必须恢复 [Cargo.toml](file:///root/atom/asterinas/Cargo.toml)。
+17. raw BIO 回归会覆盖测试盘开头，不能和保留 LVM2 结果的测试混跑。
+18. QEMU 测试要串行跑，避免 `test/initramfs/build/ext2.img` write lock 冲突。
 
 ---
 
@@ -856,32 +1004,35 @@ cargo fmt --all --check
 cargo osdk test device_mapper
 ```
 
+修改 ioctl/control、flags、event/wait 后：
+
+```bash
+cargo osdk test device_mapper
+myshell/run_dm_system_tests.sh --quick
+```
+
 修改 BIO split/remap 后：
 
 ```bash
 cargo osdk test device_mapper
-myshell/run_cross_target_bio_regression.sh
+myshell/run_dm_system_tests.sh --data
 ```
 
-修改 ioctl、block registry、devtmpfs、procfs 后：
+修改 LVM2 交互、table/status/deps 或 resize 相关路径后：
 
 ```bash
 cargo osdk test device_mapper
-make test
+myshell/run_dm_system_tests.sh --lvm2
 ```
 
-并按需跑：
+阶段验收或发版前验收：
 
 ```bash
-myshell/run_cross_pv_large_write_test.sh
-myshell/run_lvm2_resize_test.sh
+cargo osdk test device_mapper
+myshell/run_dm_system_tests.sh --full
 ```
 
-修改 NixOS 测试盘逻辑后：
-
-```bash
-DM_TEST_IMAGES="test.img test2.img" make run_nixos
-```
+修改 NixOS 测试盘或 guest 启动逻辑后，需要单独确认对应 `make run_nixos` 路径。
 
 ---
 
@@ -899,4 +1050,4 @@ DM_TEST_IMAGES="test.img test2.img" make run_nixos
 
 但它仍然是 **linear-only、无 udev 依赖、最小 Linux DM 兼容子集**。
 
-下一阶段最重要的是继续围绕 linear target 和最小 ioctl/control 语义补齐 Linux 行为，而不是扩展新 target 或引入 udev/sysfs 等外部框架。
+下一阶段重点应转为维护这套分层验证体系：ktest 负责内部语义，system tests 负责真实 dmsetup/LVM2 路径；`DM_TARGET_MSG`、`DM_DEV_SET_GEOMETRY`、`DM_DEV_ARM_POLL` 暂不为覆盖编号而硬补入口。
