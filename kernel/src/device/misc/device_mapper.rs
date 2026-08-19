@@ -334,9 +334,6 @@ fn validate_input_flags(command: u8, buffer: &[u8]) -> Result<()> {
     if flags & !DM_KNOWN_FLAGS != 0 {
         return_errno_with_message!(Errno::EINVAL, "Device Mapper ioctl flags 包含未知位");
     }
-    if flags & DM_READONLY_FLAG != 0 {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "当前不支持只读 Device Mapper 设备");
-    }
     if flags & DM_DEFERRED_REMOVE != 0 {
         return_errno_with_message!(Errno::EOPNOTSUPP, "当前不支持 deferred remove");
     }
@@ -396,16 +393,19 @@ fn create_device(buffer: &mut [u8]) -> Result<()> {
         None
     };
 
+    let readonly = flags & DM_READONLY_FLAG != 0;
+
     ostd::info!(
-        "[dm] create_device: name={} uuid={:?} requested_minor={:?}",
+        "[dm] create_device: name={} uuid={:?} requested_minor={:?} readonly={}",
         name,
         uuid,
-        requested_minor
+        requested_minor,
+        readonly
     );
 
     let manager = manager();
     let device = manager
-        .create(name.clone(), uuid, requested_minor)
+        .create_with_readonly(name.clone(), uuid, requested_minor, readonly)
         .map_err(map_dm_error)?;
     ostd::info!("[dm] create_device: created id={:?}", device.id());
     if let Err(error) = register_block_mapper(device.clone(), &name) {
@@ -486,15 +486,20 @@ fn wait_for_device_event(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
 
 fn device_rename(buffer: &mut [u8]) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
-    if flags & DM_UUID_FLAG != 0 {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "第一版不支持修改 Device Mapper UUID");
-    }
-
     let device = lookup_device(buffer)?;
     let data_start = data_start(buffer)?;
-    let new_name = c_string_until(buffer, data_start, buffer.len(), "新设备名称")?;
+    let value = c_string_until(buffer, data_start, buffer.len(), "新设备名称或 UUID")?;
 
-    rename_device_runtime(manager(), &device, &new_name, rename_block_mapper)?;
+    if flags & DM_UUID_FLAG != 0 {
+        if value.is_empty() {
+            return_errno_with_message!(Errno::EINVAL, "Device Mapper UUID 不能为空");
+        }
+        manager()
+            .rename_uuid(&device.name(), value)
+            .map_err(map_dm_error)?;
+    } else {
+        rename_device_runtime(manager(), &device, &value, rename_block_mapper)?;
+    }
     fill_device_header(buffer, &device)
 }
 
@@ -537,6 +542,7 @@ fn table_load(buffer: &mut [u8]) -> Result<()> {
 
 fn table_load_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let target_count = read_u32(buffer, OFF_TARGET_COUNT)?;
+    let flags = read_u32(buffer, OFF_FLAGS)?;
     ostd::info!("[dm] table_load: target_count={}", target_count);
     ostd::info!("[dm] table_load: device name={} found", device.name());
 
@@ -597,6 +603,9 @@ fn table_load_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     }
 
     let table = Arc::new(DmTable::new_linear(targets).map_err(map_table_error)?);
+    if flags & DM_READONLY_FLAG != 0 {
+        device.set_readonly();
+    }
     device.load_table(table);
     ostd::info!("[dm] table_load: table loaded for {}", device.name());
     fill_device_header(buffer, &device)
@@ -626,10 +635,10 @@ fn table_deps(buffer: &mut [u8]) -> Result<()> {
 
 fn table_deps_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
+    let start = data_start(buffer)?;
     let table = selected_table(device, flags);
     fill_device_header(buffer, device)?;
 
-    let start = data_start(buffer)?;
     let backing_ids = table.map(|table| table.backing_ids()).unwrap_or_default();
     let deps_len = 8usize
         .checked_add(
@@ -658,6 +667,7 @@ fn table_status(buffer: &mut [u8]) -> Result<()> {
 
 fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
+    let start = data_start(buffer)?;
     let table = selected_table(device, flags);
     fill_device_header(buffer, device)?;
 
@@ -666,7 +676,6 @@ fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     };
     write_u32(buffer, OFF_TARGET_COUNT, table.linears().len() as u32)?;
 
-    let start = data_start(buffer)?;
     let mut cursor = start;
     for target in table.linears() {
         let params = if flags & DM_STATUS_TABLE_FLAG != 0 {
@@ -752,14 +761,22 @@ fn get_target_version(buffer: &mut [u8]) -> Result<()> {
 }
 
 fn list_devices(buffer: &mut [u8]) -> Result<()> {
-    let devices = manager().devices();
+    list_devices_for_devices(buffer, manager().devices())
+}
+
+fn list_devices_for_devices<I>(buffer: &mut [u8], devices: I) -> Result<()>
+where
+    I: IntoIterator<Item = Arc<DmDevice>>,
+{
     let start = data_start(buffer)?;
     let mut cursor = start;
     let mut previous = None;
 
     for device in devices {
-        let name_len = device.name().len() + 1;
-        let uuid_len = device.uuid().map_or(0, |uuid| uuid.len() + 1);
+        let name = device.name();
+        let uuid = device.uuid();
+        let name_len = name.len() + 1;
+        let uuid_len = uuid.as_ref().map_or(0, |uuid| uuid.len() + 1);
         let (extension_offset, record_len) = name_list_record_layout(name_len, uuid_len)?;
         if available_from(buffer, cursor) < record_len {
             set_buffer_full(buffer)?;
@@ -770,17 +787,17 @@ fn list_devices(buffer: &mut [u8]) -> Result<()> {
         }
         write_u64(buffer, cursor, device.id().as_encoded_u64())?;
         write_u32(buffer, cursor + 8, 0)?;
-        write_c_string(buffer, cursor + 12, &&device.name())?;
+        write_c_string(buffer, cursor + 12, &name)?;
         let extension = cursor + extension_offset;
         write_u32(buffer, extension, device.status().event_nr)?;
-        let name_list_flags = if device.uuid().is_some() {
+        let name_list_flags = if uuid.is_some() {
             DM_NAME_LIST_FLAG_HAS_UUID
         } else {
             DM_NAME_LIST_FLAG_DOESNT_HAVE_UUID
         };
         write_u32(buffer, extension + 4, name_list_flags)?;
-        if let Some(uuid) = device.uuid() {
-            write_c_string(buffer, extension + 8, uuid)?;
+        if let Some(uuid) = uuid {
+            write_c_string(buffer, extension + 8, &uuid)?;
         }
         previous = Some(cursor);
         cursor += record_len;
@@ -822,6 +839,9 @@ fn selected_table(device: &DmDevice, flags: u32) -> Option<Arc<DmTable>> {
 fn fill_device_header(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let status = device.status();
     let mut flags = DM_EXISTS_FLAG;
+    if status.readonly {
+        flags |= DM_READONLY_FLAG;
+    }
     if status.suspended {
         flags |= DM_SUSPEND_FLAG;
     }
@@ -841,7 +861,8 @@ fn fill_device_header(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
         block_open_count(device.id()).unwrap_or(0),
     )?;
     write_c_string_fixed(buffer, OFF_NAME, DM_NAME_LEN, &&device.name())?;
-    write_c_string_fixed(buffer, OFF_UUID, DM_UUID_LEN, device.uuid().unwrap_or(""))?;
+    let uuid = device.uuid().unwrap_or_default();
+    write_c_string_fixed(buffer, OFF_UUID, DM_UUID_LEN, &uuid)?;
     buffer[DM_IOCTL_FIXED_PREFIX_SIZE..DM_IOCTL_HEADER_SIZE].fill(0);
     Ok(())
 }
@@ -922,7 +943,9 @@ fn manager() -> &'static DmManager {
 }
 
 fn data_start(buffer: &[u8]) -> Result<usize> {
-    Ok(read_u32(buffer, OFF_DATA_START)? as usize)
+    let start = read_u32(buffer, OFF_DATA_START)? as usize;
+    validate_ioctl_buffer_layout(buffer.len(), start)?;
+    Ok(start)
 }
 
 fn available_from(buffer: &[u8], start: usize) -> usize {
@@ -1274,6 +1297,44 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0)
         );
+    }
+
+    #[ktest]
+    fn fills_readonly_flag_for_readonly_device() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create_with_readonly("dm-readonly-header-test".to_string(), None, None, true)
+            .unwrap();
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
+
+        fill_device_header(&mut buffer, &device).unwrap();
+
+        assert_eq!(
+            read_u32(&buffer, OFF_FLAGS).unwrap(),
+            DM_EXISTS_FLAG | DM_READONLY_FLAG
+        );
+    }
+
+    #[ktest]
+    fn create_device_honors_readonly_flag() {
+        DM_MANAGER.call_once(|| DmManager::new().unwrap());
+        let name = "dm-readonly-create-test";
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
+        write_u32(&mut buffer, OFF_FLAGS, DM_READONLY_FLAG).unwrap();
+        write_c_string_fixed(&mut buffer, OFF_NAME, DM_NAME_LEN, name).unwrap();
+
+        create_device(&mut buffer).unwrap();
+        let device = manager().lookup_name(name).unwrap();
+
+        assert!(device.is_readonly());
+        assert!(device.status().readonly);
+        assert_eq!(
+            read_u32(&buffer, OFF_FLAGS).unwrap(),
+            DM_EXISTS_FLAG | DM_READONLY_FLAG
+        );
+
+        unregister_block_mapper(device.id(), &&device.name()).unwrap();
+        manager().remove(name).unwrap();
     }
 
     #[ktest]
@@ -1808,6 +1869,107 @@ mod tests {
     }
 
     #[ktest]
+    fn device_rename_with_uuid_flag_updates_uuid_not_name() {
+        DM_MANAGER.call_once(|| DmManager::new().unwrap());
+        let device = manager()
+            .create(
+                "dm-uuid-rename-name".to_string(),
+                Some("dm-uuid-rename-old".to_string()),
+                None,
+            )
+            .unwrap();
+        device.load_table(single_linear_table(4, 100, 1));
+        let status_before = device.status();
+        let id = device.id();
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 16);
+        write_u32(&mut buffer, OFF_FLAGS, DM_UUID_FLAG).unwrap();
+        write_u64(&mut buffer, OFF_DEV, id.as_encoded_u64()).unwrap();
+        write_c_string(&mut buffer, DM_IOCTL_HEADER_SIZE, "dm-uuid-rename-new").unwrap();
+
+        device_rename(&mut buffer).unwrap();
+
+        assert_eq!(device.name(), "dm-uuid-rename-name");
+        assert_eq!(device.uuid().unwrap(), "dm-uuid-rename-new");
+        assert!(manager().lookup_uuid("dm-uuid-rename-old").is_none());
+        assert_eq!(
+            manager().lookup_uuid("dm-uuid-rename-new").unwrap().id(),
+            id
+        );
+        assert_eq!(
+            manager().lookup_name("dm-uuid-rename-name").unwrap().id(),
+            id
+        );
+        assert_eq!(device.status(), status_before);
+        assert_eq!(read_u64(&buffer, OFF_DEV).unwrap(), id.as_encoded_u64());
+        assert_eq!(
+            required_c_string(&buffer, OFF_UUID, DM_UUID_LEN, "UUID").unwrap(),
+            "dm-uuid-rename-new"
+        );
+    }
+
+    #[ktest]
+    fn device_rename_rejects_duplicate_and_empty_uuid_without_state_change() {
+        DM_MANAGER.call_once(|| DmManager::new().unwrap());
+        let first = manager()
+            .create(
+                "dm-uuid-rename-first".to_string(),
+                Some("dm-uuid-rename-first-old".to_string()),
+                None,
+            )
+            .unwrap();
+        let second = manager()
+            .create(
+                "dm-uuid-rename-second".to_string(),
+                Some("dm-uuid-rename-second-uuid".to_string()),
+                None,
+            )
+            .unwrap();
+        let id = first.id();
+        let status_before = first.status();
+
+        let mut duplicate = test_buffer(DM_IOCTL_HEADER_SIZE + 32);
+        write_u32(&mut duplicate, OFF_FLAGS, DM_UUID_FLAG).unwrap();
+        write_u64(&mut duplicate, OFF_DEV, id.as_encoded_u64()).unwrap();
+        write_c_string(
+            &mut duplicate,
+            DM_IOCTL_HEADER_SIZE,
+            "dm-uuid-rename-second-uuid",
+        )
+        .unwrap();
+        assert_eq!(
+            device_rename(&mut duplicate).unwrap_err().error(),
+            Errno::EEXIST
+        );
+
+        assert_eq!(first.uuid().unwrap(), "dm-uuid-rename-first-old");
+        assert_eq!(first.status(), status_before);
+        assert_eq!(
+            manager()
+                .lookup_uuid("dm-uuid-rename-first-old")
+                .unwrap()
+                .id(),
+            id
+        );
+        assert_eq!(
+            manager()
+                .lookup_uuid("dm-uuid-rename-second-uuid")
+                .unwrap()
+                .id(),
+            second.id()
+        );
+
+        let mut empty = test_buffer(DM_IOCTL_HEADER_SIZE + 1);
+        write_u32(&mut empty, OFF_FLAGS, DM_UUID_FLAG).unwrap();
+        write_u64(&mut empty, OFF_DEV, id.as_encoded_u64()).unwrap();
+        write_c_string(&mut empty, DM_IOCTL_HEADER_SIZE, "").unwrap();
+        assert_eq!(
+            device_rename(&mut empty).unwrap_err().error(),
+            Errno::EINVAL
+        );
+        assert_eq!(first.uuid().unwrap(), "dm-uuid-rename-first-old");
+    }
+
+    #[ktest]
     fn selects_uuid_then_name_then_device_id() {
         let manager = DmManager::new().unwrap();
         let uuid_device = manager
@@ -1822,14 +1984,9 @@ mod tests {
             .unwrap();
 
         let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
+        let uuid = uuid_device.uuid().unwrap();
         write_c_string_fixed(&mut buffer, OFF_NAME, DM_NAME_LEN, &name_device.name()).unwrap();
-        write_c_string_fixed(
-            &mut buffer,
-            OFF_UUID,
-            DM_UUID_LEN,
-            uuid_device.uuid().unwrap(),
-        )
-        .unwrap();
+        write_c_string_fixed(&mut buffer, OFF_UUID, DM_UUID_LEN, &uuid).unwrap();
         write_u64(&mut buffer, OFF_DEV, name_device.id().as_encoded_u64()).unwrap();
         assert_eq!(lookup_device(&buffer).unwrap().id(), uuid_device.id());
 
@@ -1858,11 +2015,42 @@ mod tests {
             device.status(),
             aster_device_mapper::DmDeviceStatus {
                 suspended: false,
+                readonly: false,
                 has_active_table: false,
                 has_inactive_table: false,
                 event_nr: 0,
             }
         );
+    }
+
+    #[ktest]
+    fn table_load_with_readonly_flag_marks_device_readonly() {
+        let backing = StatusBacking::new_with_major(510, 201);
+        let backing_id = backing.id();
+        register(backing as Arc<dyn BlockDevice>).unwrap();
+
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-readonly-table-load-test".to_string(), None, None)
+            .unwrap();
+        let record_len = table_status_record_len("510:201 0".len()).unwrap();
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + record_len);
+        write_u32(&mut buffer, OFF_FLAGS, DM_READONLY_FLAG).unwrap();
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+        write_linear_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 4, 0, "510:201 0");
+
+        table_load_for_device(&mut buffer, &device).unwrap();
+
+        assert!(device.is_readonly());
+        assert!(device.status().readonly);
+        assert!(device.inactive_table().is_some());
+        assert_eq!(
+            read_u32(&buffer, OFF_FLAGS).unwrap(),
+            DM_EXISTS_FLAG | DM_READONLY_FLAG | DM_INACTIVE_PRESENT_FLAG
+        );
+
+        device.clear_inactive_table().unwrap();
+        unregister(backing_id).unwrap();
     }
 
     #[ktest]
@@ -1975,6 +2163,7 @@ mod tests {
             device.status(),
             aster_device_mapper::DmDeviceStatus {
                 suspended: false,
+                readonly: false,
                 has_active_table: false,
                 has_inactive_table: false,
                 event_nr: 0,
@@ -1983,12 +2172,168 @@ mod tests {
     }
 
     #[ktest]
+    fn rejects_invalid_data_start_before_output_writes() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-invalid-output-start-test".to_string(), None, None)
+            .unwrap();
+        device.load_table(single_linear_table(4, 100, 1));
+
+        let mut status = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        write_u32(&mut status, OFF_DATA_START, DM_IOCTL_HEADER_SIZE + 1).unwrap();
+        write_u32(&mut status, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        assert_eq!(
+            table_status_for_device(&mut status, &device)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+        assert_eq!(read_u32(&status, OFF_TARGET_COUNT).unwrap(), 0);
+        assert_eq!(
+            read_u32(&status, OFF_FLAGS).unwrap(),
+            DM_QUERY_INACTIVE_TABLE_FLAG
+        );
+
+        let mut versions = test_buffer(DM_IOCTL_HEADER_SIZE + 24);
+        write_u32(&mut versions, OFF_DATA_START, DM_IOCTL_HEADER_SIZE + 1).unwrap();
+        assert_eq!(
+            list_versions(&mut versions).unwrap_err().error(),
+            Errno::EINVAL
+        );
+        assert_eq!(read_u32(&versions, OFF_FLAGS).unwrap(), 0);
+    }
+
+    #[ktest]
+    fn lists_devices_with_linux_next_offsets_and_uuid_flags() {
+        let manager = DmManager::new().unwrap();
+        let first = manager
+            .create(
+                "dm-list-first".to_string(),
+                Some("dm-list-first-uuid".to_string()),
+                None,
+            )
+            .unwrap();
+        first.load_table(single_linear_table(4, 100, 1));
+        let second = manager
+            .create("dm-list-second".to_string(), None, None)
+            .unwrap();
+
+        let first_name = first.name();
+        let first_uuid = first.uuid().unwrap().to_string();
+        let (first_extension, first_len) =
+            name_list_record_layout(first_name.len() + 1, first_uuid.len() + 1).unwrap();
+        let second_name = second.name();
+        let (second_extension, second_len) =
+            name_list_record_layout(second_name.len() + 1, 0).unwrap();
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + first_len + second_len);
+
+        list_devices_for_devices(&mut buffer, vec![first.clone(), second.clone()]).unwrap();
+
+        let first_record = DM_IOCTL_HEADER_SIZE;
+        assert_eq!(
+            read_u64(&buffer, first_record).unwrap(),
+            first.id().as_encoded_u64()
+        );
+        assert_eq!(
+            read_u32(&buffer, first_record + 8).unwrap(),
+            first_len as u32
+        );
+        assert_eq!(
+            c_string_until(
+                &buffer,
+                first_record + 12,
+                first_record + first_extension,
+                "设备名称"
+            )
+            .unwrap(),
+            first_name
+        );
+        assert_eq!(
+            read_u32(&buffer, first_record + first_extension).unwrap(),
+            first.status().event_nr
+        );
+        assert_eq!(
+            read_u32(&buffer, first_record + first_extension + 4).unwrap(),
+            DM_NAME_LIST_FLAG_HAS_UUID
+        );
+        assert_eq!(
+            c_string_until(
+                &buffer,
+                first_record + first_extension + 8,
+                first_record + first_len,
+                "设备 UUID"
+            )
+            .unwrap(),
+            first_uuid
+        );
+
+        let second_record = DM_IOCTL_HEADER_SIZE + first_len;
+        assert_eq!(
+            read_u64(&buffer, second_record).unwrap(),
+            second.id().as_encoded_u64()
+        );
+        assert_eq!(read_u32(&buffer, second_record + 8).unwrap(), 0);
+        assert_eq!(
+            c_string_until(
+                &buffer,
+                second_record + 12,
+                second_record + second_extension,
+                "设备名称"
+            )
+            .unwrap(),
+            second_name
+        );
+        assert_eq!(
+            read_u32(&buffer, second_record + second_extension).unwrap(),
+            second.status().event_nr
+        );
+        assert_eq!(
+            read_u32(&buffer, second_record + second_extension + 4).unwrap(),
+            DM_NAME_LIST_FLAG_DOESNT_HAVE_UUID
+        );
+    }
+
+    #[ktest]
     fn marks_short_output_buffers_without_overwriting_records() {
-        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
-        list_versions(&mut buffer).unwrap();
+        let mut versions = test_buffer(DM_IOCTL_HEADER_SIZE);
+        list_versions(&mut versions).unwrap();
         assert_ne!(
-            read_u32(&buffer, OFF_FLAGS).unwrap() & DM_BUFFER_FULL_FLAG,
+            read_u32(&versions, OFF_FLAGS).unwrap() & DM_BUFFER_FULL_FLAG,
             0
+        );
+
+        let mut target = test_buffer(DM_IOCTL_HEADER_SIZE + 23);
+        write_c_string_fixed(&mut target, OFF_NAME, DM_NAME_LEN, "linear").unwrap();
+        target[DM_IOCTL_HEADER_SIZE..].fill(0xa5);
+        get_target_version(&mut target).unwrap();
+        assert_ne!(
+            read_u32(&target, OFF_FLAGS).unwrap() & DM_BUFFER_FULL_FLAG,
+            0
+        );
+        assert!(
+            target[DM_IOCTL_HEADER_SIZE..]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-short-list-device".to_string(), None, None)
+            .unwrap();
+        let record_len = name_list_record_layout(device.name().len() + 1, 0)
+            .unwrap()
+            .1;
+        let mut devices = test_buffer(DM_IOCTL_HEADER_SIZE + record_len - 1);
+        devices[DM_IOCTL_HEADER_SIZE..].fill(0xa5);
+        list_devices_for_devices(&mut devices, vec![device]).unwrap();
+        assert_ne!(
+            read_u32(&devices, OFF_FLAGS).unwrap() & DM_BUFFER_FULL_FLAG,
+            0
+        );
+        assert!(
+            devices[DM_IOCTL_HEADER_SIZE..]
+                .iter()
+                .all(|byte| *byte == 0xa5)
         );
     }
 
@@ -2026,11 +2371,7 @@ mod tests {
             Errno::EINVAL
         );
 
-        for unsupported in [
-            DM_READONLY_FLAG,
-            DM_DEFERRED_REMOVE,
-            DM_IMA_MEASUREMENT_FLAG,
-        ] {
+        for unsupported in [DM_DEFERRED_REMOVE, DM_IMA_MEASUREMENT_FLAG] {
             write_u32(&mut buffer, OFF_FLAGS, unsupported).unwrap();
             assert_eq!(
                 validate_input_flags(DM_DEV_STATUS_CMD, &buffer)
@@ -2039,6 +2380,11 @@ mod tests {
                 Errno::EOPNOTSUPP
             );
         }
+
+        write_u32(&mut buffer, OFF_FLAGS, DM_READONLY_FLAG).unwrap();
+        validate_input_flags(DM_DEV_CREATE_CMD, &buffer).unwrap();
+        validate_input_flags(DM_DEV_STATUS_CMD, &buffer).unwrap();
+        validate_input_flags(DM_TABLE_LOAD_CMD, &buffer).unwrap();
 
         write_u32(&mut buffer, OFF_FLAGS, DM_PERSISTENT_DEV_FLAG).unwrap();
         validate_input_flags(DM_DEV_CREATE_CMD, &buffer).unwrap();

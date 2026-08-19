@@ -78,6 +78,17 @@ impl DmManager {
         uuid: Option<String>,
         requested_minor: Option<u32>,
     ) -> Result<Arc<DmDevice>, DmError> {
+        self.create_with_readonly(name, uuid, requested_minor, false)
+    }
+
+    /// 创建一个尚未加载映射表的设备，并指定是否只读。
+    pub fn create_with_readonly(
+        &self,
+        name: String,
+        uuid: Option<String>,
+        requested_minor: Option<u32>,
+        readonly: bool,
+    ) -> Result<Arc<DmDevice>, DmError> {
         let mut inner = self.inner.lock();
         if inner.by_name.contains_key(&name) {
             return Err(DmError::NameExists);
@@ -104,7 +115,12 @@ impl DmManager {
         };
         let id = DeviceId::new(self.major.get(), MinorId::new(minor as u32));
         let id_owner = DmDeviceIdOwner::new(id, self.major.clone(), self.minors.clone());
-        let device = Arc::new(DmDevice::new(id_owner, name.clone(), uuid.clone()));
+        let device = Arc::new(DmDevice::new(
+            id_owner,
+            name.clone(),
+            uuid.clone(),
+            readonly,
+        ));
         inner.by_name.insert(name.clone(), device.clone());
         if let Some(uuid) = uuid {
             inner.name_by_uuid.insert(uuid, name);
@@ -150,7 +166,7 @@ impl DmManager {
         let mut inner = self.inner.lock();
         let device = inner.by_name.remove(name).ok_or(DmError::DeviceNotFound)?;
         if let Some(uuid) = device.uuid() {
-            inner.name_by_uuid.remove(uuid);
+            inner.name_by_uuid.remove(&uuid);
         }
         Ok(device)
     }
@@ -166,12 +182,34 @@ impl DmManager {
         }
         let device = inner.by_name.remove(old_name).unwrap();
         if let Some(uuid) = device.uuid() {
-            inner
-                .name_by_uuid
-                .insert(String::from(uuid), String::from(new_name));
+            inner.name_by_uuid.insert(uuid, String::from(new_name));
         }
         device.rename(String::from(new_name));
         inner.by_name.insert(String::from(new_name), device);
+        Ok(())
+    }
+
+    /// 原子更新设备 UUID 及 UUID 索引。
+    pub fn rename_uuid(&self, name: &str, new_uuid: String) -> Result<(), DmError> {
+        let mut inner = self.inner.lock();
+        let device = inner
+            .by_name
+            .get(name)
+            .cloned()
+            .ok_or(DmError::DeviceNotFound)?;
+        if let Some(owner_name) = inner.name_by_uuid.get(&new_uuid) {
+            if owner_name != name {
+                return Err(DmError::UuidExists);
+            }
+            return Ok(());
+        }
+        if let Some(old_uuid) = device.uuid() {
+            inner.name_by_uuid.remove(&old_uuid);
+        }
+        inner
+            .name_by_uuid
+            .insert(new_uuid.clone(), String::from(name));
+        device.rename_uuid(new_uuid);
         Ok(())
     }
 
@@ -231,6 +269,21 @@ mod tests {
     }
 
     #[ktest]
+    fn creates_readonly_device_when_requested() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create_with_readonly("dm-readonly".to_string(), None, None, true)
+            .unwrap();
+
+        assert!(device.is_readonly());
+        assert!(device.status().readonly);
+        assert_eq!(
+            manager.lookup_name("dm-readonly").unwrap().id(),
+            device.id()
+        );
+    }
+
+    #[ktest]
     fn renames_name_and_uuid_indexes_together() {
         let manager = DmManager::new().unwrap();
         let device = manager
@@ -243,6 +296,77 @@ mod tests {
         assert_eq!(manager.lookup_name("dm-new").unwrap().id(), device.id());
         assert_eq!(manager.lookup_uuid("dm-uuid").unwrap().id(), device.id());
         assert_eq!(device.name(), "dm-new");
+    }
+
+    #[ktest]
+    fn renames_uuid_index_without_touching_name_or_id() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create(
+                "dm-uuid-device".to_string(),
+                Some("old-uuid".to_string()),
+                None,
+            )
+            .unwrap();
+        let id = device.id();
+
+        manager
+            .rename_uuid("dm-uuid-device", "new-uuid".to_string())
+            .unwrap();
+
+        assert!(manager.lookup_uuid("old-uuid").is_none());
+        assert_eq!(manager.lookup_uuid("new-uuid").unwrap().id(), id);
+        assert_eq!(manager.lookup_name("dm-uuid-device").unwrap().id(), id);
+        assert_eq!(device.name(), "dm-uuid-device");
+        assert_eq!(device.uuid().unwrap(), "new-uuid");
+    }
+
+    #[ktest]
+    fn rejects_duplicate_uuid_rename_without_changing_state() {
+        let manager = DmManager::new().unwrap();
+        let first = manager
+            .create("dm-first".to_string(), Some("first-uuid".to_string()), None)
+            .unwrap();
+        let second = manager
+            .create(
+                "dm-second".to_string(),
+                Some("second-uuid".to_string()),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .rename_uuid("dm-first", "second-uuid".to_string())
+                .unwrap_err(),
+            DmError::UuidExists
+        );
+
+        assert_eq!(manager.lookup_uuid("first-uuid").unwrap().id(), first.id());
+        assert_eq!(
+            manager.lookup_uuid("second-uuid").unwrap().id(),
+            second.id()
+        );
+        assert_eq!(first.uuid().unwrap(), "first-uuid");
+        assert_eq!(second.uuid().unwrap(), "second-uuid");
+    }
+
+    #[ktest]
+    fn sets_uuid_on_device_created_without_uuid() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-no-uuid".to_string(), None, None)
+            .unwrap();
+
+        manager
+            .rename_uuid("dm-no-uuid", "created-uuid".to_string())
+            .unwrap();
+
+        assert_eq!(
+            manager.lookup_uuid("created-uuid").unwrap().id(),
+            device.id()
+        );
+        assert_eq!(device.uuid().unwrap(), "created-uuid");
     }
 
     #[ktest]
