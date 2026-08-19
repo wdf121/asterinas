@@ -2,7 +2,7 @@
 
 # SPDX-License-Identifier: MPL-2.0
 
-DM_SUMMARY_EXCLUDE='root@asterinas|^\+ |^echo |^trap |^set |^test |^grep |^awk |^dmsetup |^tee |^sed |^cat |^printf |^mount |^umount |^vgchange |^vgscan |^pvscan |^pvs |^vgs |^lvs |^df |^du |^md5sum |^mkdir |^sync |^poweroff |^LVM_CONFIG=|^MAPPER_DEVICE='
+DM_SUMMARY_EXCLUDE='root@asterinas|^\+ |^echo |echo (TEST_FAIL|HOST_FAIL)_|^[[:space:]]*[A-Z0-9_]+=\$\(|^trap |^set |^test |^if |^timeout |^exec |^dd |^grep |^awk |^dmsetup |^tee |^sed |^cat |^printf |^mount |^umount |^vgchange |^vgscan |^pvscan |^pvs |^vgs |^lvs |^df |^du |^md5sum |^mkdir |^sync |^poweroff |^LVM_CONFIG=|^MAPPER_DEVICE='
 
 _dm_test_tmp_slug() {
     printf '%s' "$1" | tr '[:upper:]_' '[:lower:]-'
