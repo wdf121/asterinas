@@ -78,6 +78,7 @@ pub struct DmDevice {
     uuid: Option<String>,
     state: Mutex<DmDeviceState>,
     io: Arc<DmIoState>,
+    events: WaitQueue,
 }
 
 impl DmDevice {
@@ -88,6 +89,7 @@ impl DmDevice {
             uuid,
             state: Mutex::new(DmDeviceState::default()),
             io: Arc::new(DmIoState::new()),
+            events: WaitQueue::new(),
         }
     }
 
@@ -112,9 +114,12 @@ impl DmDevice {
 
     /// 将完整验证的映射表安装为 inactive table。
     pub fn load_table(&self, table: Arc<DmTable>) {
-        let mut state = self.state.lock();
-        state.inactive = Some(table);
-        state.event_nr = state.event_nr.wrapping_add(1);
+        {
+            let mut state = self.state.lock();
+            state.inactive = Some(table);
+            state.event_nr = state.event_nr.wrapping_add(1);
+        }
+        self.events.wake_all();
     }
 
     /// 清除 inactive table。
@@ -122,16 +127,24 @@ impl DmDevice {
     /// Linux DM 将清除不存在的 inactive table 视为成功，因此该操作在空表上
     /// 幂等，不会改变 event number。
     pub fn clear_inactive_table(&self) -> Result<(), DmError> {
-        let mut state = self.state.lock();
-        if state.inactive.take().is_some() {
-            state.event_nr = state.event_nr.wrapping_add(1);
+        let changed = {
+            let mut state = self.state.lock();
+            if state.inactive.take().is_some() {
+                state.event_nr = state.event_nr.wrapping_add(1);
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.events.wake_all();
         }
         Ok(())
     }
 
     /// 暂停新的 I/O，并等待已经提交到旧 table 的 I/O 完成。
     pub fn suspend(&self) -> Result<(), DmError> {
-        {
+        let changed = {
             let mut state = self.state.lock();
             match state.phase {
                 DmDevicePhase::Suspended => return Ok(()),
@@ -140,9 +153,15 @@ impl DmDevice {
                     state.phase = DmDevicePhase::Suspending;
                     if state.active.is_some() {
                         state.event_nr = state.event_nr.wrapping_add(1);
+                        true
+                    } else {
+                        false
                     }
                 }
             }
+        };
+        if changed {
+            self.events.wake_all();
         }
 
         self.io
@@ -161,25 +180,31 @@ impl DmDevice {
     /// 没有 inactive table 时保持幂等。Suspending 阶段必须先完成 drain，避免
     /// resume 与 suspend 交错使新 I/O 穿过暂停屏障。
     pub fn resume(&self) -> Result<(), DmError> {
-        let mut state = self.state.lock();
-        if state.phase == DmDevicePhase::Suspending {
-            return Err(DmError::InvalidState);
-        }
-        if state.active.is_none() && state.inactive.is_none() {
-            return Err(DmError::InvalidState);
-        }
+        let changed = {
+            let mut state = self.state.lock();
+            if state.phase == DmDevicePhase::Suspending {
+                return Err(DmError::InvalidState);
+            }
+            if state.active.is_none() && state.inactive.is_none() {
+                return Err(DmError::InvalidState);
+            }
 
-        let mut changed = false;
-        if let Some(table) = state.inactive.take() {
-            state.active = Some(table);
-            changed = true;
-        }
-        if state.phase == DmDevicePhase::Suspended {
-            state.phase = DmDevicePhase::Running;
-            changed = true;
-        }
+            let mut changed = false;
+            if let Some(table) = state.inactive.take() {
+                state.active = Some(table);
+                changed = true;
+            }
+            if state.phase == DmDevicePhase::Suspended {
+                state.phase = DmDevicePhase::Running;
+                changed = true;
+            }
+            if changed {
+                state.event_nr = state.event_nr.wrapping_add(1);
+            }
+            changed
+        };
         if changed {
-            state.event_nr = state.event_nr.wrapping_add(1);
+            self.events.wake_all();
         }
         Ok(())
     }
@@ -192,6 +217,23 @@ impl DmDevice {
     /// 返回 inactive table 的不可变快照。
     pub fn inactive_table(&self) -> Option<Arc<DmTable>> {
         self.state.lock().inactive.clone()
+    }
+
+    /// 等待事件序号不同于给定值，并返回新的状态快照。
+    pub fn wait_event(&self, event_nr: u32) -> DmDeviceStatus {
+        self.events.wait_until(|| {
+            let status = self.status();
+            (status.event_nr != event_nr).then_some(status)
+        })
+    }
+
+    /// 记录一次控制面生命周期事件，并唤醒等待者。
+    pub fn notify_event(&self) {
+        {
+            let mut state = self.state.lock();
+            state.event_nr = state.event_nr.wrapping_add(1);
+        }
+        self.events.wake_all();
     }
 
     /// 返回当前状态快照。
@@ -366,6 +408,52 @@ mod tests {
             .unwrap(),
         );
         (device, table)
+    }
+
+    #[ktest]
+    fn wait_event_returns_when_event_has_already_changed() {
+        let (device, _table) = create_device_and_table();
+
+        device.notify_event();
+        let status = device.wait_event(0);
+
+        assert_eq!(status.event_nr, 1);
+    }
+
+    #[ktest]
+    fn wait_event_blocks_until_event_changes() {
+        let (device, table) = create_device_and_table();
+        let started = Arc::new(Mutex::new(false));
+        let finished = Arc::new(Mutex::new(false));
+        let observed = Arc::new(Mutex::new(None));
+
+        {
+            let device = device.clone();
+            let started = started.clone();
+            let finished = finished.clone();
+            let observed = observed.clone();
+            TaskOptions::new(move || {
+                *started.lock() = true;
+                let status = device.wait_event(0);
+                *observed.lock() = Some(status.event_nr);
+                *finished.lock() = true;
+            })
+            .spawn()
+            .unwrap();
+        }
+
+        while !*started.lock() {
+            Task::yield_now();
+        }
+        Task::yield_now();
+        assert!(!*finished.lock());
+
+        device.load_table(table);
+        while !*finished.lock() {
+            Task::yield_now();
+        }
+
+        assert_eq!(*observed.lock(), Some(1));
     }
 
     #[ktest]

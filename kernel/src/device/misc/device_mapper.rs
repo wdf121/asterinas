@@ -50,6 +50,7 @@ const DM_DEV_REMOVE_CMD: u8 = 4;
 const DM_DEV_RENAME_CMD: u8 = 5;
 const DM_DEV_SUSPEND_CMD: u8 = 6;
 const DM_DEV_STATUS_CMD: u8 = 7;
+const DM_DEV_WAIT_CMD: u8 = 8;
 const DM_TABLE_LOAD_CMD: u8 = 9;
 const DM_TABLE_CLEAR_CMD: u8 = 10;
 const DM_TABLE_DEPS_CMD: u8 = 11;
@@ -78,15 +79,45 @@ const TARGET_VERSIONS: &[TargetVersion] = &[
     },
 ];
 
-const DM_EXISTS_FLAG: u32 = 1 << 2;
+const DM_READONLY_FLAG: u32 = 1 << 0;
 const DM_SUSPEND_FLAG: u32 = 1 << 1;
+const DM_EXISTS_FLAG: u32 = 1 << 2;
 const DM_PERSISTENT_DEV_FLAG: u32 = 1 << 3;
 const DM_STATUS_TABLE_FLAG: u32 = 1 << 4;
 const DM_ACTIVE_PRESENT_FLAG: u32 = 1 << 5;
 const DM_INACTIVE_PRESENT_FLAG: u32 = 1 << 6;
 const DM_BUFFER_FULL_FLAG: u32 = 1 << 8;
+const DM_SKIP_BDGET_FLAG: u32 = 1 << 9;
+const DM_SKIP_LOCKFS_FLAG: u32 = 1 << 10;
+const DM_NOFLUSH_FLAG: u32 = 1 << 11;
 const DM_QUERY_INACTIVE_TABLE_FLAG: u32 = 1 << 12;
+const DM_UEVENT_GENERATED_FLAG: u32 = 1 << 13;
 const DM_UUID_FLAG: u32 = 1 << 14;
+const DM_SECURE_DATA_FLAG: u32 = 1 << 15;
+const DM_DATA_OUT_FLAG: u32 = 1 << 16;
+const DM_DEFERRED_REMOVE: u32 = 1 << 17;
+const DM_INTERNAL_SUSPEND_FLAG: u32 = 1 << 18;
+const DM_IMA_MEASUREMENT_FLAG: u32 = 1 << 19;
+
+const DM_KNOWN_FLAGS: u32 = DM_READONLY_FLAG
+    | DM_SUSPEND_FLAG
+    | DM_EXISTS_FLAG
+    | DM_PERSISTENT_DEV_FLAG
+    | DM_STATUS_TABLE_FLAG
+    | DM_ACTIVE_PRESENT_FLAG
+    | DM_INACTIVE_PRESENT_FLAG
+    | DM_BUFFER_FULL_FLAG
+    | DM_SKIP_BDGET_FLAG
+    | DM_SKIP_LOCKFS_FLAG
+    | DM_NOFLUSH_FLAG
+    | DM_QUERY_INACTIVE_TABLE_FLAG
+    | DM_UEVENT_GENERATED_FLAG
+    | DM_UUID_FLAG
+    | DM_SECURE_DATA_FLAG
+    | DM_DATA_OUT_FLAG
+    | DM_DEFERRED_REMOVE
+    | DM_INTERNAL_SUSPEND_FLAG
+    | DM_IMA_MEASUREMENT_FLAG;
 
 const DM_NAME_LIST_FLAG_HAS_UUID: u32 = 1;
 const DM_NAME_LIST_FLAG_DOESNT_HAVE_UUID: u32 = 2;
@@ -220,19 +251,26 @@ impl PerOpenFileOps for DmControlFile {
 
         let version_result = validate_client_version(&buffer);
         write_version(&mut buffer)?;
-        let command_result = version_result.and_then(|_| {
-            let _guard = DM_CONTROL_LOCK.lock();
-            let result = handle_command(command, &mut buffer);
-            ostd::info!(
-                "[dm-ioctl] command={} result={:?} registered_devices={:?}",
-                command,
-                result.as_ref().err().map(|e| e.error()),
-                aster_block::list()
-            );
-            result
-        });
+        let secure_data = flags & DM_SECURE_DATA_FLAG != 0;
+        let command_result = version_result
+            .and_then(|_| validate_input_flags(command, &buffer))
+            .and_then(|_| {
+                let result = if command == DM_DEV_WAIT_CMD {
+                    device_wait(&mut buffer)
+                } else {
+                    let _guard = DM_CONTROL_LOCK.lock();
+                    handle_command(command, &mut buffer)
+                };
+                ostd::info!(
+                    "[dm-ioctl] command={} result={:?} registered_devices={:?}",
+                    command,
+                    result.as_ref().err().map(|e| e.error()),
+                    aster_block::list()
+                );
+                result
+            });
         let write_result = current_userspace!().write_bytes(raw_ioctl.arg(), &buffer);
-        match command_result {
+        let result = match command_result {
             Ok(()) => {
                 write_result?;
                 Ok(0)
@@ -241,7 +279,11 @@ impl PerOpenFileOps for DmControlFile {
                 let _ = write_result;
                 Err(error)
             }
+        };
+        if secure_data {
+            buffer.fill(0);
         }
+        result
     }
 }
 
@@ -269,6 +311,7 @@ fn decode_command(raw: u32) -> Result<u8> {
         | DM_DEV_RENAME_CMD
         | DM_DEV_SUSPEND_CMD
         | DM_DEV_STATUS_CMD
+        | DM_DEV_WAIT_CMD
         | DM_TABLE_LOAD_CMD
         | DM_TABLE_CLEAR_CMD
         | DM_TABLE_DEPS_CMD
@@ -286,6 +329,40 @@ fn validate_client_version(buffer: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn validate_input_flags(command: u8, buffer: &[u8]) -> Result<()> {
+    let flags = read_u32(buffer, OFF_FLAGS)?;
+    if flags & !DM_KNOWN_FLAGS != 0 {
+        return_errno_with_message!(Errno::EINVAL, "Device Mapper ioctl flags 包含未知位");
+    }
+    if flags & DM_READONLY_FLAG != 0 {
+        return_errno_with_message!(Errno::EOPNOTSUPP, "当前不支持只读 Device Mapper 设备");
+    }
+    if flags & DM_DEFERRED_REMOVE != 0 {
+        return_errno_with_message!(Errno::EOPNOTSUPP, "当前不支持 deferred remove");
+    }
+    if flags & DM_IMA_MEASUREMENT_FLAG != 0 {
+        return_errno_with_message!(
+            Errno::EOPNOTSUPP,
+            "当前不支持 Device Mapper IMA measurement 输出"
+        );
+    }
+    if flags & DM_STATUS_TABLE_FLAG != 0 && command != DM_TABLE_STATUS_CMD {
+        return_errno_with_message!(Errno::EINVAL, "status table flag 只能用于 table status");
+    }
+    if flags & DM_QUERY_INACTIVE_TABLE_FLAG != 0
+        && !matches!(
+            command,
+            DM_DEV_STATUS_CMD | DM_TABLE_DEPS_CMD | DM_TABLE_STATUS_CMD
+        )
+    {
+        return_errno_with_message!(Errno::EINVAL, "query inactive table flag 不能用于该 ioctl");
+    }
+    if flags & DM_UUID_FLAG != 0 && command != DM_DEV_RENAME_CMD {
+        return_errno_with_message!(Errno::EINVAL, "uuid flag 只能用于设备重命名");
+    }
+    Ok(())
+}
+
 fn handle_command(command: u8, buffer: &mut [u8]) -> Result<()> {
     match command {
         DM_VERSION_CMD => Ok(()),
@@ -295,6 +372,7 @@ fn handle_command(command: u8, buffer: &mut [u8]) -> Result<()> {
         DM_DEV_REMOVE_CMD => remove_device(buffer),
         DM_REMOVE_ALL_CMD => remove_all(buffer),
         DM_DEV_STATUS_CMD => device_status(buffer),
+        DM_DEV_WAIT_CMD => unreachable!("DM_DEV_WAIT must not hold the control lock while waiting"),
         DM_DEV_RENAME_CMD => device_rename(buffer),
         DM_TABLE_LOAD_CMD => table_load(buffer),
         DM_DEV_SUSPEND_CMD => device_suspend(buffer),
@@ -345,6 +423,7 @@ fn create_device(buffer: &mut [u8]) -> Result<()> {
 fn remove_device(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
     unregister_block_mapper(device.id(), &&device.name())?;
+    device.notify_event();
     manager().remove(&&device.name()).map_err(map_dm_error)?;
     clear_device_header(buffer)
 }
@@ -356,6 +435,7 @@ fn remove_all(buffer: &mut [u8]) -> Result<()> {
         if unregister_block_mapper(device.id(), &&device.name()).is_err() {
             continue;
         }
+        device.notify_event();
         let _ = manager().remove(&&device.name());
     }
     clear_device_header(buffer)
@@ -363,12 +443,45 @@ fn remove_all(buffer: &mut [u8]) -> Result<()> {
 
 fn device_status(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
+    device_status_for_device(buffer, &device)
+}
+
+fn device_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
-    let target_count = selected_table(&device, flags)
+    let target_count = selected_table(device, flags)
         .map(|table| table.linears().len())
         .unwrap_or(0);
-    fill_device_header(buffer, &device)?;
+    fill_device_header(buffer, device)?;
     write_u32(buffer, OFF_TARGET_COUNT, target_count)
+}
+
+fn device_wait(buffer: &mut [u8]) -> Result<()> {
+    let device = {
+        let _guard = DM_CONTROL_LOCK.lock();
+        lookup_device(buffer)?
+    };
+    wait_for_device_event(buffer, &device)?;
+
+    let _guard = DM_CONTROL_LOCK.lock();
+    let current = manager()
+        .lookup_id(device.id())
+        .ok_or_else(|| Error::with_message(Errno::ENXIO, "Device Mapper 设备不存在"))?;
+    if !Arc::ptr_eq(&current, &device) {
+        return_errno_with_message!(Errno::ENXIO, "Device Mapper 设备不存在");
+    }
+    fill_device_header(buffer, &device)
+}
+
+#[cfg(ktest)]
+fn device_wait_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
+    wait_for_device_event(buffer, device)?;
+    fill_device_header(buffer, device)
+}
+
+fn wait_for_device_event(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
+    let event_nr = read_u32(buffer, OFF_EVENT_NR)?;
+    device.wait_event(event_nr);
+    Ok(())
 }
 
 fn device_rename(buffer: &mut [u8]) -> Result<()> {
@@ -378,21 +491,32 @@ fn device_rename(buffer: &mut [u8]) -> Result<()> {
     }
 
     let device = lookup_device(buffer)?;
-    let old_name = device.name();
     let data_start = data_start(buffer)?;
     let new_name = c_string_until(buffer, data_start, buffer.len(), "新设备名称")?;
 
+    rename_device_runtime(manager(), &device, &new_name, rename_block_mapper)?;
+    fill_device_header(buffer, &device)
+}
+
+fn rename_device_runtime<F>(
+    manager: &DmManager,
+    device: &DmDevice,
+    new_name: &str,
+    rename_alias: F,
+) -> Result<()>
+where
+    F: FnOnce(DeviceId, &str, &str) -> Result<()>,
+{
+    let old_name = device.name();
     if new_name == old_name {
-        return fill_device_header(buffer, &device);
+        return Ok(());
     }
 
     // manager 索引先更新，若 alias 移动失败则立即回滚，避免 /dev/dm-N、块注册、
     // open gate 或 backing lease 被注销重建。
-    manager()
-        .rename(&old_name, &new_name)
-        .map_err(map_dm_error)?;
-    if let Err(error) = rename_block_mapper(device.id(), &old_name, &new_name) {
-        if let Err(rollback_error) = manager().rename(&new_name, &old_name) {
+    manager.rename(&old_name, new_name).map_err(map_dm_error)?;
+    if let Err(error) = rename_alias(device.id(), &old_name, new_name) {
+        if let Err(rollback_error) = manager.rename(new_name, &old_name) {
             ostd::error!(
                 "failed to roll back Device Mapper rename {} -> {}: {:?}",
                 new_name,
@@ -403,7 +527,7 @@ fn device_rename(buffer: &mut [u8]) -> Result<()> {
         return Err(error);
     }
 
-    fill_device_header(buffer, &device)
+    Ok(())
 }
 
 fn table_load(buffer: &mut [u8]) -> Result<()> {
@@ -1455,6 +1579,235 @@ mod tests {
     }
 
     #[ktest]
+    fn query_flags_select_active_or_inactive_tables_consistently() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-query-flags-test".to_string(), None, None)
+            .unwrap();
+        let active_backing = status_backing_lease(1);
+        let inactive_first = status_backing_lease(2);
+        let inactive_second = status_backing_lease(3);
+
+        device.load_table(Arc::new(
+            DmTable::new_linear(vec![
+                LinearTarget::new(Sid::new(0), 4, Sid::new(100), active_backing.clone()).unwrap(),
+            ])
+            .unwrap(),
+        ));
+        device.resume().unwrap();
+        device.load_table(Arc::new(
+            DmTable::new_linear(vec![
+                LinearTarget::new(Sid::new(0), 4, Sid::new(200), inactive_first.clone()).unwrap(),
+                LinearTarget::new(Sid::new(4), 8, Sid::new(300), inactive_second.clone()).unwrap(),
+            ])
+            .unwrap(),
+        ));
+
+        let mut active_status = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        device_status_for_device(&mut active_status, &device).unwrap();
+        assert_eq!(read_u32(&active_status, OFF_TARGET_COUNT).unwrap(), 1);
+
+        let mut inactive_status = test_buffer(DM_IOCTL_HEADER_SIZE + 96);
+        write_u32(
+            &mut inactive_status,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG,
+        )
+        .unwrap();
+        device_status_for_device(&mut inactive_status, &device).unwrap();
+        assert_eq!(read_u32(&inactive_status, OFF_TARGET_COUNT).unwrap(), 2);
+
+        let mut active_table_status = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        write_u32(&mut active_table_status, OFF_FLAGS, DM_STATUS_TABLE_FLAG).unwrap();
+        table_status_for_device(&mut active_table_status, &device).unwrap();
+        assert_eq!(read_u32(&active_table_status, OFF_TARGET_COUNT).unwrap(), 1);
+        assert_eq!(
+            read_u64(&active_table_status, DM_IOCTL_HEADER_SIZE + 8).unwrap(),
+            4
+        );
+        assert_eq!(
+            c_string_until(
+                &active_table_status,
+                DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + 48,
+                "active target 参数"
+            )
+            .unwrap(),
+            "1:1 100"
+        );
+
+        let mut inactive_table_status = test_buffer(DM_IOCTL_HEADER_SIZE + 96);
+        write_u32(
+            &mut inactive_table_status,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG | DM_STATUS_TABLE_FLAG,
+        )
+        .unwrap();
+        table_status_for_device(&mut inactive_table_status, &device).unwrap();
+        assert_eq!(
+            read_u32(&inactive_table_status, OFF_TARGET_COUNT).unwrap(),
+            2
+        );
+        assert_eq!(
+            read_u64(&inactive_table_status, DM_IOCTL_HEADER_SIZE + 8).unwrap(),
+            4
+        );
+        assert_eq!(
+            c_string_until(
+                &inactive_table_status,
+                DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + 48,
+                "inactive first target 参数"
+            )
+            .unwrap(),
+            "1:2 200"
+        );
+        assert_eq!(
+            read_u64(&inactive_table_status, DM_IOCTL_HEADER_SIZE + 48 + 8).unwrap(),
+            8
+        );
+        assert_eq!(
+            c_string_until(
+                &inactive_table_status,
+                DM_IOCTL_HEADER_SIZE + 48 + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + 96,
+                "inactive second target 参数"
+            )
+            .unwrap(),
+            "1:3 300"
+        );
+
+        let mut active_deps = test_buffer(DM_IOCTL_HEADER_SIZE + 16);
+        table_deps_for_device(&mut active_deps, &device).unwrap();
+        assert_eq!(read_u32(&active_deps, DM_IOCTL_HEADER_SIZE).unwrap(), 1);
+        assert_eq!(
+            read_u64(&active_deps, DM_IOCTL_HEADER_SIZE + 8).unwrap(),
+            active_backing.id().as_encoded_u64()
+        );
+
+        let mut inactive_deps = test_buffer(DM_IOCTL_HEADER_SIZE + 24);
+        write_u32(&mut inactive_deps, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        table_deps_for_device(&mut inactive_deps, &device).unwrap();
+        assert_eq!(read_u32(&inactive_deps, DM_IOCTL_HEADER_SIZE).unwrap(), 2);
+        assert_eq!(
+            read_u64(&inactive_deps, DM_IOCTL_HEADER_SIZE + 8).unwrap(),
+            inactive_first.id().as_encoded_u64()
+        );
+        assert_eq!(
+            read_u64(&inactive_deps, DM_IOCTL_HEADER_SIZE + 16).unwrap(),
+            inactive_second.id().as_encoded_u64()
+        );
+    }
+
+    #[ktest]
+    fn device_wait_for_device_returns_updated_event_header() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-wait-event-test".to_string(), None, None)
+            .unwrap();
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
+        write_u32(&mut buffer, OFF_EVENT_NR, 0).unwrap();
+
+        device.load_table(single_linear_table(4, 100, 1));
+        device_wait_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(read_u32(&buffer, OFF_EVENT_NR).unwrap(), 1);
+        assert_eq!(
+            read_u32(&buffer, OFF_FLAGS).unwrap(),
+            DM_EXISTS_FLAG | DM_INACTIVE_PRESENT_FLAG
+        );
+    }
+
+    #[ktest]
+    fn rename_runtime_updates_manager_and_device_name() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create(
+                "dm-rename-old".to_string(),
+                Some("dm-rename-uuid".to_string()),
+                None,
+            )
+            .unwrap();
+        let id = device.id();
+
+        rename_device_runtime(&manager, &device, "dm-rename-new", |rename_id, old, new| {
+            assert_eq!(rename_id, id);
+            assert_eq!(old, "dm-rename-old");
+            assert_eq!(new, "dm-rename-new");
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(manager.lookup_name("dm-rename-old").is_none());
+        assert_eq!(manager.lookup_name("dm-rename-new").unwrap().id(), id);
+        assert_eq!(manager.lookup_uuid("dm-rename-uuid").unwrap().id(), id);
+        assert_eq!(device.name(), "dm-rename-new");
+    }
+
+    #[ktest]
+    fn rename_runtime_treats_same_name_as_noop() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-rename-noop".to_string(), None, None)
+            .unwrap();
+        let mut called = false;
+
+        rename_device_runtime(&manager, &device, "dm-rename-noop", |_, _, _| {
+            called = true;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(!called);
+        assert_eq!(
+            manager.lookup_name("dm-rename-noop").unwrap().id(),
+            device.id()
+        );
+        assert_eq!(device.name(), "dm-rename-noop");
+    }
+
+    #[ktest]
+    fn rename_runtime_rolls_back_manager_when_alias_rename_fails() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create(
+                "dm-rollback-old".to_string(),
+                Some("dm-rollback-uuid".to_string()),
+                None,
+            )
+            .unwrap();
+        device.load_table(single_linear_table(4, 100, 1));
+        let status_before = device.status();
+        let id = device.id();
+
+        assert_eq!(
+            rename_device_runtime(
+                &manager,
+                &device,
+                "dm-rollback-new",
+                |rename_id, old, new| {
+                    assert_eq!(rename_id, id);
+                    assert_eq!(old, "dm-rollback-old");
+                    assert_eq!(new, "dm-rollback-new");
+                    Err(Error::with_message(
+                        Errno::EEXIST,
+                        "mapper alias already exists",
+                    ))
+                }
+            )
+            .unwrap_err()
+            .error(),
+            Errno::EEXIST
+        );
+
+        assert_eq!(manager.lookup_name("dm-rollback-old").unwrap().id(), id);
+        assert!(manager.lookup_name("dm-rollback-new").is_none());
+        assert_eq!(manager.lookup_uuid("dm-rollback-uuid").unwrap().id(), id);
+        assert_eq!(device.name(), "dm-rollback-old");
+        assert_eq!(device.status(), status_before);
+    }
+
+    #[ktest]
     fn selects_uuid_then_name_then_device_id() {
         let manager = DmManager::new().unwrap();
         let uuid_device = manager
@@ -1640,9 +1993,93 @@ mod tests {
     }
 
     #[ktest]
+    fn validates_ioctl_input_flags() {
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
+
+        write_u32(
+            &mut buffer,
+            OFF_FLAGS,
+            DM_SKIP_BDGET_FLAG | DM_SKIP_LOCKFS_FLAG | DM_NOFLUSH_FLAG | DM_SECURE_DATA_FLAG,
+        )
+        .unwrap();
+        validate_input_flags(DM_DEV_SUSPEND_CMD, &buffer).unwrap();
+
+        write_u32(
+            &mut buffer,
+            OFF_FLAGS,
+            DM_EXISTS_FLAG
+                | DM_ACTIVE_PRESENT_FLAG
+                | DM_INACTIVE_PRESENT_FLAG
+                | DM_BUFFER_FULL_FLAG
+                | DM_UEVENT_GENERATED_FLAG
+                | DM_DATA_OUT_FLAG
+                | DM_INTERNAL_SUSPEND_FLAG,
+        )
+        .unwrap();
+        validate_input_flags(DM_DEV_STATUS_CMD, &buffer).unwrap();
+
+        write_u32(&mut buffer, OFF_FLAGS, 1 << 31).unwrap();
+        assert_eq!(
+            validate_input_flags(DM_DEV_STATUS_CMD, &buffer)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+
+        for unsupported in [
+            DM_READONLY_FLAG,
+            DM_DEFERRED_REMOVE,
+            DM_IMA_MEASUREMENT_FLAG,
+        ] {
+            write_u32(&mut buffer, OFF_FLAGS, unsupported).unwrap();
+            assert_eq!(
+                validate_input_flags(DM_DEV_STATUS_CMD, &buffer)
+                    .unwrap_err()
+                    .error(),
+                Errno::EOPNOTSUPP
+            );
+        }
+
+        write_u32(&mut buffer, OFF_FLAGS, DM_PERSISTENT_DEV_FLAG).unwrap();
+        validate_input_flags(DM_DEV_CREATE_CMD, &buffer).unwrap();
+        validate_input_flags(DM_DEV_STATUS_CMD, &buffer).unwrap();
+        validate_input_flags(DM_TABLE_LOAD_CMD, &buffer).unwrap();
+
+        write_u32(&mut buffer, OFF_FLAGS, DM_STATUS_TABLE_FLAG).unwrap();
+        validate_input_flags(DM_TABLE_STATUS_CMD, &buffer).unwrap();
+        assert_eq!(
+            validate_input_flags(DM_TABLE_DEPS_CMD, &buffer)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+
+        write_u32(&mut buffer, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        validate_input_flags(DM_DEV_STATUS_CMD, &buffer).unwrap();
+        validate_input_flags(DM_TABLE_DEPS_CMD, &buffer).unwrap();
+        validate_input_flags(DM_TABLE_STATUS_CMD, &buffer).unwrap();
+        assert_eq!(
+            validate_input_flags(DM_TABLE_LOAD_CMD, &buffer)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+
+        write_u32(&mut buffer, OFF_FLAGS, DM_UUID_FLAG).unwrap();
+        validate_input_flags(DM_DEV_RENAME_CMD, &buffer).unwrap();
+        assert_eq!(
+            validate_input_flags(DM_DEV_STATUS_CMD, &buffer)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+    }
+
+    #[ktest]
     fn validates_ioctl_encoding_and_alignment() {
         assert_eq!(decode_command(0xc138_fd00).unwrap(), DM_VERSION_CMD);
         assert_eq!(decode_command(0xc138_fd05).unwrap(), DM_DEV_RENAME_CMD);
+        assert_eq!(decode_command(0xc138_fd08).unwrap(), DM_DEV_WAIT_CMD);
         assert_eq!(decode_command(0xc138_fd09).unwrap(), DM_TABLE_LOAD_CMD);
         assert_eq!(
             decode_command(0xc138_fd11).unwrap(),
@@ -1785,6 +2222,12 @@ mod tests {
         assert_eq!(name_list_record_layout(4, 0).unwrap(), (16, 24));
         assert_eq!(name_list_record_layout(5, 0).unwrap(), (24, 32));
         assert_eq!(name_list_record_layout(4, 5).unwrap(), (16, 32));
+        assert_eq!(DM_READONLY_FLAG, 1 << 0);
+        assert_eq!(DM_SKIP_BDGET_FLAG, 1 << 9);
+        assert_eq!(DM_NOFLUSH_FLAG, 1 << 11);
+        assert_eq!(DM_SECURE_DATA_FLAG, 1 << 15);
+        assert_eq!(DM_DEFERRED_REMOVE, 1 << 17);
+        assert_eq!(DM_IMA_MEASUREMENT_FLAG, 1 << 19);
         assert_eq!(DM_NAME_LIST_FLAG_HAS_UUID, 1);
         assert_eq!(DM_NAME_LIST_FLAG_DOESNT_HAVE_UUID, 2);
     }
