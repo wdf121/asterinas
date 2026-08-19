@@ -3,12 +3,12 @@
 use alloc::{string::String, sync::Arc};
 use core::{
     fmt::Debug,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta,
-    bio::{BioEnqueueError, SubmittedBio},
+    bio::{BioEnqueueError, BioType, SubmittedBio},
 };
 use device_id::DeviceId;
 use ostd::sync::{Mutex, WaitQueue};
@@ -66,6 +66,7 @@ impl Default for DmDeviceState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DmDeviceStatus {
     pub suspended: bool,
+    pub readonly: bool,
     pub has_active_table: bool,
     pub has_inactive_table: bool,
     pub event_nr: u32,
@@ -75,18 +76,25 @@ pub struct DmDeviceStatus {
 pub struct DmDevice {
     id_owner: DmDeviceIdOwner,
     name: Mutex<String>,
-    uuid: Option<String>,
+    uuid: Mutex<Option<String>>,
+    readonly: AtomicBool,
     state: Mutex<DmDeviceState>,
     io: Arc<DmIoState>,
     events: WaitQueue,
 }
 
 impl DmDevice {
-    pub(crate) fn new(id_owner: DmDeviceIdOwner, name: String, uuid: Option<String>) -> Self {
+    pub(crate) fn new(
+        id_owner: DmDeviceIdOwner,
+        name: String,
+        uuid: Option<String>,
+        readonly: bool,
+    ) -> Self {
         Self {
             id_owner,
             name: Mutex::new(name),
-            uuid,
+            uuid: Mutex::new(uuid),
+            readonly: AtomicBool::new(readonly),
             state: Mutex::new(DmDeviceState::default()),
             io: Arc::new(DmIoState::new()),
             events: WaitQueue::new(),
@@ -108,8 +116,24 @@ impl DmDevice {
     }
 
     /// 返回 Device Mapper UUID；创建时未指定则返回 `None`。
-    pub fn uuid(&self) -> Option<&str> {
-        self.uuid.as_deref()
+    pub fn uuid(&self) -> Option<String> {
+        self.uuid.lock().clone()
+    }
+
+    /// 更新 DM 设备 UUID。
+    pub(crate) fn rename_uuid(&self, new_uuid: String) {
+        let mut uuid = self.uuid.lock();
+        *uuid = Some(new_uuid);
+    }
+
+    /// 返回设备是否为只读 mapper。
+    pub fn is_readonly(&self) -> bool {
+        self.readonly.load(Ordering::Acquire)
+    }
+
+    /// 将设备切换为只读 mapper。
+    pub fn set_readonly(&self) {
+        self.readonly.store(true, Ordering::Release);
     }
 
     /// 将完整验证的映射表安装为 inactive table。
@@ -241,6 +265,7 @@ impl DmDevice {
         let state = self.state.lock();
         DmDeviceStatus {
             suspended: state.phase != DmDevicePhase::Running,
+            readonly: self.is_readonly(),
             has_active_table: state.active.is_some(),
             has_inactive_table: state.inactive.is_some(),
             event_nr: state.event_nr,
@@ -253,6 +278,9 @@ impl BlockDevice for DmDevice {
         let table = {
             let state = self.state.lock();
             if state.phase != DmDevicePhase::Running {
+                return Err(BioEnqueueError::Refused);
+            }
+            if self.is_readonly() && bio.type_() == BioType::Write {
                 return Err(BioEnqueueError::Refused);
             }
             let table = state.active.clone().ok_or(BioEnqueueError::Refused)?;
@@ -306,7 +334,7 @@ mod tests {
 
     use aster_block::{
         BlockDeviceLease,
-        bio::{Bio, BioStatus, BioType},
+        bio::{Bio, BioDirection, BioSegment, BioStatus},
         id::Sid,
     };
     use device_id::{MajorId, MinorId};
@@ -464,6 +492,7 @@ mod tests {
             device.status(),
             DmDeviceStatus {
                 suspended: false,
+                readonly: false,
                 has_active_table: false,
                 has_inactive_table: false,
                 event_nr: 0,
@@ -576,20 +605,51 @@ mod tests {
     }
 
     #[ktest]
-    fn refuses_io_until_resumed_and_forwards_flush_after_resume() {
-        let (device, table) = create_device_and_table();
-        let flush = || Bio::new(BioType::Flush, Sid::new(0), vec![], None);
-
-        assert_eq!(
-            flush().submit_and_wait(device.as_ref()),
-            Err(BioEnqueueError::Refused)
+    fn readonly_device_refuses_write_but_allows_read_and_flush() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create_with_readonly("dm-readonly-test".to_string(), None, None, true)
+            .unwrap();
+        let backing = Arc::new(TestBlockDevice) as Arc<dyn BlockDevice>;
+        let table = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(16),
+                BlockDeviceLease::new_untracked(backing),
+            )
+            .unwrap(),
         );
-
         device.load_table(table);
         device.resume().unwrap();
+
+        assert!(device.status().readonly);
         assert_eq!(
-            flush().submit_and_wait(device.as_ref()).unwrap(),
+            Bio::new(
+                BioType::Read,
+                Sid::new(0),
+                vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+                None,
+            )
+            .submit_and_wait(device.as_ref())
+            .unwrap(),
             BioStatus::Complete
+        );
+        assert_eq!(
+            Bio::new(BioType::Flush, Sid::new(0), vec![], None)
+                .submit_and_wait(device.as_ref())
+                .unwrap(),
+            BioStatus::Complete
+        );
+        assert_eq!(
+            Bio::new(
+                BioType::Write,
+                Sid::new(0),
+                vec![BioSegment::alloc(1, BioDirection::ToDevice)],
+                None,
+            )
+            .submit_and_wait(device.as_ref()),
+            Err(BioEnqueueError::Refused)
         );
     }
 }
