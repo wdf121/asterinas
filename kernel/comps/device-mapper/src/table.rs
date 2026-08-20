@@ -32,17 +32,23 @@ impl DmTable {
         Self::new_targets(targets.into_iter().map(DmTarget::Linear).collect())
     }
 
-    fn new_targets(targets: Vec<DmTarget>) -> Result<Self, TableError> {
+    pub fn new_targets(targets: Vec<DmTarget>) -> Result<Self, TableError> {
         if targets.is_empty() {
             return Err(TableError::UnsupportedTargetCount);
         }
 
+        let mut has_unsupported_backing = false;
         let mut expected_start = 0_u64;
         for target in &targets {
             if target.logical_range().start.to_raw() != expected_start {
                 return Err(TableError::UnsupportedLogicalStart);
             }
-            if target.backing().downcast_ref::<crate::DmDevice>().is_some() {
+            target.for_each_backing(|backing| {
+                if backing.downcast_ref::<crate::DmDevice>().is_some() {
+                    has_unsupported_backing = true;
+                }
+            });
+            if has_unsupported_backing {
                 return Err(TableError::UnsupportedBackingDevice);
             }
             expected_start = target.logical_range().end.to_raw();
@@ -76,14 +82,17 @@ impl DmTable {
 
     /// 返回映射设备的块层能力。
     pub fn metadata(&self) -> aster_block::BlockDeviceMeta {
-        let max_nr_segments_per_bio = self
-            .targets
-            .iter()
-            .map(|target| target.backing().metadata().max_nr_segments_per_bio)
-            .min()
-            .unwrap_or(0);
+        let mut max_nr_segments_per_bio = None;
+        for target in &self.targets {
+            target.for_each_backing(|backing| {
+                let value = backing.metadata().max_nr_segments_per_bio;
+                max_nr_segments_per_bio = Some(
+                    max_nr_segments_per_bio.map_or(value, |current: usize| current.min(value)),
+                );
+            });
+        }
         aster_block::BlockDeviceMeta {
-            max_nr_segments_per_bio,
+            max_nr_segments_per_bio: max_nr_segments_per_bio.unwrap_or(0),
             nr_sectors: usize::try_from(self.length()).unwrap_or(usize::MAX),
         }
     }
@@ -102,16 +111,21 @@ impl DmTable {
     pub fn backing_ids(&self) -> Vec<DeviceId> {
         let mut ids = Vec::new();
         for target in &self.targets {
-            let id = target.backing_id();
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
+            target.for_each_backing_id(|id| {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            });
         }
         ids
     }
 
     /// 重映射并转发一个 BIO。
     pub fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+        if self.targets.iter().any(|target| !target.is_linear()) {
+            return Err(BioEnqueueError::Refused);
+        }
+
         if bio.type_() == BioType::Flush {
             return self.enqueue_flush(bio);
         }
@@ -135,7 +149,8 @@ impl DmTable {
                 .map_sector(range.start)
                 .ok_or(BioEnqueueError::Refused)?;
             bio.remap_sid_start(backing_start)?;
-            return target.backing().enqueue(bio);
+            let backing = target.backing().ok_or(BioEnqueueError::Refused)?;
+            return backing.enqueue(bio);
         }
 
         let ranges = parts
@@ -152,7 +167,11 @@ impl DmTable {
                 completion.complete_child(BioStatus::IoError);
                 continue;
             }
-            if target.backing().enqueue(child).is_err() {
+            let Some(backing) = target.backing() else {
+                completion.complete_child(BioStatus::IoError);
+                continue;
+            };
+            if backing.enqueue(child).is_err() {
                 completion.complete_child(BioStatus::IoError);
             }
         }
@@ -186,12 +205,14 @@ impl DmTable {
         let mut flushed = Vec::new();
         let mut backings = Vec::new();
         for target in &self.targets {
-            let backing_id = target.backing_id();
-            if flushed.contains(&backing_id) {
-                continue;
-            }
-            flushed.push(backing_id);
-            backings.push(target.backing());
+            target.for_each_backing(|backing| {
+                let backing_id = backing.id();
+                if flushed.contains(&backing_id) {
+                    return;
+                }
+                flushed.push(backing_id);
+                backings.push(backing);
+            });
         }
 
         if backings.is_empty() {
@@ -272,6 +293,7 @@ mod tests {
     use ostd::{prelude::ktest, sync::Mutex};
 
     use super::*;
+    use crate::target::striped::{StripedTarget, StripedTargetParams};
 
     #[derive(Debug)]
     struct RecordingBlockDevice {
@@ -281,17 +303,31 @@ mod tests {
         flush_count: Mutex<usize>,
         flush_status: BioStatus,
         fail_flush_enqueue: bool,
+        max_nr_segments_per_bio: usize,
     }
 
     impl RecordingBlockDevice {
         fn new(minor: u32) -> Arc<Self> {
-            Self::new_with_flush(minor, BioStatus::Complete, false)
+            Self::new_with_options(minor, BioStatus::Complete, false, 8)
+        }
+
+        fn new_with_queue_limit(minor: u32, max_nr_segments_per_bio: usize) -> Arc<Self> {
+            Self::new_with_options(minor, BioStatus::Complete, false, max_nr_segments_per_bio)
         }
 
         fn new_with_flush(
             minor: u32,
             flush_status: BioStatus,
             fail_flush_enqueue: bool,
+        ) -> Arc<Self> {
+            Self::new_with_options(minor, flush_status, fail_flush_enqueue, 8)
+        }
+
+        fn new_with_options(
+            minor: u32,
+            flush_status: BioStatus,
+            fail_flush_enqueue: bool,
+            max_nr_segments_per_bio: usize,
         ) -> Arc<Self> {
             Arc::new(Self {
                 id: DeviceId::new(MajorId::new(1), MinorId::new(minor)),
@@ -300,6 +336,7 @@ mod tests {
                 flush_count: Mutex::new(0),
                 flush_status,
                 fail_flush_enqueue,
+                max_nr_segments_per_bio,
             })
         }
     }
@@ -324,7 +361,7 @@ mod tests {
 
         fn metadata(&self) -> BlockDeviceMeta {
             BlockDeviceMeta {
-                max_nr_segments_per_bio: 8,
+                max_nr_segments_per_bio: self.max_nr_segments_per_bio,
                 nr_sectors: 1_024,
             }
         }
@@ -455,10 +492,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(table.target_count(), 2);
-        let DmTarget::Linear(first_target) = &table.targets()[0];
+        let DmTarget::Linear(first_target) = &table.targets()[0] else {
+            panic!("expected linear target");
+        };
         assert_eq!(first_target.backing_id(), first.id());
         assert_eq!(first_target.logical_range(), &(Sid::new(0)..Sid::new(128)));
-        let DmTarget::Linear(second_target) = &table.targets()[1];
+        let mut first_backing_ids = Vec::new();
+        table.targets()[0].for_each_backing_id(|id| first_backing_ids.push(id));
+        assert_eq!(first_backing_ids, vec![first.id()]);
+        let mut first_backings = Vec::new();
+        table.targets()[0].for_each_backing(|backing| first_backings.push(backing.id()));
+        assert_eq!(first_backings, vec![first.id()]);
+        let DmTarget::Linear(second_target) = &table.targets()[1] else {
+            panic!("expected linear target");
+        };
         assert_eq!(second_target.backing_id(), second.id());
         assert_eq!(
             second_target.logical_range(),
@@ -559,8 +606,8 @@ mod tests {
 
     #[ktest]
     fn reports_capacity_and_queue_limits_from_linear_targets() {
-        let first = RecordingBlockDevice::new(1);
-        let second = RecordingBlockDevice::new(2);
+        let first = RecordingBlockDevice::new_with_queue_limit(1, 8);
+        let second = RecordingBlockDevice::new_with_queue_limit(2, 4);
         let table = DmTable::new_linear(vec![
             LinearTarget::new(
                 Sid::new(0),
@@ -581,7 +628,105 @@ mod tests {
 
         assert_eq!(table.length(), 192);
         assert_eq!(table.metadata().nr_sectors, 192);
-        assert_eq!(table.metadata().max_nr_segments_per_bio, 8);
+        assert_eq!(table.metadata().max_nr_segments_per_bio, 4);
+    }
+
+    #[ktest]
+    fn stores_striped_targets_and_reports_all_backings() {
+        let first = RecordingBlockDevice::new_with_queue_limit(1, 8);
+        let second = RecordingBlockDevice::new_with_queue_limit(2, 4);
+        let params = StripedTargetParams::parse("2 4 1:1 0 1:2 0").unwrap();
+        let striped = StripedTarget::new(
+            Sid::new(0),
+            16,
+            params,
+            vec![
+                BlockDeviceLease::new_untracked(first.clone() as Arc<dyn BlockDevice>),
+                BlockDeviceLease::new_untracked(second.clone() as Arc<dyn BlockDevice>),
+            ],
+        )
+        .unwrap();
+        let table = DmTable::new_targets(vec![DmTarget::Striped(striped)]).unwrap();
+
+        assert_eq!(table.length(), 16);
+        assert_eq!(table.metadata().nr_sectors, 16);
+        assert_eq!(table.metadata().max_nr_segments_per_bio, 4);
+        assert_eq!(table.backing_ids(), vec![first.id(), second.id()]);
+        let DmTarget::Striped(target) = &table.targets()[0] else {
+            panic!("expected striped target");
+        };
+        assert_eq!(target.logical_range(), &(Sid::new(0)..Sid::new(16)));
+        assert_eq!(target.length(), 16);
+    }
+
+    #[ktest]
+    fn accepts_mixed_linear_and_striped_targets() {
+        let linear_backing = RecordingBlockDevice::new(1);
+        let striped_first = RecordingBlockDevice::new(2);
+        let striped_second = RecordingBlockDevice::new(3);
+        let striped = StripedTarget::new(
+            Sid::new(4),
+            16,
+            StripedTargetParams::parse("2 4 1:2 0 1:3 0").unwrap(),
+            vec![
+                BlockDeviceLease::new_untracked(striped_first.clone() as Arc<dyn BlockDevice>),
+                BlockDeviceLease::new_untracked(striped_second.clone() as Arc<dyn BlockDevice>),
+            ],
+        )
+        .unwrap();
+        let table = DmTable::new_targets(vec![
+            DmTarget::Linear(
+                LinearTarget::new(
+                    Sid::new(0),
+                    4,
+                    Sid::new(100),
+                    BlockDeviceLease::new_untracked(linear_backing.clone() as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+            ),
+            DmTarget::Striped(striped),
+        ])
+        .unwrap();
+
+        assert_eq!(table.length(), 20);
+        assert_eq!(
+            table.backing_ids(),
+            vec![linear_backing.id(), striped_first.id(), striped_second.id()]
+        );
+    }
+
+    #[ktest]
+    fn refuses_bio_for_tables_containing_striped_targets() {
+        let backing = RecordingBlockDevice::new(1);
+        let params = StripedTargetParams::parse("1 4 1:1 0").unwrap();
+        let striped = StripedTarget::new(
+            Sid::new(0),
+            8,
+            params,
+            vec![BlockDeviceLease::new_untracked(
+                backing.clone() as Arc<dyn BlockDevice>
+            )],
+        )
+        .unwrap();
+        let table = Arc::new(DmTable::new_targets(vec![DmTarget::Striped(striped)]).unwrap());
+        let read = Bio::new(
+            BioType::Read,
+            Sid::new(0),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        );
+        let flush = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
+
+        assert_eq!(
+            read.submit_and_wait(&TableDevice(table.clone()))
+                .unwrap_err(),
+            BioEnqueueError::Refused
+        );
+        assert_eq!(
+            flush.submit_and_wait(&TableDevice(table)).unwrap_err(),
+            BioEnqueueError::Refused
+        );
+        assert!(backing.submitted_ranges.lock().is_empty());
     }
 
     #[ktest]
