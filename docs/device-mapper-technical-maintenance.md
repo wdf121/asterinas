@@ -533,7 +533,7 @@ DM table 和数据面转发层。
 
 target 模块入口。
 
-当前导出最小 `DmTarget` enum，但唯一 variant 仍是 `DmTarget::Linear(LinearTarget)`。后续新增 target 时，不能只在这里加模块，还必须同步修改 ioctl parser、target version、status/deps、BIO split/remap 和测试。
+当前导出最小 `DmTarget` enum，但唯一 variant 仍是 `DmTarget::Linear(LinearTarget)`。同时存在 striped 参数解析/静态校验模块，用于锁住后续 striped 实现所需的几何公式；它尚未接入 `DmTarget`、table load、status/deps 或数据面。后续新增真实 target 时，不能只在这里加模块，还必须同步修改 ioctl parser、target version、status/deps、BIO split/remap 和测试。
 
 #### [linear.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/target/linear.rs)
 
@@ -548,7 +548,21 @@ linear target 实现。
 - 校验 length、logical overflow、backing overflow、backing capacity；
 - 把 logical sector 映射成 backing sector。
 
-它是当前唯一真正支持的数据面 target。
+#### [striped.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/target/striped.rs)
+
+striped target 参数解析和静态校验 helper。
+
+作用：
+
+- 解析 Linux DM striped 参数格式 `<stripe_count> <chunk_size> <dev1> <offset1> ...`；
+- 校验 stripe count、chunk size、字段数量、`major:minor` 和 backing start；
+- 持有已解析 backing 的 `BlockDeviceLease`，形成 runtime `StripedTarget` helper；
+- 计算每个 stripe 在给定 logical length 下实际需要的 backing sectors；
+- 校验每个 stripe 的 backing range 不溢出且不超过容量；
+- 按 chunk/stripe 轮转公式把单个 logical sector 映射到 stripe index、backing id 和 backing sector；
+- 将一个完全位于 striped target 内的 logical range 按 chunk 边界拆成多个 `StripedRangeMap`，每个 part 携带 logical range、stripe index 和 backing range。
+
+它当前不代表 striped table load 已支持：`DM_TABLE_LOAD` 仍拒绝 striped，`DmTarget` 也还没有 `Striped` variant，`DmTable`/BIO 数据面尚未接入 striped。
 
 ### 5.2 Linux DM ioctl 控制面
 
