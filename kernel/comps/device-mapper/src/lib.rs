@@ -63,6 +63,8 @@ pub enum TableError {
     BackingRangeOutOfBounds,
     /// 底层设备类型当前不受支持。
     UnsupportedBackingDevice,
+    /// target 参数格式或几何信息无效。
+    InvalidTargetParams,
     /// BIO 不完整地位于单个 target 中。
     BioOutOfRange,
 }

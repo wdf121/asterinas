@@ -8,6 +8,7 @@ use device_id::DeviceId;
 use self::linear::LinearTarget;
 
 pub mod linear;
+pub mod striped;
 
 #[derive(Debug)]
 pub enum DmTarget {
