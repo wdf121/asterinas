@@ -2,13 +2,15 @@
 
 本文档汇总当前 Device Mapper / LVM2 相关一键测试脚本的用途、运行方法、日志位置和通过标准。
 
-所有自建 shell 脚本统一放在仓库根目录下的 `myshell/`：
+所有自建 shell 脚本统一放在仓库根目录下的 `myshell/`，linear 自动化脚本位于 `myshell/dm_linear/`：
 
 ```text
 myshell/br.sh
-myshell/run_cross_target_bio_regression.sh
-myshell/run_cross_pv_large_write_test.sh
-myshell/run_lvm2_resize_test.sh
+myshell/run_dm_system_tests.sh
+myshell/dm_linear/run_cross_target_bio_regression.sh
+myshell/dm_linear/run_cross_pv_large_write_test.sh
+myshell/dm_linear/run_lvm2_resize_test.sh
+myshell/dm_linear/run_linear_full_flow_test.sh
 ```
 
 这些脚本都应该在 Asterinas 开发容器内的 `/root/asterinas` 目录运行。
@@ -17,7 +19,7 @@ myshell/run_lvm2_resize_test.sh
 
 ## 1. 测试分层逻辑
 
-当前测试按从小到大分三层：
+当前 linear 测试按从小到大分三类分脚本，另有一个单 guest 完整流程脚本：
 
 ```text
 第一层：raw BIO 边界回归
@@ -28,21 +30,26 @@ myshell/run_lvm2_resize_test.sh
 
 第三层：完整 LVM2 扩缩容流程
   验证 LV 创建、active 扩容、resize2fs、缩容和重启恢复。
+
+单 guest full flow：linear 端到端流程衔接
+  在一个 guest 内串起 control、raw BIO、LVM2 create/write/extend/shrink/cleanup。
 ```
 
 推荐顺序：
 
 ```bash
-myshell/run_cross_target_bio_regression.sh
-myshell/run_cross_pv_large_write_test.sh
-myshell/run_lvm2_resize_test.sh
+myshell/dm_linear/run_cross_target_bio_regression.sh
+myshell/dm_linear/run_cross_pv_large_write_test.sh
+myshell/dm_linear/run_lvm2_resize_test.sh
+myshell/dm_linear/run_linear_full_flow_test.sh
 ```
 
 这样排的原因：
 
 - BIO 回归最小，失败时能最快定位 DM split/remap/completion；
 - 大文件测试验证真实跨 PV 数据面；
-- LVM2 扩缩容测试最完整，也最慢，适合作最终验收。
+- LVM2 扩缩容测试覆盖重启恢复，适合作分层验收；
+- full flow 验证一个 guest 内的 linear 用户态流程能连续接好。
 
 ---
 
@@ -157,14 +164,14 @@ RESET_DM_TEST_IMAGES=0 myshell/<script>.sh
 
 ---
 
-## 4. 第一层：`myshell/run_cross_target_bio_regression.sh`
+## 4. 第一层：`myshell/dm_linear/run_cross_target_bio_regression.sh`
 
 用途：一键测试单个 4 KiB BIO 跨两个 DM linear target 边界时的拆分、重映射和 completion 聚合。
 
 运行：
 
 ```bash
-myshell/run_cross_target_bio_regression.sh
+myshell/dm_linear/run_cross_target_bio_regression.sh
 ```
 
 默认日志：
@@ -216,14 +223,14 @@ HOST_PASS_CROSS_TARGET_BIO
 
 ---
 
-## 5. 第二层：`myshell/run_cross_pv_large_write_test.sh`
+## 5. 第二层：`myshell/dm_linear/run_cross_pv_large_write_test.sh`
 
 用途：一键测试跨 PV 大文件数据路径。
 
 运行：
 
 ```bash
-myshell/run_cross_pv_large_write_test.sh
+myshell/dm_linear/run_cross_pv_large_write_test.sh
 ```
 
 默认日志：
@@ -272,21 +279,21 @@ HOST_PASS_CROSS_PV_LARGE_WRITE
 如果想临时调小文件大小，可以设置：
 
 ```bash
-LARGE_WRITE_MIB=600 myshell/run_cross_pv_large_write_test.sh
+LARGE_WRITE_MIB=600 myshell/dm_linear/run_cross_pv_large_write_test.sh
 ```
 
 默认 700 MiB 更稳，因为它大于第一块 PV 的可用空间，能确保数据进入第二块 PV。
 
 ---
 
-## 6. 第三层：`myshell/run_lvm2_resize_test.sh`
+## 6. 第三层：`myshell/dm_linear/run_lvm2_resize_test.sh`
 
 用途：一键测试完整 LVM2 扩容、跨 PV、ext2 resize、缩容和重启恢复路径。
 
 运行：
 
 ```bash
-myshell/run_lvm2_resize_test.sh
+myshell/dm_linear/run_lvm2_resize_test.sh
 ```
 
 默认日志：
@@ -346,7 +353,52 @@ TEST_FAIL_LVM2_RESIZE_SECOND
 
 ---
 
-## 7. 手工入口：`myshell/br.sh`
+## 7. 单 guest 完整流程：`myshell/dm_linear/run_linear_full_flow_test.sh`
+
+用途：在一个 NixOS guest session 内验证 linear 用户态流程可以连续接好。
+
+运行：
+
+```bash
+myshell/dm_linear/run_linear_full_flow_test.sh
+```
+
+也可以通过组合入口运行：
+
+```bash
+myshell/run_dm_system_tests.sh --linear-flow
+```
+
+默认日志：
+
+```text
+/tmp/dm-linear-full-flow-test.log
+```
+
+测试内容：
+
+```text
+check /dev/mapper/control 和 linear target version
+→ simple linear mapper table/status/deps/rename/suspend/resume
+→ raw two-target 4 KiB cross-boundary BIO
+→ LVM2 linear LV create + ext2 mount/write
+→ LV extend 到第二块 PV + ext2 grow
+→ ext2 shrink + LV shrink
+→ LV/VG/PV cleanup
+```
+
+通过标记：
+
+```text
+TEST_PASS_DM_LINEAR_FULL_FLOW
+HOST_PASS_DM_LINEAR_FULL_FLOW
+```
+
+这个脚本不做 reboot 恢复验证；重启恢复仍由跨 PV 大文件和 LVM2 resize 分脚本覆盖。它也不覆盖 striped target。
+
+---
+
+## 8. 手工入口：`myshell/br.sh`
 
 用途：手工启动 NixOS，并显式附加 DM 测试盘。默认附加两块，也可以通过 `DM_TEST_IMAGES` 附加更多块。
 
@@ -409,9 +461,9 @@ poweroff
 
 ---
 
-## 8. 常用环境变量
+## 9. 常用环境变量
 
-三个自动化测试脚本通用：
+linear 自动化测试脚本通用：
 
 ```bash
 DM_TEST_IMAGE=target/nixos/test.img
@@ -419,9 +471,9 @@ DM_TEST_IMAGE_2=target/nixos/test2.img
 RESET_DM_TEST_IMAGES=1
 ```
 
-三个自动化脚本都会动态检测 guest root shell，检测到 `root@asterinas` 后立刻注入测试命令。
+linear 自动化脚本都会动态检测 guest root shell，检测到 `root@asterinas` 后立刻注入测试命令。
 
-三个自动化脚本默认等待上限都是：
+linear 自动化脚本默认等待上限都是：
 
 ```bash
 GUEST_READY_TIMEOUT=120
@@ -441,23 +493,24 @@ DM_TEST_IMAGES="target/nixos/test.img target/nixos/test2.img target/nixos/test3.
 LVM2_RESIZE_LOG=/tmp/lvm2-resize-test.log
 CROSS_PV_LARGE_WRITE_LOG=/tmp/cross-pv-large-write-test.log
 CROSS_TARGET_BIO_LOG=/tmp/cross-target-bio-regression.log
+DM_LINEAR_FULL_FLOW_LOG=/tmp/dm-linear-full-flow-test.log
 ```
 
 如果 guest 自动登录较慢，可以加大 root shell 等待上限：
 
 ```bash
-GUEST_READY_TIMEOUT=240 myshell/run_lvm2_resize_test.sh
+GUEST_READY_TIMEOUT=240 myshell/dm_linear/run_lvm2_resize_test.sh
 ```
 
 如果要保留测试盘复查：
 
 ```bash
-RESET_DM_TEST_IMAGES=0 myshell/run_cross_pv_large_write_test.sh
+RESET_DM_TEST_IMAGES=0 myshell/dm_linear/run_cross_pv_large_write_test.sh
 ```
 
 ---
 
-## 9. 失败时先看什么
+## 10. 失败时先看什么
 
 先看 host 最终标记：
 
@@ -487,7 +540,7 @@ TEST_FAIL_...
 
 ---
 
-## 10. 和手工排查文档的关系
+## 11. 和手工排查文档的关系
 
 LVM2 扩缩容的手工排查步骤保留在：
 
@@ -495,11 +548,12 @@ LVM2 扩缩容的手工排查步骤保留在：
 docs/device-mapper-lvm1/nixos-linear-device-mapper-lvm2-test.md
 ```
 
-大文件跨 PV 和 raw BIO 跨 target 测试已经脚本化，日常入口就是：
+linear 系统测试已经脚本化，日常入口是：
 
 ```text
-myshell/run_cross_pv_large_write_test.sh
-myshell/run_cross_target_bio_regression.sh
+myshell/run_dm_system_tests.sh --quick
+myshell/run_dm_system_tests.sh --lvm2
+myshell/run_dm_system_tests.sh --linear-flow
 ```
 
-日常测试优先使用 `myshell/` 下的一键脚本；只有需要逐步排查 LVM2 扩缩容流程时，再看手工排查文档。
+需要定位单个层次时，也可以直接运行 `myshell/dm_linear/` 下的分脚本。

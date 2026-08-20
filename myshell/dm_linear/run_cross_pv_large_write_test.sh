@@ -6,7 +6,7 @@ set -euo pipefail
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     cat <<'EOF'
-Usage: myshell/run_cross_pv_large_write_test.sh
+Usage: myshell/dm_linear/run_cross_pv_large_write_test.sh
 
 Runs the two-PV large-file regression in an Asterinas NixOS guest.
 
@@ -22,8 +22,8 @@ EOF
 fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/..")
-source "${SCRIPT_DIR}/lib/dm_nixos_test.sh"
+ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
+source "${SCRIPT_DIR}/../lib/dm_nixos_test.sh"
 
 TEST_ID=CROSS_PV_LARGE_WRITE
 LOG=${CROSS_PV_LARGE_WRITE_LOG:-/tmp/cross-pv-large-write-test.log}

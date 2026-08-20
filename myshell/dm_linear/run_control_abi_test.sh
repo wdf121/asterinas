@@ -6,7 +6,7 @@ set -euo pipefail
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     cat <<'EOF'
-Usage: myshell/run_dm_control_abi_test.sh
+Usage: myshell/dm_linear/run_control_abi_test.sh
 
 Runs a lightweight NixOS guest smoke test for Device Mapper control ioctl paths.
 
@@ -21,8 +21,8 @@ EOF
 fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/..")
-source "${SCRIPT_DIR}/lib/dm_nixos_test.sh"
+ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
+source "${SCRIPT_DIR}/../lib/dm_nixos_test.sh"
 
 TEST_ID=DM_CONTROL_ABI
 LOG=${DM_CONTROL_ABI_LOG:-/tmp/dm-control-abi-test.log}

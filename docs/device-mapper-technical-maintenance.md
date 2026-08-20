@@ -2,7 +2,7 @@
 
 本文档面向后续继续开发、审查和维护 Asterinas Device Mapper 的开发者。它不是简单的维护清单，而是说明当前 Asterinas DM 做到了什么程度、为什么这样设计、如何验证、各个文件在整体中的作用，以及下一阶段应该优先补什么。
 
-当前目标不是完整复刻 Linux Device Mapper 生态，而是先实现一个 **kernel-only、linear-only、尽量对齐 Linux DM ioctl/control 核心 ABI、但避免 udev/sysfs 等成熟用户态框架依赖** 的最小可用版本。
+当前目标不是完整复刻 Linux Device Mapper 生态，而是先实现一个 **kernel-only、linear 数据面优先、striped 控制面逐步接入、尽量对齐 Linux DM ioctl/control 核心 ABI、但避免 udev/sysfs 等成熟用户态框架依赖** 的最小可用版本。
 
 ---
 
@@ -38,14 +38,14 @@ Asterinas 当前设备、udev、sysfs、devtmpfs、块层生态还没有 Linux �
 - 不做复杂 queue stacking；
 - 当前不支持 discard / write zeroes BIO 语义；
 - 不做完整 uevent、udev 和 poll/select 事件生态；
-- `striped` 只用于回应 LVM2 target version 预检，不支持实际 table load。
+- `striped` 支持 table load/status/deps 控制面，但含 striped 的 table 仍拒绝 BIO 数据面。
 
 ### 1.3 当前实现策略
 
 当前策略是：
 
 1. 内核里先做好 DM core；
-2. 只支持 linear target；
+2. 支持 linear target 的完整数据面，并支持 striped target 的 table load/status/deps 控制面；
 3. 尽量保持 Linux DM 控制面和 table 语义；
 4. 通过 Asterinas 当前已有 misc device、block registry、devtmpfs runtime node 能力对接用户态；
 5. LVM2 侧使用 `activation { udev_rules=0 }`，显式避开 udev 依赖；
@@ -178,11 +178,11 @@ Linux 6.6 `dm-ioctl.h` 中标准命令编号如下。Asterinas 的扩展原则�
 | 6 | `DM_DEV_SUSPEND` | 已支持 | 保持 suspend/resume 与 in-flight I/O drain；不引入 lockfs/udev。 |
 | 7 | `DM_DEV_STATUS` | 已支持 | 保持 header/status flags/open count/table presence/event number。 |
 | 8 | `DM_DEV_WAIT` | 已支持最小 event 等待 | 保持不持有全局 control lock；不扩展完整 uevent/poll 生态。 |
-| 9 | `DM_TABLE_LOAD` | 已支持 linear-only | 继续只接受 linear target；其它 target table load 返回错误。 |
+| 9 | `DM_TABLE_LOAD` | 已支持 linear/striped 控制面 | linear table 可进入数据面；striped 只支持 load/status/deps，BIO 仍显式拒绝。 |
 | 10 | `DM_TABLE_CLEAR` | 已支持 | 保持清理 inactive table 的幂等语义。 |
 | 11 | `DM_TABLE_DEPS` | 已支持 | 保持 active/inactive selector 与 backing deps 去重。 |
-| 12 | `DM_TABLE_STATUS` | 已支持 | 保持 info/table 两种 linear status 输出。 |
-| 13 | `DM_LIST_VERSIONS` | 已支持 | `linear` 真实支持；`striped` 仅用于 LVM2 预检兼容。 |
+| 12 | `DM_TABLE_STATUS` | 已支持 | 保持 info/table 两种 status 输出；linear 输出 backing 参数，striped 输出 canonical stripe 参数。 |
+| 13 | `DM_LIST_VERSIONS` | 已支持 | `linear` 支持完整数据面；`striped` 支持控制面并声明 version，但数据面未接入。 |
 | 14 | `DM_TARGET_MSG` | 未支持，当前命令解码拒绝 | 待定；linear target 没有真实 message 语义，单补入口价值低。 |
 | 15 | `DM_DEV_SET_GEOMETRY` | 未支持，当前命令解码拒绝 | 待定；Asterinas 当前不消费 legacy geometry，no-op 容易形成假支持。 |
 | 16 | `DM_DEV_ARM_POLL` | 未支持，当前命令解码拒绝 | 待定；没有完整 poll/uevent 生态前，单补入口不解决实际能力。 |
@@ -241,6 +241,8 @@ default-members = [
 - resume 激活 inactive table；
 - running 状态下 reload + resume 替换 active table；
 - linear 参数精确解析，严格接受 `<major>:<minor> <backing_start>` 两字段格式；
+- striped 参数解析、table load、table status canonical 参数输出和 deps 多 backing 去重；
+- 含 striped table 的 BIO 显式拒绝，避免数据面半接入；
 - linear target range 校验；
 - logical range end-exclusive；
 - table 从 0 开始且连续；
@@ -257,15 +259,16 @@ default-members = [
 
 系统实测用于验证真实用户态路径：dmsetup、LVM2、ext2、block registry、devtmpfs、procfs、VirtIO block、QEMU raw image 一起工作。
 
-当前系统测试脚本按分层套件维护：
+当前系统测试脚本按 target 类型分组维护；现有脚本组只覆盖 linear/control 回归，不覆盖 striped target：
 
-- [run_dm_control_abi_test.sh](file:///root/atom/asterinas/myshell/run_dm_control_abi_test.sh)：轻量 control ABI smoke，覆盖 `/dev/mapper/control`、`dmsetup version/targets/create/table/status/deps/info/wait`、name rename、多 target table/status/deps、多设备 list、readonly mapper 读写拒绝、busy remove、remove_all、`--noflush` suspend/resume；
-- [run_cross_target_bio_regression.sh](file:///root/atom/asterinas/myshell/run_cross_target_bio_regression.sh)：raw DM 数据面回归，验证单个 4KiB BIO 跨两个 linear target 后能正确 split/remap/聚合 completion；
-- [run_cross_pv_large_write_test.sh](file:///root/atom/asterinas/myshell/run_cross_pv_large_write_test.sh)：LVM2 跨 PV 大文件回归，验证 900MiB LV 跨两块 PV、700MiB 文件写入和重启后 md5 校验；
-- [run_lvm2_resize_test.sh](file:///root/atom/asterinas/myshell/run_lvm2_resize_test.sh)：LVM2 扩缩容回归，验证 400MiB 创建、700MiB 跨 PV 扩容、300MiB 缩容、ext2 resize、重启恢复和只读挂载读文件；
-- [run_dm_system_tests.sh](file:///root/atom/asterinas/myshell/run_dm_system_tests.sh)：组合入口，支持 `--quick`、`--data`、`--lvm2`、`--full`。
+- [dm_linear/run_control_abi_test.sh](file:///root/atom/asterinas/myshell/dm_linear/run_control_abi_test.sh)：轻量 control ABI smoke，覆盖 `/dev/mapper/control`、`dmsetup version/targets/create/table/status/deps/info/wait`、name rename、多 target table/status/deps、多设备 list、readonly mapper 读写拒绝、busy remove、remove_all、`--noflush` suspend/resume；
+- [dm_linear/run_cross_target_bio_regression.sh](file:///root/atom/asterinas/myshell/dm_linear/run_cross_target_bio_regression.sh)：raw DM 数据面回归，验证单个 4KiB BIO 跨两个 linear target 后能正确 split/remap/聚合 completion；
+- [dm_linear/run_cross_pv_large_write_test.sh](file:///root/atom/asterinas/myshell/dm_linear/run_cross_pv_large_write_test.sh)：LVM2 跨 PV 大文件回归，验证 900MiB LV 跨两块 PV、700MiB 文件写入和重启后 md5 校验；
+- [dm_linear/run_lvm2_resize_test.sh](file:///root/atom/asterinas/myshell/dm_linear/run_lvm2_resize_test.sh)：LVM2 扩缩容回归，验证 400MiB 创建、700MiB 跨 PV 扩容、300MiB 缩容、ext2 resize、重启恢复和只读挂载读文件；
+- [dm_linear/run_linear_full_flow_test.sh](file:///root/atom/asterinas/myshell/dm_linear/run_linear_full_flow_test.sh)：单个 NixOS guest 内串起 linear control smoke、raw cross-target BIO、LVM2 create/mount/write、extend、shrink 和 cleanup，用于验证 linear 用户态流程能连续接好；
+- [run_dm_system_tests.sh](file:///root/atom/asterinas/myshell/run_dm_system_tests.sh)：组合入口，支持 `--quick`、`--data`、`--lvm2`、`--linear-flow`、`--full`。
 
-这些脚本共享 [dm_nixos_test.sh](file:///root/atom/asterinas/myshell/lib/dm_nixos_test.sh) 中的 host-side 公共逻辑，包括 QEMU 占用检查、NixOS 镜像检查、测试盘重置、guest shell 等待、FIFO 注入、summary 和失败上下文输出。
+这些脚本共享 [dm_nixos_test.sh](file:///root/atom/asterinas/myshell/lib/dm_nixos_test.sh) 中的 host-side 公共逻辑，包括 QEMU 占用检查、NixOS 镜像检查、测试盘重置、guest shell 等待、FIFO 注入、summary 和失败上下文输出。组合入口顺序执行多个子脚本时，每个子脚本都是独立 guest 测试；只有 `--linear-flow` 明确验证单 guest 内的连续 linear 用户态流程。
 
 推荐按改动范围选择系统测试：
 
@@ -274,16 +277,17 @@ default-members = [
 | ioctl/control、flags、event/wait | `myshell/run_dm_system_tests.sh --quick` |
 | BIO split/remap、linear target 数据面 | `myshell/run_dm_system_tests.sh --data` |
 | LVM2 交互、table/status/deps、resize | `myshell/run_dm_system_tests.sh --lvm2` |
-| 阶段验收或发版前验收 | `myshell/run_dm_system_tests.sh --full` |
+| linear 用户态端到端流程衔接 | `myshell/run_dm_system_tests.sh --linear-flow` |
+| linear 阶段验收或发版前验收 | `myshell/run_dm_system_tests.sh --full` |
 
-系统测试和 ktest 的职责不同：ktest 精确覆盖内核内部语义；系统测试确认这些语义能通过真实用户态 ABI 和工具链走通，或至少没有破坏真实 LVM2 linear 路径。
+系统测试和 ktest 的职责不同：ktest 精确覆盖内核内部语义；系统测试确认这些语义能通过真实用户态 ABI 和工具链走通，或至少没有破坏真实 LVM2 linear 路径。当前脚本集合不等价于完整 DM target 矩阵验收，尤其不能证明 striped BIO chunk split/remap 或 LVM2 striped 路径可用。
 
 本轮 ioctl/control 收紧后已重新跑过系统级验收：
 
-- `myshell/run_dm_system_tests.sh --quick`：通过，输出 `HOST_PASS_DM_SYSTEM_TESTS --quick`；其中 `run_dm_control_abi_test.sh` 输出 `TEST_PASS_DM_CONTROL_ABI`，覆盖 create/status/deps/info、name rename、多 target table/status/deps、多设备 list、readonly mapper 读成功且写失败、busy remove/remove_all、wait/noflush；`run_cross_target_bio_regression.sh` 输出 `TEST_PASS_CROSS_TARGET_BIO`；
+- `myshell/run_dm_system_tests.sh --quick`：通过，输出 `HOST_PASS_DM_SYSTEM_TESTS --quick`；其中 `dm_linear/run_control_abi_test.sh` 输出 `TEST_PASS_DM_CONTROL_ABI`，覆盖 create/status/deps/info、name rename、多 target table/status/deps、多设备 list、readonly mapper 读成功且写失败、busy remove/remove_all、wait/noflush；`dm_linear/run_cross_target_bio_regression.sh` 输出 `TEST_PASS_CROSS_TARGET_BIO`；
 - `myshell/run_dm_system_tests.sh --lvm2`：通过，输出 `HOST_PASS_DM_SYSTEM_TESTS --lvm2`；其中跨 PV 大文件和 LVM2 扩缩容两个子场景均输出对应 `TEST_PASS_*`；
-- `myshell/run_cross_pv_large_write_test.sh`：验证 900MiB LV 跨两块 PV，重启后 md5 校验通过；
-- `myshell/run_lvm2_resize_test.sh`：验证 400MiB 创建、700MiB 跨 PV 扩容、300MiB 缩容、重启恢复和只读挂载读文件均通过。
+- `myshell/dm_linear/run_cross_pv_large_write_test.sh`：验证 900MiB LV 跨两块 PV，重启后 md5 校验通过；
+- `myshell/dm_linear/run_lvm2_resize_test.sh`：验证 400MiB 创建、700MiB 跨 PV 扩容、300MiB 缩容、重启恢复和只读挂载读文件均通过。
 
 系统测试曾暴露 `DM_TABLE_LOAD` 上 libdevmapper 会携带 `DM_PERSISTENT_DEV_FLAG` 陈旧位；当前已修正为 create 时使用该 flag，create 之外兼容忽略该陈旧位。
 
@@ -513,15 +517,16 @@ DM table 和数据面转发层。
 
 作用：
 
-- 保存一组 enum-based target，当前唯一 enabled variant 是 `DmTarget::Linear`；
+- 保存一组 enum-based target，当前 enabled variants 是 `DmTarget::Linear` 和 `DmTarget::Striped`；
 - 验证 table 从 logical sector 0 开始；
 - 验证 target 连续无空洞；
 - 计算 mapper capacity，结果等于所有连续 target 的总 logical sector 数；
 - 聚合 backing queue limit，目前只取 `max_nr_segments_per_bio` 的最小值；
 - 返回 backing deps；
-- 普通 BIO remap；
-- 跨 target BIO split；
-- flush 去重并异步 fan-out。
+- linear 普通 BIO remap；
+- 跨 linear target BIO split；
+- linear table flush 去重并异步 fan-out；
+- 含 striped target 的 table 当前拒绝 BIO 数据面。
 
 本阶段修正点：
 
@@ -533,7 +538,7 @@ DM table 和数据面转发层。
 
 target 模块入口。
 
-当前导出最小 `DmTarget` enum，但唯一 variant 仍是 `DmTarget::Linear(LinearTarget)`。同时存在 striped 参数解析/静态校验模块，用于锁住后续 striped 实现所需的几何公式；它尚未接入 `DmTarget`、table load、status/deps 或数据面。后续新增真实 target 时，不能只在这里加模块，还必须同步修改 ioctl parser、target version、status/deps、BIO split/remap 和测试。
+当前导出最小 `DmTarget` enum，已包含 `DmTarget::Linear(LinearTarget)` 和 `DmTarget::Striped(StripedTarget)`。`DmTarget` 提供多 backing 遍历 helper，`DmTable` 的 deps、queue limit 和 DM-on-DM backing 检查都通过这些 helper 汇总 backing。striped 已接入 table load/status/deps 控制面；BIO 数据面仍只支持 linear，含 striped 的 table 会显式拒绝 BIO。后续接入 striped 数据面时，需要把 `StripedTarget::map_range()` 接到 BIO chunk split/remap，并补系统级 striped 脚本。
 
 #### [linear.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/target/linear.rs)
 
@@ -562,7 +567,7 @@ striped target 参数解析和静态校验 helper。
 - 按 chunk/stripe 轮转公式把单个 logical sector 映射到 stripe index、backing id 和 backing sector；
 - 将一个完全位于 striped target 内的 logical range 按 chunk 边界拆成多个 `StripedRangeMap`，每个 part 携带 logical range、stripe index 和 backing range。
 
-它当前不代表 striped table load 已支持：`DM_TABLE_LOAD` 仍拒绝 striped，`DmTarget` 也还没有 `Striped` variant，`DmTable`/BIO 数据面尚未接入 striped。
+它当前代表 striped control plane 已可被 table load/status/deps 使用，但不代表 striped 数据面已支持：`DmTable`/BIO read-write split/remap 尚未接入 striped，含 striped 的 table 会拒绝 BIO。
 
 ### 5.2 Linux DM ioctl 控制面
 
@@ -590,8 +595,8 @@ striped target 参数解析和静态校验 helper。
 - `data_size` 必须在合理范围；
 - `data_start` 必须至少为 header size，并且 8 字节对齐；
 - `dm_target_spec.next` 在 table load 输入和 table status 输出中的含义不同；
-- table load 当前只接受 `linear`；
-- target version 可以声明 `striped`，但 table load 不允许 striped；
+- table load 当前接受 `linear` 和 `striped`；
+- `linear` 支持数据面，`striped` 当前只支持控制面，含 striped 的 table 会拒绝 BIO；
 - 单个 `DM_DEV_REMOVE` 遇到 open mapper 时返回 `EBUSY`，并保留 manager 索引和 runtime 节点；
 - `DM_REMOVE_ALL` 遇到 busy mapper 时跳过该设备，继续删除其它 mapper，ioctl 本身保持 best-effort 成功。
 
@@ -970,7 +975,7 @@ cargo osdk test device_mapper
 
 ### 8.15 支持 linear-only readonly mapper
 
-修改 [device.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/device.rs)、[manager.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/manager.rs)、[device_mapper.rs](file:///root/atom/asterinas/kernel/src/device/misc/device_mapper.rs) 和 [run_dm_control_abi_test.sh](file:///root/atom/asterinas/myshell/run_dm_control_abi_test.sh)：
+修改 [device.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/device.rs)、[manager.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/manager.rs)、[device_mapper.rs](file:///root/atom/asterinas/kernel/src/device/misc/device_mapper.rs) 和 [run_control_abi_test.sh](file:///root/atom/asterinas/myshell/dm_linear/run_control_abi_test.sh)：
 
 - `DmDeviceStatus` 增加 readonly 状态，control header 对 readonly mapper 写回 `DM_READONLY_FLAG`；
 - `DmManager::create_with_readonly()` 支持创建只读设备，原 `create()` 保持默认可写；
@@ -1016,7 +1021,7 @@ linear target 当前已明确：
 
 1. 不要把 udev 当成当前 DM 的必要依赖。
 2. LVM2 命令应显式使用 `activation { udev_rules=0 }`。
-3. `striped` 目前只是 target version 预检兼容，不能 table load。
+3. `striped` 目前只支持 table load/status/deps 控制面，不能作为可读写数据面使用。
 4. `DM_TABLE_LOAD` 的 `next` 和 `DM_TABLE_STATUS` 输出里的 `next` 语义不同。
 5. failed `DM_TABLE_LOAD` 不能改变 active/inactive table、`event_nr` 或 readonly 状态。
 6. `load_table()` 只加载 inactive table，不应直接替换 active table。
@@ -1084,11 +1089,12 @@ myshell/run_dm_system_tests.sh --full
 - kernel DM core；
 - Linux ioctl 控制面子集；
 - linear target 数据面；
+- striped target table load/status/deps 控制面；
 - BIO remap/split/completion；
 - block registry/devtmpfs/procfs 对接；
 - ktest 内核语义验证；
 - NixOS + LVM2 系统实测路径。
 
-但它仍然是 **linear-only、无 udev 依赖、最小 Linux DM 兼容子集**。
+但它仍然是 **linear 数据面为主、striped 仅控制面、无 udev 依赖、最小 Linux DM 兼容子集**。
 
 下一阶段重点应转为维护这套分层验证体系：ktest 负责内部语义，system tests 负责真实 dmsetup/LVM2 路径；`DM_TARGET_MSG`、`DM_DEV_SET_GEOMETRY`、`DM_DEV_ARM_POLL` 暂不为覆盖编号而硬补入口。

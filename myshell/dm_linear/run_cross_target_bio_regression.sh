@@ -6,7 +6,7 @@ set -euo pipefail
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     cat <<'EOF'
-Usage: myshell/run_cross_target_bio_regression.sh
+Usage: myshell/dm_linear/run_cross_target_bio_regression.sh
 
 Runs a NixOS guest regression for a single 4 KiB BIO crossing two linear targets.
 
@@ -21,8 +21,8 @@ EOF
 fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/..")
-source "${SCRIPT_DIR}/lib/dm_nixos_test.sh"
+ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
+source "${SCRIPT_DIR}/../lib/dm_nixos_test.sh"
 
 TEST_ID=CROSS_TARGET_BIO
 LOG=${CROSS_TARGET_BIO_LOG:-/tmp/cross-target-bio-regression.log}
