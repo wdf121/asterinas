@@ -12,7 +12,7 @@ Suites:
   --quick         Run linear control ABI smoke and raw cross-target BIO regression.
   --data          Run raw cross-target BIO regression only.
   --striped       Run raw dm_striped BIO split/remap regression.
-  --striped-lvm2  Run LVM2 striped file I/O and reboot recovery regression.
+  --striped-lvm2  Run LVM2 striped create, resize, file I/O, and reboot recovery regression.
   --lvm2          Run cross-PV large-file and LVM2 resize regressions.
   --linear-flow   Run the single-guest linear end-to-end flow.
   --full          Run all linear DM system regressions. This is the default.
