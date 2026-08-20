@@ -21,22 +21,19 @@ myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh
 
 ## 1. 测试分层逻辑
 
-当前 linear 测试按从小到大分三类分脚本，另有一个单 guest 完整流程脚本；striped 当前提供 raw BIO 验收脚本和 LVM2 create + 文件 I/O + reboot 恢复脚本：
+当前 linear 测试按从小到大分三类分脚本，另有一个单 guest 完整流程脚本；striped 提供 raw BIO 验收脚本和 LVM2 create/grow/shrink/reboot 完整系统验收脚本：
 
 ```text
 第一层：raw BIO 边界回归
   linear：验证单个 4 KiB BIO 跨两个 DM target 时能 split/remap/complete。
   striped：验证 2-way striped mapper 按 chunk split/remap，并检查 backing 数据分布。
 
-第二层：LVM2 文件 I/O 与重启恢复
+第二层：LVM2 文件 I/O、resize 与重启恢复
   linear：验证 ext2 + LVM2 + DM 多段 linear table 上的大文件读写和重启恢复。
-  striped：验证 LVM2 生成 2-way striped table、ext2 文件读写和重启恢复。
+  striped：验证 LVM2 生成 2-way striped table、ext2 文件读写、grow、shrink 和重启恢复。
 
-第三层：完整 LVM2 扩缩容流程
-  验证 LV 创建、active 扩容、resize2fs、缩容和重启恢复。
-
-单 guest full flow：linear 端到端流程衔接
-  在一个 guest 内串起 control、raw BIO、LVM2 create/write/extend/shrink/cleanup。
+第三层：单 guest full flow
+  linear：在一个 guest 内串起 control、raw BIO、LVM2 create/write/extend/shrink/cleanup。
 ```
 
 推荐顺序：
@@ -54,7 +51,7 @@ myshell/dm_linear/run_linear_full_flow_test.sh
 
 - BIO 回归最小，失败时能最快定位 DM split/remap/completion；
 - raw striped 脚本直接验证 striped chunk split/remap 和 backing 数据分布；
-- LVM2 striped 脚本验证真实 LVM2 table、ext2 文件 I/O 和重启恢复；
+- LVM2 striped 脚本验证真实 LVM2 table、ext2 文件 I/O、grow、shrink 和重启恢复；
 - 大文件测试验证真实跨 PV linear 数据面；
 - LVM2 扩缩容测试覆盖重启恢复，适合作分层验收；
 - full flow 验证一个 guest 内的 linear 用户态流程能连续接好。
@@ -453,9 +450,9 @@ HOST_PASS_DM_STRIPED_RAW_BIO
 
 ---
 
-## 9. LVM2 striped I/O 与重启恢复：`myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh`
+## 9. LVM2 striped 完整系统验收：`myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh`
 
-用途：一键测试 LVM2 创建 2-way striped LV 后，ext2 文件 I/O 和重启恢复路径是否可用。
+用途：一键测试 LVM2 2-way striped LV 的创建、ext2 文件 I/O、扩容、缩容和重启恢复路径。
 
 运行：
 
@@ -483,30 +480,56 @@ first guest:
   → dmsetup targets 确认 striped target 可见
   → pvcreate / vgcreate
   → lvcreate --type striped -i 2 -I 4K -L 256M
-  → dmsetup table/status/deps 确认为 2-way striped
+  → dmsetup table/status/deps 确认为 2-way striped，长度 256M
   → mkfs.ext2 + mount
-  → 写入 64 MiB 文件和 marker 文件
+  → 写入 64 MiB base 文件和 marker 文件
   → md5sum -c
+  → lvextend 到 512M
+  → dmsetup table/status/deps 确认为 2-way striped，长度 512M
+  → 离线 e2fsck + resize2fs + e2fsck
+  → 重新 mount
+  → 复查 base md5
+  → 写入 256 MiB grow 临时文件和 marker 文件
+  → md5sum -c grow.md5
+  → 删除 grow 临时文件
+  → 复查 base md5
+  → 离线 e2fsck + resize2fs 256M + e2fsck
+  → lvreduce -y -L 256M
+  → dmsetup table/status/deps 确认为 2-way striped，长度 256M
+  → 重新 mount
+  → 复查 base md5
+  → 写入 32 MiB after-shrink 文件和 marker 文件
+  → md5sum -c striped.md5
   → umount + vgchange -an
 
 second guest:
-  → vgscan --mknodes + vgchange -ay
-  → dmsetup table/status/deps 再次确认为 2-way striped
+  → 重新定位两块测试盘
+  → pvscan / vgscan --mknodes / vgchange -ay
+  → dmsetup table/status/deps 确认为最终 256M 2-way striped
   → readonly mount
-  → md5sum -c
-  → 读取 marker 文件
+  → md5sum -c striped.md5
+  → 读取 base marker 和 shrink marker
   → umount + vgchange -an
 ```
 
 通过标记：
 
 ```text
+CHECK_PASS_STRIPED_LVM2_SETUP
+CHECK_PASS_STRIPED_LVM2_INITIAL_TABLE_STATUS_DEPS
+CHECK_PASS_STRIPED_LVM2_BASE_FILE_MD5
+CHECK_PASS_STRIPED_LVM2_EXTENDED_TABLE_STATUS_DEPS
+CHECK_PASS_STRIPED_LVM2_GROW_FILE_MD5
+CHECK_PASS_STRIPED_LVM2_SHRUNK_TABLE_STATUS_DEPS
+CHECK_PASS_STRIPED_LVM2_SHRINK_FILE_MD5
 TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_FIRST
+CHECK_PASS_STRIPED_LVM2_RECOVERED_TABLE_STATUS_DEPS
+CHECK_PASS_STRIPED_LVM2_RECOVERED_FILE_MD5
 TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_SECOND
 HOST_PASS_DM_STRIPED_LVM2_IO_REBOOT
 ```
 
-这个脚本验证 LVM2 生成 striped table 后的文件 I/O 和 reboot recovery；不做 striped resize/shrink，也不复刻 raw 脚本中的 backing A+C/B+D 物理分布校验。
+这个脚本覆盖 LVM2/libdevmapper 生成 striped table、active table reload、mapper capacity grow/shrink、ext2 grow/shrink、缩容后文件 I/O 和 reboot recovery。raw `dmsetup striped` 的 backing A+C/B+D 物理分布校验由 `run_raw_striped_bio_test.sh` 覆盖。
 
 ---
 
@@ -610,11 +633,15 @@ DM_STRIPED_RAW_BIO_LOG=/tmp/dm-striped-raw-bio-test.log
 DM_STRIPED_LVM2_IO_REBOOT_LOG=/tmp/dm-striped-lvm2-io-reboot-test.log
 ```
 
-LVM2 striped 脚本还支持调整 LV、文件和 stripe chunk 大小：
+LVM2 striped 脚本支持调整 LV、文件和 stripe chunk 大小：
 
 ```bash
-STRIPED_LV_MIB=256
-STRIPED_FILE_MIB=64
+STRIPED_INITIAL_LV_MIB=256
+STRIPED_EXTENDED_LV_MIB=512
+STRIPED_SHRUNK_LV_MIB=256
+STRIPED_BASE_FILE_MIB=64
+STRIPED_GROW_FILE_MIB=256
+STRIPED_AFTER_SHRINK_FILE_MIB=32
 STRIPED_CHUNK_KIB=4
 ```
 
