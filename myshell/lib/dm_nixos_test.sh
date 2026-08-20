@@ -27,9 +27,25 @@ dm_check_nixos_image() {
     fi
 }
 
+dm_test_images() {
+    if [ -n "${DM_TEST_IMAGES:-}" ]; then
+        printf '%s\n' ${DM_TEST_IMAGES}
+    else
+        printf '%s\n' "${DM_TEST_IMAGE}" "${DM_TEST_IMAGE_2}"
+    fi
+}
+
+dm_test_images_env() {
+    dm_test_images | paste -sd ' ' -
+}
+
 dm_reset_test_images() {
+    local image_path
+
     if [ "${RESET_DM_TEST_IMAGES}" = "1" ]; then
-        rm -f "${DM_TEST_IMAGE}" "${DM_TEST_IMAGE_2}"
+        dm_test_images | while IFS= read -r image_path; do
+            rm -f "${image_path}"
+        done
     fi
 }
 
@@ -48,8 +64,9 @@ dm_run_guest_script() {
     local script_file=$2
     local log_mode=$3
     local label=$4
-    local slug fifo start_line qemu_pid waited status
+    local slug fifo start_line qemu_pid waited status dm_test_images
 
+    dm_test_images=$(dm_test_images_env)
     slug=$(_dm_test_tmp_slug "${test_id}")
     fifo=$(mktemp -u "/tmp/${slug}-stdin.XXXXXX")
     mkfifo "${fifo}"
@@ -61,10 +78,12 @@ dm_run_guest_script() {
     fi
 
     if [ "${log_mode}" = "append" ]; then
+        DM_TEST_IMAGES="${dm_test_images}" \
         DM_TEST_IMAGE="${DM_TEST_IMAGE}" \
         DM_TEST_IMAGE_2="${DM_TEST_IMAGE_2}" \
         setsid make run_nixos <"${fifo}" >>"${LOG}" 2>&1 &
     else
+        DM_TEST_IMAGES="${dm_test_images}" \
         DM_TEST_IMAGE="${DM_TEST_IMAGE}" \
         DM_TEST_IMAGE_2="${DM_TEST_IMAGE_2}" \
         setsid make run_nixos <"${fifo}" >"${LOG}" 2>&1 &
