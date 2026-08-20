@@ -6,7 +6,7 @@ set -euo pipefail
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     cat <<'EOF'
-Usage: myshell/run_lvm2_resize_test.sh
+Usage: myshell/dm_linear/run_lvm2_resize_test.sh
 
 Runs the full two-PV LVM2 resize regression in an Asterinas NixOS guest.
 
@@ -21,8 +21,8 @@ EOF
 fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/..")
-source "${SCRIPT_DIR}/lib/dm_nixos_test.sh"
+ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
+source "${SCRIPT_DIR}/../lib/dm_nixos_test.sh"
 
 TEST_ID=LVM2_RESIZE
 LOG=${LVM2_RESIZE_LOG:-/tmp/lvm2-resize-test.log}

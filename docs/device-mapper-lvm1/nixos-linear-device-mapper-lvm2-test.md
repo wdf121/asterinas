@@ -4,9 +4,9 @@
 
 ```text
 docs/device-mapper-lvm1/test1.md
-myshell/run_lvm2_resize_test.sh
-myshell/run_cross_pv_large_write_test.sh
-myshell/run_cross_target_bio_regression.sh
+myshell/dm_linear/run_lvm2_resize_test.sh
+myshell/dm_linear/run_cross_pv_large_write_test.sh
+myshell/dm_linear/run_cross_target_bio_regression.sh
 ```
 
 本文只保留 LVM2 扩缩容测试的核心思路和失败时的手工排查命令。
@@ -61,7 +61,7 @@ make nixos
 运行完整 LVM2 扩缩容测试：
 
 ```bash
-myshell/run_lvm2_resize_test.sh
+myshell/dm_linear/run_lvm2_resize_test.sh
 ```
 
 默认日志：
