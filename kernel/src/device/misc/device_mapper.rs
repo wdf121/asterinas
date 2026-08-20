@@ -10,7 +10,8 @@ use alloc::{format, vec};
 
 use aster_block::{BlockDevice, id::Sid, lookup_lease};
 use aster_device_mapper::{
-    DmDevice, DmError, DmManager, DmTable, TableError, target::linear::LinearTarget,
+    DmDevice, DmError, DmManager, DmTable, TableError,
+    target::{DmTarget, linear::LinearTarget},
 };
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::mm::VmIo;
@@ -449,7 +450,7 @@ fn device_status(buffer: &mut [u8]) -> Result<()> {
 fn device_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
     let target_count = selected_table(device, flags)
-        .map(|table| table.linears().len())
+        .map(|table| table.target_count())
         .unwrap_or(0);
     fill_device_header(buffer, device)?;
     write_u32(buffer, OFF_TARGET_COUNT, target_count)
@@ -674,10 +675,11 @@ fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let Some(table) = table else {
         return Ok(());
     };
-    write_u32(buffer, OFF_TARGET_COUNT, table.linears().len() as u32)?;
+    write_u32(buffer, OFF_TARGET_COUNT, table.target_count() as u32)?;
 
     let mut cursor = start;
-    for target in table.linears() {
+    for target in table.targets() {
+        let DmTarget::Linear(target) = target;
         let params = if flags & DM_STATUS_TABLE_FLAG != 0 {
             let backing = target.backing_id();
             format!(
@@ -1208,6 +1210,11 @@ mod tests {
             ])
             .unwrap(),
         )
+    }
+
+    fn linear_target(table: &DmTable, index: usize) -> &LinearTarget {
+        let DmTarget::Linear(target) = &table.targets()[index];
+        target
     }
 
     fn assert_failed_table_load_preserves_state(
@@ -2273,19 +2280,15 @@ mod tests {
 
         table_load_for_device(&mut buffer, &device).unwrap();
         let table = device.inactive_table().unwrap();
-        assert_eq!(table.linears().len(), 2);
-        assert_eq!(
-            table.linears()[0].logical_range(),
-            &(Sid::new(0)..Sid::new(4))
-        );
-        assert_eq!(table.linears()[0].backing_id(), first_id);
-        assert_eq!(table.linears()[0].backing_start(), Sid::new(100));
-        assert_eq!(
-            table.linears()[1].logical_range(),
-            &(Sid::new(4)..Sid::new(12))
-        );
-        assert_eq!(table.linears()[1].backing_id(), second_id);
-        assert_eq!(table.linears()[1].backing_start(), Sid::new(200));
+        assert_eq!(table.target_count(), 2);
+        let first_target = linear_target(&table, 0);
+        assert_eq!(first_target.logical_range(), &(Sid::new(0)..Sid::new(4)));
+        assert_eq!(first_target.backing_id(), first_id);
+        assert_eq!(first_target.backing_start(), Sid::new(100));
+        let second_target = linear_target(&table, 1);
+        assert_eq!(second_target.logical_range(), &(Sid::new(4)..Sid::new(12)));
+        assert_eq!(second_target.backing_id(), second_id);
+        assert_eq!(second_target.backing_start(), Sid::new(200));
 
         drop(table);
         device.clear_inactive_table().unwrap();

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::{
+    ops::Range,
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+};
 
 use aster_block::{
     BlockDeviceLease,
@@ -11,18 +14,25 @@ use aster_block::{
 use device_id::DeviceId;
 use ostd::sync::SpinLock;
 
-use crate::{TableError, target::linear::LinearTarget};
+use crate::{
+    TableError,
+    target::{DmTarget, linear::LinearTarget},
+};
 
 /// 一份通过完整验证且安装后不可变的 Device Mapper 映射表。
 #[derive(Debug)]
 pub struct DmTable {
-    linears: Vec<LinearTarget>,
+    targets: Vec<DmTarget>,
     length: u64,
 }
 
 impl DmTable {
     /// 创建由一段或多段 linear target 组成的映射表。
     pub fn new_linear(targets: Vec<LinearTarget>) -> Result<Self, TableError> {
+        Self::new_targets(targets.into_iter().map(DmTarget::Linear).collect())
+    }
+
+    fn new_targets(targets: Vec<DmTarget>) -> Result<Self, TableError> {
         if targets.is_empty() {
             return Err(TableError::UnsupportedTargetCount);
         }
@@ -39,7 +49,7 @@ impl DmTable {
         }
 
         Ok(Self {
-            linears: targets,
+            targets,
             length: expected_start,
         })
     }
@@ -67,7 +77,7 @@ impl DmTable {
     /// 返回映射设备的块层能力。
     pub fn metadata(&self) -> aster_block::BlockDeviceMeta {
         let max_nr_segments_per_bio = self
-            .linears
+            .targets
             .iter()
             .map(|target| target.backing().metadata().max_nr_segments_per_bio)
             .min()
@@ -78,15 +88,20 @@ impl DmTable {
         }
     }
 
-    /// 返回所有 linear target。
-    pub fn linears(&self) -> &[LinearTarget] {
-        &self.linears
+    /// 返回所有 target。
+    pub fn targets(&self) -> &[DmTarget] {
+        &self.targets
+    }
+
+    /// 返回 target 数量。
+    pub fn target_count(&self) -> usize {
+        self.targets.len()
     }
 
     /// 返回底层块设备 ID 列表，按首次出现顺序去重。
     pub fn backing_ids(&self) -> Vec<DeviceId> {
         let mut ids = Vec::new();
-        for target in &self.linears {
+        for target in &self.targets {
             let id = target.backing_id();
             if !ids.contains(&id) {
                 ids.push(id);
@@ -148,12 +163,12 @@ impl DmTable {
         &self,
         start: Sid,
         end: u64,
-    ) -> Result<Vec<(core::ops::Range<Sid>, &LinearTarget)>, BioEnqueueError> {
+    ) -> Result<Vec<(Range<Sid>, &DmTarget)>, BioEnqueueError> {
         let mut cursor = start.to_raw();
         let mut parts = Vec::new();
         while cursor < end {
             let target = self
-                .linears
+                .targets
                 .iter()
                 .find(|target| {
                     cursor >= target.logical_range().start.to_raw()
@@ -170,7 +185,7 @@ impl DmTable {
     fn enqueue_flush(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
         let mut flushed = Vec::new();
         let mut backings = Vec::new();
-        for target in &self.linears {
+        for target in &self.targets {
             let backing_id = target.backing_id();
             if flushed.contains(&backing_id) {
                 continue;
@@ -261,8 +276,8 @@ mod tests {
     #[derive(Debug)]
     struct RecordingBlockDevice {
         id: DeviceId,
-        last_range: Mutex<Option<core::ops::Range<Sid>>>,
-        submitted_ranges: Mutex<Vec<core::ops::Range<Sid>>>,
+        last_range: Mutex<Option<Range<Sid>>>,
+        submitted_ranges: Mutex<Vec<Range<Sid>>>,
         flush_count: Mutex<usize>,
         flush_status: BioStatus,
         fail_flush_enqueue: bool,
@@ -415,6 +430,40 @@ mod tests {
 
         assert_eq!(table.length(), 192);
         assert_eq!(table.backing_ids(), vec![first.id(), second.id()]);
+    }
+
+    #[ktest]
+    fn stores_linear_targets_as_ordered_dm_targets() {
+        let first = RecordingBlockDevice::new(1);
+        let second = RecordingBlockDevice::new(2);
+        let table = DmTable::new_linear(vec![
+            LinearTarget::new(
+                Sid::new(0),
+                128,
+                Sid::new(100),
+                BlockDeviceLease::new_untracked(first.clone() as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+            LinearTarget::new(
+                Sid::new(128),
+                64,
+                Sid::new(200),
+                BlockDeviceLease::new_untracked(second.clone() as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(table.target_count(), 2);
+        let DmTarget::Linear(first_target) = &table.targets()[0];
+        assert_eq!(first_target.backing_id(), first.id());
+        assert_eq!(first_target.logical_range(), &(Sid::new(0)..Sid::new(128)));
+        let DmTarget::Linear(second_target) = &table.targets()[1];
+        assert_eq!(second_target.backing_id(), second.id());
+        assert_eq!(
+            second_target.logical_range(),
+            &(Sid::new(128)..Sid::new(192))
+        );
     }
 
     #[ktest]
