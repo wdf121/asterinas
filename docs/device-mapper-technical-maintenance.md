@@ -19,7 +19,7 @@ Asterinas Device Mapper 当前是一个最小 Linux DM 兼容子集，核心目�
 | 数据面 | 支持 Read/Write/Flush；支持 BIO remap、跨 table target split、striped chunk split、completion 聚合。 |
 | flush | 按 backing `DeviceId` 去重，异步 fan-out，聚合完成状态。 |
 | 设备节点 | 支持 `/dev/dm-N` 和 `/dev/mapper/<name>` runtime node。 |
-| LVM2 适配 | 通过 `activation { udev_rules=0 }` 避开 udev 依赖；linear 和 striped create/I/O/reboot 路径已系统验收。 |
+| LVM2 适配 | 通过 `activation { udev_rules=0 }` 避开 udev 依赖；linear resize 和 striped create/grow/shrink/reboot 路径已系统验收。 |
 | 测试盘定位 | VirtIO block serial 暴露给 guest，脚本用 locator 稳定定位测试盘。 |
 
 ### 1.2 target 支持矩阵
@@ -27,7 +27,7 @@ Asterinas Device Mapper 当前是一个最小 Linux DM 兼容子集，核心目�
 | Target | 控制面 | 数据面 | 系统验收 | 当前边界 |
 |---|---|---|---|---|
 | `linear` | table load/status/deps 已支持 | Read/Write/Flush 已支持；跨 target BIO split 已支持 | control smoke、raw cross-target BIO、LVM2 large write、LVM2 resize、single-guest full flow 已覆盖 | 不支持 discard/write zeroes；queue stacking 只做现有块层能力的保守汇总。 |
-| `striped` | table load/status/deps 已支持；version 为 `1.6.0` | Read/Write/Flush 已支持；按 stripe chunk 拆分并 remap 到对应 backing | raw BIO 分布验收和 LVM2 create/I/O/reboot 验收已覆盖 | striped resize/shrink 尚未覆盖；不支持更多 Linux striped 周边特性。 |
+| `striped` | table load/status/deps 已支持；version 为 `1.6.0` | Read/Write/Flush 已支持；按 stripe chunk 拆分并 remap 到对应 backing | raw BIO 分布验收和 LVM2 create/grow/shrink/reboot 验收已覆盖 | 不支持 discard/write zeroes；不承诺 Linux striped 周边扩展语义。 |
 
 ### 1.3 明确不做的内容
 
@@ -40,8 +40,7 @@ Asterinas Device Mapper 当前是一个最小 Linux DM 兼容子集，核心目�
 - `DM_TARGET_MSG`、`DM_DEV_SET_GEOMETRY`、`DM_DEV_ARM_POLL`；
 - discard / write zeroes BIO 语义；
 - Linux DM 完整 queue stacking 规则；
-- DM-on-DM backing；
-- striped resize/shrink 系统验收。
+- DM-on-DM backing。
 
 ## 2. 设计目标与原则
 
@@ -487,7 +486,7 @@ docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout 1200 cargo osdk 
 | `--quick` | linear control ABI smoke + raw cross-target BIO。 |
 | `--data` | raw cross-target BIO regression。 |
 | `--striped` | raw `dmsetup striped` BIO split/remap 和 backing 分布。 |
-| `--striped-lvm2` | LVM2 striped create、ext2 I/O、reboot recovery。 |
+| `--striped-lvm2` | LVM2 striped create、ext2 I/O、grow、shrink、reboot recovery。 |
 | `--lvm2` | linear LVM2 cross-PV large write + resize。 |
 | `--linear-flow` | 单 guest linear control、raw BIO、LVM2 create/extend/shrink/cleanup 全流程。 |
 | `--full` | 当前 linear 全量系统回归；不默认包含 striped。 |
@@ -520,8 +519,12 @@ LVM2 striped：
 
 ```text
 CHECK_PASS_STRIPED_LVM2_SETUP
-CHECK_PASS_STRIPED_LVM2_TABLE_STATUS_DEPS
-CHECK_PASS_STRIPED_LVM2_FILE_MD5
+CHECK_PASS_STRIPED_LVM2_INITIAL_TABLE_STATUS_DEPS
+CHECK_PASS_STRIPED_LVM2_BASE_FILE_MD5
+CHECK_PASS_STRIPED_LVM2_EXTENDED_TABLE_STATUS_DEPS
+CHECK_PASS_STRIPED_LVM2_GROW_FILE_MD5
+CHECK_PASS_STRIPED_LVM2_SHRUNK_TABLE_STATUS_DEPS
+CHECK_PASS_STRIPED_LVM2_SHRINK_FILE_MD5
 TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_FIRST
 CHECK_PASS_STRIPED_LVM2_RECOVERED_TABLE_STATUS_DEPS
 CHECK_PASS_STRIPED_LVM2_RECOVERED_FILE_MD5
@@ -530,13 +533,14 @@ HOST_PASS_DM_STRIPED_LVM2_IO_REBOOT
 HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2
 ```
 
-LVM2 striped 验收中真实 table 示例：
+LVM2 striped table 示例：
 
 ```text
 0 524288 striped 2 8 253:64 2048 253:80 2048
+0 1048576 striped 2 8 253:64 2048 253:80 2048
 ```
 
-含义：256 MiB LV、2-way stripe、4 KiB chunk、两个 PV data offset 均为 2048 sectors。
+含义：2-way stripe、4 KiB chunk、两个 PV data offset 均为 2048 sectors；第一行是 256 MiB LV，第二行是 512 MiB LV。
 
 ### 8.4 按改动范围选择验证
 
@@ -547,7 +551,7 @@ LVM2 striped 验收中真实 table 示例：
 | linear BIO split/remap | ktest + `myshell/run_dm_system_tests.sh --data` |
 | striped BIO split/remap | ktest + `myshell/run_dm_system_tests.sh --striped` |
 | LVM2 linear create/resize/recovery | ktest + `myshell/run_dm_system_tests.sh --lvm2` |
-| LVM2 striped create/I/O/recovery | ktest + `myshell/run_dm_system_tests.sh --striped-lvm2` |
+| LVM2 striped create/grow/shrink/recovery | ktest + `myshell/run_dm_system_tests.sh --striped-lvm2` |
 | 阶段验收或发版前 linear 回归 | ktest + `myshell/run_dm_system_tests.sh --full` |
 
 系统测试前如果内核或 NixOS image 相关内容变更，先执行：
@@ -631,27 +635,39 @@ QEMU 系统测试必须串行运行，避免测试盘和 `test/initramfs/build/e
 
 ## 11. 后续工作
 
-### 11.1 第一优先级：striped resize/shrink 验收
+### 11.1 多 segment 与多 PV 组合
 
-当前 striped 已有 raw BIO 和 LVM2 create/I/O/reboot 验收，但还没有：
+striped table 校验和系统验收应继续覆盖更复杂的 LVM2 generated table：
 
-- `lvextend` striped；
-- `lvreduce` striped；
-- `resize2fs` on striped；
-- striped resize 后重启恢复。
+- 多个 striped segment；
+- 3 块或更多 PV；
+- 不同 segment 使用不同 backing offset；
+- grow/shrink 后 table 保持连续但不强制单行；
+- deps 输出按 backing device 去重且顺序稳定。
 
-这应作为独立阶段设计脚本，不能直接照搬 linear resize 脚本。原因是 striped LV 扩缩容涉及 stripe geometry、PV 空间分配和 LVM2 generated table 变化，风险点不同。
+这类验收应校验 table 语义：logical start 连续、总长度正确、target type 正确、stripe count/chunk size 正确、deps 完整。不应绑定 LVM2 某一次输出是否单行。
 
-### 11.2 第二优先级：系统测试矩阵稳定化
+### 11.2 异常路径与边界输入
 
-需要继续保持：
+需要继续补强的边界包括：
 
-- raw BIO 脚本验证 target-specific 数据分布；
-- LVM2 脚本验证真实 libdevmapper/LVM metadata 路径；
+- striped target 参数非法：stripe count、chunk size、device/offset 数量不匹配；
+- table length 与 backing required sectors 不匹配；
+- BIO 覆盖多个 target 且同时跨 striped chunk；
+- backing enqueue 失败后的 split BIO completion 聚合；
+- flush fan-out 中部分 backing 失败；
+- running device reload table 时 active/inactive table 状态保持一致。
+
+### 11.3 系统测试矩阵稳定化
+
+系统测试入口保持分层：
+
+- `--striped` 验证 raw `dmsetup striped` 的 target-specific 数据分布；
+- `--striped-lvm2` 验证真实 LVM2/libdevmapper、ext2、resize 和 reboot recovery 路径；
 - `--full` 保持 linear 全量语义；
-- striped 测试通过显式 `--striped` 和 `--striped-lvm2` 运行。
+- QEMU/NixOS 系统测试串行运行。
 
-### 11.3 暂不优先的项目
+### 11.4 暂不优先的项目
 
 以下内容只有在真实用户态路径需要或底层框架补齐后再做：
 
@@ -663,15 +679,15 @@ QEMU 系统测试必须串行运行，避免测试盘和 `test/initramfs/build/e
 - target registry 泛化；
 - 更多 DM target。
 
-## 12. 阶段结论
+## 12. 设计结论
 
-当前 Asterinas DM 已具备可维护的最小栈：
+Asterinas Device Mapper 维护一个可运行、可验收、边界明确的 Linux DM 兼容子集：
 
-- Linux DM ioctl 核心子集；
-- active/inactive table 生命周期；
-- linear target 完整数据面和 LVM2 resize 系统验收；
-- striped target table load/status/deps、raw BIO 数据面和 LVM2 create/I/O/reboot 系统验收；
+- Linux DM ioctl 核心命令和 table 生命周期；
+- active/inactive table、suspend/resume、status/deps/table 输出；
+- linear target 数据面和 LVM2 resize 系统验收；
+- striped target 数据面和 LVM2 create/grow/shrink/reboot 系统验收；
 - BIO split/remap/completion 和 flush fan-out；
 - block registry、devtmpfs、procfs、VirtIO serial、NixOS guest 测试链路。
 
-剩余主要空白不是“striped 是否可用”，而是“striped resize/shrink 是否可验收”。后续维护应继续按 target-specific 风险拆测试：control 通用能力不重复造轮子，数据面和 LVM2 行为按 target 差异单独验收。
+维护重点是保持语义闭环：control ABI、target params、table 校验、BIO 映射、系统验收必须同步演进。新 target 或新 BIO 语义应先定义 table/status/deps、数据面映射、flush 行为和验收脚本，再接入用户态入口。
