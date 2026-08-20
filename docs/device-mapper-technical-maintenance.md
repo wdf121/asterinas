@@ -374,6 +374,8 @@ DmDevice::enqueue
         ↓
 active DmTable::enqueue
         ↓
+DmTarget::Linear(...)
+        ↓
 LinearTarget::map_sector
         ↓
 SubmittedBio::remap_sid_start
@@ -386,9 +388,9 @@ backing BlockDevice::enqueue
 ```text
 logical range
         ↓
-找到唯一 LinearTarget
+找到唯一 DmTarget
         ↓
-计算 backing_start + logical_offset
+按 target kind 映射；当前只支持 LinearTarget
         ↓
 remap 原 BIO
         ↓
@@ -422,7 +424,7 @@ flush 是特殊 BIO，不按普通 sector remap 处理。
 ```text
 Flush BIO 到达 DmTable
         ↓
-遍历所有 linear target
+遍历所有 target
         ↓
 按 backing DeviceId 去重
         ↓
@@ -511,10 +513,10 @@ DM table 和数据面转发层。
 
 作用：
 
-- 保存一组 linear target；
+- 保存一组 enum-based target，当前唯一 enabled variant 是 `DmTarget::Linear`；
 - 验证 table 从 logical sector 0 开始；
 - 验证 target 连续无空洞；
-- 计算 mapper capacity，结果等于所有连续 linear target 的总 logical sector 数；
+- 计算 mapper capacity，结果等于所有连续 target 的总 logical sector 数；
 - 聚合 backing queue limit，目前只取 `max_nr_segments_per_bio` 的最小值；
 - 返回 backing deps；
 - 普通 BIO remap；
@@ -531,7 +533,7 @@ DM table 和数据面转发层。
 
 target 模块入口。
 
-当前只声明 linear target。后续新增 target 时，不能只在这里加模块，还必须同步修改 table 表示、ioctl parser、target version、status/deps 和测试。
+当前导出最小 `DmTarget` enum，但唯一 variant 仍是 `DmTarget::Linear(LinearTarget)`。后续新增 target 时，不能只在这里加模块，还必须同步修改 ioctl parser、target version、status/deps、BIO split/remap 和测试。
 
 #### [linear.rs](file:///root/atom/asterinas/kernel/comps/device-mapper/src/target/linear.rs)
 
