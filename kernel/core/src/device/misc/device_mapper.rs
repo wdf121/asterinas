@@ -11,7 +11,11 @@ use alloc::{format, vec};
 use aster_block::{BlockDevice, id::Sid, lookup_lease};
 use aster_device_mapper::{
     DmDevice, DmError, DmManager, DmTable, TableError,
-    target::{DmTarget, linear::LinearTarget},
+    target::{
+        DmTarget,
+        linear::LinearTarget,
+        striped::{StripedTarget, StripedTargetParams},
+    },
 };
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::mm::VmIo;
@@ -71,9 +75,8 @@ const TARGET_VERSIONS: &[TargetVersion] = &[
         name: "linear",
         version: [1, 4, 0],
     },
-    // LVM2 在创建 LV 前会检查 striped target 是否可用，即使单盘 VG 最终
-    // 使用 linear target（use_linear_target=1，默认开启）。此处仅声明版本
-    // 以通过 LVM2 预检；table_load 仍会拒绝 striped target 的实际加载。
+    // LVM2 在创建 LV 前会检查 striped target 是否可用；当前支持 striped
+    // table load/status/deps 控制面，BIO 数据面仍会拒绝含 striped 的 table。
     TargetVersion {
         name: "striped",
         version: [1, 6, 0],
@@ -568,42 +571,76 @@ fn table_load_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
         let next_spec = validate_target_spec_next(cursor, next, buffer.len())?;
         let target_type =
             required_c_string(buffer, cursor + 24, DM_TARGET_TYPE_LEN, "target 类型")?;
-        if target_type != "linear" {
-            return_errno_with_message!(Errno::EINVAL, "当前仅支持 linear target");
-        }
-        let params = c_string_until(buffer, spec_end, next_spec, "linear 参数")?;
-        let (backing_id, backing_start) = parse_linear_params(&params)?;
-        ostd::info!(
-            "[dm] table_load: name={}, backing={}:{}, start_sector={}, logical_start={}, length={}",
-            device.name(),
-            backing_id.major().get(),
-            backing_id.minor().get(),
-            backing_start,
-            logical_start,
-            length
-        );
-        let backing = lookup_lease(backing_id).ok_or_else(|| {
-            ostd::warn!(
-                "[dm] lookup_lease failed for {}:{}, registered devices: {:?}",
-                backing_id.major().get(),
-                backing_id.minor().get(),
-                aster_block::list()
-            );
-            Error::with_message(Errno::ENODEV, "linear backing 设备不存在或正在移除")
-        })?;
-        targets.push(
-            LinearTarget::new(
-                Sid::new(logical_start),
-                length,
-                Sid::new(backing_start),
-                backing,
-            )
-            .map_err(map_table_error)?,
-        );
+        let params = c_string_until(buffer, spec_end, next_spec, "target 参数")?;
+        let target = match target_type.as_str() {
+            "linear" => {
+                let (backing_id, backing_start) = parse_linear_params(&params)?;
+                ostd::info!(
+                    "[dm] table_load: name={}, type=linear, backing={}:{}, start_sector={}, logical_start={}, length={}",
+                    device.name(),
+                    backing_id.major().get(),
+                    backing_id.minor().get(),
+                    backing_start,
+                    logical_start,
+                    length
+                );
+                let backing = lookup_lease(backing_id).ok_or_else(|| {
+                    ostd::warn!(
+                        "[dm] lookup_lease failed for {}:{}, registered devices: {:?}",
+                        backing_id.major().get(),
+                        backing_id.minor().get(),
+                        aster_block::list()
+                    );
+                    Error::with_message(Errno::ENODEV, "linear backing 设备不存在或正在移除")
+                })?;
+                DmTarget::Linear(
+                    LinearTarget::new(
+                        Sid::new(logical_start),
+                        length,
+                        Sid::new(backing_start),
+                        backing,
+                    )
+                    .map_err(map_table_error)?,
+                )
+            }
+            "striped" => {
+                let striped_params =
+                    StripedTargetParams::parse(&params).map_err(map_table_error)?;
+                let mut backings = Vec::new();
+                for (stripe_index, stripe) in striped_params.stripes().iter().enumerate() {
+                    let backing_id = stripe.id();
+                    let backing = lookup_lease(backing_id).ok_or_else(|| {
+                        ostd::warn!(
+                            "[dm] lookup_lease failed for striped stripe {} {}:{}, registered devices: {:?}",
+                            stripe_index,
+                            backing_id.major().get(),
+                            backing_id.minor().get(),
+                            aster_block::list()
+                        );
+                        Error::with_message(Errno::ENODEV, "striped backing 设备不存在或正在移除")
+                    })?;
+                    backings.push(backing);
+                }
+                ostd::info!(
+                    "[dm] table_load: name={}, type=striped, stripe_count={}, chunk_size={}, logical_start={}, length={}",
+                    device.name(),
+                    striped_params.stripe_count(),
+                    striped_params.chunk_size(),
+                    logical_start,
+                    length
+                );
+                DmTarget::Striped(
+                    StripedTarget::new(Sid::new(logical_start), length, striped_params, backings)
+                        .map_err(map_table_error)?,
+                )
+            }
+            _ => return_errno_with_message!(Errno::EINVAL, "不支持的 target 类型"),
+        };
+        targets.push(target);
         cursor = next_spec;
     }
 
-    let table = Arc::new(DmTable::new_linear(targets).map_err(map_table_error)?);
+    let table = Arc::new(DmTable::new_targets(targets).map_err(map_table_error)?);
     if flags & DM_READONLY_FLAG != 0 {
         device.set_readonly();
     }
@@ -679,17 +716,38 @@ fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
 
     let mut cursor = start;
     for target in table.targets() {
-        let DmTarget::Linear(target) = target;
-        let params = if flags & DM_STATUS_TABLE_FLAG != 0 {
-            let backing = target.backing_id();
-            format!(
-                "{}:{} {}",
-                backing.major().get(),
-                backing.minor().get(),
-                target.backing_start().to_raw()
-            )
-        } else {
-            String::new()
+        let (target_type, params) = match target {
+            DmTarget::Linear(target) => {
+                let params = if flags & DM_STATUS_TABLE_FLAG != 0 {
+                    let backing = target.backing_id();
+                    format!(
+                        "{}:{} {}",
+                        backing.major().get(),
+                        backing.minor().get(),
+                        target.backing_start().to_raw()
+                    )
+                } else {
+                    String::new()
+                };
+                ("linear", params)
+            }
+            DmTarget::Striped(target) => {
+                let params = if flags & DM_STATUS_TABLE_FLAG != 0 {
+                    let mut params = format!("{} {}", target.stripe_count(), target.chunk_size());
+                    target.for_each_stripe(|backing, backing_start| {
+                        params.push_str(&format!(
+                            " {}:{} {}",
+                            backing.major().get(),
+                            backing.minor().get(),
+                            backing_start.to_raw()
+                        ));
+                    });
+                    params
+                } else {
+                    String::new()
+                };
+                ("striped", params)
+            }
         };
         let record_len = table_status_record_len(params.len())?;
         if available_from(buffer, cursor) < record_len {
@@ -700,7 +758,7 @@ fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
         write_u64(buffer, cursor + 8, target.length())?;
         write_u32(buffer, cursor + 16, 0)?;
         write_u32(buffer, cursor + 20, cursor + record_len - start)?;
-        write_c_string_fixed(buffer, cursor + 24, DM_TARGET_TYPE_LEN, "linear")?;
+        write_c_string_fixed(buffer, cursor + 24, DM_TARGET_TYPE_LEN, target_type)?;
         write_c_string(buffer, cursor + DM_TARGET_SPEC_SIZE, &params)?;
         cursor += record_len;
     }
@@ -1212,8 +1270,36 @@ mod tests {
         )
     }
 
+    fn single_striped_table(length: u64, params: &str, backing_minors: &[u32]) -> Arc<DmTable> {
+        let backings = backing_minors
+            .iter()
+            .map(|minor| status_backing_lease(*minor))
+            .collect();
+        Arc::new(
+            DmTable::new_targets(vec![DmTarget::Striped(
+                StripedTarget::new(
+                    Sid::new(0),
+                    length,
+                    StripedTargetParams::parse(params).unwrap(),
+                    backings,
+                )
+                .unwrap(),
+            )])
+            .unwrap(),
+        )
+    }
+
     fn linear_target(table: &DmTable, index: usize) -> &LinearTarget {
-        let DmTarget::Linear(target) = &table.targets()[index];
+        let DmTarget::Linear(target) = &table.targets()[index] else {
+            panic!("expected linear target");
+        };
+        target
+    }
+
+    fn striped_target(table: &DmTable, index: usize) -> &StripedTarget {
+        let DmTarget::Striped(target) = &table.targets()[index] else {
+            panic!("expected striped target");
+        };
         target
     }
 
@@ -1515,6 +1601,91 @@ mod tests {
     }
 
     #[ktest]
+    fn reports_striped_table_status_with_canonical_params() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-striped-table-status-test".to_string(), None, None)
+            .unwrap();
+        let params = "2 4 1:1 10 1:2 20";
+        let record_len = table_status_record_len(params.len()).unwrap();
+        device.load_table(single_striped_table(16, params, &[1, 2]));
+
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + record_len);
+        write_u32(
+            &mut buffer,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG | DM_STATUS_TABLE_FLAG,
+        )
+        .unwrap();
+        table_status_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 1);
+        assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
+        assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 8).unwrap(), 16);
+        assert_eq!(
+            read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 20).unwrap(),
+            record_len as u32
+        );
+        assert_eq!(
+            c_string_until(
+                &buffer,
+                DM_IOCTL_HEADER_SIZE + 24,
+                DM_IOCTL_HEADER_SIZE + 40,
+                "target 类型"
+            )
+            .unwrap(),
+            "striped"
+        );
+        assert_eq!(
+            c_string_until(
+                &buffer,
+                DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + record_len,
+                "target 参数"
+            )
+            .unwrap(),
+            params
+        );
+    }
+
+    #[ktest]
+    fn reports_striped_info_status_with_empty_params() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-striped-info-status-test".to_string(), None, None)
+            .unwrap();
+        device.load_table(single_striped_table(16, "2 4 1:1 0 1:2 0", &[1, 2]));
+
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        write_u32(&mut buffer, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        table_status_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 1);
+        assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 8).unwrap(), 16);
+        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 20).unwrap(), 48);
+        assert_eq!(
+            c_string_until(
+                &buffer,
+                DM_IOCTL_HEADER_SIZE + 24,
+                DM_IOCTL_HEADER_SIZE + 40,
+                "target 类型"
+            )
+            .unwrap(),
+            "striped"
+        );
+        assert_eq!(
+            c_string_until(
+                &buffer,
+                DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + 48,
+                "target 参数"
+            )
+            .unwrap(),
+            ""
+        );
+    }
+
+    #[ktest]
     fn reports_table_deps_with_duplicate_backing_devices_deduplicated() {
         let manager = DmManager::new().unwrap();
         let device = manager
@@ -1526,6 +1697,47 @@ mod tests {
             LinearTarget::new(Sid::new(0), 4, Sid::new(100), first.clone()).unwrap(),
             LinearTarget::new(Sid::new(4), 4, Sid::new(104), first.clone()).unwrap(),
             LinearTarget::new(Sid::new(8), 4, Sid::new(200), second.clone()).unwrap(),
+        ])
+        .unwrap();
+        device.load_table(Arc::new(table));
+
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 24);
+        write_u32(&mut buffer, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        table_deps_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE).unwrap(), 2);
+        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 4).unwrap(), 0);
+        assert_eq!(
+            read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 8).unwrap(),
+            first.id().as_encoded_u64()
+        );
+        assert_eq!(
+            read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 16).unwrap(),
+            second.id().as_encoded_u64()
+        );
+    }
+
+    #[ktest]
+    fn reports_table_deps_from_mixed_linear_and_striped_targets() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-mixed-striped-deps-test".to_string(), None, None)
+            .unwrap();
+        let first = status_backing_lease(1);
+        let second = status_backing_lease(2);
+        let table = DmTable::new_targets(vec![
+            DmTarget::Linear(
+                LinearTarget::new(Sid::new(0), 4, Sid::new(100), first.clone()).unwrap(),
+            ),
+            DmTarget::Striped(
+                StripedTarget::new(
+                    Sid::new(4),
+                    16,
+                    StripedTargetParams::parse("2 4 1:1 0 1:2 0").unwrap(),
+                    vec![first.clone(), second.clone()],
+                )
+                .unwrap(),
+            ),
         ])
         .unwrap();
         device.load_table(Arc::new(table));
@@ -1564,6 +1776,32 @@ mod tests {
         table_status_for_device(&mut buffer, &device).unwrap();
 
         assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 2);
+        assert_ne!(
+            read_u32(&buffer, OFF_FLAGS).unwrap() & DM_BUFFER_FULL_FLAG,
+            0
+        );
+    }
+
+    #[ktest]
+    fn marks_striped_table_status_buffer_full_when_params_do_not_fit() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-striped-status-buffer-full-test".to_string(), None, None)
+            .unwrap();
+        let params = "2 4 1:1 0 1:2 0";
+        let record_len = table_status_record_len(params.len()).unwrap();
+        device.load_table(single_striped_table(16, params, &[1, 2]));
+
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + record_len - 1);
+        write_u32(
+            &mut buffer,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG | DM_STATUS_TABLE_FLAG,
+        )
+        .unwrap();
+        table_status_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 1);
         assert_ne!(
             read_u32(&buffer, OFF_FLAGS).unwrap() & DM_BUFFER_FULL_FLAG,
             0
@@ -2297,28 +2535,132 @@ mod tests {
     }
 
     #[ktest]
-    fn rejects_unsupported_table_targets_without_changing_device_state() {
-        for target_type in ["striped", "unknown"] {
-            let manager = DmManager::new().unwrap();
-            let device = manager
-                .create(format!("dm-unsupported-{target_type}-test"), None, None)
-                .unwrap();
-            let params = "2 128 510:220 0 510:221 0";
-            let mut buffer =
-                test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
-            write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
-            write_target_spec(
-                &mut buffer,
-                DM_IOCTL_HEADER_SIZE,
-                0,
-                8,
-                0,
-                target_type,
-                params,
-            );
+    fn loads_single_striped_target_through_ioctl() {
+        let first = StatusBacking::new_with_major(510, 220);
+        let second = StatusBacking::new_with_major(510, 221);
+        let first_id = first.id();
+        let second_id = second.id();
+        register(first as Arc<dyn BlockDevice>).unwrap();
+        register(second as Arc<dyn BlockDevice>).unwrap();
 
-            assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
-        }
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-striped-load-test".to_string(), None, None)
+            .unwrap();
+        let params = "2 128 510:220 0 510:221 0";
+        let mut buffer =
+            test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+        write_target_spec(
+            &mut buffer,
+            DM_IOCTL_HEADER_SIZE,
+            0,
+            300,
+            0,
+            "striped",
+            params,
+        );
+
+        table_load_for_device(&mut buffer, &device).unwrap();
+        let table = device.inactive_table().unwrap();
+        assert_eq!(table.target_count(), 1);
+        let target = striped_target(&table, 0);
+        assert_eq!(target.logical_range(), &(Sid::new(0)..Sid::new(300)));
+        assert_eq!(target.stripe_count(), 2);
+        assert_eq!(target.chunk_size(), 128);
+        let mut ids = Vec::new();
+        target.for_each_backing_id(|id| ids.push(id));
+        assert_eq!(ids, vec![first_id, second_id]);
+
+        drop(table);
+        device.clear_inactive_table().unwrap();
+        unregister(first_id).unwrap();
+        unregister(second_id).unwrap();
+    }
+
+    #[ktest]
+    fn loads_mixed_linear_and_striped_targets_through_ioctl() {
+        let linear = StatusBacking::new_with_major(510, 222);
+        let striped_first = StatusBacking::new_with_major(510, 223);
+        let striped_second = StatusBacking::new_with_major(510, 224);
+        let linear_id = linear.id();
+        let striped_first_id = striped_first.id();
+        let striped_second_id = striped_second.id();
+        register(linear as Arc<dyn BlockDevice>).unwrap();
+        register(striped_first as Arc<dyn BlockDevice>).unwrap();
+        register(striped_second as Arc<dyn BlockDevice>).unwrap();
+
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-mixed-striped-load-test".to_string(), None, None)
+            .unwrap();
+        let linear_params = "510:222 100";
+        let striped_params = "2 4 510:223 0 510:224 0";
+        let first_next = table_status_record_len(linear_params.len()).unwrap();
+        let mut buffer = test_buffer(
+            DM_IOCTL_HEADER_SIZE
+                + first_next
+                + table_status_record_len(striped_params.len()).unwrap(),
+        );
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 2).unwrap();
+        write_linear_target_spec(
+            &mut buffer,
+            DM_IOCTL_HEADER_SIZE,
+            0,
+            4,
+            first_next as u32,
+            linear_params,
+        );
+        write_target_spec(
+            &mut buffer,
+            DM_IOCTL_HEADER_SIZE + first_next,
+            4,
+            16,
+            0,
+            "striped",
+            striped_params,
+        );
+
+        table_load_for_device(&mut buffer, &device).unwrap();
+        let table = device.inactive_table().unwrap();
+        assert_eq!(table.target_count(), 2);
+        assert_eq!(table.length(), 20);
+        assert_eq!(linear_target(&table, 0).backing_id(), linear_id);
+        let striped = striped_target(&table, 1);
+        assert_eq!(striped.logical_range(), &(Sid::new(4)..Sid::new(20)));
+        let mut ids = Vec::new();
+        striped.for_each_backing_id(|id| ids.push(id));
+        assert_eq!(ids, vec![striped_first_id, striped_second_id]);
+
+        drop(table);
+        device.clear_inactive_table().unwrap();
+        unregister(linear_id).unwrap();
+        unregister(striped_first_id).unwrap();
+        unregister(striped_second_id).unwrap();
+    }
+
+    #[ktest]
+    fn rejects_unsupported_table_targets_without_changing_device_state() {
+        let target_type = "unknown";
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create(format!("dm-unsupported-{target_type}-test"), None, None)
+            .unwrap();
+        let params = "2 128 510:220 0 510:221 0";
+        let mut buffer =
+            test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+        write_target_spec(
+            &mut buffer,
+            DM_IOCTL_HEADER_SIZE,
+            0,
+            8,
+            0,
+            target_type,
+            params,
+        );
+
+        assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
     }
 
     #[ktest]
@@ -2336,6 +2678,104 @@ mod tests {
 
         assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::ENODEV);
         assert!(!device.is_readonly());
+    }
+
+    #[ktest]
+    fn rejects_missing_striped_backing_without_setting_readonly_or_table() {
+        let first = StatusBacking::new_with_major(510, 225);
+        let first_id = first.id();
+        register(first as Arc<dyn BlockDevice>).unwrap();
+
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-missing-striped-backing-test".to_string(), None, None)
+            .unwrap();
+        let params = "2 128 510:225 0 510:226 0";
+        let mut buffer =
+            test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+        write_u32(&mut buffer, OFF_FLAGS, DM_READONLY_FLAG).unwrap();
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+        write_target_spec(
+            &mut buffer,
+            DM_IOCTL_HEADER_SIZE,
+            0,
+            256,
+            0,
+            "striped",
+            params,
+        );
+
+        assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::ENODEV);
+        assert!(!device.is_readonly());
+
+        unregister(first_id).unwrap();
+    }
+
+    #[ktest]
+    fn rejects_invalid_striped_params_without_changing_device_state() {
+        for (name, params, length) in [
+            ("few-fields", "2 128 510:227 0", 8),
+            ("extra-fields", "1 128 510:227 0 extra", 8),
+            ("zero-stripes", "0 128", 8),
+            ("zero-chunk", "1 0 510:227 0", 8),
+            ("bad-dev", "1 128 bad 0", 8),
+            ("bad-start", "1 128 510:227 -1", 8),
+        ] {
+            let manager = DmManager::new().unwrap();
+            let device = manager
+                .create(format!("dm-invalid-striped-{name}-test"), None, None)
+                .unwrap();
+            let mut buffer =
+                test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+            write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+            write_target_spec(
+                &mut buffer,
+                DM_IOCTL_HEADER_SIZE,
+                0,
+                length,
+                0,
+                "striped",
+                params,
+            );
+
+            assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
+        }
+    }
+
+    #[ktest]
+    fn rejects_striped_range_errors_through_ioctl_without_changing_device_state() {
+        let backing = StatusBacking::new_with_major(510, 227);
+        let backing_id = backing.id();
+        register(backing as Arc<dyn BlockDevice>).unwrap();
+
+        for (name, start, length, backing_start) in [
+            ("zero", 0, 0, 0),
+            ("logical-overflow", u64::MAX, 1, 0),
+            ("backing-overflow", 0, 1, u64::MAX),
+            ("backing-out-of-bounds", 0, 2_048, 0),
+        ] {
+            let manager = DmManager::new().unwrap();
+            let device = manager
+                .create(format!("dm-striped-range-{name}-test"), None, None)
+                .unwrap();
+            let params = format!("1 128 510:227 {backing_start}");
+            let mut buffer =
+                test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+            write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+            write_target_spec(
+                &mut buffer,
+                DM_IOCTL_HEADER_SIZE,
+                start,
+                length,
+                0,
+                "striped",
+                &params,
+            );
+
+            assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
+        }
+
+        unregister(backing_id).unwrap();
     }
 
     #[ktest]

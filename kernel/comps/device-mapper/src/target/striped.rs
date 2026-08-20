@@ -296,10 +296,28 @@ impl StripedTarget {
             .map(|stripe| stripe.backing_id)
     }
 
+    pub fn for_each_backing_id(&self, mut f: impl FnMut(DeviceId)) {
+        for stripe in &self.stripes {
+            f(stripe.backing_id);
+        }
+    }
+
+    pub fn for_each_stripe(&self, mut f: impl FnMut(DeviceId, Sid)) {
+        for stripe in &self.stripes {
+            f(stripe.backing_id, stripe.backing_start);
+        }
+    }
+
     pub fn backing(&self, stripe_index: usize) -> Option<&dyn BlockDevice> {
         self.stripes
             .get(stripe_index)
             .map(|stripe| stripe.backing.device().as_ref())
+    }
+
+    pub fn for_each_backing<'a>(&'a self, mut f: impl FnMut(&'a dyn BlockDevice)) {
+        for stripe in &self.stripes {
+            f(stripe.backing.device().as_ref());
+        }
     }
 
     pub fn map_sector(&self, logical: Sid) -> Option<StripedSectorMap> {
@@ -668,6 +686,25 @@ mod tests {
                 .unwrap_err(),
             TableError::BackingRangeOverflow
         );
+    }
+
+    #[ktest]
+    fn iterates_all_striped_backings() {
+        let target = two_stripe_target();
+
+        let mut ids = Vec::new();
+        target.for_each_backing_id(|id| ids.push(id.minor().get()));
+        assert_eq!(ids, vec![1, 2]);
+
+        let mut backing_ids = Vec::new();
+        target.for_each_backing(|backing| backing_ids.push(backing.id().minor().get()));
+        assert_eq!(backing_ids, vec![1, 2]);
+
+        let mut stripes = Vec::new();
+        target.for_each_stripe(|id, backing_start| {
+            stripes.push((id.minor().get(), backing_start.to_raw()))
+        });
+        assert_eq!(stripes, vec![(1, 100), (2, 200)]);
     }
 
     #[ktest]
