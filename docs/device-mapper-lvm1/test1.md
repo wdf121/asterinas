@@ -2,7 +2,7 @@
 
 本文档汇总当前 Device Mapper / LVM2 相关一键测试脚本的用途、运行方法、日志位置和通过标准。
 
-所有自建 shell 脚本统一放在仓库根目录下的 `myshell/`，linear 自动化脚本位于 `myshell/dm_linear/`：
+所有自建 shell 脚本统一放在仓库根目录下的 `myshell/`，linear 自动化脚本位于 `myshell/dm_linear/`，striped 自动化脚本位于 `myshell/dm_striped/`：
 
 ```text
 myshell/br.sh
@@ -11,6 +11,8 @@ myshell/dm_linear/run_cross_target_bio_regression.sh
 myshell/dm_linear/run_cross_pv_large_write_test.sh
 myshell/dm_linear/run_lvm2_resize_test.sh
 myshell/dm_linear/run_linear_full_flow_test.sh
+myshell/dm_striped/run_raw_striped_bio_test.sh
+myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh
 ```
 
 这些脚本都应该在 Asterinas 开发容器内的 `/root/asterinas` 目录运行。
@@ -19,14 +21,16 @@ myshell/dm_linear/run_linear_full_flow_test.sh
 
 ## 1. 测试分层逻辑
 
-当前 linear 测试按从小到大分三类分脚本，另有一个单 guest 完整流程脚本：
+当前 linear 测试按从小到大分三类分脚本，另有一个单 guest 完整流程脚本；striped 当前提供 raw BIO 验收脚本和 LVM2 create + 文件 I/O + reboot 恢复脚本：
 
 ```text
 第一层：raw BIO 边界回归
-  验证单个 4 KiB BIO 跨两个 DM target 时能 split/remap/complete。
+  linear：验证单个 4 KiB BIO 跨两个 DM target 时能 split/remap/complete。
+  striped：验证 2-way striped mapper 按 chunk split/remap，并检查 backing 数据分布。
 
-第二层：跨 PV 大文件数据面
-  验证 ext2 + LVM2 + DM 多段 linear table 上的大文件读写和重启恢复。
+第二层：LVM2 文件 I/O 与重启恢复
+  linear：验证 ext2 + LVM2 + DM 多段 linear table 上的大文件读写和重启恢复。
+  striped：验证 LVM2 生成 2-way striped table、ext2 文件读写和重启恢复。
 
 第三层：完整 LVM2 扩缩容流程
   验证 LV 创建、active 扩容、resize2fs、缩容和重启恢复。
@@ -39,6 +43,8 @@ myshell/dm_linear/run_linear_full_flow_test.sh
 
 ```bash
 myshell/dm_linear/run_cross_target_bio_regression.sh
+myshell/dm_striped/run_raw_striped_bio_test.sh
+myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh
 myshell/dm_linear/run_cross_pv_large_write_test.sh
 myshell/dm_linear/run_lvm2_resize_test.sh
 myshell/dm_linear/run_linear_full_flow_test.sh
@@ -47,7 +53,9 @@ myshell/dm_linear/run_linear_full_flow_test.sh
 这样排的原因：
 
 - BIO 回归最小，失败时能最快定位 DM split/remap/completion；
-- 大文件测试验证真实跨 PV 数据面；
+- raw striped 脚本直接验证 striped chunk split/remap 和 backing 数据分布；
+- LVM2 striped 脚本验证真实 LVM2 table、ext2 文件 I/O 和重启恢复；
+- 大文件测试验证真实跨 PV linear 数据面；
 - LVM2 扩缩容测试覆盖重启恢复，适合作分层验收；
 - full flow 验证一个 guest 内的 linear 用户态流程能连续接好。
 
@@ -398,7 +406,111 @@ HOST_PASS_DM_LINEAR_FULL_FLOW
 
 ---
 
-## 8. 手工入口：`myshell/br.sh`
+## 8. raw striped BIO 验收：`myshell/dm_striped/run_raw_striped_bio_test.sh`
+
+用途：一键测试 raw `dm_striped` mapper 的 chunk split/remap 和 backing 数据分布。
+
+运行：
+
+```bash
+myshell/dm_striped/run_raw_striped_bio_test.sh
+```
+
+也可以通过组合入口运行：
+
+```bash
+myshell/run_dm_system_tests.sh --striped
+```
+
+默认日志：
+
+```text
+/tmp/dm-striped-raw-bio-test.log
+```
+
+测试内容：
+
+```text
+两块 512 MiB 测试盘
+→ dmsetup targets 确认 striped target 可见
+→ dmsetup create dm_striped_raw
+→ table 为 2-way striped、chunk size 4 sectors、总长 16 sectors
+→ 写入 8 KiB payload，覆盖四个 2 KiB stripe chunk
+→ 从 mapper 读回 8 KiB 并校验 md5
+→ 校验第一块 backing 包含 chunk A + C
+→ 校验第二块 backing 包含 chunk B + D
+→ 查询 table/status/deps
+```
+
+通过标记：
+
+```text
+TEST_PASS_DM_STRIPED_RAW_BIO
+HOST_PASS_DM_STRIPED_RAW_BIO
+```
+
+这个脚本只验证 raw `dmsetup create ... striped ...` 路径，不做 mkfs/mount，也不覆盖 LVM2 `lvcreate --type striped`。
+
+---
+
+## 9. LVM2 striped I/O 与重启恢复：`myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh`
+
+用途：一键测试 LVM2 创建 2-way striped LV 后，ext2 文件 I/O 和重启恢复路径是否可用。
+
+运行：
+
+```bash
+myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh
+```
+
+也可以通过组合入口运行：
+
+```bash
+myshell/run_dm_system_tests.sh --striped-lvm2
+```
+
+默认日志：
+
+```text
+/tmp/dm-striped-lvm2-io-reboot-test.log
+```
+
+测试内容：
+
+```text
+first guest:
+  两块 512 MiB 测试盘
+  → dmsetup targets 确认 striped target 可见
+  → pvcreate / vgcreate
+  → lvcreate --type striped -i 2 -I 4K -L 256M
+  → dmsetup table/status/deps 确认为 2-way striped
+  → mkfs.ext2 + mount
+  → 写入 64 MiB 文件和 marker 文件
+  → md5sum -c
+  → umount + vgchange -an
+
+second guest:
+  → vgscan --mknodes + vgchange -ay
+  → dmsetup table/status/deps 再次确认为 2-way striped
+  → readonly mount
+  → md5sum -c
+  → 读取 marker 文件
+  → umount + vgchange -an
+```
+
+通过标记：
+
+```text
+TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_FIRST
+TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_SECOND
+HOST_PASS_DM_STRIPED_LVM2_IO_REBOOT
+```
+
+这个脚本验证 LVM2 生成 striped table 后的文件 I/O 和 reboot recovery；不做 striped resize/shrink，也不复刻 raw 脚本中的 backing A+C/B+D 物理分布校验。
+
+---
+
+## 10. 手工入口：`myshell/br.sh`
 
 用途：手工启动 NixOS，并显式附加 DM 测试盘。默认附加两块，也可以通过 `DM_TEST_IMAGES` 附加更多块。
 
@@ -461,7 +573,7 @@ poweroff
 
 ---
 
-## 9. 常用环境变量
+## 11. 常用环境变量
 
 linear 自动化测试脚本通用：
 
@@ -494,12 +606,22 @@ LVM2_RESIZE_LOG=/tmp/lvm2-resize-test.log
 CROSS_PV_LARGE_WRITE_LOG=/tmp/cross-pv-large-write-test.log
 CROSS_TARGET_BIO_LOG=/tmp/cross-target-bio-regression.log
 DM_LINEAR_FULL_FLOW_LOG=/tmp/dm-linear-full-flow-test.log
+DM_STRIPED_RAW_BIO_LOG=/tmp/dm-striped-raw-bio-test.log
+DM_STRIPED_LVM2_IO_REBOOT_LOG=/tmp/dm-striped-lvm2-io-reboot-test.log
+```
+
+LVM2 striped 脚本还支持调整 LV、文件和 stripe chunk 大小：
+
+```bash
+STRIPED_LV_MIB=256
+STRIPED_FILE_MIB=64
+STRIPED_CHUNK_KIB=4
 ```
 
 如果 guest 自动登录较慢，可以加大 root shell 等待上限：
 
 ```bash
-GUEST_READY_TIMEOUT=240 myshell/dm_linear/run_lvm2_resize_test.sh
+GUEST_READY_TIMEOUT=300 myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh
 ```
 
 如果要保留测试盘复查：
@@ -510,7 +632,7 @@ RESET_DM_TEST_IMAGES=0 myshell/dm_linear/run_cross_pv_large_write_test.sh
 
 ---
 
-## 10. 失败时先看什么
+## 12. 失败时先看什么
 
 先看 host 最终标记：
 
@@ -540,7 +662,7 @@ TEST_FAIL_...
 
 ---
 
-## 11. 和手工排查文档的关系
+## 13. 和手工排查文档的关系
 
 LVM2 扩缩容的手工排查步骤保留在：
 
@@ -548,12 +670,14 @@ LVM2 扩缩容的手工排查步骤保留在：
 docs/device-mapper-lvm1/nixos-linear-device-mapper-lvm2-test.md
 ```
 
-linear 系统测试已经脚本化，日常入口是：
+linear 和 striped 系统测试已经脚本化，日常入口是：
 
 ```text
 myshell/run_dm_system_tests.sh --quick
+myshell/run_dm_system_tests.sh --striped
+myshell/run_dm_system_tests.sh --striped-lvm2
 myshell/run_dm_system_tests.sh --lvm2
 myshell/run_dm_system_tests.sh --linear-flow
 ```
 
-需要定位单个层次时，也可以直接运行 `myshell/dm_linear/` 下的分脚本。
+需要定位单个层次时，也可以直接运行 `myshell/dm_linear/` 或 `myshell/dm_striped/` 下的分脚本。
