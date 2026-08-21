@@ -75,8 +75,7 @@ const TARGET_VERSIONS: &[TargetVersion] = &[
         name: "linear",
         version: [1, 4, 0],
     },
-    // LVM2 在创建 LV 前会检查 striped target 是否可用；当前支持 striped
-    // table load/status/deps 控制面，BIO 数据面仍会拒绝含 striped 的 table。
+    // LVM2 在创建 LV 前会检查 striped target 是否可用。
     TargetVersion {
         name: "striped",
         version: [1, 6, 0],
@@ -1168,8 +1167,13 @@ pub(super) fn init_in_first_kthread() {
 #[cfg(ktest)]
 mod tests {
     use alloc::format;
+    use core::ops::Range;
 
-    use aster_block::{BlockDeviceLease, BlockDeviceMeta, register, unregister};
+    use aster_block::{
+        BlockDeviceLease, BlockDeviceMeta,
+        bio::{Bio, BioDirection, BioSegment, BioStatus},
+        register, unregister,
+    };
     use ostd::prelude::ktest;
 
     use super::*;
@@ -1184,6 +1188,7 @@ mod tests {
     #[derive(Debug)]
     struct StatusBacking {
         id: DeviceId,
+        submitted_ranges: Mutex<Vec<Range<Sid>>>,
     }
 
     impl StatusBacking {
@@ -1194,6 +1199,7 @@ mod tests {
         fn new_with_major(major: u16, minor: u32) -> Arc<Self> {
             Arc::new(Self {
                 id: DeviceId::new(MajorId::new(major), MinorId::new(minor)),
+                submitted_ranges: Mutex::new(Vec::new()),
             })
         }
     }
@@ -1203,7 +1209,8 @@ mod tests {
             &self,
             bio: aster_block::bio::SubmittedBio,
         ) -> core::result::Result<(), aster_block::bio::BioEnqueueError> {
-            bio.complete(aster_block::bio::BioStatus::Complete);
+            self.submitted_ranges.lock().push(bio.sid_range().clone());
+            bio.complete(BioStatus::Complete);
             Ok(())
         }
 
@@ -2631,9 +2638,179 @@ mod tests {
         let mut ids = Vec::new();
         striped.for_each_backing_id(|id| ids.push(id));
         assert_eq!(ids, vec![striped_first_id, striped_second_id]);
-
         drop(table);
+
+        let mut device_status = test_buffer(DM_IOCTL_HEADER_SIZE);
+        write_u32(&mut device_status, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        device_status_for_device(&mut device_status, &device).unwrap();
+        assert_eq!(read_u32(&device_status, OFF_TARGET_COUNT).unwrap(), 2);
+        assert_eq!(
+            read_u32(&device_status, OFF_FLAGS).unwrap(),
+            DM_EXISTS_FLAG | DM_INACTIVE_PRESENT_FLAG
+        );
+
+        let linear_status_len = table_status_record_len(linear_params.len()).unwrap();
+        let striped_status_len = table_status_record_len(striped_params.len()).unwrap();
+        let total_status_len = linear_status_len + striped_status_len;
+        let mut status = test_buffer(DM_IOCTL_HEADER_SIZE + total_status_len);
+        write_u32(
+            &mut status,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG | DM_STATUS_TABLE_FLAG,
+        )
+        .unwrap();
+        table_status_for_device(&mut status, &device).unwrap();
+        assert_eq!(read_u32(&status, OFF_TARGET_COUNT).unwrap(), 2);
+        assert_eq!(read_u64(&status, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
+        assert_eq!(read_u64(&status, DM_IOCTL_HEADER_SIZE + 8).unwrap(), 4);
+        assert_eq!(
+            read_u32(&status, DM_IOCTL_HEADER_SIZE + 20).unwrap(),
+            linear_status_len as u32
+        );
+        assert_eq!(
+            c_string_until(
+                &status,
+                DM_IOCTL_HEADER_SIZE + 24,
+                DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                "linear target 类型"
+            )
+            .unwrap(),
+            "linear"
+        );
+        assert_eq!(
+            c_string_until(
+                &status,
+                DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + linear_status_len,
+                "linear target 参数"
+            )
+            .unwrap(),
+            linear_params
+        );
+
+        let striped_record = DM_IOCTL_HEADER_SIZE + linear_status_len;
+        assert_eq!(read_u64(&status, striped_record).unwrap(), 4);
+        assert_eq!(read_u64(&status, striped_record + 8).unwrap(), 16);
+        assert_eq!(
+            read_u32(&status, striped_record + 20).unwrap(),
+            total_status_len as u32
+        );
+        assert_eq!(
+            c_string_until(
+                &status,
+                striped_record + 24,
+                striped_record + DM_TARGET_SPEC_SIZE,
+                "striped target 类型"
+            )
+            .unwrap(),
+            "striped"
+        );
+        assert_eq!(
+            c_string_until(
+                &status,
+                striped_record + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + total_status_len,
+                "striped target 参数"
+            )
+            .unwrap(),
+            striped_params
+        );
+
+        let mut deps = test_buffer(DM_IOCTL_HEADER_SIZE + 32);
+        write_u32(&mut deps, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        table_deps_for_device(&mut deps, &device).unwrap();
+        assert_eq!(read_u32(&deps, DM_IOCTL_HEADER_SIZE).unwrap(), 3);
+        assert_eq!(read_u32(&deps, DM_IOCTL_HEADER_SIZE + 4).unwrap(), 0);
+        assert_eq!(
+            read_u64(&deps, DM_IOCTL_HEADER_SIZE + 8).unwrap(),
+            linear_id.as_encoded_u64()
+        );
+        assert_eq!(
+            read_u64(&deps, DM_IOCTL_HEADER_SIZE + 16).unwrap(),
+            striped_first_id.as_encoded_u64()
+        );
+        assert_eq!(
+            read_u64(&deps, DM_IOCTL_HEADER_SIZE + 24).unwrap(),
+            striped_second_id.as_encoded_u64()
+        );
+
         device.clear_inactive_table().unwrap();
+        unregister(linear_id).unwrap();
+        unregister(striped_first_id).unwrap();
+        unregister(striped_second_id).unwrap();
+    }
+
+    #[ktest]
+    fn submits_bio_across_ioctl_loaded_mixed_linear_and_striped_targets() {
+        let linear = StatusBacking::new_with_major(510, 240);
+        let striped_first = StatusBacking::new_with_major(510, 241);
+        let striped_second = StatusBacking::new_with_major(510, 242);
+        let linear_id = linear.id();
+        let striped_first_id = striped_first.id();
+        let striped_second_id = striped_second.id();
+        register(linear.clone() as Arc<dyn BlockDevice>).unwrap();
+        register(striped_first.clone() as Arc<dyn BlockDevice>).unwrap();
+        register(striped_second.clone() as Arc<dyn BlockDevice>).unwrap();
+
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-mixed-striped-bio-test".to_string(), None, None)
+            .unwrap();
+        let linear_params = "510:240 100";
+        let striped_params = "2 4 510:241 0 510:242 0";
+        let first_next = table_status_record_len(linear_params.len()).unwrap();
+        let mut buffer = test_buffer(
+            DM_IOCTL_HEADER_SIZE
+                + first_next
+                + table_status_record_len(striped_params.len()).unwrap(),
+        );
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 2).unwrap();
+        write_linear_target_spec(
+            &mut buffer,
+            DM_IOCTL_HEADER_SIZE,
+            0,
+            4,
+            first_next as u32,
+            linear_params,
+        );
+        write_target_spec(
+            &mut buffer,
+            DM_IOCTL_HEADER_SIZE + first_next,
+            4,
+            16,
+            0,
+            "striped",
+            striped_params,
+        );
+
+        table_load_for_device(&mut buffer, &device).unwrap();
+        device.resume().unwrap();
+        let read = Bio::new(
+            aster_block::bio::BioType::Read,
+            Sid::new(2),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        );
+
+        assert_eq!(
+            read.submit_and_wait(device.as_ref()).unwrap(),
+            BioStatus::Complete
+        );
+        assert_eq!(
+            *linear.submitted_ranges.lock(),
+            vec![Sid::new(102)..Sid::new(104)]
+        );
+        assert_eq!(
+            *striped_first.submitted_ranges.lock(),
+            vec![Sid::new(0)..Sid::new(4)]
+        );
+        assert_eq!(
+            *striped_second.submitted_ranges.lock(),
+            vec![Sid::new(0)..Sid::new(2)]
+        );
+
+        drop(device);
+        drop(manager);
         unregister(linear_id).unwrap();
         unregister(striped_first_id).unwrap();
         unregister(striped_second_id).unwrap();

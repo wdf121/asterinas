@@ -327,6 +327,8 @@ mod tests {
         last_range: Mutex<Option<Range<Sid>>>,
         submitted_ranges: Mutex<Vec<Range<Sid>>>,
         flush_count: Mutex<usize>,
+        bio_status: BioStatus,
+        fail_bio_enqueue: bool,
         flush_status: BioStatus,
         fail_flush_enqueue: bool,
         max_nr_segments_per_bio: usize,
@@ -334,11 +336,40 @@ mod tests {
 
     impl RecordingBlockDevice {
         fn new(minor: u32) -> Arc<Self> {
-            Self::new_with_options(minor, BioStatus::Complete, false, 8)
+            Self::new_with_options(
+                minor,
+                BioStatus::Complete,
+                false,
+                BioStatus::Complete,
+                false,
+                8,
+            )
         }
 
         fn new_with_queue_limit(minor: u32, max_nr_segments_per_bio: usize) -> Arc<Self> {
-            Self::new_with_options(minor, BioStatus::Complete, false, max_nr_segments_per_bio)
+            Self::new_with_options(
+                minor,
+                BioStatus::Complete,
+                false,
+                BioStatus::Complete,
+                false,
+                max_nr_segments_per_bio,
+            )
+        }
+
+        fn new_failing_enqueue(minor: u32) -> Arc<Self> {
+            Self::new_with_options(
+                minor,
+                BioStatus::Complete,
+                true,
+                BioStatus::Complete,
+                false,
+                8,
+            )
+        }
+
+        fn new_with_bio_status(minor: u32, bio_status: BioStatus) -> Arc<Self> {
+            Self::new_with_options(minor, bio_status, false, BioStatus::Complete, false, 8)
         }
 
         fn new_with_flush(
@@ -346,11 +377,20 @@ mod tests {
             flush_status: BioStatus,
             fail_flush_enqueue: bool,
         ) -> Arc<Self> {
-            Self::new_with_options(minor, flush_status, fail_flush_enqueue, 8)
+            Self::new_with_options(
+                minor,
+                BioStatus::Complete,
+                false,
+                flush_status,
+                fail_flush_enqueue,
+                8,
+            )
         }
 
         fn new_with_options(
             minor: u32,
+            bio_status: BioStatus,
+            fail_bio_enqueue: bool,
             flush_status: BioStatus,
             fail_flush_enqueue: bool,
             max_nr_segments_per_bio: usize,
@@ -360,6 +400,8 @@ mod tests {
                 last_range: Mutex::new(None),
                 submitted_ranges: Mutex::new(Vec::new()),
                 flush_count: Mutex::new(0),
+                bio_status,
+                fail_bio_enqueue,
                 flush_status,
                 fail_flush_enqueue,
                 max_nr_segments_per_bio,
@@ -379,9 +421,12 @@ mod tests {
                 bio.complete(self.flush_status);
                 return Ok(());
             }
+            if self.fail_bio_enqueue {
+                return Err(BioEnqueueError::Refused);
+            }
             *self.last_range.lock() = Some(bio.sid_range().clone());
             self.submitted_ranges.lock().push(bio.sid_range().clone());
-            bio.complete(BioStatus::Complete);
+            bio.complete(self.bio_status);
             Ok(())
         }
 
@@ -463,6 +508,91 @@ mod tests {
         assert_eq!(
             read.submit_and_wait(&TableDevice(table)).unwrap(),
             BioStatus::Complete
+        );
+        assert_eq!(
+            *first.submitted_ranges.lock(),
+            vec![Sid::new(100)..Sid::new(104)]
+        );
+        assert_eq!(
+            *second.submitted_ranges.lock(),
+            vec![Sid::new(200)..Sid::new(204)]
+        );
+    }
+
+    #[ktest]
+    fn reports_io_error_when_split_child_enqueue_fails() {
+        let first = RecordingBlockDevice::new(1);
+        let second = RecordingBlockDevice::new_failing_enqueue(2);
+        let table = Arc::new(
+            DmTable::new_linear(vec![
+                LinearTarget::new(
+                    Sid::new(0),
+                    4,
+                    Sid::new(100),
+                    BlockDeviceLease::new_untracked(first.clone() as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+                LinearTarget::new(
+                    Sid::new(4),
+                    4,
+                    Sid::new(200),
+                    BlockDeviceLease::new_untracked(second.clone() as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        let read = Bio::new(
+            BioType::Read,
+            Sid::new(0),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        );
+
+        assert_eq!(
+            read.submit_and_wait(&TableDevice(table)).unwrap(),
+            BioStatus::IoError
+        );
+        assert_eq!(
+            *first.submitted_ranges.lock(),
+            vec![Sid::new(100)..Sid::new(104)]
+        );
+        assert!(second.submitted_ranges.lock().is_empty());
+    }
+
+    #[ktest]
+    fn reports_io_error_when_split_child_completes_with_error() {
+        let first = RecordingBlockDevice::new(1);
+        let second = RecordingBlockDevice::new_with_bio_status(2, BioStatus::IoError);
+        let table = Arc::new(
+            DmTable::new_linear(vec![
+                LinearTarget::new(
+                    Sid::new(0),
+                    4,
+                    Sid::new(100),
+                    BlockDeviceLease::new_untracked(first.clone() as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+                LinearTarget::new(
+                    Sid::new(4),
+                    4,
+                    Sid::new(200),
+                    BlockDeviceLease::new_untracked(second.clone() as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        let read = Bio::new(
+            BioType::Read,
+            Sid::new(0),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        );
+
+        assert_eq!(
+            read.submit_and_wait(&TableDevice(table)).unwrap(),
+            BioStatus::IoError
         );
         assert_eq!(
             *first.submitted_ranges.lock(),
