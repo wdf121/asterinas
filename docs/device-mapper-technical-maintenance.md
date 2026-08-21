@@ -19,7 +19,7 @@ Asterinas Device Mapper 当前是一个最小 Linux DM 兼容子集，核心目�
 | 数据面 | 支持 Read/Write/Flush；支持 BIO remap、跨 table target split、striped chunk split、completion 聚合。 |
 | flush | 按 backing `DeviceId` 去重，异步 fan-out，聚合完成状态。 |
 | 设备节点 | 支持 `/dev/dm-N` 和 `/dev/mapper/<name>` runtime node。 |
-| LVM2 适配 | 通过 `activation { udev_rules=0 }` 避开 udev 依赖；linear resize、striped create/grow/shrink/reboot 和 striped 3PV/3-way reboot 路径已系统验收。 |
+| LVM2 适配 | 通过 `activation { udev_rules=0 }` 避开 udev 依赖；linear resize、striped create/grow/shrink/reboot、striped 3PV/3-way reboot 和 striped multi-segment reboot 路径已系统验收。 |
 | 测试盘定位 | VirtIO block serial 暴露给 guest，脚本用 locator 稳定定位测试盘。 |
 
 ### 1.2 target 支持矩阵
@@ -27,7 +27,7 @@ Asterinas Device Mapper 当前是一个最小 Linux DM 兼容子集，核心目�
 | Target | 控制面 | 数据面 | 系统验收 | 当前边界 |
 |---|---|---|---|---|
 | `linear` | table load/status/deps 已支持 | Read/Write/Flush 已支持；跨 target BIO split 已支持 | control smoke、raw cross-target BIO、LVM2 large write、LVM2 resize、single-guest full flow 已覆盖 | 不支持 discard/write zeroes；queue stacking 只做现有块层能力的保守汇总。 |
-| `striped` | table load/status/deps 已支持；version 为 `1.6.0` | Read/Write/Flush 已支持；按 stripe chunk 拆分并 remap 到对应 backing | raw BIO 分布验收、LVM2 2-way create/grow/shrink/reboot 验收和 LVM2 3PV/3-way reboot 验收已覆盖 | 不支持 discard/write zeroes；不承诺 Linux striped 周边扩展语义。 |
+| `striped` | table load/status/deps 已支持；version 为 `1.6.0` | Read/Write/Flush 已支持；按 stripe chunk 拆分并 remap 到对应 backing | raw BIO 分布验收、LVM2 2-way create/grow/shrink/reboot、LVM2 3PV/3-way reboot 和 LVM2 multi-segment reboot 验收已覆盖 | 不支持 discard/write zeroes；不承诺 Linux striped 周边扩展语义。 |
 
 ### 1.3 明确不做的内容
 
@@ -488,6 +488,7 @@ docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout 1200 cargo osdk 
 | `--striped` | raw `dmsetup striped` BIO split/remap 和 backing 分布。 |
 | `--striped-lvm2` | LVM2 striped create、ext2 I/O、grow、shrink、reboot recovery。 |
 | `--striped-lvm2-3pv` | LVM2 3PV / 3-way striped create、ext2 I/O、reboot recovery。 |
+| `--striped-lvm2-multi-segment` | LVM2 multi-segment striped create、ext2 I/O、reboot recovery。 |
 | `--lvm2` | linear LVM2 cross-PV large write + resize。 |
 | `--linear-flow` | 单 guest linear control、raw BIO、LVM2 create/extend/shrink/cleanup 全流程。 |
 | `--full` | 当前 linear 全量系统回归；不默认包含 striped。 |
@@ -502,6 +503,7 @@ docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout 1200 cargo osdk 
 - [myshell/dm_striped/run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh)
 - [myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh)
 - [myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh)
+- [myshell/dm_striped/run_lvm2_striped_multi_segment_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_multi_segment_reboot_test.sh)
 
 ### 8.3 当前已通过的系统验收
 
@@ -549,15 +551,33 @@ HOST_PASS_DM_STRIPED_LVM2_3PV_REBOOT
 HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2-3pv
 ```
 
+LVM2 striped multi-segment：
+
+```text
+CHECK_PASS_STRIPED_MS_LVM2_SETUP
+CHECK_PASS_STRIPED_MS_LVM2_INITIAL_TABLE_STATUS_DEPS
+CHECK_PASS_STRIPED_MS_LVM2_BASE_FILE_MD5
+CHECK_PASS_STRIPED_MS_LVM2_EXTENDED_MULTI_SEGMENT_TABLE_STATUS_DEPS
+CHECK_PASS_STRIPED_MS_LVM2_GROW_FILE_MD5
+TEST_PASS_DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT_FIRST
+CHECK_PASS_STRIPED_MS_LVM2_RECOVERED_MULTI_SEGMENT_TABLE_STATUS_DEPS
+CHECK_PASS_STRIPED_MS_LVM2_RECOVERED_FILE_MD5
+TEST_PASS_DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT_SECOND
+HOST_PASS_DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT
+HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2-multi-segment
+```
+
 LVM2 striped table 示例：
 
 ```text
 0 524288 striped 2 8 253:64 2048 253:80 2048
 0 1048576 striped 2 8 253:64 2048 253:80 2048
 0 786432 striped 3 8 253:64 2048 253:80 2048 253:96 2048
+0 524288 striped 2 8 253:64 2048 253:80 2048
+524288 524288 striped 2 8 253:80 264192 253:96 2048
 ```
 
-含义：前两行是 2-way stripe、4 KiB chunk、两个 PV data offset 均为 2048 sectors；第三行是 3-way stripe、4 KiB chunk、三个 PV data offset 均为 2048 sectors。
+含义：前两行是 2-way stripe、4 KiB chunk、两个 PV data offset 均为 2048 sectors；第三行是 3-way stripe、4 KiB chunk、三个 PV data offset 均为 2048 sectors；最后两行是 multi-segment 示例，第一段使用 PV1+PV2，第二段使用 PV2+PV3。
 
 ### 8.4 按改动范围选择验证
 
@@ -570,6 +590,7 @@ LVM2 striped table 示例：
 | LVM2 linear create/resize/recovery | ktest + `myshell/run_dm_system_tests.sh --lvm2` |
 | LVM2 striped create/grow/shrink/recovery | ktest + `myshell/run_dm_system_tests.sh --striped-lvm2` |
 | LVM2 striped stripe_count > 2/recovery | ktest + `myshell/run_dm_system_tests.sh --striped-lvm2-3pv` |
+| LVM2 striped multi-segment/recovery | ktest + `myshell/run_dm_system_tests.sh --striped-lvm2-multi-segment` |
 | 阶段验收或发版前 linear 回归 | ktest + `myshell/run_dm_system_tests.sh --full` |
 
 系统测试前如果内核或 NixOS image 相关内容变更，先执行：
@@ -653,12 +674,11 @@ QEMU 系统测试必须串行运行，避免测试盘和 `test/initramfs/build/e
 
 ## 11. 后续工作
 
-### 11.1 多 segment 组合
+### 11.1 更复杂的 segment 组合
 
-striped table 校验和系统验收应继续覆盖更复杂的 LVM2 generated table：
+striped table 校验和系统验收可继续覆盖更复杂的 LVM2 generated table：
 
-- 多个 striped segment；
-- 不同 segment 使用不同 backing offset；
+- 三段或更多 striped segment；
 - grow/shrink 后 table 保持连续但不强制单行；
 - deps 输出按 backing device 去重且顺序稳定。
 
@@ -682,6 +702,7 @@ striped table 校验和系统验收应继续覆盖更复杂的 LVM2 generated ta
 - `--striped` 验证 raw `dmsetup striped` 的 target-specific 数据分布；
 - `--striped-lvm2` 验证真实 LVM2/libdevmapper、ext2、resize 和 reboot recovery 路径；
 - `--striped-lvm2-3pv` 验证真实 LVM2/libdevmapper、ext2 和 `stripe_count > 2` 的 reboot recovery 路径；
+- `--striped-lvm2-multi-segment` 验证真实 LVM2/libdevmapper、ext2 和多段 striped table 的 reboot recovery 路径；
 - `--full` 保持 linear 全量语义；
 - QEMU/NixOS 系统测试串行运行。
 
