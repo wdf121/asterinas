@@ -2641,26 +2641,62 @@ mod tests {
 
     #[ktest]
     fn rejects_unsupported_table_targets_without_changing_device_state() {
-        let target_type = "unknown";
-        let manager = DmManager::new().unwrap();
-        let device = manager
-            .create(format!("dm-unsupported-{target_type}-test"), None, None)
-            .unwrap();
-        let params = "2 128 510:220 0 510:221 0";
-        let mut buffer =
-            test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
-        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
-        write_target_spec(
-            &mut buffer,
-            DM_IOCTL_HEADER_SIZE,
-            0,
-            8,
-            0,
-            target_type,
-            params,
-        );
+        for target_type in ["unknown", "error", "snapshot"] {
+            let manager = DmManager::new().unwrap();
+            let device = manager
+                .create(format!("dm-unsupported-{target_type}-test"), None, None)
+                .unwrap();
+            let params = "2 128 510:220 0 510:221 0";
+            let mut buffer =
+                test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+            write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+            write_target_spec(
+                &mut buffer,
+                DM_IOCTL_HEADER_SIZE,
+                0,
+                8,
+                0,
+                target_type,
+                params,
+            );
 
-        assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
+            assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
+        }
+    }
+
+    #[ktest]
+    fn rejects_invalid_target_type_strings_without_changing_device_state() {
+        let params = "510:230 0";
+        for name in ["empty", "missing-nul"] {
+            let manager = DmManager::new().unwrap();
+            let device = manager
+                .create(format!("dm-invalid-target-type-{name}-test"), None, None)
+                .unwrap();
+            let mut buffer =
+                test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+            write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+            write_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 4, 0, "linear", params);
+
+            match name {
+                "empty" => {
+                    write_c_string_fixed(
+                        &mut buffer,
+                        DM_IOCTL_HEADER_SIZE + 24,
+                        DM_TARGET_TYPE_LEN,
+                        "",
+                    )
+                    .unwrap();
+                }
+                "missing-nul" => {
+                    buffer
+                        [DM_IOCTL_HEADER_SIZE + 24..DM_IOCTL_HEADER_SIZE + 24 + DM_TARGET_TYPE_LEN]
+                        .fill(b'x');
+                }
+                _ => unreachable!(),
+            }
+
+            assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
+        }
     }
 
     #[ktest]
@@ -2718,6 +2754,8 @@ mod tests {
             ("extra-fields", "1 128 510:227 0 extra", 8),
             ("zero-stripes", "0 128", 8),
             ("zero-chunk", "1 0 510:227 0", 8),
+            ("bad-stripe-count", "many 128 510:227 0", 8),
+            ("bad-chunk-size", "1 many 510:227 0", 8),
             ("bad-dev", "1 128 bad 0", 8),
             ("bad-start", "1 128 510:227 -1", 8),
         ] {
@@ -2855,6 +2893,9 @@ mod tests {
             ("too-small", 2, 39, DM_IOCTL_HEADER_SIZE + 48),
             ("unaligned", 2, 41, DM_IOCTL_HEADER_SIZE + 48),
             ("out-of-bounds", 2, 56, DM_IOCTL_HEADER_SIZE + 48),
+            ("final-too-small", 1, 39, DM_IOCTL_HEADER_SIZE + 48),
+            ("final-unaligned", 1, 41, DM_IOCTL_HEADER_SIZE + 48),
+            ("final-out-of-bounds", 1, 56, DM_IOCTL_HEADER_SIZE + 48),
         ] {
             let manager = DmManager::new().unwrap();
             let device = manager
@@ -2904,30 +2945,27 @@ mod tests {
 
     #[ktest]
     fn rejects_invalid_linear_params_without_changing_device_state() {
-        let manager = DmManager::new().unwrap();
-        let device = manager
-            .create("dm-invalid-linear-params-test".to_string(), None, None)
-            .unwrap();
-        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
-        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
-        write_linear_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 4, 0, "8:1 0 sectors");
+        for (name, params) in [
+            ("missing-dev", ""),
+            ("missing-start", "8:1"),
+            ("extra-fields", "8:1 0 extra"),
+            ("bad-dev", "bad 0"),
+            ("bad-major", ":1 0"),
+            ("bad-minor", "8: 0"),
+            ("bad-start", "8:1 -1"),
+            ("overflow-start", "8:1 18446744073709551616"),
+        ] {
+            let manager = DmManager::new().unwrap();
+            let device = manager
+                .create(format!("dm-invalid-linear-{name}-test"), None, None)
+                .unwrap();
+            let mut buffer =
+                test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+            write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+            write_linear_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 4, 0, params);
 
-        assert_eq!(
-            table_load_for_device(&mut buffer, &device)
-                .unwrap_err()
-                .error(),
-            Errno::EINVAL
-        );
-        assert_eq!(
-            device.status(),
-            aster_device_mapper::DmDeviceStatus {
-                suspended: false,
-                readonly: false,
-                has_active_table: false,
-                has_inactive_table: false,
-                event_nr: 0,
-            }
-        );
+            assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
+        }
     }
 
     #[ktest]
