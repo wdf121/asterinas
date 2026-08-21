@@ -413,7 +413,12 @@ mod tests {
             )
             .unwrap(),
         );
-        let read = Bio::new(BioType::Read, Sid::new(8), vec![], None);
+        let read = Bio::new(
+            BioType::Read,
+            Sid::new(8),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        );
 
         assert_eq!(
             read.submit_and_wait(&TableDevice(table)).unwrap(),
@@ -421,7 +426,7 @@ mod tests {
         );
         assert_eq!(
             *backing.last_range.lock(),
-            Some(Sid::new(108)..Sid::new(108))
+            Some(Sid::new(108)..Sid::new(116))
         );
     }
 
