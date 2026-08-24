@@ -19,7 +19,7 @@ Asterinas Device Mapper 当前是一个最小 Linux DM 兼容子集，核心目�
 | 数据面 | 支持 Read/Write/Flush；支持 BIO remap、跨 table target split、striped chunk split、completion 聚合。 |
 | flush | 按 backing `DeviceId` 去重，异步 fan-out，聚合完成状态。 |
 | 设备节点 | 支持 `/dev/dm-N` 和 `/dev/mapper/<name>` runtime node。 |
-| LVM2 适配 | 通过 `activation { udev_rules=0 }` 避开 udev 依赖；linear resize、striped create/grow/shrink/reboot、striped 3PV/3-way reboot 和 striped multi-segment reboot 路径已系统验收。 |
+| LVM2 适配 | 通过 `activation { udev_rules=0 }` 避开 udev 依赖；linear resize、striped create/grow/shrink/reboot、striped 3PV/3-way reboot、striped multi-segment reboot 和 linear + striped mixed table reboot 路径已系统验收。 |
 | 测试盘定位 | VirtIO block serial 暴露给 guest，脚本用 locator 稳定定位测试盘。 |
 
 ### 1.2 target 支持矩阵
@@ -489,6 +489,7 @@ docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout 1200 cargo osdk 
 | `--striped-lvm2` | LVM2 striped create、ext2 I/O、grow、shrink、reboot recovery。 |
 | `--striped-lvm2-3pv` | LVM2 3PV / 3-way striped create、ext2 I/O、reboot recovery。 |
 | `--striped-lvm2-multi-segment` | LVM2 multi-segment striped create、ext2 I/O、reboot recovery。 |
+| `--mixed-lvm2` | LVM2 linear + striped mixed table create、ext2 I/O、reboot recovery。 |
 | `--lvm2` | linear LVM2 cross-PV large write + resize。 |
 | `--linear-flow` | 单 guest linear control、raw BIO、LVM2 create/extend/shrink/cleanup 全流程。 |
 | `--full` | 当前 linear 全量系统回归；不默认包含 striped。 |
@@ -504,6 +505,7 @@ docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout 1200 cargo osdk 
 - [myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh)
 - [myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh)
 - [myshell/dm_striped/run_lvm2_striped_multi_segment_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_multi_segment_reboot_test.sh)
+- [myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh](../myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh)
 
 ### 8.3 当前已通过的系统验收
 
@@ -567,6 +569,31 @@ HOST_PASS_DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT
 HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2-multi-segment
 ```
 
+LVM2 linear + striped mixed table：
+
+```text
+CHECK_PASS_MIXED_LVM2_SETUP
+CHECK_PASS_MIXED_LVM2_INITIAL_LINEAR_TABLE_STATUS_DEPS
+CHECK_PASS_MIXED_LVM2_BASE_FILE_MD5
+CHECK_PASS_MIXED_LVM2_EXTENDED_MIXED_TABLE_STATUS_DEPS
+CHECK_PASS_MIXED_LVM2_GROW_FILE_MD5
+TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_FIRST
+CHECK_PASS_MIXED_LVM2_RECOVERED_MIXED_TABLE_STATUS_DEPS
+CHECK_PASS_MIXED_LVM2_RECOVERED_FILE_MD5
+TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_SECOND
+HOST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT
+HOST_PASS_DM_SYSTEM_TESTS --mixed-lvm2
+```
+
+LVM2 mixed table 示例：
+
+```text
+0 524288 linear 253:64 2048
+524288 524288 striped 2 8 253:80 2048 253:96 2048
+```
+
+含义：第一段是 PV1 上的 linear segment，第二段是 PV2+PV3 上的 2-way stripe、4 KiB chunk。
+
 LVM2 striped table 示例：
 
 ```text
@@ -591,6 +618,7 @@ LVM2 striped table 示例：
 | LVM2 striped create/grow/shrink/recovery | ktest + `myshell/run_dm_system_tests.sh --striped-lvm2` |
 | LVM2 striped stripe_count > 2/recovery | ktest + `myshell/run_dm_system_tests.sh --striped-lvm2-3pv` |
 | LVM2 striped multi-segment/recovery | ktest + `myshell/run_dm_system_tests.sh --striped-lvm2-multi-segment` |
+| LVM2 linear + striped mixed table/recovery | ktest + `myshell/run_dm_system_tests.sh --mixed-lvm2` |
 | 阶段验收或发版前 linear 回归 | ktest + `myshell/run_dm_system_tests.sh --full` |
 
 系统测试前如果内核或 NixOS image 相关内容变更，先执行：
@@ -703,6 +731,7 @@ striped table 校验和系统验收可继续覆盖更复杂的 LVM2 generated ta
 - `--striped-lvm2` 验证真实 LVM2/libdevmapper、ext2、resize 和 reboot recovery 路径；
 - `--striped-lvm2-3pv` 验证真实 LVM2/libdevmapper、ext2 和 `stripe_count > 2` 的 reboot recovery 路径；
 - `--striped-lvm2-multi-segment` 验证真实 LVM2/libdevmapper、ext2 和多段 striped table 的 reboot recovery 路径；
+- `--mixed-lvm2` 验证真实 LVM2/libdevmapper、ext2 和同一 LV 内 linear + striped mixed table 的 reboot recovery 路径；
 - `--full` 保持 linear 全量语义；
 - QEMU/NixOS 系统测试串行运行。
 
@@ -726,6 +755,7 @@ Asterinas Device Mapper 维护一个可运行、可验收、边界明确的 Linu
 - active/inactive table、suspend/resume、status/deps/table 输出；
 - linear target 数据面和 LVM2 resize 系统验收；
 - striped target 数据面和 LVM2 create/grow/shrink/reboot 系统验收；
+- 同一 LV 内 linear + striped mixed table 的 LVM2 reboot 系统验收；
 - BIO split/remap/completion 和 flush fan-out；
 - block registry、devtmpfs、procfs、VirtIO serial、NixOS guest 测试链路。
 
