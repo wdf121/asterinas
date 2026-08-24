@@ -2741,6 +2741,156 @@ mod tests {
     }
 
     #[ktest]
+    fn resume_replaces_active_linear_table_with_ioctl_loaded_mixed_table() {
+        let linear = StatusBacking::new_with_major(510, 243);
+        let striped_first = StatusBacking::new_with_major(510, 244);
+        let striped_second = StatusBacking::new_with_major(510, 245);
+        let linear_id = linear.id();
+        let striped_first_id = striped_first.id();
+        let striped_second_id = striped_second.id();
+        register(linear as Arc<dyn BlockDevice>).unwrap();
+        register(striped_first as Arc<dyn BlockDevice>).unwrap();
+        register(striped_second as Arc<dyn BlockDevice>).unwrap();
+
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-mixed-replace-active-test".to_string(), None, None)
+            .unwrap();
+        device.load_table(single_linear_table(4, 100, 1));
+        device.resume().unwrap();
+
+        let linear_params = "510:243 0";
+        let striped_params = "2 4 510:244 0 510:245 0";
+        let first_next = table_status_record_len(linear_params.len()).unwrap();
+        let total_len = first_next + table_status_record_len(striped_params.len()).unwrap();
+        let mut load = test_buffer(DM_IOCTL_HEADER_SIZE + total_len);
+        write_u32(&mut load, OFF_TARGET_COUNT, 2).unwrap();
+        write_linear_target_spec(
+            &mut load,
+            DM_IOCTL_HEADER_SIZE,
+            0,
+            4,
+            first_next as u32,
+            linear_params,
+        );
+        write_target_spec(
+            &mut load,
+            DM_IOCTL_HEADER_SIZE + first_next,
+            4,
+            16,
+            0,
+            "striped",
+            striped_params,
+        );
+        table_load_for_device(&mut load, &device).unwrap();
+
+        let mut active_before_resume = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        write_u32(&mut active_before_resume, OFF_FLAGS, DM_STATUS_TABLE_FLAG).unwrap();
+        table_status_for_device(&mut active_before_resume, &device).unwrap();
+        assert_eq!(
+            read_u32(&active_before_resume, OFF_TARGET_COUNT).unwrap(),
+            1
+        );
+        assert_eq!(
+            c_string_until(
+                &active_before_resume,
+                DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + 48,
+                "active target 参数"
+            )
+            .unwrap(),
+            "1:1 100"
+        );
+
+        let mut inactive_before_resume = test_buffer(DM_IOCTL_HEADER_SIZE + total_len);
+        write_u32(
+            &mut inactive_before_resume,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG | DM_STATUS_TABLE_FLAG,
+        )
+        .unwrap();
+        table_status_for_device(&mut inactive_before_resume, &device).unwrap();
+        assert_eq!(
+            read_u32(&inactive_before_resume, OFF_TARGET_COUNT).unwrap(),
+            2
+        );
+        assert_eq!(
+            c_string_until(
+                &inactive_before_resume,
+                DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + first_next,
+                "inactive linear target 参数"
+            )
+            .unwrap(),
+            linear_params
+        );
+
+        device.resume().unwrap();
+        assert!(device.active_table().is_some());
+        assert!(device.inactive_table().is_none());
+
+        let mut active_after_resume = test_buffer(DM_IOCTL_HEADER_SIZE + total_len);
+        write_u32(&mut active_after_resume, OFF_FLAGS, DM_STATUS_TABLE_FLAG).unwrap();
+        table_status_for_device(&mut active_after_resume, &device).unwrap();
+        assert_eq!(read_u32(&active_after_resume, OFF_TARGET_COUNT).unwrap(), 2);
+        assert_eq!(
+            c_string_until(
+                &active_after_resume,
+                DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + first_next,
+                "active mixed linear target 参数"
+            )
+            .unwrap(),
+            linear_params
+        );
+        assert_eq!(
+            c_string_until(
+                &active_after_resume,
+                DM_IOCTL_HEADER_SIZE + first_next + DM_TARGET_SPEC_SIZE,
+                DM_IOCTL_HEADER_SIZE + total_len,
+                "active mixed striped target 参数"
+            )
+            .unwrap(),
+            striped_params
+        );
+
+        let mut inactive_after_resume = test_buffer(DM_IOCTL_HEADER_SIZE + total_len);
+        write_u32(
+            &mut inactive_after_resume,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG,
+        )
+        .unwrap();
+        table_status_for_device(&mut inactive_after_resume, &device).unwrap();
+        assert_eq!(
+            read_u32(&inactive_after_resume, OFF_TARGET_COUNT).unwrap(),
+            0
+        );
+
+        let mut deps = test_buffer(DM_IOCTL_HEADER_SIZE + 32);
+        table_deps_for_device(&mut deps, &device).unwrap();
+        assert_eq!(read_u32(&deps, DM_IOCTL_HEADER_SIZE).unwrap(), 3);
+        assert_eq!(
+            read_u64(&deps, DM_IOCTL_HEADER_SIZE + 8).unwrap(),
+            linear_id.as_encoded_u64()
+        );
+        assert_eq!(
+            read_u64(&deps, DM_IOCTL_HEADER_SIZE + 16).unwrap(),
+            striped_first_id.as_encoded_u64()
+        );
+        assert_eq!(
+            read_u64(&deps, DM_IOCTL_HEADER_SIZE + 24).unwrap(),
+            striped_second_id.as_encoded_u64()
+        );
+
+        drop(device);
+        drop(manager);
+        unregister(linear_id).unwrap();
+        unregister(striped_first_id).unwrap();
+        unregister(striped_second_id).unwrap();
+    }
+
+    #[ktest]
     fn submits_bio_across_ioctl_loaded_mixed_linear_and_striped_targets() {
         let linear = StatusBacking::new_with_major(510, 240);
         let striped_first = StatusBacking::new_with_major(510, 241);

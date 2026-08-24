@@ -13,7 +13,7 @@ See [AGENTS.md](AGENTS.md).
 - 用户说“分点提交”表示按逻辑点拆成多个 commit，不是一个 commit 里写分点说明。
 - 默认不 push；只有用户明确要求 push 才推送。
 - 小阶段通常由 Claude 实现并验证，通过后由用户决定是否提交；用户明确要求提交时再提交。
-- 不要创建大段临时规划文档；阶段性工程日志写入 `log/YYYY-M-D.md`。
+- 不要创建大段临时规划文档；阶段性工程日志写入 `log/YYYY-M-D.md`，写入前先用 `date +%F` 核对当天日期。
 
 ## 执行环境与安全边界
 
@@ -85,20 +85,20 @@ docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 
 
 ## 当前 Device Mapper 状态
 
-截至 2026-08-21，`dm` 分支最近相关提交：
+截至 2026-08-24，`dm` 分支最近相关提交：
 
 ```text
+2e1a3350f 记录 dm 分支协作说明
 8f00dec97 补充 Device Mapper mixed table ktest
 fd94cd2c7 补充 Device Mapper table-load 非法输入 ktest
 49ef85c72 修复 Device Mapper table remap ktest
 487f375c3 新增 Device Mapper striped multi-segment 验收
-aa1575a3a 新增 Device Mapper striped 3PV 验收
 ```
 
 当前已完成并验证的范围：
 
 - Device Mapper linear 多 target 已支持 LVM2 跨 PV 扩容 / 缩容相关路径。
-- Device Mapper striped 已覆盖 raw BIO、2-way LVM2、3PV / 3-way、multi-segment reboot recovery。
+- Device Mapper striped 已覆盖 raw BIO、2-way LVM2、3PV / 3-way、multi-segment reboot recovery；ktest 已补 3-way partial final row range 拆分和 BIO 恰好结束在 striped target 末尾的边界。
 - 同一 DM device / 同一 LV 内的 BIO 可以跨 target 边界拆分；这不是跨 LV。
 - 一个 BIO 不应跨两个不同 LV；BIO 是发给某一个 block device 的。
 - `DmTable` 数据面支持：
@@ -114,6 +114,7 @@ aa1575a3a 新增 Device Mapper striped 3PV 验收
   - mixed inactive table 的 `DM_DEV_STATUS.target_count`。
   - mixed table 的 `DM_TABLE_STATUS` type / params / next offset。
   - mixed table 的 `DM_TABLE_DEPS` backing 顺序。
+  - running device 中 active linear table 被 ioctl-loaded mixed table 替换后的 active / inactive 查询、resume 切换和 deps 切换。
 - table-load 非法输入已补 ktest：
   - linear 参数缺失、额外字段、bad major/minor、bad start、start 溢出。
   - striped 参数字段数、zero stripes、zero chunk、非数字 stripe_count/chunk_size、bad dev/start。
@@ -138,15 +139,15 @@ aa1575a3a 新增 Device Mapper striped 3PV 验收
 
 ## 后续可做优先级
 
-1. 复查当前已提交的 mixed / split ktest 是否需要拆分或补充说明；如果用户要求，可按逻辑点继续拆 commit 或补日志。
-2. 继续补 active / inactive table 状态切换边界，尤其是 mixed table 在 active/inactive 间替换、失败 load 不污染旧表等场景；先查现有覆盖，避免重复。
-3. 补更少量、非重复的 striped 几何边界，例如 chunk / length 对齐、极端长度、range 溢出等；不要堆重复 parser case。
-4. 如能找到稳定 LVM2 命令自然生成 linear + striped mixed table，再考虑系统级验收。
-5. udev / devtmpfs / systemd 自动联动放最后。
+1. 复查当前 mixed / split / striped boundary ktest 是否需要拆分或补充说明；如果用户要求，可按逻辑点继续拆 commit 或补日志。
+2. 如能找到稳定 LVM2 命令自然生成 linear + striped mixed table，再考虑系统级验收。
+3. udev / devtmpfs / systemd 自动联动放最后。
 
 ## 工程日志规则
 
-- `log/2026-8-21.md` 已记录当前 DM 小阶段 1 到 6。
+- 写日志前先用 `date +%F` 核对当前日期，按当天日期写入 `log/YYYY-M-D.md`。
+- 每天的日志阶段号都从 1 开始，不沿用前一天的阶段编号。
+- `log/2026-8-21.md` 已记录当天 DM 小阶段 1 到 6；`log/2026-8-24.md` 从第 1 阶段开始记录当天改动，当前已到第 2 阶段。
 - 日志按小阶段顺序写：背景、改动、测试。
 - 不按“生产代码 / ktest”分类。
 - 只记录实际工程改动和验证；单纯讨论、复核、规划不写入日志。

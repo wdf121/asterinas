@@ -807,4 +807,29 @@ mod tests {
         assert_eq!(mapped(&target, 19), Some((0, 1, 17)));
         assert_eq!(mapped(&target, 20), None);
     }
+
+    #[ktest]
+    fn splits_three_stripe_range_across_partial_final_row() {
+        let params = StripedTargetParams::parse("3 3 510:1 10 510:2 20 510:3 30").unwrap();
+        let target = StripedTarget::new(
+            Sid::new(0),
+            20,
+            params,
+            vec![backing(1, 32), backing(2, 29), backing(3, 36)],
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapped_range(&target, 2, 20).unwrap(),
+            vec![
+                (2, 3, 0, 1, 12, 13),
+                (3, 6, 1, 2, 20, 23),
+                (6, 9, 2, 3, 30, 33),
+                (9, 12, 0, 1, 13, 16),
+                (12, 15, 1, 2, 23, 26),
+                (15, 18, 2, 3, 33, 36),
+                (18, 20, 0, 1, 16, 18),
+            ]
+        );
+    }
 }

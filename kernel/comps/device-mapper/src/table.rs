@@ -944,6 +944,40 @@ mod tests {
     }
 
     #[ktest]
+    fn splits_striped_bio_ending_at_target_end() {
+        let first = RecordingBlockDevice::new(1);
+        let second = RecordingBlockDevice::new(2);
+        let table = Arc::new(
+            DmTable::new_targets(vec![striped_dm_target(
+                0,
+                16,
+                "2 4 1:1 100 1:2 200",
+                &[first.clone(), second.clone()],
+            )])
+            .unwrap(),
+        );
+        let read = Bio::new(
+            BioType::Read,
+            Sid::new(8),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        );
+
+        assert_eq!(
+            read.submit_and_wait(&TableDevice(table)).unwrap(),
+            BioStatus::Complete
+        );
+        assert_eq!(
+            *first.submitted_ranges.lock(),
+            vec![Sid::new(104)..Sid::new(108)]
+        );
+        assert_eq!(
+            *second.submitted_ranges.lock(),
+            vec![Sid::new(204)..Sid::new(208)]
+        );
+    }
+
+    #[ktest]
     fn splits_bio_across_linear_and_striped_targets() {
         let linear_backing = RecordingBlockDevice::new(1);
         let striped_first = RecordingBlockDevice::new(2);
