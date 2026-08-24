@@ -37,6 +37,9 @@ inputs:
   mem:
     description: 'Guest memory size'
     required: false
+  rootfs_boot:
+    description: 'Boot directly from rootfs'
+    required: false
 
   # Conformance Test
   conformance_test_suite:
@@ -50,11 +53,14 @@ inputs:
     required: false
 
   # Xfstest-specific parameters
-  xfstests_disk_size:
-    description: 'The disk size for xfstests'
+  xfstests_fs_type:
+    description: 'Filesystem type for xfstests (ext2, tmpfs, etc.)'
     required: false
   xfstests_runlist:
-    description: 'Run list file for xfstests'
+    description: 'Run list filename for xfstests'
+    required: false
+  xfstests_disk_size:
+    description: 'The disk size for xfstests'
     required: false
 
 runs:
@@ -103,8 +109,10 @@ runs:
         [[ -n "${{ inputs.conformance_test_workdir }}" ]] && CMD+=" CONFORMANCE_TEST_WORKDIR=${{ inputs.conformance_test_workdir }}"
         [[ -n "${{ inputs.boot_protocol }}" ]] && CMD+=" BOOT_PROTOCOL=${{ inputs.boot_protocol }}"
         [[ -n "${{ inputs.mem }}" ]] && CMD+=" MEM=${{ inputs.mem }}"
-        [[ -n "${{ inputs.xfstests_disk_size }}" ]] && CMD+=" XFSTESTS_DISK_SIZE=${{ inputs.xfstests_disk_size }}"
+        [[ "${{ inputs.rootfs_boot }}" == "true" ]] && CMD+=" INITRAMFS=off CMDLINE='root=/dev/vdd rootfstype=ext2 init=/init'"
+        [[ -n "${{ inputs.xfstests_fs_type }}" ]] && CMD+=" XFSTESTS_FS_TYPE=${{ inputs.xfstests_fs_type }}"
         [[ -n "${{ inputs.xfstests_runlist }}" ]] && CMD+=" XFSTESTS_RUNLIST=${{ inputs.xfstests_runlist }}"
+        [[ -n "${{ inputs.xfstests_disk_size }}" ]] && CMD+=" XFSTESTS_DISK_SIZE=${{ inputs.xfstests_disk_size }}"
 
         echo "Executing: $CMD"
         eval $CMD

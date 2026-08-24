@@ -116,6 +116,7 @@ echo "All mount bind file test passed."
 ./getcwd/getcwd
 
 ./inotify/inotify_align
+./inotify/inotify_close
 ./inotify/inotify_o_path
 ./inotify/inotify_poll
 ./inotify/inotify_unlink
@@ -147,6 +148,8 @@ echo "All mount bind file test passed."
 ./pseudofs/pseudo_dev_id
 ./pseudofs/pseudo_inode
 ./pseudofs/pseudo_mount
+
+./rename/same_inode
 
 ./statx/btime
 

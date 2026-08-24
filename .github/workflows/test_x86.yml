@@ -11,7 +11,7 @@ jobs:
   basic-test:
     runs-on: ubuntu-latest
     container:
-      image: asterinas/asterinas:0.18.0-20260702
+      image: asterinas/kernel-dev:0.18.1-20260805
       options: -v /dev:/dev --privileged
       volumes:
         # Map the following directories on the host into the container so that
@@ -43,9 +43,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ['asterinas/asterinas:0.18.0-20260702', 'asterinas/osdk:0.18.0-20260702']
+        image: ['asterinas/kernel-dev:0.18.1-20260805', 'asterinas/osdk-dev:0.18.1-20260805']
     steps:
       - uses: actions/checkout@v4
+
+      # TODO: Remove this step after the next release includes Clang in the dev images.
+      - name: Install Clang temporarily
+        run: |
+          apt-get update
+          apt-get install -y clang
+
       - name: Run OSDK tests
         uses: ./.github/actions/test
         with:
@@ -55,7 +62,7 @@ jobs:
   boot-test:
     runs-on: ubuntu-latest
     container:
-      image: asterinas/asterinas:0.18.0-20260702
+      image: asterinas/kernel-dev:0.18.1-20260805
       options: -v /dev:/dev --privileged
     strategy:
       fail-fast: false
@@ -63,6 +70,7 @@ jobs:
         include:
           - { variant: 'legacy32', boot_protocol: 'linux-legacy32', smp: 4 }
           - { variant: 'multiboot2-smp4', boot_protocol: 'multiboot', smp: 4 }
+          - { variant: 'multiboot2-smp4-rootfs', boot_protocol: 'multiboot', smp: 4, rootfs_boot: true }
     steps:
       - uses: actions/checkout@v4
       - name: Run boot test (${{ matrix.variant }})
@@ -71,11 +79,12 @@ jobs:
           auto_test: 'boot'
           smp: ${{ matrix.smp }}
           boot_protocol: ${{ matrix.boot_protocol }}
+          rootfs_boot: ${{ matrix.rootfs_boot }}
 
   regression-test:
     runs-on: ubuntu-latest
     container:
-      image: asterinas/asterinas:0.18.0-20260702
+      image: asterinas/kernel-dev:0.18.1-20260805
       options: -v /dev:/dev --privileged
       volumes:
         # Map the following directories on the host into the container so that
@@ -106,7 +115,7 @@ jobs:
   conformance-test:
     runs-on: ubuntu-latest
     container:
-      image: asterinas/asterinas:0.18.0-20260702
+      image: asterinas/kernel-dev:0.18.1-20260805
       options: -v /dev:/dev --privileged
       volumes:
         # Map the following directories on the host into the container so that
@@ -158,7 +167,7 @@ jobs:
         include:
           - name: arm-cross-boot
             runs_on: ubuntu-24.04-arm
-            image: asterinas/asterinas:0.18.0-20260702
+            image: asterinas/kernel-dev:0.18.1-20260805
             auto_test: boot
             enable_kvm: false
     runs-on: ${{ matrix.runs_on }}
@@ -173,25 +182,37 @@ jobs:
           enable_kvm: ${{ matrix.enable_kvm }}
 
   xfstests:
+    name: xfstests (${{ matrix.fs_type }})
     runs-on: ubuntu-latest
     container:
-      image: asterinas/asterinas:0.18.0-20260702
+      image: asterinas/kernel-dev:0.18.1-20260805
       options: -v /dev:/dev --privileged
       volumes:
         - /usr/lib/google-cloud-sdk:/usr/lib/google-cloud-sdk
         - /usr/local/lib/android:/usr/local/lib/android
         - /usr/share/dotnet:/usr/share/dotnet
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fs_type: 'ext2'
+            runlist: 'short.list'
+            disk_size: '2G'
+          - fs_type: 'tmpfs'
+            runlist: 'short.list'
+            disk_size: ''
     steps:
       - name: Free disk space
         run: rm -rf /usr/lib/google-cloud-sdk/* /usr/local/lib/android/* /usr/share/dotnet/*
       - uses: actions/checkout@v4
-      - name: Run xfstests
+      - name: Run xfstests (${{ matrix.fs_type }})
         uses: ./.github/actions/test
         with:
           auto_test: 'conformance'
           conformance_test_suite: 'xfstests'
           release: true
           mem: '12G'
-          xfstests_disk_size: '2G'
-          xfstests_runlist: '/opt/xfstests/short.list'
+          xfstests_fs_type: ${{ matrix.fs_type }}
+          xfstests_runlist: ${{ matrix.runlist }}
+          xfstests_disk_size: ${{ matrix.disk_size }}

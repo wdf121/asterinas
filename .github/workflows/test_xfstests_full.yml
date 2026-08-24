@@ -10,7 +10,7 @@ jobs:
   xfstests-full:
     runs-on: ubuntu-4-cores-150GB-ssd
     container:
-      image: asterinas/asterinas:0.18.0-20260702
+      image: asterinas/kernel-dev:0.18.1-20260805
       options: --device=/dev/kvm --privileged
     timeout-minutes: 90
     steps:
@@ -22,5 +22,6 @@ jobs:
           conformance_test_suite: 'xfstests'
           release: true
           mem: '12G'
+          xfstests_fs_type: 'ext2'
+          xfstests_runlist: 'full.list'
           xfstests_disk_size: '12G'
-          xfstests_runlist: '/opt/xfstests/full.list'
