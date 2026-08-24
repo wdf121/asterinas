@@ -1,0 +1,1367 @@
+diff --git a/log/2026-8-20.md b/log/2026-8-20.md
+new file mode 100644
+index 000000000..0a4c1f8bd
+--- /dev/null
++++ b/log/2026-8-20.md
+@@ -0,0 +1,1361 @@
++# 2026-8-20 Device Mapper 工程改动日志
++
++本文按小阶段记录今天实际发生的工程改动。单纯文档解释、代码复核、后续规划不写入本日志；测试和验证结果跟随对应小阶段记录。
++
++## 1. DmTable target enum 化
++
++涉及文件：
++
++- `kernel/comps/device-mapper/src/target/mod.rs`
++- `kernel/comps/device-mapper/src/table.rs`
++- `kernel/src/device/misc/device_mapper.rs`
++- `docs/device-mapper-technical-maintenance.md`
++
++### 原来
++
++`DmTable` 内部直接保存：
++
++```text
++Vec<LinearTarget>
++```
++
++这对当前 linear-only 主路径足够，但后续引入 striped target 时，table/status/deps/BIO split 都会继续被 `linears()` API 绑定住。
++
++### 现在
++
++新增最小 target enum：
++
++```text
++DmTarget::Linear(LinearTarget)
++```
++
++`DmTable` 内部改为保存 enum-based target list：
++
++```text
++Vec<DmTarget>
++```
++
++保留当前唯一公开构造入口：
++
++```text
++DmTable::new_linear(Vec<LinearTarget>)
++```
++
++该入口内部把 linear target wrap 成 `DmTarget::Linear`，再复用统一 table 校验：
++
++```text
++非空
++从 logical sector 0 开始
++target 连续无空洞/重叠
++不允许 DM-on-DM backing
++```
++
++数据面路径同步改为按 `DmTarget` 迭代：
++
++```text
++metadata queue limit 汇总
++backing deps 去重
++BIO part 查找
++single BIO remap
++dynamic split 后 child remap/enqueue
++flush backing 去重 fan-out
++```
++
++control status 路径改为遍历 `table.targets()` 并匹配 `DmTarget::Linear` 输出原来的 linear status record。`DM_TABLE_LOAD` 仍只解析 `linear`，继续拒绝 `striped`/unknown target。
++
++本阶段没有实现 striped parser、striped mapping、target trait 或 target registry。
++
++### 测试
++
++补充 table 层 ktest，确认 `DmTable::new_linear` 会按顺序保存为 `DmTarget::Linear`，且 target count、logical range、backing id 不变。
++
++执行：
++
++```text
++cargo fmt --all --check
++timeout 1200 cargo osdk test device_mapper
++```
++
++结果：通过。ktest 期间临时将根 `Cargo.toml default-members` 缩小到只跑 `kernel`，验证结束后已恢复，并确认 `git diff -- Cargo.toml` 无输出。
++
++## 2. 新增 striped 参数解析与静态校验 helper
++
++涉及文件：
++
++- `kernel/comps/device-mapper/src/lib.rs`
++- `kernel/comps/device-mapper/src/target/mod.rs`
++- `kernel/comps/device-mapper/src/target/striped.rs`
++- `docs/device-mapper-technical-maintenance.md`
++
++### 原来
++
++`TARGET_VERSIONS` 已经声明 `striped` 用于 LVM2 预检兼容，但代码中没有 striped 参数 parser，也没有 stripe/chunk 容量公式测试。
++
++真实 `DM_TABLE_LOAD` 遇到 striped 仍返回 `EINVAL`，不安装 table。
++
++### 现在
++
++新增 `target/striped.rs`，只实现 parser 和静态校验 helper，不接入 table load 或数据面。
++
++支持解析格式：
++
++```text
++<stripe_count> <chunk_size> <dev1> <offset1> <dev2> <offset2> ...
++```
++
++新增 `StripedTargetParams`，保存：
++
++```text
++stripe_count
++chunk_size
++每个 stripe 的 DeviceId 和 backing_start
++```
++
++新增 required sectors 公式，按 stripe index 计算给定 logical length 下该 backing 实际需要多少 sectors。例如：
++
++```text
++N=2, C=128, L=300 -> stripe0=172, stripe1=128
++N=3, C=64,  L=400 -> stripe0=144, stripe1=128, stripe2=128
++```
++
++静态校验覆盖：
++
++```text
++zero length
++logical range overflow
++stripe width overflow
++backing_start + required overflow
++backing range out of bounds
++capacity 数量和 stripe 数量不一致
++```
++
++新增 `TableError::InvalidTargetParams` 表示 target 参数格式或几何信息无效。
++
++本阶段仍不新增 `DmTarget::Striped`，`DM_TABLE_LOAD` 仍拒绝 striped。
++
++### 测试
++
++新增 ktest 覆盖：
++
++```text
++正常 striped 参数解析
++mixed whitespace
++缺字段/多字段
++zero stripe count
++zero chunk size
++invalid major:minor
++invalid backing start
++required sectors uneven tail 公式
++backing capacity exact-fit / out-of-bounds
++logical overflow / backing overflow
++```
++
++执行：
++
++```text
++cargo fmt --all --check
++timeout 1200 cargo osdk test device_mapper
++```
++
++结果：通过。第一次直接使用全量 default-members 跑 ktest 时因为 unrelated crate 并发和后续编译修正中断；最终临时将根 `Cargo.toml default-members` 缩小到只跑 `kernel` 后通过。验证结束后已恢复 `Cargo.toml`，并确认 `git diff -- Cargo.toml` 无输出。
++
++## 3. 新增 StripedTarget sector mapping helper
++
++涉及文件：
++
++- `kernel/comps/device-mapper/src/target/striped.rs`
++- `docs/device-mapper-technical-maintenance.md`
++
++### 原来
++
++上一阶段已有 `StripedTargetParams`，能解析 striped 参数并校验每个 stripe 需要的 backing sectors，但还没有 runtime target，也没有 logical sector 到 stripe/backing sector 的映射 API。
++
++### 现在
++
++新增 runtime helper：
++
++```text
++StripedTarget
++StripedTargetStripe
++StripedSectorMap
++```
++
++`StripedTarget::new()` 接收：
++
++```text
++logical_start
++length
++StripedTargetParams
++Vec<BlockDeviceLease>
++```
++
++构造时校验：
++
++```text
++length 非 0
++logical range 不溢出
++backing lease 数量等于 stripe count
++backing lease id 和 params 中的 DeviceId 一致
++backing capacity 满足 required sectors 公式
++stripe width 计算不溢出
++```
++
++新增 `map_sector(logical)`，按以下公式返回 stripe index、backing id、backing sector：
++
++```text
++offset = logical - logical_start
++row = offset / stripe_width
++within_row = offset % stripe_width
++stripe_index = within_row / chunk_size
++chunk_offset = within_row % chunk_size
++backing_offset = row * chunk_size + chunk_offset
++backing_sector = backing_start[stripe_index] + backing_offset
++```
++
++本阶段仍不新增 `DmTarget::Striped`，不修改 `DmTable`、`DM_TABLE_LOAD`、status/deps 或 BIO split/remap。
++
++### 测试
++
++新增 ktest 覆盖：
++
++```text
++StripedTarget 构造 happy path 和 exact-fit capacity
++length 0
++logical overflow
++backing capacity 不足
++backing start overflow
++backing 数量不匹配
++backing id 不匹配
++2 stripe / chunk 4 / logical start 10 的边界映射
++3 stripe / chunk 3 / partial final row 的映射
++```
++
++执行：
++
++```text
++cargo fmt --all --check
++timeout 1200 cargo osdk test device_mapper
++```
++
++结果：通过。ktest 期间临时将根 `Cargo.toml default-members` 缩小到只跑 `kernel`，验证结束后已恢复，并确认 `git diff -- Cargo.toml` 无输出。
++
++## 4. 新增 StripedTarget range split helper
++
++涉及文件：
++
++- `kernel/comps/device-mapper/src/target/striped.rs`
++- `docs/device-mapper-technical-maintenance.md`
++
++### 原来
++
++`StripedTarget::map_sector()` 已经能映射单个 logical sector，但后续 BIO split 需要处理 logical range。跨 chunk 的 range 不能只按起点 remap，否则会把跨 stripe 的 I/O 错误落到同一个 backing。
++
++### 现在
++
++新增 `StripedRangeMap`：
++
++```text
++logical_range
++stripe_index
++backing_id
++backing_range
++```
++
++新增 `StripedTarget::map_range()`，把一个完全位于 target 内的 logical range 按 striped chunk 边界拆分。
++
++例如 2 stripe、chunk size 4、logical start 10 时：
++
++```text
++12..14 -> stripe0 backing 102..104
++14..18 -> stripe1 backing 200..204
++18..22 -> stripe0 backing 104..108
++22..23 -> stripe1 backing 204..205
++```
++
++该 helper 只生成映射描述，不提交 BIO，不调用 `SubmittedBio::split()`，也不接入 `DmTable`。
++
++### 测试
++
++新增 ktest 覆盖：
++
++```text
++单 chunk 内 range
++跨多个 chunk/stripe 的 range
++range end 等于 target end
++空 range / target 前 / target 后 / 部分越界 / start > end
++每个 range part 与 map_sector(part.start) 保持一致
++```
++
++本阶段重新执行：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --all --check'
++docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout 1200 cargo osdk test device_mapper'
++```
++
++结果：通过。ktest 期间临时将根 `Cargo.toml default-members` 缩小到 `kernel` 和 `kernel/comps/device-mapper`，验证结束后已恢复，并确认 `git diff -- Cargo.toml` 无输出、`git diff --check` 通过。
++
++## 5. 为 striped 接入准备多 backing target 抽象
++
++涉及文件：
++
++- `kernel/comps/device-mapper/src/target/mod.rs`
++- `kernel/comps/device-mapper/src/target/striped.rs`
++- `kernel/comps/device-mapper/src/table.rs`
++- `docs/device-mapper-technical-maintenance.md`
++
++### 原来
++
++`DmTable` 的内部汇总路径仍围绕 single-backing target 接口写：
++
++```text
++target.backing_id()
++target.backing()
++```
++
++这对 linear target 足够，但 striped target 一个 target 内会持有多个 backing。后续如果直接加 `DmTarget::Striped`，table deps、flush、queue limit 和 DM-on-DM backing 检查都会先遇到单 backing 假设。
++
++### 现在
++
++`DmTarget` 新增多 backing 遍历 helper：
++
++```text
++for_each_backing_id()
++for_each_backing()
++```
++
++当前 `DmTarget` 仍只有 `Linear` variant，因此 linear 行为不变；但 `DmTable` 的汇总逻辑已经改为通过 plural helper 遍历 backing：
++
++```text
++metadata queue limit：遍历所有 target 的所有 backing 后取最小值
++backing_ids：遍历所有 backing id 并按首次出现顺序去重
++enqueue_flush：遍历所有 backing，按 DeviceId 去重后 fan-out
++new_targets：遍历所有 backing，继续拒绝 DM-on-DM backing
++```
++
++`StripedTarget` 同步提供同形 backing 遍历 helper，后续把它包进 target enum 时可以直接接到 `DmTarget` plural helper。
++
++本阶段仍不新增可加载的 `DmTarget::Striped`，不修改 `DM_TABLE_LOAD`，不修改 table status/deps 输出格式，也不接入 BIO striped 数据面。
++
++### 测试
++
++补充/调整 ktest 覆盖：
++
++```text
++DmTarget linear variant 的 for_each_backing_id / for_each_backing 返回唯一 backing
++DmTable metadata 从所有 backing 的 queue limit 中取最小值
++StripedTarget for_each_backing_id / for_each_backing 能遍历 target 内所有 stripe backing
++```
++
++本阶段重新执行：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --all && cargo fmt --all --check'
++docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout 1200 cargo osdk test device_mapper'
++```
++
++结果：通过。ktest 期间临时将根 `Cargo.toml default-members` 缩小到 `kernel` 和 `kernel/comps/device-mapper`，验证结束后已恢复，并确认 `git diff -- Cargo.toml` 无输出、`git diff --check` 通过。
++
++## 6. 重组 linear 系统测试脚本并新增 full flow
++
++涉及文件：
++
++- `myshell/run_dm_system_tests.sh`
++- `myshell/dm_linear/run_control_abi_test.sh`
++- `myshell/dm_linear/run_cross_target_bio_regression.sh`
++- `myshell/dm_linear/run_cross_pv_large_write_test.sh`
++- `myshell/dm_linear/run_lvm2_resize_test.sh`
++- `myshell/dm_linear/run_linear_full_flow_test.sh`
++- `docs/device-mapper-technical-maintenance.md`
++
++### 原来
++
++`myshell/` 下的 DM 系统测试脚本都在顶层：
++
++```text
++run_dm_control_abi_test.sh
++run_cross_target_bio_regression.sh
++run_cross_pv_large_write_test.sh
++run_lvm2_resize_test.sh
++```
++
++它们分别验证 control ABI、raw cross-target BIO、跨 PV 大文件和 LVM2 resize。`run_dm_system_tests.sh --full` 只是顺序执行这些独立脚本；每个脚本都会重新准备测试盘并启动一个新的 NixOS guest，因此它不是“单个 guest 内完整用户态流程”。
++
++这些脚本也只覆盖 linear/control 回归，不覆盖 striped target。
++
++### 现在
++
++新增 `myshell/dm_linear/` 分组，并把现有 linear 脚本移动进去：
++
++```text
++dm_linear/run_control_abi_test.sh
++dm_linear/run_cross_target_bio_regression.sh
++dm_linear/run_cross_pv_large_write_test.sh
++dm_linear/run_lvm2_resize_test.sh
++```
++
++新增：
++
++```text
++dm_linear/run_linear_full_flow_test.sh
++```
++
++该脚本在一个 NixOS guest session 内串起：
++
++```text
++control ABI smoke
++simple linear mapper table/status/deps/rename/suspend/resume
++raw cross-target 4KiB BIO split 验证
++LVM2 linear LV create + ext2 mount/write
++LV extend 到第二块 PV + ext2 grow
++ext2 shrink + LV shrink
++LV/VG/PV cleanup
++```
++
++`run_dm_system_tests.sh` 新增 `--linear-flow`，并把 `--full` 改为执行所有 linear 回归脚本，包括新的 full flow。
++
++文档同步明确：现有系统脚本是 linear/control 回归集合，不是完整 DM target 矩阵验收，也不能证明 striped table load、status/deps、BIO chunk split/remap 或 LVM2 striped 路径可用。
++
++### 测试
++
++本阶段只做脚本结构和新增脚本的语法/入口检查，未启动 NixOS guest：
++
++```text
++bash -n myshell/run_dm_system_tests.sh \
++       myshell/lib/dm_nixos_test.sh \
++       myshell/dm_linear/run_control_abi_test.sh \
++       myshell/dm_linear/run_cross_target_bio_regression.sh \
++       myshell/dm_linear/run_cross_pv_large_write_test.sh \
++       myshell/dm_linear/run_lvm2_resize_test.sh \
++       myshell/dm_linear/run_linear_full_flow_test.sh
++myshell/run_dm_system_tests.sh --help
++```
++
++结果：通过。尚未执行 `make nixos` 或 `myshell/run_dm_system_tests.sh --linear-flow`。
++
++## 7. 接入 striped table load/status/deps 控制面
++
++涉及文件：
++
++- `kernel/comps/device-mapper/src/target/mod.rs`
++- `kernel/comps/device-mapper/src/target/striped.rs`
++- `kernel/comps/device-mapper/src/table.rs`
++- `kernel/src/device/misc/device_mapper.rs`
++- `docs/device-mapper-technical-maintenance.md`
++
++### 原来
++
++`striped` 已有参数解析、静态校验、sector mapping、range split 和多 backing helper，但还不能作为 `DmTarget` variant 进入 table。
++
++`DM_TABLE_LOAD` 仍只接受 `linear`，`DM_TABLE_STATUS` 也只会输出 linear target record。`DM_TABLE_DEPS` 虽然已经通过 `table.backing_ids()` 汇总 backing，但没有 striped target 可供验证。
++
++### 现在
++
++`DmTarget` 新增：
++
++```text
++DmTarget::Striped(StripedTarget)
++```
++
++`DmTarget` 的 logical range、length、backing 遍历 helper 已支持 linear 和 striped。single-backing helper 改为只对 linear 返回有效值，避免把 striped 误当成“第一个 backing”的 linear target。
++
++`DmTable::new_targets()` 公开为通用构造入口，继续复用原来的 table 非空、从 0 开始、target 连续、DM-on-DM backing 拒绝和 queue limit/deps 汇总逻辑。含 striped target 的 table 当前会显式拒绝 BIO，避免在 read/write split/remap 尚未接入时形成半成品数据面。
++
++`DM_TABLE_LOAD` 现在支持：
++
++```text
++linear
++striped
++```
++
++其中 striped 分支复用 `StripedTargetParams::parse()` 和 `StripedTarget::new()`，按参数中的 stripe 顺序查找 backing lease。所有 target 都解析和构造成功后才替换 inactive table；参数错误、缺 backing 或 range/capacity 错误仍保持失败不改设备状态。
++
++`DM_TABLE_STATUS | DM_STATUS_TABLE_FLAG` 会对 striped 输出 canonical 参数：
++
++```text
++<stripe_count> <chunk_size> <dev1> <offset1> <dev2> <offset2> ...
++```
++
++`DM_TABLE_STATUS` info 模式仍输出空 params。`DM_TABLE_DEPS` 不新增 striped 特判，继续通过 `table.backing_ids()` 返回所有 backing 并按首次出现顺序去重。
++
++本阶段仍不接入 striped BIO chunk split/remap，不新增 `myshell/dm_striped/` 系统脚本，也不宣称 LVM2 striped 路径可用。
++
++### 测试
++
++补充 ktest 覆盖：
++
++```text
++DmTarget::Striped 的 logical range、length、backing 遍历
++StripedTarget for_each_stripe status 元数据遍历
++DmTable::new_targets 接受 striped 和 linear+striped 连续 table
++含 striped table 的 read/write/flush BIO 返回 Refused
++DM_TABLE_LOAD 成功加载 striped 和 linear+striped 混合 table
++invalid striped params、missing backing、range/capacity 错误失败不改状态
++DM_TABLE_STATUS 输出 striped canonical params 和 info empty params
++DM_TABLE_STATUS 对 striped 长 params 的 buffer-full 语义
++DM_TABLE_DEPS 返回 mixed linear/striped backing 并去重
++unknown target 仍拒绝，striped 不再作为 unsupported target
++```
++
++验证：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --all --check'
++docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout 1200 cargo osdk test device_mapper'
++git diff -- Cargo.toml
++git diff --check
++```
++
++结果：通过。ktest 期间临时将根 `Cargo.toml default-members` 缩小到 `kernel` 和 `kernel/comps/device-mapper`，验证结束后已恢复，并确认 `git diff -- Cargo.toml` 无输出、`git diff --check` 通过。第一次未缩小 default-members 的 ktest 触发全 workspace OSDK 测试，失败点是 `test/initramfs/build/ext2.img` 写锁冲突；随后重新执行小范围 ktest 通过。
++
++## 8. 接入 striped BIO 数据面
++
++涉及文件：
++
++- `kernel/comps/device-mapper/src/table.rs`
++- `docs/device-mapper-technical-maintenance.md`
++
++### 原来
++
++第 7 阶段后，striped 已能通过 `DM_TABLE_LOAD` 安装到 table，也能通过 `DM_TABLE_STATUS` 和 `DM_TABLE_DEPS` 查询控制面信息，但 `DmTable::enqueue()` 入口仍会拒绝任何包含非 linear target 的 table。
++
++这意味着含 striped table 的 read/write/flush BIO 都返回 `BioEnqueueError::Refused`，`StripedTarget::map_range()` 还没有接到真实 BIO split/remap 路径。
++
++### 现在
++
++`DmTable::enqueue()` 改为先处理 `BioType::Flush`，再对普通 read/write BIO 生成 table 内部 mapped part：
++
++```text
++logical_range
++backing_start
++backing device
++```
++
++linear target 继续按原来的 `map_sector()` 和 single backing remap。striped target 复用 `StripedTarget::map_range()`，把一个 logical range 按 stripe chunk 边界拆成多个 `StripedRangeMap`，再用每个 part 的 `stripe_index` 找到对应 backing，并用 `backing_range.start` 作为 child BIO 的 remap 起点。
++
++最终 mapped part 只有一个时仍直接 remap/enqueue；多个 part 时复用 `SubmittedBio::split()` 和已有 split completion 聚合。任一 child remap 或 enqueue 失败仍完成该 child 为 `BioStatus::IoError`，保持原跨 linear target split 的错误语义。
++
++flush 不再因为 table 含 striped target 被提前拒绝，继续复用现有 backing 去重 fan-out；同一 backing 出现在 linear target 和 striped stripe 中时仍只 flush 一次。
++
++本阶段不修改 `SubmittedBio::split()`，不改变 `DmTarget::backing()` / `DmTarget::map_sector()` 对 striped 返回 `None` 的 single-backing 语义，不新增 `myshell/dm_striped/` 脚本，也不宣称 LVM2 striped 路径已可用。
++
++### 测试
++
++补充 table 层 ktest 覆盖：
++
++```text
++单 striped chunk 内 BIO remap 到正确 backing range
++跨 striped chunk 的 BIO split/remap 到多个 backing range
++跨 linear 和 striped target 边界的 BIO 同时按 target/chunk 边界 split
++含 striped table 的 flush fan-out 到每个 backing
++linear 与 striped 共用 backing 时 flush 按 DeviceId 去重
++striped table 越界 BIO 仍返回 Refused
++```
++
++验证：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --all --check'
++docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout 1200 cargo osdk test device_mapper'
++git diff -- Cargo.toml
++```
++
++结果：通过。第一次格式检查发现 `table.rs` 新增 helper 函数签名需要 rustfmt 换行，执行 `cargo fmt --all` 后复查通过。ktest 期间临时将根 `Cargo.toml default-members` 缩小到 `kernel` 和 `kernel/comps/device-mapper`，验证结束后已恢复，并确认 `git diff -- Cargo.toml` 无输出。
++
++## 9. 新增 raw dm_striped 系统测试脚本
++
++涉及文件：
++
++- `myshell/dm_striped/run_raw_striped_bio_test.sh`
++- `myshell/run_dm_system_tests.sh`
++- `docs/device-mapper-lvm1/test1.md`
++- `docs/device-mapper-technical-maintenance.md`
++
++### 原来
++
++第 8 阶段已经在 ktest 中验证 striped BIO chunk split/remap 和 flush fan-out，但还没有 NixOS guest 里的 raw `dmsetup create ... striped ...` 脚本。
++
++这意味着 striped 数据面已经有内核单元测试，但还没有真实用户态 ABI 路径验证；系统测试文档也仍主要围绕 linear/control 脚本组织。
++
++### 现在
++
++新增：
++
++```text
++myshell/dm_striped/run_raw_striped_bio_test.sh
++```
++
++该脚本启动单个 NixOS guest，定位两块测试盘，确认 `dmsetup targets` 中存在 `striped`，创建 2-way striped mapper：
++
++```text
++0 16 striped 2 4 <dev1> 0 <dev2> 0
++```
++
++脚本写入 8 KiB payload，覆盖四个 2 KiB stripe chunk：
++
++```text
++chunk A -> dev1 offset 0
++chunk B -> dev2 offset 0
++chunk C -> dev1 offset 2048
++chunk D -> dev2 offset 2048
++```
++
++随后校验 mapper 读回 md5 等于原 payload，并分别校验两块 backing 的前 4 KiB 为 `A+C` 和 `B+D`。同时检查 table/status/deps 输出。
++
++`myshell/run_dm_system_tests.sh` 新增显式入口：
++
++```text
++--striped
++```
++
++默认 `--full` 仍保持 linear 全量回归，避免默认慢验收范围突然扩大。文档同步说明 raw striped 已有脚本覆盖，但 LVM2 `lvcreate --type striped` 路径仍未验收。
++
++### 测试
++
++验证：
++
++```text
++bash -n myshell/run_dm_system_tests.sh \
++       myshell/lib/dm_nixos_test.sh \
++       myshell/dm_linear/run_control_abi_test.sh \
++       myshell/dm_linear/run_cross_target_bio_regression.sh \
++       myshell/dm_linear/run_cross_pv_large_write_test.sh \
++       myshell/dm_linear/run_lvm2_resize_test.sh \
++       myshell/dm_linear/run_linear_full_flow_test.sh \
++       myshell/dm_striped/run_raw_striped_bio_test.sh
++myshell/run_dm_system_tests.sh --help
++myshell/dm_striped/run_raw_striped_bio_test.sh --help
++```
++
++结果：通过。随后执行 raw striped 系统验收：第一次默认 `GUEST_READY_TIMEOUT=120` 时 guest 已进入 Asterinas NixOS Stage 2 但未在 120 秒内出现 root shell，脚本返回 `HOST_FAIL_DM_STRIPED_RAW_BIO guest_guest_shell_timeout=120s`；确认无残留 QEMU 后，以 `GUEST_READY_TIMEOUT=300` 重跑 `myshell/run_dm_system_tests.sh --striped` 通过。
++
++通过标记：
++
++```text
++CHECK_PASS_STRIPED_RAW_SETUP
++CHECK_PASS_STRIPED_RAW_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_RAW_MAPPER_READBACK_MD5
++CHECK_PASS_STRIPED_RAW_BACKING_DISTRIBUTION_MD5
++TEST_PASS_DM_STRIPED_RAW_BIO
++HOST_PASS_DM_STRIPED_RAW_BIO
++HOST_PASS_DM_SYSTEM_TESTS --striped
++```
++
++## 10. 新增 LVM2 striped 系统验收脚本
++
++涉及文件：
++
++- `myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh`
++- `myshell/run_dm_system_tests.sh`
++- `docs/device-mapper-lvm1/test1.md`
++- `docs/device-mapper-technical-maintenance.md`
++
++### 原来
++
++第 9 阶段已经通过 raw `dmsetup create ... striped ...` 系统验收，证明手写 striped table 的 table/status/deps、8 KiB mapper readback 和 backing A+C/B+D 分布正确。
++
++但这还没有覆盖 LVM2/libdevmapper 生成真实 striped table 的路径，也没有覆盖 PV metadata、非零 backing data offset、ext2 文件 I/O、VG/LV 重启恢复。
++
++### 现在
++
++新增 two-guest LVM2 striped 验收脚本：
++
++```text
++myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh
++```
++
++first guest 流程：
++
++```text
++检查 /dev/mapper/control 和 striped target
++定位两块测试盘
++pvcreate / vgcreate
++lvcreate --type striped -i 2 -I 4K -L 256M
++检查 dmsetup table/status/deps 为 2-way striped
++mkfs.ext2 + mount
++写入 64 MiB 文件和 marker 文件
++md5sum -c
++umount + vgchange -an
++```
++
++second guest 流程：
++
++```text
++重新定位测试盘
++pvscan / vgscan --mknodes / vgchange -ay
++再次检查 dmsetup table/status/deps 为 2-way striped
++readonly mount
++md5sum -c
++读取 marker 文件
++umount + vgchange -an
++```
++
++新增组合入口：
++
++```text
++myshell/run_dm_system_tests.sh --striped-lvm2
++```
++
++`--striped` 仍只跑 raw striped，`--full` 仍保持 linear 全量回归。本阶段不做 striped resize/shrink，也不修改启动基础设置。
++
++### 测试
++
++验证：
++
++```text
++bash -n myshell/run_dm_system_tests.sh myshell/lib/dm_nixos_test.sh myshell/dm_striped/run_raw_striped_bio_test.sh myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh
++myshell/run_dm_system_tests.sh --help
++myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh --help
++docker exec myAsterinas bash -lc 'cd /root/asterinas && make nixos && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2'
++docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped'
++```
++
++结果：通过。LVM2 striped 验收中 first guest root shell ready 用时 125s，second guest ready 用时 173s；raw striped 回归 root shell ready 用时 106s。LVM2 生成的 table 为：
++
++```text
++0 524288 striped 2 8 253:64 2048 253:80 2048
++```
++
++脚本验证了 table/status/deps、64 MiB 文件和 marker 的 md5、重启后 readonly mount + md5 复查。随后补跑 raw `--striped` 回归，验证 raw mapper readback 和 backing A+C/B+D 分布仍通过。
++
++通过标记：
++
++```text
++CHECK_PASS_STRIPED_LVM2_SETUP
++CHECK_PASS_STRIPED_LVM2_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_LVM2_FILE_MD5
++TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_FIRST
++CHECK_PASS_STRIPED_LVM2_RECOVERED_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_LVM2_RECOVERED_FILE_MD5
++TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_SECOND
++HOST_PASS_DM_STRIPED_LVM2_IO_REBOOT
++HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2
++CHECK_PASS_STRIPED_RAW_BACKING_DISTRIBUTION_MD5
++HOST_PASS_DM_SYSTEM_TESTS --striped
++```
++
++## 11. 新增 LVM2 striped 扩容验收脚本
++
++涉及文件：
++
++- `myshell/dm_striped/run_lvm2_striped_extend_test.sh`
++- `myshell/run_dm_system_tests.sh`
++
++### 原来
++
++第 10 阶段已经覆盖 LVM2 striped create + 文件 I/O + reboot recovery，但还没有覆盖 striped LV 扩容路径。
++
++这意味着当前已验证：LVM2 能创建 2-way striped table，ext2 能在该 mapper 上写文件，重启后能恢复并只读校验；但尚未验证 `lvextend` 后 table reload、mapper capacity 增大、ext2 grow、新增容量区域写入和重启后恢复。
++
++### 现在
++
++新增 two-guest LVM2 striped 扩容验收脚本：
++
++```text
++myshell/dm_striped/run_lvm2_striped_extend_test.sh
++```
++
++first guest 流程：
++
++```text
++检查 /dev/mapper/control 和 striped target
++定位两块测试盘
++pvcreate / vgcreate
++lvcreate --type striped -i 2 -I 4K -L 256M
++检查 initial dmsetup table/status/deps 为 2-way striped
++mkfs.ext2 + mount
++写入 64 MiB base 文件和 marker 文件
++md5sum -c
++lvextend 到 512M
++检查 extended dmsetup table/status/deps 为 2-way striped 且总长度增大
++离线 e2fsck + resize2fs + e2fsck
++重新 mount
++复查 base md5
++写入 192 MiB extended 文件和 marker 文件
++md5sum -c
++umount + vgchange -an
++```
++
++second guest 流程：
++
++```text
++重新定位测试盘
++pvscan / vgscan --mknodes / vgchange -ay
++检查 recovered dmsetup table/status/deps 为扩容后的 2-way striped
++readonly mount
++md5sum -c
++读取 base marker 和 extend marker
++umount + vgchange -an
++```
++
++新增组合入口：
++
++```text
++myshell/run_dm_system_tests.sh --striped-lvm2-extend
++```
++
++`--striped`、`--striped-lvm2` 和 `--full` 语义保持不变。本阶段不做 striped shrink，不更新 `docs/device-mapper-technical-maintenance.md`，也暂不更新测试说明文档。
++
++### 测试
++
++验证：
++
++```text
++bash -n myshell/run_dm_system_tests.sh myshell/lib/dm_nixos_test.sh myshell/dm_striped/run_raw_striped_bio_test.sh myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh myshell/dm_striped/run_lvm2_striped_extend_test.sh
++myshell/run_dm_system_tests.sh --help
++myshell/dm_striped/run_lvm2_striped_extend_test.sh --help
++docker exec myAsterinas bash -lc 'cd /root/asterinas && make nixos && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-extend'
++```
++
++结果：通过。first guest root shell ready 用时 103s，second guest ready 用时 119s。initial table 为：
++
++```text
++0 524288 striped 2 8 253:64 2048 253:80 2048
++```
++
++扩容后 table 为：
++
++```text
++0 1048576 striped 2 8 253:64 2048 253:80 2048
++```
++
++重启恢复后的 table 为：
++
++```text
++0 1048576 striped 2 8 253:64 2048 253:80 2048
++```
++
++脚本验证了 256M 2-way striped LV 创建、64 MiB base 文件 md5、`lvextend` 到 512M、离线 `resize2fs`、192 MiB extended 文件 md5、重启后恢复 VG/LV、readonly mount 和全量 md5 复查。
++
++通过标记：
++
++```text
++CHECK_PASS_STRIPED_LVM2_EXTEND_SETUP
++CHECK_PASS_STRIPED_LVM2_EXTEND_INITIAL_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_LVM2_EXTEND_BASE_FILE_MD5
++CHECK_PASS_STRIPED_LVM2_EXTENDED_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_LVM2_EXTEND_FILE_MD5
++TEST_PASS_DM_STRIPED_LVM2_EXTEND_FIRST
++CHECK_PASS_STRIPED_LVM2_EXTEND_RECOVERED_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_LVM2_EXTEND_RECOVERED_FILE_MD5
++TEST_PASS_DM_STRIPED_LVM2_EXTEND_SECOND
++HOST_PASS_DM_STRIPED_LVM2_EXTEND
++HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2-extend
++```
++
++## 12. 新增 LVM2 striped 缩容验收脚本
++
++### 背景
++
++第 10 阶段已经覆盖 LVM2 striped create + 文件 I/O + reboot recovery，第 11 阶段已经覆盖 `lvextend` + ext2 grow + reboot recovery。当前还缺反向 resize 路径：先离线缩 ext2，再执行 `lvreduce`，最后确认缩容后的 striped table、缩容后文件 I/O 和重启恢复。
++
++这个阶段补系统验收，不预期修改内核数据面。原来扩容是把 active table 变长后让新增逻辑区域继续按 stripe chunk 分发到底层两块盘；本阶段缩容则验证 active table 变短后，保留逻辑区域的数据仍然可读写，重启恢复后 table 长度也保持缩容后的大小。
++
++### 改动
++
++新增脚本：
++
++```text
++myshell/dm_striped/run_lvm2_striped_shrink_test.sh
++```
++
++默认覆盖：
++
++```text
++512M 2-way striped LV
++64 MiB keep 文件
++离线 resize2fs 到 256M
++lvreduce 到 256M
++32 MiB after-shrink 文件
++重启后 readonly mount + md5 复查
++```
++
++first guest 流程：
++
++```text
++检查 /dev/mapper/control 和 striped target
++定位 vdmtest / vdmtest2 两块测试盘
++pvcreate / vgcreate
++lvcreate --type striped -i 2 -I 4K -L 512M
++检查 initial dmsetup table/status/deps
++mkfs.ext2 + 写 keep 文件 + md5sum -c
++umount + e2fsck + resize2fs 256M + e2fsck
++lvreduce -y -L 256M
++检查 shrunk dmsetup table/status/deps
++重新 mount + 复查 keep md5
++写 after-shrink 文件 + 追加 md5 + md5sum -c
++vgchange -an + poweroff
++```
++
++second guest 流程：
++
++```text
++重新定位测试盘
++pvscan / vgscan --mknodes / vgchange -ay
++检查 recovered dmsetup table/status/deps 为缩容后的 2-way striped
++readonly mount
++md5sum -c
++读取 keep marker 和 shrink marker
++umount + vgchange -an
++```
++
++新增组合入口：
++
++```text
++myshell/run_dm_system_tests.sh --striped-lvm2-shrink
++```
++
++`--striped`、`--striped-lvm2`、`--striped-lvm2-extend` 和 `--full` 语义保持不变。本阶段不更新 `docs/device-mapper-technical-maintenance.md`，也暂不更新测试说明文档。
++
++### 测试
++
++验证：
++
++```text
++bash -n myshell/run_dm_system_tests.sh myshell/lib/dm_nixos_test.sh myshell/dm_striped/run_raw_striped_bio_test.sh myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh myshell/dm_striped/run_lvm2_striped_extend_test.sh myshell/dm_striped/run_lvm2_striped_shrink_test.sh
++myshell/run_dm_system_tests.sh --help
++myshell/dm_striped/run_lvm2_striped_shrink_test.sh --help
++docker exec myAsterinas bash -lc 'cd /root/asterinas && make nixos && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-shrink'
++```
++
++结果：通过。first guest root shell ready 用时 132s，second guest ready 用时 112s。initial table 为：
++
++```text
++0 1048576 striped 2 8 253:64 2048 253:80 2048
++```
++
++缩容后 table 为：
++
++```text
++0 524288 striped 2 8 253:64 2048 253:80 2048
++```
++
++重启恢复后的 table 为：
++
++```text
++0 524288 striped 2 8 253:64 2048 253:80 2048
++```
++
++脚本验证了 512M 2-way striped LV 创建、64 MiB keep 文件 md5、离线 `resize2fs 256M`、`lvreduce` 到 256M、32 MiB after-shrink 文件 md5、重启后恢复 VG/LV、readonly mount 和全量 md5 复查。
++
++通过标记：
++
++```text
++CHECK_PASS_STRIPED_LVM2_SHRINK_SETUP
++CHECK_PASS_STRIPED_LVM2_SHRINK_INITIAL_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_LVM2_SHRINK_KEEP_FILE_MD5
++CHECK_PASS_STRIPED_LVM2_SHRUNK_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_LVM2_SHRINK_FILE_MD5
++TEST_PASS_DM_STRIPED_LVM2_SHRINK_FIRST
++CHECK_PASS_STRIPED_LVM2_SHRINK_RECOVERED_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_LVM2_SHRINK_RECOVERED_FILE_MD5
++TEST_PASS_DM_STRIPED_LVM2_SHRINK_SECOND
++HOST_PASS_DM_STRIPED_LVM2_SHRINK
++HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2-shrink
++```
++
++## 13. 收敛 LVM2 striped 系统验收脚本
++
++### 背景
++
++第 11、12 阶段为了单独验证扩容和缩容，临时拆出了 `--striped-lvm2-extend` 和 `--striped-lvm2-shrink`。这个拆分便于定位问题，但最终系统级验收不应该长期保留成多个碎片脚本；linear target 的 resize 验收也是在一个大脚本里覆盖 create、grow、shrink 和 reboot recovery。
++
++因此本阶段把 LVM2 striped create、extend、shrink、文件 I/O 和 reboot recovery 收敛回主脚本：
++
++```text
++myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh
++```
++
++### 改动
++
++主脚本 first guest 现在覆盖：
++
++```text
++检查 /dev/mapper/control 和 striped target
++定位 vdmtest / vdmtest2 两块测试盘
++pvcreate / vgcreate
++lvcreate --type striped -i 2 -I 4K -L 256M
++检查 initial dmsetup table/status/deps
++mkfs.ext2 + 写 base 文件 + md5sum -c
++lvextend 到 512M
++检查 extended dmsetup table/status/deps
++离线 resize2fs grow
++写 grow 临时大文件 + md5sum -c
++删除 grow 临时大文件，避免影响后续 shrink
++离线 resize2fs 到 256M
++lvreduce -y -L 256M
++检查 shrunk dmsetup table/status/deps
++重新 mount + 复查 base md5
++写 after-shrink 文件 + 追加 md5 + md5sum -c
++vgchange -an + poweroff
++```
++
++second guest 现在覆盖：
++
++```text
++重新定位测试盘
++pvscan / vgscan --mknodes / vgchange -ay
++检查 recovered dmsetup table/status/deps 为最终 256M 2-way striped
++readonly mount
++md5sum -c base 和 after-shrink 文件
++读取 base marker 和 shrink marker
++umount + vgchange -an
++```
++
++删除临时脚本和入口：
++
++```text
++myshell/dm_striped/run_lvm2_striped_extend_test.sh
++myshell/dm_striped/run_lvm2_striped_shrink_test.sh
++myshell/run_dm_system_tests.sh --striped-lvm2-extend
++myshell/run_dm_system_tests.sh --striped-lvm2-shrink
++```
++
++保留入口：
++
++```text
++myshell/run_dm_system_tests.sh --striped-lvm2
++```
++
++`--striped` 和 `--full` 语义保持不变。本阶段不更新 `docs/device-mapper-technical-maintenance.md`，也暂不更新测试说明文档。
++
++### 测试
++
++验证：
++
++```text
++bash -n myshell/run_dm_system_tests.sh myshell/lib/dm_nixos_test.sh myshell/dm_striped/run_raw_striped_bio_test.sh myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh
++myshell/run_dm_system_tests.sh --help
++myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh --help
++docker exec myAsterinas bash -lc 'cd /root/asterinas && make nixos && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2'
++```
++
++结果：通过。first guest root shell ready 用时 161s，second guest ready 用时 143s。initial table 为：
++
++```text
++0 524288 striped 2 8 253:64 2048 253:80 2048
++```
++
++扩容后 table 为：
++
++```text
++0 1048576 striped 2 8 253:64 2048 253:80 2048
++```
++
++缩容后 table 为：
++
++```text
++0 524288 striped 2 8 253:64 2048 253:80 2048
++```
++
++重启恢复后的 table 为：
++
++```text
++0 524288 striped 2 8 253:64 2048 253:80 2048
++```
++
++脚本验证了 256M 2-way striped LV 创建、64 MiB base 文件 md5、`lvextend` 到 512M、离线 `resize2fs` grow、256 MiB grow 临时文件 md5、删除 grow 临时文件、离线 `resize2fs 256M`、`lvreduce` 到 256M、32 MiB after-shrink 文件 md5、重启后恢复 VG/LV、readonly mount 和最终 md5 复查。
++
++通过标记：
++
++```text
++CHECK_PASS_STRIPED_LVM2_SETUP
++CHECK_PASS_STRIPED_LVM2_INITIAL_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_LVM2_BASE_FILE_MD5
++CHECK_PASS_STRIPED_LVM2_EXTENDED_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_LVM2_GROW_FILE_MD5
++CHECK_PASS_STRIPED_LVM2_SHRUNK_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_LVM2_SHRINK_FILE_MD5
++TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_FIRST
++CHECK_PASS_STRIPED_LVM2_RECOVERED_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED_LVM2_RECOVERED_FILE_MD5
++TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_SECOND
++HOST_PASS_DM_STRIPED_LVM2_IO_REBOOT
++HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2
++```
++
++## 14. 收敛 Device Mapper 文档
++
++### 背景
++
++LVM2 striped 系统验收已收敛为单个 create/grow/shrink/reboot 大脚本，测试说明和技术维护文档需要同步到最终入口和最终能力边界。
++
++### 改动
++
++更新测试说明文档：
++
++```text
++docs/device-mapper-lvm1/test1.md
++```
++
++记录：
++
++```text
++--striped 是 raw dmsetup striped BIO 分布验收
++--striped-lvm2 是 LVM2 striped create/grow/shrink/reboot 系统验收
++run_lvm2_striped_io_reboot_test.sh 覆盖 256M create、512M grow、256M shrink、reboot recovery
++LVM2 striped 参数改为 STRIPED_INITIAL_LV_MIB / STRIPED_EXTENDED_LV_MIB / STRIPED_SHRUNK_LV_MIB 等最终变量
++```
++
++更新技术维护文档：
++
++```text
++docs/device-mapper-technical-maintenance.md
++```
++
++记录当前设计事实：
++
++```text
++linear 和 striped target 支持 Read/Write/Flush
++striped 数据面按 stripe chunk split/remap
++LVM2 striped create/grow/shrink/reboot 已纳入系统验收
++后续工作聚焦多 segment、多 PV、异常路径和测试矩阵稳定化
++```
++
++技术维护文档按当前设计事实组织，不写阶段对比和过程描述。
++
++### 测试
++
++验证：
++
++```text
++git diff --check
++grep docs/device-mapper-lvm1/test1.md 和 docs/device-mapper-technical-maintenance.md 中是否残留临时 striped suite
++grep docs/device-mapper-technical-maintenance.md 中是否残留阶段对比或 striped resize/shrink 空白描述
++git status --short
++```
++
++结果：通过。`git diff --check` 无输出；技术维护文档未发现 `之前`、`现在`、`尚未覆盖`、`不做 striped resize` 等阶段式残留；两份文档未发现 `--striped-lvm2-extend`、`--striped-lvm2-shrink`、`run_lvm2_striped_extend_test`、`run_lvm2_striped_shrink_test` 残留。
++
++## 15. 新增 LVM2 striped 3PV / 3-way 系统验收
++
++### 背景
++
++2-way LVM2 striped create/grow/shrink/reboot 已经收敛到主脚本；还需要补充 `stripe_count > 2` 的真实 LVM2/libdevmapper、ext2 文件 I/O 和 reboot recovery 验收。
++
++本阶段只覆盖单 segment 3PV / 3-way striped LV，不把 multi-segment 混入本阶段。
++
++### 改动
++
++公共 NixOS DM 测试 harness 支持显式 `DM_TEST_IMAGES` 多盘列表：
++
++```text
++myshell/lib/dm_nixos_test.sh
++```
++
++未设置 `DM_TEST_IMAGES` 时继续按 `DM_TEST_IMAGE` 和 `DM_TEST_IMAGE_2` 保持两盘默认行为；reset 和两次 `make run_nixos` 使用同一份测试盘列表。
++
++新增脚本：
++
++```text
++myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh
++```
++
++默认覆盖：
++
++```text
++三块 512 MiB 测试盘
++384M 3-way striped LV
++4 KiB stripe chunk
++96 MiB 文件和 marker
++重启后 readonly mount + md5 复查
++```
++
++first guest 流程：
++
++```text
++检查 /dev/mapper/control 和 striped target
++定位 vdmtest / vdmtest2 / vdmtest3 三块测试盘
++pvcreate / vgcreate
++lvcreate --type striped -i 3 -I 4K -L 384M
++检查 dmsetup table/status/deps 为 3-way striped、总长 384M、3 dependencies
++mkfs.ext2 + 写 96 MiB 文件和 marker
++md5sum -c
++vgchange -an + poweroff
++```
++
++second guest 流程：
++
++```text
++重新定位三块测试盘
++pvscan / vgscan --mknodes / vgchange -ay
++检查 recovered dmsetup table/status/deps 为 384M 3-way striped
++readonly mount
++md5sum -c
++读取 marker
++vgchange -an + poweroff
++```
++
++新增组合入口：
++
++```text
++myshell/run_dm_system_tests.sh --striped-lvm2-3pv
++```
++
++`--striped`、`--striped-lvm2` 和 `--full` 语义保持不变，`--full` 不加入 striped 全量。
++
++测试说明和技术维护文档同步记录 3PV 入口、默认参数、通过标记和验证矩阵。
++
++### 测试
++
++验证：
++
++```text
++bash -n myshell/lib/dm_nixos_test.sh \
++       myshell/run_dm_system_tests.sh \
++       myshell/dm_striped/run_raw_striped_bio_test.sh \
++       myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh \
++       myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh
++myshell/run_dm_system_tests.sh --help
++myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh --help
++docker exec myAsterinas bash -lc 'cd /root/asterinas && make nixos && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-3pv'
++docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped'
++docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2'
++```
++
++结果：通过。3PV first guest ready 用时 109s，second guest ready 用时 157s；raw striped guest ready 用时 169s；2-way LVM2 striped first guest ready 用时 150s，second guest ready 用时 139s。
++
++3PV 创建和重启恢复 table 均为：
++
++```text
++0 786432 striped 3 8 253:64 2048 253:80 2048 253:96 2048
++```
++
++通过标记：
++
++```text
++CHECK_PASS_STRIPED3_LVM2_SETUP
++CHECK_PASS_STRIPED3_LVM2_CREATED_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED3_LVM2_FILE_MD5
++TEST_PASS_DM_STRIPED_LVM2_3PV_REBOOT_FIRST
++CHECK_PASS_STRIPED3_LVM2_RECOVERED_TABLE_STATUS_DEPS
++CHECK_PASS_STRIPED3_LVM2_RECOVERED_FILE_MD5
++TEST_PASS_DM_STRIPED_LVM2_3PV_REBOOT_SECOND
++HOST_PASS_DM_STRIPED_LVM2_3PV_REBOOT
++HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2-3pv
++HOST_PASS_DM_SYSTEM_TESTS --striped
++HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2
++```
++
++## 验证记录
++
++今天针对上述工程改动，已在容器 `myAsterinas` 内跑过：
++
++```bash
++cargo fmt --all --check
++timeout 1200 cargo osdk test device_mapper
++```
++
++第 5 阶段额外执行过：
++
++```bash
++cargo fmt --all
++cargo fmt --all --check
++timeout 1200 cargo osdk test device_mapper
++```
++
++第 6 阶段额外执行过脚本语法和入口检查：
++
++```bash
++bash -n myshell/run_dm_system_tests.sh \
++       myshell/lib/dm_nixos_test.sh \
++       myshell/dm_linear/run_control_abi_test.sh \
++       myshell/dm_linear/run_cross_target_bio_regression.sh \
++       myshell/dm_linear/run_cross_pv_large_write_test.sh \
++       myshell/dm_linear/run_lvm2_resize_test.sh \
++       myshell/dm_linear/run_linear_full_flow_test.sh
++myshell/run_dm_system_tests.sh --help
++```
++
++第 7 阶段额外执行过 Rust 格式检查、device_mapper ktest 和 diff 检查：
++
++```bash
++docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --all --check'
++docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout 1200 cargo osdk test device_mapper'
++git diff -- Cargo.toml
++git diff --check
++```
++
++结果：通过。第一次未缩小 `default-members` 的 ktest 触发全 workspace OSDK 测试，失败点是 `test/initramfs/build/ext2.img` 写锁冲突；随后重新执行小范围 ktest 通过。
++
++第 8 阶段额外执行过 Rust 格式检查、device_mapper ktest 和 Cargo.toml 恢复检查：
++
++```bash
++docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --all --check'
++docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --all'
++docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --all --check'
++docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout 1200 cargo osdk test device_mapper'
++git diff -- Cargo.toml
++```
++
++结果：通过。第一次格式检查发现 `table.rs` 需要 rustfmt，格式化后复查通过。ktest 期间临时缩小 `default-members`，验证结束后已恢复 `Cargo.toml`，并确认无 diff。
++
++第 9 阶段额外执行过脚本语法和入口检查：
++
++```bash
++bash -n myshell/run_dm_system_tests.sh \
++       myshell/lib/dm_nixos_test.sh \
++       myshell/dm_linear/run_control_abi_test.sh \
++       myshell/dm_linear/run_cross_target_bio_regression.sh \
++       myshell/dm_linear/run_cross_pv_large_write_test.sh \
++       myshell/dm_linear/run_lvm2_resize_test.sh \
++       myshell/dm_linear/run_linear_full_flow_test.sh \
++       myshell/dm_striped/run_raw_striped_bio_test.sh
++myshell/run_dm_system_tests.sh --help
++myshell/dm_striped/run_raw_striped_bio_test.sh --help
++```
++
++结果：通过。脚本语法/help 检查通过后，raw striped 系统验收第一次因 guest root shell 等待 120 秒超时失败；确认无残留 QEMU 后，以 `GUEST_READY_TIMEOUT=300` 重跑 `myshell/run_dm_system_tests.sh --striped` 通过，输出 `TEST_PASS_DM_STRIPED_RAW_BIO`、`HOST_PASS_DM_STRIPED_RAW_BIO` 和 `HOST_PASS_DM_SYSTEM_TESTS --striped`。
++
++第 10 阶段额外执行过脚本语法、入口检查和 LVM2 striped two-guest 系统验收：
++
++```bash
++bash -n myshell/run_dm_system_tests.sh myshell/lib/dm_nixos_test.sh myshell/dm_striped/run_raw_striped_bio_test.sh myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh
++myshell/run_dm_system_tests.sh --help
++myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh --help
++docker exec myAsterinas bash -lc 'cd /root/asterinas && make nixos && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2'
++docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped'
++```
++
++结果：通过，LVM2 striped 输出 `TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_FIRST`、`TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_SECOND`、`HOST_PASS_DM_STRIPED_LVM2_IO_REBOOT` 和 `HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2`；raw striped 回归输出 `CHECK_PASS_STRIPED_RAW_BACKING_DISTRIBUTION_MD5`、`TEST_PASS_DM_STRIPED_RAW_BIO`、`HOST_PASS_DM_STRIPED_RAW_BIO` 和 `HOST_PASS_DM_SYSTEM_TESTS --striped`。LVM2 first guest ready 用时 125s，second guest ready 用时 173s；raw striped guest ready 用时 106s。
++
++第 11 阶段额外执行过脚本语法、入口检查和 LVM2 striped extend two-guest 系统验收：
++
++```bash
++bash -n myshell/run_dm_system_tests.sh myshell/lib/dm_nixos_test.sh myshell/dm_striped/run_raw_striped_bio_test.sh myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh myshell/dm_striped/run_lvm2_striped_extend_test.sh
++myshell/run_dm_system_tests.sh --help
++myshell/dm_striped/run_lvm2_striped_extend_test.sh --help
++docker exec myAsterinas bash -lc 'cd /root/asterinas && make nixos && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-extend'
++```
++
++结果：通过，输出 `TEST_PASS_DM_STRIPED_LVM2_EXTEND_FIRST`、`TEST_PASS_DM_STRIPED_LVM2_EXTEND_SECOND`、`HOST_PASS_DM_STRIPED_LVM2_EXTEND` 和 `HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2-extend`。first guest ready 用时 103s，second guest ready 用时 119s；initial table 为 256M，扩容后和重启恢复后 table 均为 512M。
++
++第 12 阶段额外执行过脚本语法、入口检查和 LVM2 striped shrink two-guest 系统验收：
++
++```bash
++bash -n myshell/run_dm_system_tests.sh myshell/lib/dm_nixos_test.sh myshell/dm_striped/run_raw_striped_bio_test.sh myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh myshell/dm_striped/run_lvm2_striped_extend_test.sh myshell/dm_striped/run_lvm2_striped_shrink_test.sh
++myshell/run_dm_system_tests.sh --help
++myshell/dm_striped/run_lvm2_striped_shrink_test.sh --help
++docker exec myAsterinas bash -lc 'cd /root/asterinas && make nixos && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-shrink'
++```
++
++结果：通过，输出 `TEST_PASS_DM_STRIPED_LVM2_SHRINK_FIRST`、`TEST_PASS_DM_STRIPED_LVM2_SHRINK_SECOND`、`HOST_PASS_DM_STRIPED_LVM2_SHRINK` 和 `HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2-shrink`。first guest ready 用时 132s，second guest ready 用时 112s；initial table 为 512M，缩容后和重启恢复后 table 均为 256M。
++
++第 13 阶段额外执行过脚本语法、入口检查和收敛后的 LVM2 striped create/grow/shrink/reboot 系统验收：
++
++```bash
++bash -n myshell/run_dm_system_tests.sh myshell/lib/dm_nixos_test.sh myshell/dm_striped/run_raw_striped_bio_test.sh myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh
++myshell/run_dm_system_tests.sh --help
++myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh --help
++docker exec myAsterinas bash -lc 'cd /root/asterinas && make nixos && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2'
++```
++
++结果：通过，输出 `TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_FIRST`、`TEST_PASS_DM_STRIPED_LVM2_IO_REBOOT_SECOND`、`HOST_PASS_DM_STRIPED_LVM2_IO_REBOOT` 和 `HOST_PASS_DM_SYSTEM_TESTS --striped-lvm2`。first guest ready 用时 161s，second guest ready 用时 143s；initial table 为 256M，扩容后 table 为 512M，缩容后和重启恢复后 table 均为 256M。
++
++本日截至第 15 阶段已完成 raw `dm_striped`、收敛后的 LVM2 striped create/grow/shrink/reboot 系统验收，以及 LVM2 striped 3PV / 3-way reboot 系统验收。第 15 阶段补齐 `stripe_count > 2` 的真实 LVM2/libdevmapper、ext2 文件 I/O、VG/LV 重启恢复和只读 md5 复查；multi-segment 组合后续单独推进。
++
++注意：
++
++- ktest 期间临时缩小过 `Cargo.toml default-members`；
++- 验证结束后 `Cargo.toml` 已恢复；
++- 最后确认 `Cargo.toml` 无 diff，`git diff --check` 通过。

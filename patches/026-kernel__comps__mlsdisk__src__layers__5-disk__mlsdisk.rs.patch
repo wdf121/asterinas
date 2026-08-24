@@ -1,0 +1,13 @@
+diff --git a/kernel/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs b/kernel/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs
+index af076f15d..6d87e08b5 100644
+--- a/kernel/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs
++++ b/kernel/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs
+@@ -159,7 +159,7 @@ impl<D: BlockSet + 'static> aster_block::BlockDevice for MlsDisk<D> {
+         }
+     }
+ 
+-    fn name(&self) -> &str {
++    fn name(&self) -> String {
+         todo!()
+     }
+ 

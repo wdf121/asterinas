@@ -1,0 +1,309 @@
+diff --git a/myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh b/myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh
+new file mode 100755
+index 000000000..560f06ab6
+--- /dev/null
++++ b/myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh
+@@ -0,0 +1,303 @@
++#!/bin/bash
++
++# SPDX-License-Identifier: MPL-2.0
++
++set -euo pipefail
++
++if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
++    cat <<'EOF'
++Usage: myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh
++
++Runs a two-guest NixOS regression for a 3PV / 3-way LVM2 striped LV, ext2 file I/O, and reboot recovery.
++
++Optional environment variables:
++  DM_TEST_IMAGES                    Backing test image list, default "target/nixos/test.img target/nixos/test2.img target/nixos/test3.img"
++  DM_STRIPED_LVM2_3PV_REBOOT_LOG    Host-side log path, default /tmp/dm-striped-lvm2-3pv-reboot-test.log
++  GUEST_READY_TIMEOUT               Seconds to wait for guest root shell, default 300
++  RESET_DM_TEST_IMAGES              1 to delete test images before running, default 1
++  STRIPED3_LV_MIB                   Striped LV size in MiB, default 384
++  STRIPED3_FILE_MIB                 Test file size in MiB, default 96
++  STRIPED3_CHUNK_KIB                LVM stripe chunk size in KiB, default 4
++EOF
++    exit 0
++fi
++
++SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
++ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
++source "${SCRIPT_DIR}/../lib/dm_nixos_test.sh"
++
++TEST_ID=DM_STRIPED_LVM2_3PV_REBOOT
++LOG=${DM_STRIPED_LVM2_3PV_REBOOT_LOG:-/tmp/dm-striped-lvm2-3pv-reboot-test.log}
++DM_TEST_IMAGE=${DM_TEST_IMAGE:-target/nixos/test.img}
++DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
++DM_TEST_IMAGE_3=${DM_TEST_IMAGE_3:-target/nixos/test3.img}
++DM_TEST_IMAGES=${DM_TEST_IMAGES:-${DM_TEST_IMAGE} ${DM_TEST_IMAGE_2} ${DM_TEST_IMAGE_3}}
++set -- ${DM_TEST_IMAGES}
++test "$#" -eq 3
++DM_TEST_IMAGE=$1
++DM_TEST_IMAGE_2=$2
++DM_TEST_IMAGE_3=$3
++GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-300}
++RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
++STRIPED3_LV_MIB=${STRIPED3_LV_MIB:-384}
++STRIPED3_FILE_MIB=${STRIPED3_FILE_MIB:-96}
++STRIPED3_CHUNK_KIB=${STRIPED3_CHUNK_KIB:-4}
++
++test "${STRIPED3_FILE_MIB}" -lt "${STRIPED3_LV_MIB}"
++
++cd "${ASTERINAS_DIR}"
++dm_prepare_nixos_test "${TEST_ID}"
++echo "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
++echo "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
++echo "HOST_INFO_${TEST_ID} disk3=${DM_TEST_IMAGE_3} serial=vdmtest3"
++echo "HOST_INFO_${TEST_ID} lv_mib=${STRIPED3_LV_MIB} file_mib=${STRIPED3_FILE_MIB} chunk_kib=${STRIPED3_CHUNK_KIB}"
++
++FIRST_GUEST_SCRIPT=$(mktemp /tmp/dm-striped-lvm2-3pv-first.XXXXXX)
++cat >"${FIRST_GUEST_SCRIPT}" <<'GUEST_SCRIPT'
++stty -echo 2>/dev/null || true
++set -eu
++trap 'status=$?; echo TEST_FAIL_DM_STRIPED_LVM2_3PV_REBOOT_FIRST status=$status; sync; poweroff; exit $status' ERR
++
++LVM_CONFIG='activation { udev_rules=0 }'
++STRIPED3_LV_MIB=__STRIPED3_LV_MIB__
++STRIPED3_FILE_MIB=__STRIPED3_FILE_MIB__
++STRIPED3_CHUNK_KIB=__STRIPED3_CHUNK_KIB__
++STRIPED3_LV_SECTORS=$((STRIPED3_LV_MIB * 2048))
++STRIPED3_CHUNK_SECTORS=$((STRIPED3_CHUNK_KIB * 2))
++MAPPER_NAME=striped3_vg-striped3_lv
++MAPPER_DEVICE=/dev/mapper/$MAPPER_NAME
++MOUNT_DIR=/mnt/dmstriped3
++
++devno() {
++    printf '%d:%d' "0x$(stat -c '%t' "$1")" "0x$(stat -c '%T' "$1")"
++}
++
++dep_token() {
++    printf '(%s, %s)' "${1%%:*}" "${1##*:}"
++}
++
++check_striped3_table() {
++    local table_file=$1 deps_file=$2 expected_sectors=$3 dev1=$4 dev2=$5 dev3=$6
++    test "$(wc -l < "$table_file")" -ge 1
++    awk -v len="$expected_sectors" -v chunk="$STRIPED3_CHUNK_SECTORS" '
++        BEGIN { expected_start = 0; ok = 1 }
++        $1 != expected_start { ok = 0 }
++        $3 != "striped" { ok = 0 }
++        $4 != 3 { ok = 0 }
++        $5 != chunk { ok = 0 }
++        { expected_start += $2 }
++        END { exit !(ok && expected_start == len) }
++    ' "$table_file"
++    grep -F -q "$dev1" "$table_file"
++    grep -F -q "$dev2" "$table_file"
++    grep -F -q "$dev3" "$table_file"
++    grep -q '3 dependencies' "$deps_file"
++    grep -F -q "$(dep_token "$dev1")" "$deps_file"
++    grep -F -q "$(dep_token "$dev2")" "$deps_file"
++    grep -F -q "$(dep_token "$dev3")" "$deps_file"
++}
++
++check_striped3_status() {
++    local status_file=$1 expected_sectors=$2
++    test "$(wc -l < "$status_file")" -ge 1
++    awk -v len="$expected_sectors" '
++        BEGIN { expected_start = 0; ok = 1 }
++        $1 != expected_start { ok = 0 }
++        $3 != "striped" { ok = 0 }
++        { expected_start += $2 }
++        END { exit !(ok && expected_start == len) }
++    ' "$status_file"
++}
++
++check_striped3_table_status_deps() {
++    local label=$1 table_file=$2 status_file=$3 deps_file=$4 expected_sectors=$5 dev1=$6 dev2=$7 dev3=$8
++    echo "DM_TABLE_LVM2_STRIPED3_${label}_BEGIN"
++    dmsetup table "$MAPPER_NAME" | tee "$table_file" | sed "s/^/DM_TABLE_LVM2_STRIPED3_${label} /"
++    echo "DM_TABLE_LVM2_STRIPED3_${label}_END"
++    dmsetup status "$MAPPER_NAME" | tee "$status_file"
++    dmsetup deps "$MAPPER_NAME" | tee "$deps_file"
++    check_striped3_table "$table_file" "$deps_file" "$expected_sectors" "$dev1" "$dev2" "$dev3"
++    check_striped3_status "$status_file" "$expected_sectors"
++}
++
++echo '=== STEP 1: check dm control device, striped target, and three test disks ==='
++test -c /dev/mapper/control
++dmsetup targets | tee /tmp/striped3-lvm2-targets.txt
++grep -q '^striped' /tmp/striped3-lvm2-targets.txt
++TEST_DISK=$(aster-dm-disk-locator)
++TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
++TEST_DISK3=$(aster-dm-disk-locator vdmtest3)
++printf 'TEST_DISK=%s\nTEST_DISK2=%s\nTEST_DISK3=%s\n' "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
++test "$TEST_DISK" != "$TEST_DISK2"
++test "$TEST_DISK" != "$TEST_DISK3"
++test "$TEST_DISK2" != "$TEST_DISK3"
++test -b "$TEST_DISK"
++test -b "$TEST_DISK2"
++test -b "$TEST_DISK3"
++DEV1=$(devno "$TEST_DISK")
++DEV2=$(devno "$TEST_DISK2")
++DEV3=$(devno "$TEST_DISK3")
++printf 'DEV1=%s\nDEV2=%s\nDEV3=%s\n' "$DEV1" "$DEV2" "$DEV3"
++echo CHECK_PASS_STRIPED3_LVM2_SETUP
++
++echo '=== STEP 2: create 3-way LVM2 striped LV ==='
++pvcreate "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
++vgcreate striped3_vg "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
++lvcreate --config "$LVM_CONFIG" --type striped -i 3 -I "${STRIPED3_CHUNK_KIB}K" -L "${STRIPED3_LV_MIB}M" -n striped3_lv striped3_vg "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
++pvs -o pv_name,pv_size,vg_name
++vgs -o vg_name,vg_size,vg_free,pv_count,lv_count
++lvs -a -o lv_name,lv_size,seg_count,devices striped3_vg
++lvs --segments -o lv_name,seg_start,seg_size,stripes,stripesize,devices striped3_vg/striped3_lv
++check_striped3_table_status_deps CREATED /tmp/striped3-lvm2-created-table.txt /tmp/striped3-lvm2-created-status.txt /tmp/striped3-lvm2-created-deps.txt "$STRIPED3_LV_SECTORS" "$DEV1" "$DEV2" "$DEV3"
++echo CHECK_PASS_STRIPED3_LVM2_CREATED_TABLE_STATUS_DEPS
++
++echo '=== STEP 3: create ext2 filesystem and write file data ==='
++mkfs.ext2 -F -b 4096 "$MAPPER_DEVICE"
++blkid "$MAPPER_DEVICE"
++mkdir -p "$MOUNT_DIR"
++mount -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
++dd if=/dev/urandom of="$MOUNT_DIR/striped3-${STRIPED3_FILE_MIB}.bin" bs=1M count="$STRIPED3_FILE_MIB" conv=fsync status=none
++printf 'lvm2 striped 3pv\nlv_mib=%s chunk_kib=%s file_mib=%s\n' "$STRIPED3_LV_MIB" "$STRIPED3_CHUNK_KIB" "$STRIPED3_FILE_MIB" > "$MOUNT_DIR/striped3-marker.txt"
++(
++    cd "$MOUNT_DIR"
++    md5sum "striped3-${STRIPED3_FILE_MIB}.bin" striped3-marker.txt > striped3.md5
++    md5sum -c striped3.md5
++)
++sync
++umount "$MOUNT_DIR"
++vgchange --config "$LVM_CONFIG" -an striped3_vg
++sync
++echo CHECK_PASS_STRIPED3_LVM2_FILE_MD5
++
++echo TEST_PASS_DM_STRIPED_LVM2_3PV_REBOOT_FIRST
++poweroff
++GUEST_SCRIPT
++
++SECOND_GUEST_SCRIPT=$(mktemp /tmp/dm-striped-lvm2-3pv-second.XXXXXX)
++cat >"${SECOND_GUEST_SCRIPT}" <<'GUEST_SCRIPT'
++stty -echo 2>/dev/null || true
++set -eu
++trap 'status=$?; echo TEST_FAIL_DM_STRIPED_LVM2_3PV_REBOOT_SECOND status=$status; sync; poweroff; exit $status' ERR
++
++LVM_CONFIG='activation { udev_rules=0 }'
++STRIPED3_LV_MIB=__STRIPED3_LV_MIB__
++STRIPED3_FILE_MIB=__STRIPED3_FILE_MIB__
++STRIPED3_CHUNK_KIB=__STRIPED3_CHUNK_KIB__
++STRIPED3_LV_SECTORS=$((STRIPED3_LV_MIB * 2048))
++STRIPED3_CHUNK_SECTORS=$((STRIPED3_CHUNK_KIB * 2))
++MAPPER_NAME=striped3_vg-striped3_lv
++MAPPER_DEVICE=/dev/mapper/$MAPPER_NAME
++MOUNT_DIR=/mnt/dmstriped3
++
++devno() {
++    printf '%d:%d' "0x$(stat -c '%t' "$1")" "0x$(stat -c '%T' "$1")"
++}
++
++dep_token() {
++    printf '(%s, %s)' "${1%%:*}" "${1##*:}"
++}
++
++check_striped3_table() {
++    local table_file=$1 deps_file=$2 expected_sectors=$3 dev1=$4 dev2=$5 dev3=$6
++    test "$(wc -l < "$table_file")" -ge 1
++    awk -v len="$expected_sectors" -v chunk="$STRIPED3_CHUNK_SECTORS" '
++        BEGIN { expected_start = 0; ok = 1 }
++        $1 != expected_start { ok = 0 }
++        $3 != "striped" { ok = 0 }
++        $4 != 3 { ok = 0 }
++        $5 != chunk { ok = 0 }
++        { expected_start += $2 }
++        END { exit !(ok && expected_start == len) }
++    ' "$table_file"
++    grep -F -q "$dev1" "$table_file"
++    grep -F -q "$dev2" "$table_file"
++    grep -F -q "$dev3" "$table_file"
++    grep -q '3 dependencies' "$deps_file"
++    grep -F -q "$(dep_token "$dev1")" "$deps_file"
++    grep -F -q "$(dep_token "$dev2")" "$deps_file"
++    grep -F -q "$(dep_token "$dev3")" "$deps_file"
++}
++
++check_striped3_status() {
++    local status_file=$1 expected_sectors=$2
++    test "$(wc -l < "$status_file")" -ge 1
++    awk -v len="$expected_sectors" '
++        BEGIN { expected_start = 0; ok = 1 }
++        $1 != expected_start { ok = 0 }
++        $3 != "striped" { ok = 0 }
++        { expected_start += $2 }
++        END { exit !(ok && expected_start == len) }
++    ' "$status_file"
++}
++
++check_striped3_table_status_deps() {
++    local label=$1 table_file=$2 status_file=$3 deps_file=$4 expected_sectors=$5 dev1=$6 dev2=$7 dev3=$8
++    echo "DM_TABLE_LVM2_STRIPED3_${label}_BEGIN"
++    dmsetup table "$MAPPER_NAME" | tee "$table_file" | sed "s/^/DM_TABLE_LVM2_STRIPED3_${label} /"
++    echo "DM_TABLE_LVM2_STRIPED3_${label}_END"
++    dmsetup status "$MAPPER_NAME" | tee "$status_file"
++    dmsetup deps "$MAPPER_NAME" | tee "$deps_file"
++    check_striped3_table "$table_file" "$deps_file" "$expected_sectors" "$dev1" "$dev2" "$dev3"
++    check_striped3_status "$status_file" "$expected_sectors"
++}
++
++echo '=== STEP 1: recover 3-way striped LV after reboot ==='
++TEST_DISK=$(aster-dm-disk-locator)
++TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
++TEST_DISK3=$(aster-dm-disk-locator vdmtest3)
++printf 'TEST_DISK=%s\nTEST_DISK2=%s\nTEST_DISK3=%s\n' "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
++test "$TEST_DISK" != "$TEST_DISK2"
++test "$TEST_DISK" != "$TEST_DISK3"
++test "$TEST_DISK2" != "$TEST_DISK3"
++test -b "$TEST_DISK"
++test -b "$TEST_DISK2"
++test -b "$TEST_DISK3"
++DEV1=$(devno "$TEST_DISK")
++DEV2=$(devno "$TEST_DISK2")
++DEV3=$(devno "$TEST_DISK3")
++printf 'DEV1=%s\nDEV2=%s\nDEV3=%s\n' "$DEV1" "$DEV2" "$DEV3"
++pvscan
++vgscan --mknodes
++vgchange --config "$LVM_CONFIG" -ay striped3_vg
++pvs -o pv_name,pv_size,vg_name
++vgs -o vg_name,vg_size,vg_free,pv_count,lv_count
++lvs -a -o lv_name,lv_size,seg_count,devices striped3_vg
++lvs --segments -o lv_name,seg_start,seg_size,stripes,stripesize,devices striped3_vg/striped3_lv
++check_striped3_table_status_deps RECOVERED /tmp/striped3-lvm2-recovered-table.txt /tmp/striped3-lvm2-recovered-status.txt /tmp/striped3-lvm2-recovered-deps.txt "$STRIPED3_LV_SECTORS" "$DEV1" "$DEV2" "$DEV3"
++echo CHECK_PASS_STRIPED3_LVM2_RECOVERED_TABLE_STATUS_DEPS
++
++echo '=== STEP 2: readonly mount and verify md5 after reboot ==='
++mkdir -p "$MOUNT_DIR"
++mount -o ro -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
++(
++    cd "$MOUNT_DIR"
++    md5sum -c striped3.md5
++    cat striped3-marker.txt
++)
++df -h "$MOUNT_DIR"
++du -sh "$MOUNT_DIR" "$MOUNT_DIR/striped3-${STRIPED3_FILE_MIB}.bin"
++umount "$MOUNT_DIR"
++vgchange --config "$LVM_CONFIG" -an striped3_vg
++sync
++echo CHECK_PASS_STRIPED3_LVM2_RECOVERED_FILE_MD5
++
++echo TEST_PASS_DM_STRIPED_LVM2_3PV_REBOOT_SECOND
++poweroff
++GUEST_SCRIPT
++
++for script in "${FIRST_GUEST_SCRIPT}" "${SECOND_GUEST_SCRIPT}"; do
++    sed -i \
++        -e "s/__STRIPED3_LV_MIB__/${STRIPED3_LV_MIB}/g" \
++        -e "s/__STRIPED3_FILE_MIB__/${STRIPED3_FILE_MIB}/g" \
++        -e "s/__STRIPED3_CHUNK_KIB__/${STRIPED3_CHUNK_KIB}/g" \
++        "${script}"
++done
++
++SUMMARY_INCLUDE='TEST_|CHECK_PASS_|=== STEP|=== CHECK|TEST_DISK=|TEST_DISK2=|TEST_DISK3=|DEV1=|DEV2=|DEV3=|DM_TABLE_LVM2_STRIPED3|striped3_vg|striped3_lv|^striped[[:space:]]|^0 [0-9]+ striped |^3 dependencies|striped3-[0-9]+\.bin|OK|No space left|Input/output error|Command failed|Kernel panic|panicked|records in|records out|bytes .* copied'
++dm_run_two_guest_test \
++    "${TEST_ID}" \
++    "${FIRST_GUEST_SCRIPT}" \
++    "${SECOND_GUEST_SCRIPT}" \
++    TEST_PASS_DM_STRIPED_LVM2_3PV_REBOOT_FIRST \
++    TEST_PASS_DM_STRIPED_LVM2_3PV_REBOOT_SECOND \
++    "${SUMMARY_INCLUDE}"

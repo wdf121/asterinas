@@ -1,0 +1,431 @@
+diff --git a/myshell/dm_striped/run_lvm2_striped_multi_segment_reboot_test.sh b/myshell/dm_striped/run_lvm2_striped_multi_segment_reboot_test.sh
+new file mode 100755
+index 000000000..f527f5f93
+--- /dev/null
++++ b/myshell/dm_striped/run_lvm2_striped_multi_segment_reboot_test.sh
+@@ -0,0 +1,425 @@
++#!/bin/bash
++
++# SPDX-License-Identifier: MPL-2.0
++
++set -euo pipefail
++
++if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
++    cat <<'EOF'
++Usage: myshell/dm_striped/run_lvm2_striped_multi_segment_reboot_test.sh
++
++Runs a two-guest NixOS regression for a multi-segment LVM2 striped LV, ext2 file I/O, and reboot recovery.
++
++Optional environment variables:
++  DM_TEST_IMAGES                                  Backing test image list, default "target/nixos/test.img target/nixos/test2.img target/nixos/test3.img"
++  DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT_LOG        Host-side log path, default /tmp/dm-striped-lvm2-multiseg-reboot-test.log
++  GUEST_READY_TIMEOUT                             Seconds to wait for guest root shell, default 300
++  RESET_DM_TEST_IMAGES                            1 to delete test images before running, default 1
++  STRIPED_MS_INITIAL_LV_MIB                       Initial striped LV size in MiB, default 256
++  STRIPED_MS_EXTENDED_LV_MIB                      Extended striped LV size in MiB, default 512
++  STRIPED_MS_BASE_FILE_MIB                        Base test file size in MiB, default 64
++  STRIPED_MS_GROW_FILE_MIB                        Post-grow test file size in MiB, default 256
++  STRIPED_MS_CHUNK_KIB                            LVM stripe chunk size in KiB, default 4
++EOF
++    exit 0
++fi
++
++SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
++ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
++source "${SCRIPT_DIR}/../lib/dm_nixos_test.sh"
++
++TEST_ID=DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT
++LOG=${DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT_LOG:-/tmp/dm-striped-lvm2-multiseg-reboot-test.log}
++DM_TEST_IMAGE=${DM_TEST_IMAGE:-target/nixos/test.img}
++DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
++DM_TEST_IMAGE_3=${DM_TEST_IMAGE_3:-target/nixos/test3.img}
++DM_TEST_IMAGES=${DM_TEST_IMAGES:-${DM_TEST_IMAGE} ${DM_TEST_IMAGE_2} ${DM_TEST_IMAGE_3}}
++set -- ${DM_TEST_IMAGES}
++test "$#" -eq 3
++DM_TEST_IMAGE=$1
++DM_TEST_IMAGE_2=$2
++DM_TEST_IMAGE_3=$3
++GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-300}
++RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
++STRIPED_MS_INITIAL_LV_MIB=${STRIPED_MS_INITIAL_LV_MIB:-256}
++STRIPED_MS_EXTENDED_LV_MIB=${STRIPED_MS_EXTENDED_LV_MIB:-512}
++STRIPED_MS_BASE_FILE_MIB=${STRIPED_MS_BASE_FILE_MIB:-64}
++STRIPED_MS_GROW_FILE_MIB=${STRIPED_MS_GROW_FILE_MIB:-256}
++STRIPED_MS_CHUNK_KIB=${STRIPED_MS_CHUNK_KIB:-4}
++
++test "${STRIPED_MS_INITIAL_LV_MIB}" -lt "${STRIPED_MS_EXTENDED_LV_MIB}"
++test "${STRIPED_MS_BASE_FILE_MIB}" -lt "${STRIPED_MS_INITIAL_LV_MIB}"
++test $((STRIPED_MS_BASE_FILE_MIB + STRIPED_MS_GROW_FILE_MIB)) -gt "${STRIPED_MS_INITIAL_LV_MIB}"
++test $((STRIPED_MS_BASE_FILE_MIB + STRIPED_MS_GROW_FILE_MIB)) -lt "${STRIPED_MS_EXTENDED_LV_MIB}"
++
++cd "${ASTERINAS_DIR}"
++dm_prepare_nixos_test "${TEST_ID}"
++echo "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
++echo "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
++echo "HOST_INFO_${TEST_ID} disk3=${DM_TEST_IMAGE_3} serial=vdmtest3"
++echo "HOST_INFO_${TEST_ID} initial_lv_mib=${STRIPED_MS_INITIAL_LV_MIB} extended_lv_mib=${STRIPED_MS_EXTENDED_LV_MIB} base_file_mib=${STRIPED_MS_BASE_FILE_MIB} grow_file_mib=${STRIPED_MS_GROW_FILE_MIB} chunk_kib=${STRIPED_MS_CHUNK_KIB}"
++
++wrap_guest_script() {
++    local script_file=$1 guest_path=$2 wrapped_file
++
++    wrapped_file=$(mktemp "${script_file}.wrapped.XXXXXX")
++    {
++        printf 'stty -echo 2>/dev/null || true\n'
++        printf "cat >%s <<'DM_STRIPED_MS_GUEST_SCRIPT'\n" "${guest_path}"
++        cat "${script_file}"
++        printf "\nDM_STRIPED_MS_GUEST_SCRIPT\nbash %s\n" "${guest_path}"
++    } >"${wrapped_file}"
++    mv "${wrapped_file}" "${script_file}"
++}
++
++FIRST_GUEST_SCRIPT=$(mktemp /tmp/dm-striped-lvm2-multiseg-first.XXXXXX)
++cat >"${FIRST_GUEST_SCRIPT}" <<'GUEST_SCRIPT'
++stty -echo 2>/dev/null || true
++set -eu
++trap 'status=$?; echo TEST_FAIL_DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT_FIRST status=$status; sync; poweroff; exit $status' ERR
++
++LVM_CONFIG='activation { udev_rules=0 }'
++STRIPED_MS_INITIAL_LV_MIB=__STRIPED_MS_INITIAL_LV_MIB__
++STRIPED_MS_EXTENDED_LV_MIB=__STRIPED_MS_EXTENDED_LV_MIB__
++STRIPED_MS_BASE_FILE_MIB=__STRIPED_MS_BASE_FILE_MIB__
++STRIPED_MS_GROW_FILE_MIB=__STRIPED_MS_GROW_FILE_MIB__
++STRIPED_MS_CHUNK_KIB=__STRIPED_MS_CHUNK_KIB__
++STRIPED_MS_INITIAL_LV_SECTORS=$((STRIPED_MS_INITIAL_LV_MIB * 2048))
++STRIPED_MS_EXTENDED_LV_SECTORS=$((STRIPED_MS_EXTENDED_LV_MIB * 2048))
++STRIPED_MS_CHUNK_SECTORS=$((STRIPED_MS_CHUNK_KIB * 2))
++MAPPER_NAME=striped_ms_vg-striped_ms_lv
++MAPPER_DEVICE=/dev/mapper/$MAPPER_NAME
++MOUNT_DIR=/mnt/dmstripedms
++
++devno() {
++    printf '%d:%d' "0x$(stat -c '%t' "$1")" "0x$(stat -c '%T' "$1")"
++}
++
++dep_token() {
++    printf '(%s, %s)' "${1%%:*}" "${1##*:}"
++}
++
++check_striped_ms_table_common() {
++    local table_file=$1 expected_sectors=$2 expected_min_lines=$3
++    test "$(wc -l < "$table_file")" -ge "$expected_min_lines"
++    awk -v len="$expected_sectors" -v chunk="$STRIPED_MS_CHUNK_SECTORS" '
++        BEGIN { expected_start = 0; ok = 1 }
++        $1 != expected_start { ok = 0 }
++        $3 != "striped" { ok = 0 }
++        $4 != 2 { ok = 0 }
++        $5 != chunk { ok = 0 }
++        { expected_start += $2 }
++        END { exit !(ok && expected_start == len) }
++    ' "$table_file"
++}
++
++check_striped_ms_status() {
++    local status_file=$1 expected_sectors=$2
++    test "$(wc -l < "$status_file")" -ge 1
++    awk -v len="$expected_sectors" '
++        BEGIN { expected_start = 0; ok = 1 }
++        $1 != expected_start { ok = 0 }
++        $3 != "striped" { ok = 0 }
++        { expected_start += $2 }
++        END { exit !(ok && expected_start == len) }
++    ' "$status_file"
++}
++
++check_row_pair() {
++    local table_file=$1 expected_start=$2 expected_len=$3 dev_a=$4 dev_b=$5
++    awk -v start="$expected_start" -v len="$expected_len" -v chunk="$STRIPED_MS_CHUNK_SECTORS" -v dev_a="$dev_a" -v dev_b="$dev_b" '
++        $1 == start && $2 == len && $3 == "striped" && $4 == 2 && $5 == chunk {
++            found_a = 0; found_b = 0
++            for (i = 6; i <= NF; i += 2) {
++                if ($i == dev_a) found_a = 1
++                if ($i == dev_b) found_b = 1
++            }
++            if (found_a && found_b) ok = 1
++        }
++        END { exit !ok }
++    ' "$table_file"
++}
++
++check_striped_ms_initial_table() {
++    local table_file=$1 deps_file=$2 status_file=$3 dev1=$4 dev2=$5
++    check_striped_ms_table_common "$table_file" "$STRIPED_MS_INITIAL_LV_SECTORS" 1
++    check_row_pair "$table_file" 0 "$STRIPED_MS_INITIAL_LV_SECTORS" "$dev1" "$dev2"
++    grep -q '2 dependencies' "$deps_file"
++    grep -F -q "$(dep_token "$dev1")" "$deps_file"
++    grep -F -q "$(dep_token "$dev2")" "$deps_file"
++    check_striped_ms_status "$status_file" "$STRIPED_MS_INITIAL_LV_SECTORS"
++}
++
++check_striped_ms_final_table() {
++    local table_file=$1 deps_file=$2 status_file=$3 dev1=$4 dev2=$5 dev3=$6
++    local grow_sectors=$((STRIPED_MS_EXTENDED_LV_SECTORS - STRIPED_MS_INITIAL_LV_SECTORS))
++    check_striped_ms_table_common "$table_file" "$STRIPED_MS_EXTENDED_LV_SECTORS" 2
++    check_row_pair "$table_file" 0 "$STRIPED_MS_INITIAL_LV_SECTORS" "$dev1" "$dev2"
++    check_row_pair "$table_file" "$STRIPED_MS_INITIAL_LV_SECTORS" "$grow_sectors" "$dev2" "$dev3"
++    grep -F -q "$dev1" "$table_file"
++    grep -F -q "$dev2" "$table_file"
++    grep -F -q "$dev3" "$table_file"
++    grep -q '3 dependencies' "$deps_file"
++    grep -F -q "$(dep_token "$dev1")" "$deps_file"
++    grep -F -q "$(dep_token "$dev2")" "$deps_file"
++    grep -F -q "$(dep_token "$dev3")" "$deps_file"
++    check_striped_ms_status "$status_file" "$STRIPED_MS_EXTENDED_LV_SECTORS"
++}
++
++check_striped_ms_table_status_deps() {
++    local label=$1 mode=$2 table_file=$3 status_file=$4 deps_file=$5 dev1=$6 dev2=$7 dev3=${8:-}
++    echo "DM_TABLE_LVM2_STRIPED_MS_${label}_BEGIN"
++    dmsetup table "$MAPPER_NAME" | tee "$table_file" | sed "s/^/DM_TABLE_LVM2_STRIPED_MS_${label} /"
++    echo "DM_TABLE_LVM2_STRIPED_MS_${label}_END"
++    dmsetup status "$MAPPER_NAME" | tee "$status_file"
++    dmsetup deps "$MAPPER_NAME" | tee "$deps_file"
++    if [ "$mode" = "initial" ]; then
++        check_striped_ms_initial_table "$table_file" "$deps_file" "$status_file" "$dev1" "$dev2"
++    else
++        check_striped_ms_final_table "$table_file" "$deps_file" "$status_file" "$dev1" "$dev2" "$dev3"
++    fi
++}
++
++echo '=== STEP 1: check dm control device, striped target, and three test disks ==='
++test -c /dev/mapper/control
++dmsetup targets | tee /tmp/striped-ms-lvm2-targets.txt
++grep -q '^striped' /tmp/striped-ms-lvm2-targets.txt
++TEST_DISK=$(aster-dm-disk-locator)
++TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
++TEST_DISK3=$(aster-dm-disk-locator vdmtest3)
++printf 'TEST_DISK=%s\nTEST_DISK2=%s\nTEST_DISK3=%s\n' "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
++test "$TEST_DISK" != "$TEST_DISK2"
++test "$TEST_DISK" != "$TEST_DISK3"
++test "$TEST_DISK2" != "$TEST_DISK3"
++test -b "$TEST_DISK"
++test -b "$TEST_DISK2"
++test -b "$TEST_DISK3"
++DEV1=$(devno "$TEST_DISK")
++DEV2=$(devno "$TEST_DISK2")
++DEV3=$(devno "$TEST_DISK3")
++printf 'DEV1=%s\nDEV2=%s\nDEV3=%s\n' "$DEV1" "$DEV2" "$DEV3"
++echo CHECK_PASS_STRIPED_MS_LVM2_SETUP
++
++echo '=== STEP 2: create initial 2-way striped LV on PV1+PV2 ==='
++pvcreate "$TEST_DISK" "$TEST_DISK2"
++vgcreate striped_ms_vg "$TEST_DISK" "$TEST_DISK2"
++lvcreate --config "$LVM_CONFIG" --type striped -i 2 -I "${STRIPED_MS_CHUNK_KIB}K" -L "${STRIPED_MS_INITIAL_LV_MIB}M" -n striped_ms_lv striped_ms_vg "$TEST_DISK" "$TEST_DISK2"
++pvs -o pv_name,pv_size,vg_name
++vgs -o vg_name,vg_size,vg_free,pv_count,lv_count
++lvs -a -o lv_name,lv_size,seg_count,devices striped_ms_vg
++lvs --segments -o lv_name,seg_start,seg_size,stripes,stripesize,devices striped_ms_vg/striped_ms_lv
++check_striped_ms_table_status_deps INITIAL initial /tmp/striped-ms-lvm2-initial-table.txt /tmp/striped-ms-lvm2-initial-status.txt /tmp/striped-ms-lvm2-initial-deps.txt "$DEV1" "$DEV2"
++echo CHECK_PASS_STRIPED_MS_LVM2_INITIAL_TABLE_STATUS_DEPS
++
++echo '=== STEP 3: create ext2 filesystem and write base data ==='
++mkfs.ext2 -F -b 4096 "$MAPPER_DEVICE"
++blkid "$MAPPER_DEVICE"
++mkdir -p "$MOUNT_DIR"
++mount -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
++dd if=/dev/urandom of="$MOUNT_DIR/base${STRIPED_MS_BASE_FILE_MIB}.bin" bs=1M count="$STRIPED_MS_BASE_FILE_MIB" conv=fsync status=none
++printf 'lvm2 striped multi-segment base\ninitial_lv_mib=%s chunk_kib=%s\n' "$STRIPED_MS_INITIAL_LV_MIB" "$STRIPED_MS_CHUNK_KIB" > "$MOUNT_DIR/base-marker.txt"
++(
++    cd "$MOUNT_DIR"
++    md5sum "base${STRIPED_MS_BASE_FILE_MIB}.bin" base-marker.txt > striped-ms.md5
++    md5sum -c striped-ms.md5
++)
++sync
++umount "$MOUNT_DIR"
++echo CHECK_PASS_STRIPED_MS_LVM2_BASE_FILE_MD5
++
++echo '=== STEP 4: extend with PV2+PV3 to create a second striped segment ==='
++pvcreate "$TEST_DISK3"
++vgextend striped_ms_vg "$TEST_DISK3"
++lvextend --config "$LVM_CONFIG" -i 2 -I "${STRIPED_MS_CHUNK_KIB}K" -L "${STRIPED_MS_EXTENDED_LV_MIB}M" striped_ms_vg/striped_ms_lv "$TEST_DISK2" "$TEST_DISK3"
++pvs -o pv_name,pv_size,vg_name
++vgs -o vg_name,vg_size,vg_free,pv_count,lv_count
++lvs -a -o lv_name,lv_size,seg_count,devices striped_ms_vg
++lvs --segments -o lv_name,seg_start,seg_size,stripes,stripesize,devices striped_ms_vg/striped_ms_lv
++check_striped_ms_table_status_deps EXTENDED final /tmp/striped-ms-lvm2-extended-table.txt /tmp/striped-ms-lvm2-extended-status.txt /tmp/striped-ms-lvm2-extended-deps.txt "$DEV1" "$DEV2" "$DEV3"
++echo CHECK_PASS_STRIPED_MS_LVM2_EXTENDED_MULTI_SEGMENT_TABLE_STATUS_DEPS
++
++echo '=== STEP 5: grow ext2 offline and write data across the extended LV ==='
++e2fsck -f -y "$MAPPER_DEVICE"
++resize2fs "$MAPPER_DEVICE"
++e2fsck -f -y "$MAPPER_DEVICE"
++mount -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
++(
++    cd "$MOUNT_DIR"
++    md5sum -c striped-ms.md5
++)
++dd if=/dev/urandom of="$MOUNT_DIR/grow${STRIPED_MS_GROW_FILE_MIB}.bin" bs=1M count="$STRIPED_MS_GROW_FILE_MIB" conv=fsync status=none
++printf 'lvm2 striped multi-segment grow\nextended_lv_mib=%s grow_file_mib=%s\n' "$STRIPED_MS_EXTENDED_LV_MIB" "$STRIPED_MS_GROW_FILE_MIB" > "$MOUNT_DIR/grow-marker.txt"
++(
++    cd "$MOUNT_DIR"
++    md5sum "grow${STRIPED_MS_GROW_FILE_MIB}.bin" grow-marker.txt >> striped-ms.md5
++    md5sum -c striped-ms.md5
++)
++sync
++umount "$MOUNT_DIR"
++vgchange --config "$LVM_CONFIG" -an striped_ms_vg
++sync
++echo CHECK_PASS_STRIPED_MS_LVM2_GROW_FILE_MD5
++
++echo TEST_PASS_DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT_FIRST
++poweroff
++GUEST_SCRIPT
++
++SECOND_GUEST_SCRIPT=$(mktemp /tmp/dm-striped-lvm2-multiseg-second.XXXXXX)
++cat >"${SECOND_GUEST_SCRIPT}" <<'GUEST_SCRIPT'
++stty -echo 2>/dev/null || true
++set -eu
++trap 'status=$?; echo TEST_FAIL_DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT_SECOND status=$status; sync; poweroff; exit $status' ERR
++
++LVM_CONFIG='activation { udev_rules=0 }'
++STRIPED_MS_INITIAL_LV_MIB=__STRIPED_MS_INITIAL_LV_MIB__
++STRIPED_MS_EXTENDED_LV_MIB=__STRIPED_MS_EXTENDED_LV_MIB__
++STRIPED_MS_BASE_FILE_MIB=__STRIPED_MS_BASE_FILE_MIB__
++STRIPED_MS_GROW_FILE_MIB=__STRIPED_MS_GROW_FILE_MIB__
++STRIPED_MS_CHUNK_KIB=__STRIPED_MS_CHUNK_KIB__
++STRIPED_MS_INITIAL_LV_SECTORS=$((STRIPED_MS_INITIAL_LV_MIB * 2048))
++STRIPED_MS_EXTENDED_LV_SECTORS=$((STRIPED_MS_EXTENDED_LV_MIB * 2048))
++STRIPED_MS_CHUNK_SECTORS=$((STRIPED_MS_CHUNK_KIB * 2))
++MAPPER_NAME=striped_ms_vg-striped_ms_lv
++MAPPER_DEVICE=/dev/mapper/$MAPPER_NAME
++MOUNT_DIR=/mnt/dmstripedms
++
++devno() {
++    printf '%d:%d' "0x$(stat -c '%t' "$1")" "0x$(stat -c '%T' "$1")"
++}
++
++dep_token() {
++    printf '(%s, %s)' "${1%%:*}" "${1##*:}"
++}
++
++check_striped_ms_table_common() {
++    local table_file=$1 expected_sectors=$2 expected_min_lines=$3
++    test "$(wc -l < "$table_file")" -ge "$expected_min_lines"
++    awk -v len="$expected_sectors" -v chunk="$STRIPED_MS_CHUNK_SECTORS" '
++        BEGIN { expected_start = 0; ok = 1 }
++        $1 != expected_start { ok = 0 }
++        $3 != "striped" { ok = 0 }
++        $4 != 2 { ok = 0 }
++        $5 != chunk { ok = 0 }
++        { expected_start += $2 }
++        END { exit !(ok && expected_start == len) }
++    ' "$table_file"
++}
++
++check_striped_ms_status() {
++    local status_file=$1 expected_sectors=$2
++    test "$(wc -l < "$status_file")" -ge 1
++    awk -v len="$expected_sectors" '
++        BEGIN { expected_start = 0; ok = 1 }
++        $1 != expected_start { ok = 0 }
++        $3 != "striped" { ok = 0 }
++        { expected_start += $2 }
++        END { exit !(ok && expected_start == len) }
++    ' "$status_file"
++}
++
++check_row_pair() {
++    local table_file=$1 expected_start=$2 expected_len=$3 dev_a=$4 dev_b=$5
++    awk -v start="$expected_start" -v len="$expected_len" -v chunk="$STRIPED_MS_CHUNK_SECTORS" -v dev_a="$dev_a" -v dev_b="$dev_b" '
++        $1 == start && $2 == len && $3 == "striped" && $4 == 2 && $5 == chunk {
++            found_a = 0; found_b = 0
++            for (i = 6; i <= NF; i += 2) {
++                if ($i == dev_a) found_a = 1
++                if ($i == dev_b) found_b = 1
++            }
++            if (found_a && found_b) ok = 1
++        }
++        END { exit !ok }
++    ' "$table_file"
++}
++
++check_striped_ms_final_table() {
++    local table_file=$1 deps_file=$2 status_file=$3 dev1=$4 dev2=$5 dev3=$6
++    local grow_sectors=$((STRIPED_MS_EXTENDED_LV_SECTORS - STRIPED_MS_INITIAL_LV_SECTORS))
++    check_striped_ms_table_common "$table_file" "$STRIPED_MS_EXTENDED_LV_SECTORS" 2
++    check_row_pair "$table_file" 0 "$STRIPED_MS_INITIAL_LV_SECTORS" "$dev1" "$dev2"
++    check_row_pair "$table_file" "$STRIPED_MS_INITIAL_LV_SECTORS" "$grow_sectors" "$dev2" "$dev3"
++    grep -F -q "$dev1" "$table_file"
++    grep -F -q "$dev2" "$table_file"
++    grep -F -q "$dev3" "$table_file"
++    grep -q '3 dependencies' "$deps_file"
++    grep -F -q "$(dep_token "$dev1")" "$deps_file"
++    grep -F -q "$(dep_token "$dev2")" "$deps_file"
++    grep -F -q "$(dep_token "$dev3")" "$deps_file"
++    check_striped_ms_status "$status_file" "$STRIPED_MS_EXTENDED_LV_SECTORS"
++}
++
++check_striped_ms_table_status_deps() {
++    local label=$1 table_file=$2 status_file=$3 deps_file=$4 dev1=$5 dev2=$6 dev3=$7
++    echo "DM_TABLE_LVM2_STRIPED_MS_${label}_BEGIN"
++    dmsetup table "$MAPPER_NAME" | tee "$table_file" | sed "s/^/DM_TABLE_LVM2_STRIPED_MS_${label} /"
++    echo "DM_TABLE_LVM2_STRIPED_MS_${label}_END"
++    dmsetup status "$MAPPER_NAME" | tee "$status_file"
++    dmsetup deps "$MAPPER_NAME" | tee "$deps_file"
++    check_striped_ms_final_table "$table_file" "$deps_file" "$status_file" "$dev1" "$dev2" "$dev3"
++}
++
++echo '=== STEP 1: recover multi-segment striped LV after reboot ==='
++TEST_DISK=$(aster-dm-disk-locator)
++TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
++TEST_DISK3=$(aster-dm-disk-locator vdmtest3)
++printf 'TEST_DISK=%s\nTEST_DISK2=%s\nTEST_DISK3=%s\n' "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
++test "$TEST_DISK" != "$TEST_DISK2"
++test "$TEST_DISK" != "$TEST_DISK3"
++test "$TEST_DISK2" != "$TEST_DISK3"
++test -b "$TEST_DISK"
++test -b "$TEST_DISK2"
++test -b "$TEST_DISK3"
++DEV1=$(devno "$TEST_DISK")
++DEV2=$(devno "$TEST_DISK2")
++DEV3=$(devno "$TEST_DISK3")
++printf 'DEV1=%s\nDEV2=%s\nDEV3=%s\n' "$DEV1" "$DEV2" "$DEV3"
++pvscan
++vgscan --mknodes
++vgchange --config "$LVM_CONFIG" -ay striped_ms_vg
++pvs -o pv_name,pv_size,vg_name
++vgs -o vg_name,vg_size,vg_free,pv_count,lv_count
++lvs -a -o lv_name,lv_size,seg_count,devices striped_ms_vg
++lvs --segments -o lv_name,seg_start,seg_size,stripes,stripesize,devices striped_ms_vg/striped_ms_lv
++check_striped_ms_table_status_deps RECOVERED /tmp/striped-ms-lvm2-recovered-table.txt /tmp/striped-ms-lvm2-recovered-status.txt /tmp/striped-ms-lvm2-recovered-deps.txt "$DEV1" "$DEV2" "$DEV3"
++echo CHECK_PASS_STRIPED_MS_LVM2_RECOVERED_MULTI_SEGMENT_TABLE_STATUS_DEPS
++
++echo '=== STEP 2: readonly mount and verify md5 after reboot ==='
++mkdir -p "$MOUNT_DIR"
++mount -o ro -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
++(
++    cd "$MOUNT_DIR"
++    md5sum -c striped-ms.md5
++    cat base-marker.txt
++    cat grow-marker.txt
++)
++df -h "$MOUNT_DIR"
++du -sh "$MOUNT_DIR" "$MOUNT_DIR/base${STRIPED_MS_BASE_FILE_MIB}.bin" "$MOUNT_DIR/grow${STRIPED_MS_GROW_FILE_MIB}.bin"
++umount "$MOUNT_DIR"
++vgchange --config "$LVM_CONFIG" -an striped_ms_vg
++sync
++echo CHECK_PASS_STRIPED_MS_LVM2_RECOVERED_FILE_MD5
++
++echo TEST_PASS_DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT_SECOND
++poweroff
++GUEST_SCRIPT
++
++for script in "${FIRST_GUEST_SCRIPT}" "${SECOND_GUEST_SCRIPT}"; do
++    sed -i \
++        -e "s/__STRIPED_MS_INITIAL_LV_MIB__/${STRIPED_MS_INITIAL_LV_MIB}/g" \
++        -e "s/__STRIPED_MS_EXTENDED_LV_MIB__/${STRIPED_MS_EXTENDED_LV_MIB}/g" \
++        -e "s/__STRIPED_MS_BASE_FILE_MIB__/${STRIPED_MS_BASE_FILE_MIB}/g" \
++        -e "s/__STRIPED_MS_GROW_FILE_MIB__/${STRIPED_MS_GROW_FILE_MIB}/g" \
++        -e "s/__STRIPED_MS_CHUNK_KIB__/${STRIPED_MS_CHUNK_KIB}/g" \
++        "${script}"
++done
++wrap_guest_script "${FIRST_GUEST_SCRIPT}" /tmp/dm-striped-ms-first.sh
++wrap_guest_script "${SECOND_GUEST_SCRIPT}" /tmp/dm-striped-ms-second.sh
++
++SUMMARY_INCLUDE='TEST_|CHECK_PASS_|=== STEP|=== CHECK|TEST_DISK=|TEST_DISK2=|TEST_DISK3=|DEV1=|DEV2=|DEV3=|DM_TABLE_LVM2_STRIPED_MS|striped_ms_vg|striped_ms_lv|^striped[[:space:]]|^0 [0-9]+ striped |^524288 [0-9]+ striped |^[0-9]+ dependencies|base[0-9]+\.bin|grow[0-9]+\.bin|marker|OK|No space left|Input/output error|Command failed|Kernel panic|panicked|records in|records out|bytes .* copied'
++dm_run_two_guest_test \
++    "${TEST_ID}" \
++    "${FIRST_GUEST_SCRIPT}" \
++    "${SECOND_GUEST_SCRIPT}" \
++    TEST_PASS_DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT_FIRST \
++    TEST_PASS_DM_STRIPED_LVM2_MULTI_SEGMENT_REBOOT_SECOND \
++    "${SUMMARY_INCLUDE}"

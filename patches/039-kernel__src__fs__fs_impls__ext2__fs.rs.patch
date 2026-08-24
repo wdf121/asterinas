@@ -1,0 +1,74 @@
+diff --git a/kernel/src/fs/fs_impls/ext2/fs.rs b/kernel/src/fs/fs_impls/ext2/fs.rs
+index 7b76c7974..60d2a2e88 100644
+--- a/kernel/src/fs/fs_impls/ext2/fs.rs
++++ b/kernel/src/fs/fs_impls/ext2/fs.rs
+@@ -21,7 +21,7 @@
+ 
+ use core::sync::atomic::{AtomicU32, Ordering};
+ 
+-use aster_block::bio::BioCompleteFn;
++use aster_block::{BlockDeviceLease, bio::BioCompleteFn};
+ use device_id::DeviceId;
+ 
+ use super::{
+@@ -51,7 +51,7 @@ pub(super) const ROOT_INO: u32 = 2;
+ #[derive(Debug)]
+ pub struct Ext2 {
+     /// Backing block device.
+-    block_device: Arc<dyn BlockDevice>,
++    block_device: BlockDeviceLease,
+     /// Superblock with dirty tracking.
+     super_block: RwMutex<Dirty<SuperBlock>>,
+     /// Block group descriptors and caches.
+@@ -116,12 +116,13 @@ impl Ext2MountOptions {
+ impl Ext2 {
+     /// Opens and loads an Ext2 filesystem from a block device.
+     pub(super) fn open(
+-        device: Arc<dyn BlockDevice>,
++        device: BlockDeviceLease,
+         flags: FsFlags,
+         data: Option<&str>,
+     ) -> Result<Arc<Self>> {
++        let block_device = device.device();
+         let super_block = {
+-            let raw_super_block = device.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)?;
++            let raw_super_block = block_device.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)?;
+             SuperBlock::try_from(raw_super_block)?
+         };
+         let block_size = super_block.block_size();
+@@ -143,7 +144,7 @@ impl Ext2 {
+                 .alloc_segment(nblocks)?;
+             let bio_segment =
+                 BioSegment::new_from_segment(segment.clone().into(), BioDirection::FromDevice);
+-            match device.read_blocks(
++            match block_device.read_blocks(
+                 Bid::new(super_block.group_descriptors_bid(0) as u64),
+                 bio_segment,
+             )? {
+@@ -168,7 +169,7 @@ impl Ext2 {
+                     &group_descriptors_segment,
+                     group_idx,
+                     &super_block,
+-                    device.clone(),
++                    block_device.clone(),
+                 )?;
+                 block_groups.push(group);
+             }
+@@ -193,7 +194,7 @@ impl Ext2 {
+ 
+     /// Returns the block device.
+     pub(super) fn block_device(&self) -> &dyn BlockDevice {
+-        self.block_device.as_ref()
++        self.block_device.device().as_ref()
+     }
+ 
+     /// Returns the maximum regular file size supported by this ext2 instance.
+@@ -742,7 +743,7 @@ mod test {
+     fn stat_minixdf_reports_total() {
+         let f = Ext2FixtureBuilder::new(3, 512).build().unwrap();
+         let ext2 = Ext2::open(
+-            f.disk.clone() as Arc<dyn BlockDevice>,
++            BlockDeviceLease::new_untracked(f.disk.clone() as Arc<dyn BlockDevice>),
+             FsFlags::empty(),
+             Some("minixdf"),
+         )

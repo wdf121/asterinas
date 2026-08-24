@@ -1,0 +1,15 @@
+diff --git a/kernel/src/vm/page_cache/tests/utils.rs b/kernel/src/vm/page_cache/tests/utils.rs
+index 840b86713..803c52a02 100644
+--- a/kernel/src/vm/page_cache/tests/utils.rs
++++ b/kernel/src/vm/page_cache/tests/utils.rs
+@@ -319,8 +319,8 @@ impl BlockDevice for MockPageCacheBackend {
+         }
+     }
+ 
+-    fn name(&self) -> &str {
+-        "mock-page-cache"
++    fn name(&self) -> String {
++        String::from("mock-page-cache")
+     }
+ 
+     fn id(&self) -> DeviceId {
