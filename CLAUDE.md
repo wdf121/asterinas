@@ -81,6 +81,7 @@ docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 
 docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2'
 docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-3pv'
 docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-multi-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --mixed-lvm2'
 ```
 
 ## 当前 Device Mapper 状态
@@ -88,17 +89,18 @@ docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 
 截至 2026-08-24，`dm` 分支最近相关提交：
 
 ```text
+8426e405a 补充 Device Mapper mixed 与 striped 边界 ktest
 2e1a3350f 记录 dm 分支协作说明
 8f00dec97 补充 Device Mapper mixed table ktest
 fd94cd2c7 补充 Device Mapper table-load 非法输入 ktest
 49ef85c72 修复 Device Mapper table remap ktest
-487f375c3 新增 Device Mapper striped multi-segment 验收
 ```
 
 当前已完成并验证的范围：
 
 - Device Mapper linear 多 target 已支持 LVM2 跨 PV 扩容 / 缩容相关路径。
 - Device Mapper striped 已覆盖 raw BIO、2-way LVM2、3PV / 3-way、multi-segment reboot recovery；ktest 已补 3-way partial final row range 拆分和 BIO 恰好结束在 striped target 末尾的边界。
+- LVM2 已覆盖同一 LV 内 linear + striped mixed table 的 create、ext2 I/O、grow 和 reboot recovery，入口为 `myshell/run_dm_system_tests.sh --mixed-lvm2`。
 - 同一 DM device / 同一 LV 内的 BIO 可以跨 target 边界拆分；这不是跨 LV。
 - 一个 BIO 不应跨两个不同 LV；BIO 是发给某一个 block device 的。
 - `DmTable` 数据面支持：
@@ -139,15 +141,14 @@ fd94cd2c7 补充 Device Mapper table-load 非法输入 ktest
 
 ## 后续可做优先级
 
-1. 复查当前 mixed / split / striped boundary ktest 是否需要拆分或补充说明；如果用户要求，可按逻辑点继续拆 commit 或补日志。
-2. 如能找到稳定 LVM2 命令自然生成 linear + striped mixed table，再考虑系统级验收。
-3. udev / devtmpfs / systemd 自动联动放最后。
+1. 复查当前 mixed / split / striped boundary / mixed-lvm2 系统验收是否需要拆分或补充说明；如果用户要求，可按逻辑点继续拆 commit 或补日志。
+2. udev / devtmpfs / systemd 自动联动放最后。
 
 ## 工程日志规则
 
 - 写日志前先用 `date +%F` 核对当前日期，按当天日期写入 `log/YYYY-M-D.md`。
 - 每天的日志阶段号都从 1 开始，不沿用前一天的阶段编号。
-- `log/2026-8-21.md` 已记录当天 DM 小阶段 1 到 6；`log/2026-8-24.md` 从第 1 阶段开始记录当天改动，当前已到第 2 阶段。
+- `log/2026-8-21.md` 已记录当天 DM 小阶段 1 到 6；`log/2026-8-24.md` 从第 1 阶段开始记录当天改动，当前已到第 3 阶段。
 - 日志按小阶段顺序写：背景、改动、测试。
 - 不按“生产代码 / ktest”分类。
 - 只记录实际工程改动和验证；单纯讨论、复核、规划不写入日志。
