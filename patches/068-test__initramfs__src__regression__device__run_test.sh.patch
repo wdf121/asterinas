@@ -1,0 +1,12 @@
+diff --git a/test/initramfs/src/regression/device/run_test.sh b/test/initramfs/src/regression/device/run_test.sh
+index 8bd683665..235c07859 100755
+--- a/test/initramfs/src/regression/device/run_test.sh
++++ b/test/initramfs/src/regression/device/run_test.sh
+@@ -15,6 +15,7 @@ set -e
+ ./vt/vt_ioctl
+ 
+ ./devtmpfs_mode
++./device_mapper
+ ./evdev
+ ./framebuffer
+ ./full

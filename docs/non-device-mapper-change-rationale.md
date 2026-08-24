@@ -1,0 +1,691 @@
+# 非 Device Mapper 专属改动说明
+
+本文整理 `dm` 分支中不属于 Device Mapper core 本身、但为 Device Mapper / LVM2 路径提供支撑的改动。重点说明：为什么需要这些改动、原来缺什么、解决了什么问题。
+
+说明范围：
+
+- 代码级说明不展开 `kernel/comps/device-mapper/**`、`kernel/src/device/misc/device_mapper.rs`、Device Mapper 专项文档和日志。
+- 非代码级说明单独整理 Nix、Makefile、QEMU/NixOS shell、`myshell/` 系统验收脚本等改动。
+- 关注支撑 DM/LVM2 的通用内核能力、Linux 兼容接口、测试基础设施和回归用例。
+
+## 总体背景
+
+Device Mapper 本身只是内核里的 stacked block device。要让真实 LVM2 用户态工作，仅实现 `DM_TABLE_LOAD`、BIO remap 和 `/dev/dm-*` 还不够。
+
+LVM2 会依赖一组 Linux 兼容行为：
+
+- 通过 `/proc/devices` 发现 block major，例如 `device-mapper`、`virtblk`、`nvme`。
+- 通过 `/dev/mapper/<name>` 访问运行期创建的 DM 设备。
+- 对 block device 发起 legacy ioctl，例如 `BLKGETSIZE`、`BLKGETSIZE64`、`BLKSSZGET`、`BLKRAGET`。
+- 在 PV / VG / LV 生命周期中动态创建、打开、挂载、关闭、删除 block device。
+- 在多测试盘场景中稳定识别哪块盘是测试 PV，而不是依赖 `/dev/vdX` 枚举顺序。
+
+因此，分支中有一批非 DM 专属改动，本质是补齐 Linux block / procfs / devtmpfs / NixOS 测试链路，让 DM core 能被真实 LVM2 路径验证。
+
+## 非代码级别改动单独整理
+
+本节只整理 Nix、Makefile 和 shell 层面的改动。这些改动不属于内核功能实现，但决定了真实 LVM2 系统验收能否稳定运行。
+
+### A. NixOS 镜像内容改动：把 LVM2 验收工具静态放进 guest
+
+相关文件：
+
+- [configuration.nix](../distro/etc_nixos/configuration.nix)
+- [default.nix](../distro/etc_nixos/overlays/hello-asterinas/default.nix)
+
+改动内容：
+
+- [configuration.nix](../distro/etc_nixos/configuration.nix) 的 `environment.systemPackages` 从只包含 `hello-asterinas`，扩展为包含：
+  - `aster-dm-disk-locator`
+  - `e2fsprogs`
+  - `hello-asterinas`
+  - `lvm2`
+  - `strace`
+  - `util-linux`
+- [default.nix](../distro/etc_nixos/overlays/hello-asterinas/default.nix) 新增 `aster-dm-disk-locator` 包，在构建 NixOS 镜像时编译进 guest。
+
+为什么要改：
+
+- LVM2 系统验收不是内核 ktest，guest 内必须真实运行 `pvcreate`、`vgcreate`、`lvcreate`、`dmsetup`、`mkfs.ext2`、`mount`、`resize2fs`、`e2fsck` 等用户态工具。
+- 多块测试盘不能依赖 `/dev/vdX` 枚举顺序，guest 内需要一个稳定定位工具按 VirtIO serial 找到指定测试盘。
+- 这些工具需要在 NixOS 镜像构建阶段静态放入系统环境，否则系统测试启动后无法补装依赖。
+
+解决的问题：
+
+- 解决 guest 内缺少 LVM2 / ext2 / util-linux 工具导致系统验收无法执行的问题。
+- 解决多测试盘场景下误选根盘、误选其他测试盘、PV 顺序不稳定的问题。
+- 让系统测试脚本可以用 `aster-dm-disk-locator vdmtest2` 这类方式稳定找到 PV2 / PV3。
+
+与“静态测试改动 Nix 文件”的关系：
+
+- 这类改动不是为了改变内核运行逻辑，而是为了让静态构建出的 NixOS guest 镜像自带验收工具。
+- 后续只要重新构建 NixOS 镜像，测试环境就稳定包含这些依赖，不需要每个 shell 测试临时安装。
+
+### B. NixOS / QEMU 启动 shell 改动：支持多块持久测试盘
+
+相关文件：
+
+- [run.sh](../tools/nixos/run.sh)
+- [qemu_args.sh](../tools/qemu_args.sh)
+- [build_nixos.sh](../tools/nixos/build_nixos.sh)
+
+改动内容：
+
+- [run.sh](../tools/nixos/run.sh) 支持 `DM_TEST_IMAGES`，可一次附加多块 raw 测试盘。
+- 兼容旧变量 `DM_TEST_IMAGE` / `DM_TEST_IMAGE_2`。
+- 每块测试盘自动设置稳定 VirtIO serial：
+  - 第一块：`vdmtest`
+  - 第二块：`vdmtest2`
+  - 第三块：`vdmtest3`
+- 测试盘不存在时创建 512 MiB raw image。
+- 防止测试盘路径包含空白字符。
+- 防止把 NixOS 根盘 `target/nixos/asterinas.img` 当作 DM 测试盘。
+- 防止同一个测试盘镜像被重复附加。
+- NixOS 根盘增加 `bootindex=1`。
+- [run.sh](../tools/nixos/run.sh) 调用 [qemu_args.sh](../tools/qemu_args.sh) 时设置 `FORCE_OVMF=on`。
+- [qemu_args.sh](../tools/qemu_args.sh) 新增 `FORCE_OVMF`，用于让 NixOS run 保持 OVMF 启动，不受通用 boot method / boot protocol 环境变量影响。
+- [build_nixos.sh](../tools/nixos/build_nixos.sh) 中留下了几行注释掉的诊断输出，不改变构建行为；如果后续整理 patch，可作为清理项删除。
+
+为什么要改：
+
+- LVM2 的 striped、3PV、mixed table 验收需要多块 PV，因此 QEMU 必须能同时挂多块测试盘。
+- reboot recovery 验收要求第一次启动写入的 PV/VG/LV 元数据和文件数据，在第二次启动时仍然存在，因此测试盘必须是持久 raw image，而不是临时盘。
+- NixOS 根镜像是 UEFI 安装，系统测试不应被外部 `BOOT_METHOD` / `BOOT_PROTOCOL` 改成非 OVMF 启动方式。
+
+解决的问题：
+
+- 解决只能附加单测试盘、无法覆盖多 PV / striped / mixed LVM2 场景的问题。
+- 解决 reboot 后测试盘数据无法复用的问题。
+- 解决多盘路径重复、误用根盘导致破坏测试环境的问题。
+- 解决 NixOS 系统测试被 ktest 常用启动参数干扰的问题。
+
+### C. Makefile 非代码改动：默认验收配置和测试盘清理入口
+
+相关文件：
+
+- [Makefile](../Makefile)
+
+改动内容：
+
+- `RELEASE ?= 0` 改为 `RELEASE ?= 1`。
+- 新增 `rm_dm` target，用于清理 DM 系统测试生成的测试盘镜像。
+- `rm_dm` 支持：
+  - 显式清理 `DM_TEST_IMAGES` 指定的镜像。
+  - 默认清理 `target/nixos/test.img` 和 `target/nixos/test[0-9]*.img`。
+
+为什么要改：
+
+- DM / LVM2 系统验收启动 guest、跑 LVM2、mkfs、reboot，耗时较长；默认 release 构建能减少系统验收时间。
+- LVM2 会把 PV/VG/LV 元数据写进测试盘。旧镜像不清理时，下一次 `pvcreate` / `vgcreate` / `lvcreate` 可能受到旧元数据污染。
+
+解决的问题：
+
+- 提供一键清理测试盘的入口，避免手工删除漏文件。
+- 降低系统验收受历史 PV/VG/LV 元数据影响的概率。
+- 让多盘测试失败后可以快速回到干净状态。
+
+### D. `myshell/lib` 公共测试库：抽出 NixOS guest 驱动逻辑
+
+相关文件：
+
+- [dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh)
+
+改动内容：
+
+- 抽出通用 NixOS 系统测试流程：准备测试、启动 guest、等待 root shell、注入 guest 脚本、收集关键输出、判断 pass/fail。
+- 支持两次 guest 启动，用于 reboot recovery 测试。
+- 支持统一超时、日志路径、测试盘清理、结果摘要过滤。
+
+为什么要改：
+
+- linear、striped、3PV、multi-segment、mixed 等系统验收都需要类似的 host 驱动逻辑。
+- 如果每个脚本重复写 QEMU 交互、等待 guest、过滤日志、判定通过，容易出现不一致和维护成本高。
+
+解决的问题：
+
+- 统一系统验收行为和输出标记。
+- 让每个具体测试脚本只关注 guest 内的 LVM2 / dmsetup / 文件系统操作。
+- 降低新增系统验收入口时复制错误的概率。
+
+### E. `myshell/run_dm_system_tests.sh`：统一系统验收入口
+
+相关文件：
+
+- [run_dm_system_tests.sh](../myshell/run_dm_system_tests.sh)
+
+改动内容：
+
+新增统一入口，支持：
+
+- `--quick`
+- `--data`
+- `--striped`
+- `--striped-lvm2`
+- `--striped-lvm2-3pv`
+- `--striped-lvm2-multi-segment`
+- `--mixed-lvm2`
+- `--lvm2`
+- `--linear-flow`
+- `--full`
+
+为什么要改：
+
+- 随着系统验收增多，需要一个稳定入口给开发、阶段验收和文档引用。
+- 不同测试耗时不同，需要按场景选择窄跑，而不是每次都跑全量。
+- `--full` 需要保持原 linear 全量语义，不能因为新增 striped / mixed 慢测试而变慢。
+
+解决的问题：
+
+- 统一系统测试命令，减少记忆成本。
+- 支持按链路窄跑，避免无关慢测试扩大验证范围。
+- 保持 `--full` 语义稳定，避免影响既有使用者。
+
+### F. `myshell/dm_linear`：linear 和基础控制面系统验收脚本
+
+相关文件：
+
+- [run_control_abi_test.sh](../myshell/dm_linear/run_control_abi_test.sh)
+- [run_cross_pv_large_write_test.sh](../myshell/dm_linear/run_cross_pv_large_write_test.sh)
+- [run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh)
+- [run_linear_full_flow_test.sh](../myshell/dm_linear/run_linear_full_flow_test.sh)
+- [run_lvm2_resize_test.sh](../myshell/dm_linear/run_lvm2_resize_test.sh)
+
+改动目的：
+
+- 覆盖 DM control ioctl 基础路径。
+- 覆盖 raw cross-target BIO 回归。
+- 覆盖 linear LVM2 cross-PV 大文件写入。
+- 覆盖 LVM2 resize / extend / shrink。
+- 覆盖单 guest linear 端到端流程。
+
+为什么要改：
+
+- ktest 能验证内核内部逻辑，但不能证明真实 `dmsetup` / LVM2 / ext2 / mount 路径可用。
+- linear 是 DM 最基础 target，也是后续 striped / mixed 验收的对照基线。
+
+解决的问题：
+
+- 确认 `/dev/mapper/control`、table load、resume、deps/status 等控制面能被真实用户态使用。
+- 确认 linear 数据面在真实文件系统和 LVM2 resize 场景中能保持数据正确。
+
+### G. `myshell/dm_striped`：striped 多盘系统验收脚本
+
+相关文件：
+
+- [run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh)
+- [run_lvm2_striped_io_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh)
+- [run_lvm2_striped_3pv_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh)
+- [run_lvm2_striped_multi_segment_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_multi_segment_reboot_test.sh)
+
+改动目的：
+
+- 覆盖 raw striped BIO 拆分。
+- 覆盖 2-way striped LVM2 create / I/O / grow / shrink / reboot recovery。
+- 覆盖 3PV / 3-way striped reboot recovery。
+- 覆盖 multi-segment striped table reboot recovery。
+
+为什么要改：
+
+- striped target 依赖多块盘和跨 stripe chunk 拆分，单盘 linear 验收覆盖不到。
+- 真实 LVM2 生成的 striped table、deps、status 输出需要和内核实现对齐。
+- reboot recovery 能验证 PV/VG/LV 元数据和文件数据在第二次启动后仍可恢复。
+
+解决的问题：
+
+- 验证多盘测试基础设施确实稳定。
+- 验证 BIO split 到多个 backing device 后数据仍正确。
+- 验证真实 LVM2 生成的 striped table 能被 Asterinas DM 接收和恢复。
+
+### H. `myshell/dm_mixed`：linear + striped mixed table 系统验收脚本
+
+相关文件：
+
+- [run_lvm2_linear_striped_mixed_reboot_test.sh](../myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh)
+
+改动目的：
+
+- 在同一个 LV 中先创建 PV1 上的 linear segment，再用 PV2+PV3 做 2-way striped 扩容，生成真实 LVM2 linear + striped mixed table。
+- 验证 create、ext2 I/O、grow、table/status/deps、reboot recovery。
+
+为什么要改：
+
+- ktest 已能覆盖 mixed table 的控制面和数据面，但仍需要真实 LVM2/libdevmapper 路径证明系统级兼容。
+- mixed table 是跨 target BIO split 的真实用户态来源之一，不能只靠手写 table 或内核单测证明。
+
+解决的问题：
+
+- 验证真实 LVM2 能自然生成并恢复 mixed table。
+- 验证第一段 linear、第二段 striped 的 deps/status/table 都符合预期。
+- 验证写入跨越 mixed LV 扩展区域的数据，重启后仍能通过 md5 复查。
+
+## 1. Block BIO：支持 stacked block device 的 remap、split 和完成聚合
+
+相关文件：
+
+- [bio.rs](../kernel/comps/block/src/bio.rs)
+- [request_queue.rs](../kernel/comps/block/src/request_queue.rs)
+- [partition.rs](../kernel/comps/block/src/partition.rs)
+
+### 原来缺什么
+
+原有 BIO 模型更接近“上层提交到一个真实底层设备”：
+
+- BIO 的 sector range 基本等同于原始请求范围。
+- partition 只需要做简单 offset remap。
+- request queue 按原始 range 做 merge / dispatch 即可。
+- 一个 BIO 通常对应一次底层提交和一次完成。
+
+但 DM / partition 这类 stacked block device 需要更复杂的语义：
+
+- 上层 BIO 的逻辑 sector 要映射到底层设备 sector。
+- linear target 需要改变起始 sector。
+- striped target 可能把一个 BIO 拆到多个底层盘。
+- mixed table 可能把一个 BIO 拆到相邻 target。
+- 原始 BIO 的调用者仍然只能看到一次最终完成。
+
+### 为什么要改
+
+如果不区分“原始 BIO 范围”和“当前层 remap 后范围”，底层 request queue 可能按错误 sector 下发 I/O。
+
+如果不支持 child BIO split 和 completion 聚合，跨 stripe chunk、跨 target 边界、跨底层设备的请求无法正确表达；即使能拆出去，也无法把多个 child 的完成状态合并回原始 BIO。
+
+### 解决的问题
+
+这组改动让 block 层具备通用 stacked device 能力：
+
+- BIO 保留原始 metadata，同时维护当前层使用的 sector range。
+- 支持对 submitted BIO 做 sector remap。
+- 支持按连续区间切分 child BIO。
+- 支持 child BIO 数据窗口落在原 segment 中间的情况。
+- 支持多个 child completion 聚合成原始 BIO 的最终状态。
+- 支持 stacked device 追加自己的 completion 清理逻辑，而不是覆盖上层回调。
+- request queue 使用 remap 后的当前 range 做 merge 和 dispatch。
+- partition 层也改用同一套 offset 语义，避免 partition 与 DM 多层叠加时语义不一致。
+
+### 与 DM/LVM2 的关系
+
+这不是 DM 专属代码，但 DM 的核心数据面依赖它：
+
+- linear 多 target 需要 remap。
+- striped 需要拆 BIO 到多个底层盘。
+- linear + striped mixed table 需要跨 target split。
+- LVM2 grow / shrink / reboot recovery 中的 ext2 I/O 都依赖这些 BIO 语义正确。
+
+## 2. Block device registry：支持动态注册、注销、租约和 major 名称
+
+相关文件：
+
+- [lib.rs](../kernel/comps/block/src/lib.rs)
+- [device_id.rs](../kernel/comps/block/src/device_id.rs)
+- [block.rs](../kernel/src/device/registry/block.rs)
+- [registry/mod.rs](../kernel/src/device/registry/mod.rs)
+
+### 原来缺什么
+
+原来的 block registry 更适合启动期固定设备，例如 virtio-blk、NVMe 这类枚举后长期存在的设备。
+
+DM 设备不同：
+
+- `dmsetup create` / `lvcreate` 会在运行期创建 block device。
+- `dmsetup remove` / LVM deactivate 会在运行期删除 block device。
+- `dmsetup rename` / LVM 命名规则会影响 `/dev/mapper/<name>`。
+- 已打开或已挂载的设备不能被直接移除。
+- LVM2 需要从 major number 反查 major name。
+
+### 为什么要改
+
+没有动态生命周期控制时，运行期创建的 DM device 可能处于半注册状态就被用户态发现，或删除时仍被 mount/open 使用。
+
+没有租约时，文件系统已经持有 block device 但 registry 不知道，DM remove 可能错误成功，导致后续 I/O 访问被拆掉的设备。
+
+没有 major name 时，`/proc/devices` 无法输出 `device-mapper`、`virtblk`、`nvme` 这类 Linux 兼容名称，LVM2 的设备发现路径会缺关键输入。
+
+### 解决的问题
+
+这组改动补齐 block registry 的动态语义：
+
+- 支持 pending registration，避免半注册设备被 lookup。
+- 支持 commit / abort registration。
+- 支持 begin / commit / abort unregister。
+- 支持 unregister 前阻止新的 lookup。
+- 支持 `BlockDeviceLease`，让长期使用者持有设备租约。
+- 设备仍被打开或挂载时，remove 可以返回 busy。
+- major allocator 记录 major name，并能枚举给 `/proc/devices`。
+- kernel registry 层维护 open count 和 runtime mapper 节点管理。
+
+### 与 DM/LVM2 的关系
+
+这组改动解决的是 DM 生命周期能否安全进入 Linux 用户态的问题：
+
+- LVM2 创建 LV 时需要动态注册新的 DM block device。
+- LVM2 deactivate / remove 时需要安全注销。
+- ext2 挂载在 `/dev/mapper/<vg-lv>` 上时，DM 设备不能被误删。
+- `/proc/devices` 中必须能看到 `device-mapper` major。
+
+## 3. devtmpfs / VFS：支持运行期安全维护 `/dev/dm-*` 和 `/dev/mapper/*`
+
+相关文件：
+
+- [device/mod.rs](../kernel/src/device/mod.rs)
+- [dentry.rs](../kernel/src/fs/vfs/path/dentry.rs)
+- [path/mod.rs](../kernel/src/fs/vfs/path/mod.rs)
+
+### 原来缺什么
+
+启动期设备节点和运行期 DM 节点不是同一类问题。
+
+原来更偏向启动阶段生成固定设备节点；DM 需要在系统运行过程中：
+
+- 创建 `/dev/dm-N`。
+- 创建 `/dev/mapper/<name>`。
+- 创建必要的父目录，例如 `/dev/mapper`。
+- rename mapper 名称。
+- remove 时删除对应节点。
+
+这些操作必须在 devtmpfs 已挂载、甚至 stage-1 已经切换 root 后仍然可用。
+
+### 为什么要改
+
+如果没有运行期 devtmpfs 节点维护，LVM2 即使成功通过 ioctl 创建 DM device，也无法通过标准路径 `/dev/mapper/<vg-lv>` 打开 LV。
+
+如果删除节点时只按路径 unlink，可能误删后来被其他代码替换进去的同名节点。
+
+如果 rename 覆盖已有节点，可能破坏已有设备路径。
+
+### 解决的问题
+
+这组改动提供运行期设备节点的安全操作能力：
+
+- 保存 devtmpfs root，确保 stage-1 切根后仍能操作同一 devtmpfs 实例。
+- 支持运行期创建设备节点和 symlink。
+- 支持自动创建父目录。
+- 支持 no-replace rename，避免覆盖已有 mapper 节点。
+- 支持只在 inode 匹配预期对象时 unlink / rmdir，避免误删。
+- 放宽必要的 dentry 可见性，使 device 层能比较和维护节点。
+
+### 与 DM/LVM2 的关系
+
+LVM2 的常规访问路径是 `/dev/mapper/<vg-lv>`。这组改动让 DM 设备不只是 registry 里的对象，也能被用户态通过 Linux 兼容路径访问和管理。
+
+## 4. `/proc/devices`：补齐 LVM2 依赖的 Linux 发现接口
+
+相关文件：
+
+- [devices.rs](../kernel/src/fs/fs_impls/procfs/devices.rs)
+- [procfs/mod.rs](../kernel/src/fs/fs_impls/procfs/mod.rs)
+- [procfs/devices.c](../test/initramfs/src/regression/fs/procfs/devices.c)
+- [fs/run_test.sh](../test/initramfs/src/regression/fs/run_test.sh)
+
+### 原来缺什么
+
+这里需要强调：实际 Linux 兼容文件是 `/proc/devices`，不是 `/proc/device`。
+
+LVM2 会读取 `/proc/devices` 来确认系统有哪些 character / block major。缺这个文件时，真实 LVM2 路径可能无法识别 `device-mapper` major，也无法按 Linux 习惯理解 block device 类型。
+
+### 为什么要改
+
+DM core 可以自己管理 major/minor，但 LVM2 是外部用户态程序。它不认识 Asterinas 内部 registry，只会按 Linux ABI 查询系统能力。
+
+没有 `/proc/devices` 时，会出现“内核里 DM 已实现，但 LVM2 用户态发现不到或不信任相关设备”的问题。
+
+### 解决的问题
+
+新增 `/proc/devices` 后：
+
+- procfs 输出 Linux 兼容的 `Character devices:` 和 `Block devices:` 段落。
+- block devices 部分来自 block major registry。
+- 可以输出 `device-mapper`、`virtblk`、`nvme` 等 major 名称。
+- initramfs regression 覆盖基本读取、短读和 offset 行为，防止后续破坏 procfs 文件语义。
+
+### 与 DM/LVM2 的关系
+
+这是让真实 LVM2 能发现 DM 的关键非 DM 改动之一。没有它，`lvcreate` / `vgchange` / `dmsetup` 相关路径可能在用户态发现阶段失败，而不是在 DM ioctl 本身失败。
+
+## 5. Block ioctl：补齐 LVM2 / mkfs / mount 常用查询
+
+相关文件：
+
+- [block.rs](../kernel/src/device/registry/block.rs)
+- [block_device.c](../test/initramfs/src/regression/io/file_io/block_device.c)
+
+### 原来缺什么
+
+真实用户态工具不会只调用 DM ioctl。它们还会对 block device 调用通用 ioctl 来查询能力：
+
+- `BLKGETSIZE64`：字节大小。
+- `BLKGETSIZE`：legacy sector 数。
+- `BLKSSZGET`：logical sector size。
+- `BLKRAGET`：read-ahead 设置。
+
+原有覆盖不足会导致 LVM2、mkfs、mount 或辅助工具误判设备能力。
+
+### 为什么要改
+
+即使 DM table 正确，用户态仍可能因为普通 block ioctl 不兼容而失败。例如：
+
+- 不能确定设备大小。
+- sector size 返回类型或值不符合 Linux 预期。
+- legacy 工具使用 `BLKGETSIZE` 时失败。
+
+### 解决的问题
+
+这组改动补齐了 LVM2 常用的 block 查询接口，并用 initramfs regression 锁住行为：
+
+- 支持 legacy `BLKGETSIZE`。
+- 支持 `BLKRAGET`。
+- 修正 `BLKSSZGET` 写出类型和值。
+- 保留 `BLKGETSIZE64` 路径。
+- 新增测试确保普通 block device ioctl 兼容性不会退化。
+
+### 与 DM/LVM2 的关系
+
+这是让真实 `pvcreate`、`vgcreate`、`lvcreate`、`mkfs.ext2`、`mount` 能在 Asterinas 上跑通的基础 ABI。
+
+## 6. ext2 / exfat / VFS mount：挂载时持有 block device lease
+
+相关文件：
+
+- [registry.rs](../kernel/src/fs/vfs/fs_apis/registry.rs)
+- [ext2/fs.rs](../kernel/src/fs/fs_impls/ext2/fs.rs)
+- [ext2/fs_type.rs](../kernel/src/fs/fs_impls/ext2/fs_type.rs)
+- [ext2/test_utils.rs](../kernel/src/fs/fs_impls/ext2/test_utils.rs)
+- [exfat/fs.rs](../kernel/src/fs/fs_impls/exfat/fs.rs)
+- [utils.rs](../kernel/src/vm/page_cache/tests/utils.rs)
+
+### 原来缺什么
+
+挂载文件系统后，文件系统会长期持有 block device 并持续发起 I/O。
+
+如果 mount 只拿到裸 `Arc<dyn BlockDevice>`，registry 无法知道这个设备仍被文件系统使用。此时运行期 remove 可能错误成功。
+
+### 为什么要改
+
+DM / LVM2 场景里常见流程是：
+
+1. 创建 `/dev/mapper/<lv>`。
+2. 在 LV 上 `mkfs.ext2`。
+3. mount 后进行文件 I/O。
+4. 尝试 deactivate/remove 或 reboot recovery。
+
+挂载期间如果 DM device 被删除，会破坏文件系统 I/O 生命周期。
+
+### 解决的问题
+
+这组改动让 mount 与 block registry 生命周期打通：
+
+- `resolve_block_device()` 返回 block device lease。
+- ext2 / exfat 挂载期间保存 lease。
+- 卸载后释放 lease。
+- FS cache key 仍基于 backing `DeviceId`，避免同一设备重复创建 FS 实例。
+- 测试工具适配新的 block device trait 和 lease API。
+
+### 与 DM/LVM2 的关系
+
+挂载 `/dev/mapper/<lv>` 后，DM remove 能正确感知 busy 状态，避免设备生命周期早于文件系统生命周期结束。
+
+## 7. VirtIO / NVMe / mlsdisk：暴露 block identity，支持稳定定位测试盘
+
+相关文件：
+
+- [virtio block mod.rs](../kernel/comps/virtio/src/device/block/mod.rs)
+- [virtio block device.rs](../kernel/comps/virtio/src/device/block/device.rs)
+- [virtio lib.rs](../kernel/comps/virtio/src/lib.rs)
+- [nvme block_device.rs](../kernel/comps/nvme/src/device/block_device.rs)
+- [nvme lib.rs](../kernel/comps/nvme/src/lib.rs)
+- [mlsdisk.rs](../kernel/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs)
+- [mlsdisk lib.rs](../kernel/comps/mlsdisk/src/lib.rs)
+
+### 原来缺什么
+
+多盘 LVM2 验收不能可靠依赖 `/dev/vda`、`/dev/vdb`、`/dev/vdc` 的枚举顺序。测试需要明确区分：
+
+- NixOS 根盘。
+- 普通测试盘。
+- PV1 / PV2 / PV3。
+
+### 为什么要改
+
+如果测试脚本猜错测试盘，就可能：
+
+- 把根盘当 PV 清理。
+- 把 PV 顺序弄反，导致 table/deps 校验不稳定。
+- 多次 reboot 后设备名变化，recovery 测试失败。
+
+### 解决的问题
+
+这组改动给 block device 暴露更稳定的 identity：
+
+- VirtIO block 支持读取 host 提供的固定 ID / serial。
+- 提供测试用 ioctl 读取 VirtIO block ID。
+- VirtIO major name 注册为 `virtblk`。
+- NVMe major name 注册为 `nvme`。
+- VirtIO / NVMe block device 提供稳定 `name()` / `id()`。
+- mlsdisk 适配新的 block device trait，避免接口变更后编译断裂。
+
+### 与 DM/LVM2 的关系
+
+NixOS guest 内的测试 helper 可以按 serial 找到 `vdmtest`、`vdmtest2`、`vdmtest3` 等测试盘。striped、3PV、mixed LVM2 验收都依赖这个稳定定位能力。
+
+## 8. NixOS / QEMU 测试基础设施：支持真实 LVM2 多盘系统验收
+
+相关文件：
+
+- [configuration.nix](../distro/etc_nixos/configuration.nix)
+- [default.nix](../distro/etc_nixos/overlays/hello-asterinas/default.nix)
+- [run.sh](../tools/nixos/run.sh)
+- [build_nixos.sh](../tools/nixos/build_nixos.sh)
+- [qemu_args.sh](../tools/qemu_args.sh)
+
+### 原来缺什么
+
+真实 LVM2 系统验收需要完整 guest 环境：
+
+- guest 内有 `lvm2`、`e2fsprogs`、`util-linux`、`strace` 等工具。
+- QEMU 能挂载多块持久 raw 测试盘。
+- 每块盘有稳定 serial。
+- reboot recovery 时第二次启动能复用第一次写入的 PV/VG/LV 元数据。
+- NixOS 根镜像启动方式稳定。
+
+### 为什么要改
+
+没有这些基础设施，DM 只能靠 ktest 或手工 dmsetup 覆盖，无法确认真实 LVM2/libdevmapper 路径。
+
+多 PV / striped / mixed table 特别依赖多块持久测试盘；如果每次启动都是临时盘，reboot recovery 无法验证。
+
+### 解决的问题
+
+这组改动让 NixOS 系统测试能稳定覆盖真实 LVM2：
+
+- NixOS image 内置 LVM2 和 ext2 相关工具。
+- 提供 `aster-dm-disk-locator`，按 serial 定位测试盘。
+- `tools/nixos/run.sh` 支持 `DM_TEST_IMAGES`，一次挂多块测试盘。
+- 防止重复附加同一镜像。
+- 防止把根盘误当测试盘。
+- QEMU 参数支持为测试盘设置 serial。
+- NixOS run 强制 OVMF，避免受通用 boot protocol 环境变量影响。
+
+### 与 DM/LVM2 的关系
+
+这组改动解决的是“能否跑真实系统验收”的问题：
+
+- linear LVM2 cross-PV resize。
+- striped create/grow/shrink/reboot。
+- 3PV / 3-way striped reboot。
+- multi-segment striped reboot。
+- linear + striped mixed table reboot。
+
+这些路径都依赖多盘、LVM2 工具、稳定 serial 和 reboot 后持久元数据。
+
+## 9. 构建、workspace 和回归测试挂接
+
+相关文件：
+
+- [Cargo.toml](../Cargo.toml)
+- [Cargo.lock](../Cargo.lock)
+- [kernel/Cargo.toml](../kernel/Cargo.toml)
+- [Makefile](../Makefile)
+- [.gitignore](../.gitignore)
+- [device/run_test.sh](../test/initramfs/src/regression/device/run_test.sh)
+- [fs/run_test.sh](../test/initramfs/src/regression/fs/run_test.sh)
+
+### 原来缺什么
+
+新增 DM component 和 Linux 兼容接口后，需要进入常规构建和测试链路，否则代码存在但不会被默认构建或回归覆盖。
+
+系统验收也会生成一批测试盘镜像，如果没有清理入口，旧 PV/VG/LV 元数据容易污染下一次测试。
+
+### 为什么要改
+
+如果 workspace / kernel dependency 没接好，DM crate 可能只是在源码树中存在，CI 或本地默认构建不会覆盖。
+
+如果 regression runner 没挂接，新补的 `/proc/devices`、block ioctl、device mapper 回归无法自动跑到。
+
+如果测试盘清理不方便，LVM2 验收可能受旧元数据影响，出现非确定性失败。
+
+### 解决的问题
+
+这组改动完成工程链路挂接：
+
+- workspace 纳入新的 component。
+- kernel 能链接 DM 控制面。
+- lockfile 同步新增依赖。
+- regression runner 挂接新增用例。
+- Makefile 提供测试盘清理入口。
+- `.gitignore` 调整 target 忽略规则，避免误忽略子目录中需要跟踪的路径。
+
+### 与 DM/LVM2 的关系
+
+这些不是 DM 功能实现，但保证 DM 相关代码和非 DM ABI 能被构建、测试和系统验收稳定覆盖。
+
+## 10. 单独说明：为什么 `/proc/devices` 是必要改动
+
+用户态 LVM2 不直接理解 Asterinas 内部的 block registry。它按 Linux ABI 工作，典型依赖包括：
+
+```text
+/proc/devices
+/dev/mapper/control
+/dev/mapper/<vg-lv>
+block ioctl
+sysfs/procfs/devtmpfs 上的设备发现信息
+```
+
+当前分支先补的是 `/proc/devices` 这条关键路径。它解决的问题是：
+
+- 让用户态能枚举 block major。
+- 让 `device-mapper` major 以 Linux 兼容形式暴露。
+- 让 `virtblk` / `nvme` 等底层 block major 也可见。
+- 为 LVM2 判断设备类型和生成过滤规则提供输入。
+
+因此，新增 `/proc/devices` 不是为了 DM core 内部使用，而是为了让真实 Linux 用户态工具能发现并接受 Asterinas 暴露的 block device。
+
+## 结论
+
+非 Device Mapper 专属改动可以概括为五类：
+
+1. **block 数据面通用能力**：BIO remap、split、completion 聚合。
+2. **block 设备生命周期**：动态注册、注销、租约、open/mount busy 保护。
+3. **Linux 用户态兼容接口**：`/proc/devices`、block ioctl、devtmpfs runtime node。
+4. **NixOS 测试镜像环境**：静态放入 LVM2、e2fsprogs、util-linux、测试盘 locator 等工具。
+5. **shell 系统验收基础设施**：多测试盘、稳定 serial、QEMU 挂盘、测试盘清理、reboot recovery 驱动脚本。
+
+这些改动的共同目标不是扩大 DM scope，而是补齐真实 LVM2 路径所需的内核、NixOS guest 和 shell 验收环境前提。没有这些支撑，DM core 即使能通过内核单元测试，也无法稳定通过真实 LVM2/libdevmapper/ext2/reboot recovery 验收。

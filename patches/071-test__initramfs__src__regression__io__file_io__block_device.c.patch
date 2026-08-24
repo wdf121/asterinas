@@ -1,0 +1,33 @@
+diff --git a/test/initramfs/src/regression/io/file_io/block_device.c b/test/initramfs/src/regression/io/file_io/block_device.c
+index fdf5f787f..73b5d5c5c 100644
+--- a/test/initramfs/src/regression/io/file_io/block_device.c
++++ b/test/initramfs/src/regression/io/file_io/block_device.c
+@@ -30,7 +30,27 @@ FN_TEST(seek_end_matches_block_device_size)
+ }
+ END_TEST()
+ 
+-// Verifies that short and non-sector-aligned block-device reads return the
++// Verifies the legacy block ioctl command numbers used by LVM2 during device
++// discovery. BLKGETSIZE is measured in 512-byte sectors; BLKRAGET returns
++// the configured readahead in sectors, which is zero until readahead exists.
++FN_TEST(legacy_block_ioctls_report_linux_compatible_values)
++{
++	int fd;
++	unsigned long legacy_sectors;
++	uint64_t byte_size;
++	long readahead;
++
++	fd = TEST_SUCC(open_block_device(BLOCK_VDB_EXFAT));
++
++	TEST_SUCC(ioctl(fd, BLKGETSIZE, &legacy_sectors));
++	TEST_SUCC(ioctl(fd, BLKGETSIZE64, &byte_size));
++	TEST_RES((uint64_t)legacy_sectors * SECTOR_SIZE == byte_size, _ret == 1);
++	TEST_SUCC(ioctl(fd, BLKRAGET, &readahead));
++	TEST_RES(readahead == 0, _ret == 1);
++
++	TEST_SUCC(close_block_device(fd));
++}
++END_TEST()
+ // requested byte range instead of leaking sector-sized read internals.
+ FN_TEST(short_unaligned_pread_matches_sector_bytes)
+ {

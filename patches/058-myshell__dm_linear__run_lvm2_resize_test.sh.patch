@@ -1,0 +1,196 @@
+diff --git a/myshell/dm_linear/run_lvm2_resize_test.sh b/myshell/dm_linear/run_lvm2_resize_test.sh
+new file mode 100755
+index 000000000..4fe51ba21
+--- /dev/null
++++ b/myshell/dm_linear/run_lvm2_resize_test.sh
+@@ -0,0 +1,190 @@
++#!/bin/bash
++
++# SPDX-License-Identifier: MPL-2.0
++
++set -euo pipefail
++
++if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
++    cat <<'EOF'
++Usage: myshell/dm_linear/run_lvm2_resize_test.sh
++
++Runs the full two-PV LVM2 resize regression in an Asterinas NixOS guest.
++
++Optional environment variables:
++  DM_TEST_IMAGE          First backing test image path, default target/nixos/test.img
++  DM_TEST_IMAGE_2        Second backing test image path, default target/nixos/test2.img
++  LVM2_RESIZE_LOG        Host-side log path, default /tmp/lvm2-resize-test.log
++  GUEST_READY_TIMEOUT    Seconds to wait for guest root shell, default 120
++  RESET_DM_TEST_IMAGES   1 to delete test images before running, default 1
++EOF
++    exit 0
++fi
++
++SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
++ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
++source "${SCRIPT_DIR}/../lib/dm_nixos_test.sh"
++
++TEST_ID=LVM2_RESIZE
++LOG=${LVM2_RESIZE_LOG:-/tmp/lvm2-resize-test.log}
++DM_TEST_IMAGE=${DM_TEST_IMAGE:-target/nixos/test.img}
++DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
++GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-120}
++RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
++
++cd "${ASTERINAS_DIR}"
++dm_prepare_nixos_test "${TEST_ID}"
++echo "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
++echo "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
++
++FIRST_GUEST_SCRIPT=$(mktemp /tmp/lvm2-resize-first.XXXXXX)
++cat >"${FIRST_GUEST_SCRIPT}" <<'GUEST_FIRST'
++stty -echo 2>/dev/null || true
++set -eu
++trap 'status=$?; echo TEST_FAIL_LVM2_RESIZE_FIRST status=$status; sync; poweroff; exit $status' ERR
++
++echo '=== STEP 1: locate test disks ==='
++TEST_DISK=$(aster-dm-disk-locator)
++TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
++printf 'TEST_DISK=%s\nTEST_DISK2=%s\n' "$TEST_DISK" "$TEST_DISK2"
++ls -l "$TEST_DISK" "$TEST_DISK2"
++test "$TEST_DISK" != "$TEST_DISK2"
++test -b "$TEST_DISK"
++test -b "$TEST_DISK2"
++
++LVM_CONFIG='activation { udev_rules=0 }'
++
++echo '=== STEP 2: create PV/VG and 400M LV ==='
++pvcreate "$TEST_DISK" "$TEST_DISK2"
++vgcreate test_vg "$TEST_DISK" "$TEST_DISK2"
++lvcreate --config "$LVM_CONFIG" --type linear -L 400M -n test_lv test_vg "$TEST_DISK"
++pvs -o pv_name,pv_size,vg_name
++vgs -o vg_name,vg_size,vg_free,pv_count,lv_count
++lvs -a -o lv_name,vg_name,lv_size,lv_attr,devices
++lvs --segments -o lv_name,seg_start,seg_size,devices test_vg/test_lv
++
++echo '=== CHECK 1: initial dm table is 400M ==='
++echo 'DM_TABLE_LVM2_INITIAL_BEGIN'
++dmsetup table test_vg-test_lv | tee /tmp/initial-table.txt | sed 's/^/DM_TABLE_LVM2_INITIAL /'
++echo 'DM_TABLE_LVM2_INITIAL_END'
++test "$(wc -l < /tmp/initial-table.txt)" -eq 1
++awk '{ sum += $2 } END { exit !(sum == 819200) }' /tmp/initial-table.txt
++awk '{ if ($3 != "linear") exit 1 }' /tmp/initial-table.txt
++
++echo '=== STEP 3: mkfs, mount, write hello ==='
++MAPPER_DEVICE=/dev/mapper/test_vg-test_lv
++mkfs.ext2 -F -b 4096 "$MAPPER_DEVICE"
++blkid "$MAPPER_DEVICE"
++mkdir -p /mnt/dmtest
++mount -t ext2 "$MAPPER_DEVICE" /mnt/dmtest
++printf 'hello world\n' > /mnt/dmtest/hello.txt
++cat /mnt/dmtest/hello.txt
++du -sh /mnt/dmtest /mnt/dmtest/hello.txt
++sync
++
++echo '=== STEP 4: extend LV to 700M while mounted ==='
++lvextend --config "$LVM_CONFIG" -L 700M test_vg/test_lv "$TEST_DISK2"
++lvs --segments -o lv_name,seg_start,seg_size,devices test_vg/test_lv
++echo 'DM_TABLE_LVM2_EXTENDED_BEGIN'
++dmsetup table test_vg-test_lv | tee /tmp/extended-table.txt | sed 's/^/DM_TABLE_LVM2_EXTENDED /'
++echo 'DM_TABLE_LVM2_EXTENDED_END'
++cat /mnt/dmtest/hello.txt
++du -sh /mnt/dmtest /mnt/dmtest/hello.txt
++sync
++
++echo '=== CHECK 2: extended dm table crosses PVs ==='
++test "$(wc -l < /tmp/extended-table.txt)" -ge 2
++awk '{ sum += $2 } END { exit !(sum == 1433600) }' /tmp/extended-table.txt
++awk '{ if ($3 != "linear") exit 1 }' /tmp/extended-table.txt
++awk '{ dev[$4] = 1 } END { count = 0; for (d in dev) count++; exit !(count >= 2) }' /tmp/extended-table.txt
++
++echo '=== STEP 5: offline grow ext2 and write grow.txt ==='
++umount /mnt/dmtest
++e2fsck -f -y "$MAPPER_DEVICE"
++resize2fs "$MAPPER_DEVICE"
++e2fsck -f -y "$MAPPER_DEVICE"
++mount -t ext2 "$MAPPER_DEVICE" /mnt/dmtest
++cat /mnt/dmtest/hello.txt
++printf 'after grow\n' > /mnt/dmtest/grow.txt
++cat /mnt/dmtest/grow.txt
++du -sh /mnt/dmtest /mnt/dmtest/hello.txt /mnt/dmtest/grow.txt
++sync
++
++echo '=== STEP 6: shrink ext2 and LV to 300M ==='
++umount /mnt/dmtest
++e2fsck -f -y "$MAPPER_DEVICE"
++resize2fs "$MAPPER_DEVICE" 300M
++e2fsck -f -y "$MAPPER_DEVICE"
++lvreduce --config "$LVM_CONFIG" -y -L 300M test_vg/test_lv
++lvs --segments -o lv_name,seg_start,seg_size,devices test_vg/test_lv
++echo 'DM_TABLE_LVM2_SHRUNK_BEGIN'
++dmsetup table test_vg-test_lv | tee /tmp/shrunk-table.txt | sed 's/^/DM_TABLE_LVM2_SHRUNK /'
++echo 'DM_TABLE_LVM2_SHRUNK_END'
++
++echo '=== CHECK 3: shrunk dm table is 300M linear ==='
++test "$(wc -l < /tmp/shrunk-table.txt)" -eq 1
++awk '{ sum += $2 } END { exit !(sum == 614400) }' /tmp/shrunk-table.txt
++awk '{ if ($3 != "linear") exit 1 }' /tmp/shrunk-table.txt
++mount -t ext2 "$MAPPER_DEVICE" /mnt/dmtest
++cat /mnt/dmtest/hello.txt
++cat /mnt/dmtest/grow.txt
++du -sh /mnt/dmtest /mnt/dmtest/hello.txt /mnt/dmtest/grow.txt
++sync
++
++echo '=== STEP 7: cleanup first guest ==='
++umount /mnt/dmtest
++vgchange --config "$LVM_CONFIG" -an test_vg
++sync
++echo TEST_PASS_LVM2_RESIZE_FIRST
++poweroff
++GUEST_FIRST
++
++SECOND_GUEST_SCRIPT=$(mktemp /tmp/lvm2-resize-second.XXXXXX)
++cat >"${SECOND_GUEST_SCRIPT}" <<'GUEST_SECOND'
++stty -echo 2>/dev/null || true
++set -eu
++trap 'status=$?; echo TEST_FAIL_LVM2_RESIZE_SECOND status=$status; sync; poweroff; exit $status' ERR
++
++echo '=== STEP 8: recover VG/LV after reboot ==='
++TEST_DISK=$(aster-dm-disk-locator)
++TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
++printf 'TEST_DISK=%s\nTEST_DISK2=%s\n' "$TEST_DISK" "$TEST_DISK2"
++test "$TEST_DISK" != "$TEST_DISK2"
++LVM_CONFIG='activation { udev_rules=0 }'
++pvscan
++vgscan
++vgchange --config "$LVM_CONFIG" -ay test_vg
++pvs -o pv_name,pv_size,vg_name
++vgs -o vg_name,vg_size,vg_free,pv_count,lv_count
++lvs -a -o lv_name,vg_name,lv_size,lv_attr,devices
++lvs --segments -o lv_name,seg_start,seg_size,devices test_vg/test_lv
++echo 'DM_TABLE_LVM2_RECOVERED_BEGIN'
++dmsetup table test_vg-test_lv | tee /tmp/recovered-table.txt | sed 's/^/DM_TABLE_LVM2_RECOVERED /'
++echo 'DM_TABLE_LVM2_RECOVERED_END'
++ls -l /dev/dm-* /dev/mapper /dev/test_vg
++
++echo '=== CHECK 4: recovered dm table is 300M linear ==='
++test "$(wc -l < /tmp/recovered-table.txt)" -eq 1
++awk '{ sum += $2 } END { exit !(sum == 614400) }' /tmp/recovered-table.txt
++awk '{ if ($3 != "linear") exit 1 }' /tmp/recovered-table.txt
++
++echo '=== STEP 9: readonly mount and read files ==='
++mkdir -p /mnt/dmtest
++mount -t ext2 -o ro /dev/mapper/test_vg-test_lv /mnt/dmtest
++cat /mnt/dmtest/hello.txt
++cat /mnt/dmtest/grow.txt
++du -sh /mnt/dmtest /mnt/dmtest/hello.txt /mnt/dmtest/grow.txt
++umount /mnt/dmtest
++vgchange --config "$LVM_CONFIG" -an test_vg
++sync
++echo TEST_PASS_LVM2_RESIZE_SECOND
++poweroff
++GUEST_SECOND
++
++SUMMARY_INCLUDE='TEST_|=== STEP|=== CHECK|TEST_DISK=|TEST_DISK2=|DM_TABLE_LVM2|test_vg|test_lv|linear|hello world|after grow|No space left|Input/output error|Command failed|Kernel panic|panicked|records in|records out|bytes .* copied'
++dm_run_two_guest_test \
++    "${TEST_ID}" \
++    "${FIRST_GUEST_SCRIPT}" \
++    "${SECOND_GUEST_SCRIPT}" \
++    TEST_PASS_LVM2_RESIZE_FIRST \
++    TEST_PASS_LVM2_RESIZE_SECOND \
++    "${SUMMARY_INCLUDE}"

@@ -1,0 +1,15 @@
+diff --git a/kernel/comps/nvme/src/device/block_device.rs b/kernel/comps/nvme/src/device/block_device.rs
+index d578f9ac1..cdabeb1db 100644
+--- a/kernel/comps/nvme/src/device/block_device.rs
++++ b/kernel/comps/nvme/src/device/block_device.rs
+@@ -81,8 +81,8 @@ impl aster_block::BlockDevice for NvmeBlockDevice {
+         }
+     }
+ 
+-    fn name(&self) -> &str {
+-        &self.name
++    fn name(&self) -> String {
++        self.name.clone()
+     }
+ 
+     fn id(&self) -> DeviceId {

@@ -1,0 +1,152 @@
+diff --git a/log/2026-8-24.md b/log/2026-8-24.md
+new file mode 100644
+index 000000000..7c6eb1024
+--- /dev/null
++++ b/log/2026-8-24.md
+@@ -0,0 +1,146 @@
++# 2026-8-24 Device Mapper 工程改动日志
++
++本文按小阶段记录今天实际发生的工程改动。单纯文档解释、代码复核、后续规划不写入本日志；测试和验证结果跟随对应小阶段记录。
++
++## 1. 补充 mixed table active / inactive 替换 ktest
++
++### 背景
++
++前面已覆盖 mixed table 的 inactive 控制面和 active 数据面。本阶段继续补状态机边界：运行中的 DM 设备已有 active linear table 时，通过 ioctl load 一个 mixed linear + striped inactive table，在 resume 前 active 查询仍应返回旧表，inactive 查询返回 mixed 新表；resume 后 active 应切换到 mixed table，inactive 清空，deps 也应切到 mixed backing 集合。
++
++### 改动
++
++`kernel/src/device/misc/device_mapper.rs`：
++
++```text
++新增 resume_replaces_active_linear_table_with_ioctl_loaded_mixed_table，覆盖 running device 中 active linear table 被 ioctl loaded mixed table 替换的状态机路径。
++验证 resume 前 active / inactive table status 分离，resume 后 active table status 和 deps 均切换到 mixed table，inactive table 清空。
++```
++
++本阶段不新增 QEMU/NixOS 系统测试入口，不涉及 udev / devtmpfs / systemd 联动。
++
++### 测试
++
++已通过静态检查：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --check'
++```
++
++`aster-kernel` ioctl 层 ktest 通过临时缩减根 `Cargo.toml` 的 `default-members` 为 `kernel` 后执行；验证完成后已还原 `Cargo.toml`。
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_kernel::device::misc::device_mapper::tests::resume_replaces_active_linear_table_with_ioctl_loaded_mixed_table"'
++test aster_kernel::device::misc::device_mapper::tests::resume_replaces_active_linear_table_with_ioctl_loaded_mixed_table ... ok
++test result: ok. 1 passed; 0 failed; 173 filtered out.
++```
++
++## 2. 补充 striped 几何边界 ktest
++
++### 背景
++
++前面已覆盖 striped 正常映射、基础非法参数、跨 stripe chunk 拆分和 mixed table 路径。本阶段只补少量非重复的几何边界：三路 striped 在 partial final row 上的 range 拆分，以及 BIO 恰好结束在 striped target 末尾时的数据面拆分。
++
++### 改动
++
++`kernel/comps/device-mapper/src/target/striped.rs`：
++
++```text
++新增 splits_three_stripe_range_across_partial_final_row，覆盖 3-way striped range 跨完整 row 并落在 partial final row 的拆分结果。
++```
++
++`kernel/comps/device-mapper/src/table.rs`：
++
++```text
++新增 splits_striped_bio_ending_at_target_end，覆盖 striped table 中 BIO 结束位置恰好等于 target end 时的 child BIO 下发范围。
++```
++
++本阶段不新增 QEMU/NixOS 系统测试入口，不涉及 udev / devtmpfs / systemd 联动。
++
++### 测试
++
++已通过静态检查：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --check'
++```
++
++`aster-device-mapper` crate ktest 通过临时缩减根 `Cargo.toml` 的 `default-members` 为 `kernel/comps/device-mapper` 后执行；验证完成后已还原 `Cargo.toml`。
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_device_mapper::target::striped::tests::splits_three_stripe_range_across_partial_final_row"'
++test aster_device_mapper::target::striped::tests::splits_three_stripe_range_across_partial_final_row ... ok
++test result: ok. 1 passed; 0 failed; 51 filtered out.
++
++docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_device_mapper::table::tests::splits_striped_bio_ending_at_target_end"'
++test aster_device_mapper::table::tests::splits_striped_bio_ending_at_target_end ... ok
++test result: ok. 1 passed; 0 failed; 51 filtered out.
++```
++
++## 3. 新增 mixed linear + striped LVM2 系统验收
++
++### 背景
++
++前面已通过 ktest 覆盖 linear + striped mixed table 的 ioctl 控制面、数据面和 active/inactive 替换。本阶段补真实 LVM2/libdevmapper 路径：先在 PV1 上创建 linear LV，再用 PV2+PV3 做 2-way striped 扩容，使同一个 LV 自然生成 linear + striped mixed table，并验证重启后可恢复和读取数据。
++
++### 改动
++
++新增脚本：
++
++```text
++myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh
++```
++
++新增组合入口：
++
++```text
++myshell/run_dm_system_tests.sh --mixed-lvm2
++```
++
++默认覆盖：
++
++```text
++三块 512 MiB 测试盘
++PV1 创建 256M linear LV
++PV2+PV3 扩容到 512M，形成第二段 2-way striped segment
++64 MiB base 文件
++256 MiB grow 文件
++重启后 readonly mount + md5 复查
++```
++
++`--full` 语义保持不变，不加入 mixed / striped 慢速矩阵。本阶段不涉及 udev / devtmpfs / systemd 自动联动。
++
++### 测试
++
++已通过静态检查：
++
++```text
++bash -n myshell/run_dm_system_tests.sh myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh
++myshell/run_dm_system_tests.sh --help
++myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh --help
++```
++
++已通过系统验收：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --mixed-lvm2'
++```
++
++关键结果：
++
++```text
++HOST_INFO_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT first_guest_ready_after=28s
++HOST_INFO_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT second_guest_ready_after=19s
++DM_TABLE_LVM2_MIXED_EXTENDED 0 524288 linear 253:64 2048
++DM_TABLE_LVM2_MIXED_EXTENDED 524288 524288 striped 2 8 253:80 2048 253:96 2048
++DM_TABLE_LVM2_MIXED_RECOVERED 0 524288 linear 253:64 2048
++DM_TABLE_LVM2_MIXED_RECOVERED 524288 524288 striped 2 8 253:80 2048 253:96 2048
++CHECK_PASS_MIXED_LVM2_EXTENDED_MIXED_TABLE_STATUS_DEPS
++CHECK_PASS_MIXED_LVM2_GROW_FILE_MD5
++CHECK_PASS_MIXED_LVM2_RECOVERED_MIXED_TABLE_STATUS_DEPS
++CHECK_PASS_MIXED_LVM2_RECOVERED_FILE_MD5
++TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_FIRST
++TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_SECOND
++HOST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT
++HOST_PASS_DM_SYSTEM_TESTS --mixed-lvm2
++```

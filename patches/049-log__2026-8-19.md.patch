@@ -1,0 +1,871 @@
+diff --git a/log/2026-8-19.md b/log/2026-8-19.md
+new file mode 100644
+index 000000000..cc99dc089
+--- /dev/null
++++ b/log/2026-8-19.md
+@@ -0,0 +1,865 @@
++# 2026-8-19 Device Mapper 工程改动日志
++
++本文按小阶段记录今天实际发生的工程改动。单纯文档解释、代码复核、后续规划不写入本日志；测试和验证结果跟随对应小阶段记录。
++
++## 1. suspend 状态机边界修正
++
++涉及文件：
++
++- `kernel/comps/device-mapper/src/device.rs`
++
++### 原来
++
++fresh DM device 还没有 active table 时执行 suspend，也会递增 `event_nr`。
++
++例子：
++
++```text
++DM_DEV_CREATE
++DM_DEV_SUSPEND with suspend flag
++DM_DEV_STATUS
++```
++
++原来可能看到 `event_nr` 从 0 变成 1，即使这个 device 还没有真正 active table，也没有实际 I/O 屏障变化。
++
++### 现在
++
++只有存在 active table 时，`suspend()` 才递增 `event_nr`。
++
++同时，`Suspending` 阶段对外 status 也表现为 suspended，避免 control 面在等待 in-flight I/O drain 时仍显示 running。
++
++### 测试
++
++已有/补充 ktest 锁住 fresh device suspend 不错误增加 `event_nr`，以及 suspend/drain 期间 status 表现为 suspended。
++
++## 2. flush 转发模型改成异步 fan-out
++
++涉及文件：
++
++- `kernel/comps/device-mapper/src/table.rs`
++
++### 原来
++
++DM table 收到 Flush BIO 后，会遍历 backing device，并在 enqueue 路径里同步调用 `submit_and_wait()`。
++
++```text
++上层 flush -> DM -> backing A flush submit_and_wait -> backing B flush submit_and_wait
++```
++
++如果底层 flush 被延迟完成，DM enqueue 路径会同步卡住；在 suspend/drain 场景里容易造成不该有的阻塞。
++
++### 现在
++
++Flush BIO 改成：
++
++```text
++上层 flush
++  -> DM 按 backing device 去重
++  -> 给每个 backing 异步提交一个 Flush BIO
++  -> FlushCompletion 聚合所有 child flush 完成结果
++  -> 全部成功则原 flush 成功；任意失败则原 flush 失败
++```
++
++一个 LV 跨两块盘时，原来是先等第一块盘 flush 完再等第二块盘；现在两个 backing flush 都异步提交，最终聚合完成。
++
++### 测试
++
++补充 ktest 锁住：
++
++- flush 每个 backing 只转发一次；
++- flush child completion 失败会传播到原始 BIO；
++- backing enqueue flush 失败时，原始 flush BIO 以 `IoError` 完成。
++
++## 3. BIO / table / ioctl 边界测试补强
++
++涉及文件：
++
++- `kernel/comps/block/src/bio.rs`
++- `kernel/comps/device-mapper/src/table.rs`
++- `kernel/src/device/misc/device_mapper.rs`
++
++### 内容
++
++补充 ktest 锁住多个边界：
++
++- child BIO 可以跨原始 segment 边界；
++- 跨 linear target 的 BIO split 后，各 child range 正确 remap；
++- BIO 越过 table 范围时拒绝；
++- mapper capacity 来自 table length；
++- queue limit 当前取所有 backing 的最小 `max_nr_segments_per_bio`；
++- table status 多 target 的 Linux-style `next` offset；
++- table deps backing device 去重；
++- table status/deps buffer-full 语义；
++- resume 激活 inactive table；
++- running 状态下 reload + resume 替换 active table；
++- multi-target table load 使用 `dm_target_spec.next` 正确解析。
++
++## 4. 对齐 Linux linear status 输出
++
++涉及文件：
++
++- `kernel/src/device/misc/device_mapper.rs`
++
++### 原来
++
++需要确认 Asterinas 的 `DM_TABLE_STATUS` 对 linear target 输出是否和 Linux `dm-linear` 一致。
++
++### 现在
++
++确认并锁住两种输出：
++
++1. 不带 `DM_STATUS_TABLE_FLAG`：对齐 Linux `STATUSTYPE_INFO`，linear 参数为空；
++2. 带 `DM_STATUS_TABLE_FLAG`：对齐 Linux `STATUSTYPE_TABLE`，linear 参数为：
++
++```text
++<major>:<minor> <backing_start>
++```
++
++### 例子
++
++如果 table 是：
++
++```text
++0 4096 linear 8:1 2048
++```
++
++那么 table status 输出参数是：
++
++```text
++8:1 2048
++```
++
++info status 输出参数是空字符串。
++
++### 测试
++
++补 ktest 锁住 info/table 两种 status 输出差异。
++
++## 5. 收紧 linear 参数解析格式
++
++涉及文件：
++
++- `kernel/src/device/misc/device_mapper.rs`
++
++### 原来
++
++`parse_linear_params()` 接受标准两字段：
++
++```text
++8:1 2048
++```
++
++也额外接受：
++
++```text
++8:1 2048 sectors
++```
++
++也就是把第三个字段 `sectors` 当成可选单位后缀。
++
++### 现在
++
++只接受严格两字段：
++
++```text
++<major>:<minor> <backing_start>
++```
++
++例如：
++
++```text
++8:1 2048
++```
++
++这些都会被拒绝：
++
++```text
++8:1
++8:1 x
++8:1 2048 sectors
++8:1 2048 extra
++bad 2048
++8:1 -1
++65536:1 0
++8:4294967296 0
++```
++
++如果用户态传：
++
++```text
++0 4096 linear 8:1 2048 sectors
++```
++
++原来可能加载成功，生成 inactive table；现在 `DM_TABLE_LOAD` 返回 `EINVAL`，并且 device state 不变。
++
++### 测试
++
++补充 ktest 覆盖：
++
++- 合法参数；
++- 缺字段；
++- 额外字段；
++- 畸形 `major:minor`；
++- major/minor/start 数值溢出；
++- table load 失败不改变 device state。
++
++## 6. 钉住 rename 失败回滚语义
++
++涉及文件：
++
++- `kernel/src/device/misc/device_mapper.rs`
++
++### 原来
++
++`device_rename()` 里已经有失败回滚逻辑：
++
++```text
++先把 manager 名字 old -> new
++再 rename /dev/mapper alias
++如果 alias rename 失败，再把 manager 名字 new -> old
++```
++
++但这段逻辑直接绑在真实 `rename_block_mapper()` 上，不方便用 ktest 模拟 alias rename 失败。
++
++### 现在
++
++把 runtime rename 流程抽成：
++
++```text
++rename_device_runtime(manager, device, new_name, rename_alias)
++```
++
++生产路径仍传入真实 `rename_block_mapper()`，行为不变；测试路径可以传入故意失败的 `rename_alias`，模拟 `/dev/mapper/<new>` 已存在或 alias rename 失败。
++
++### 例子
++
++已有设备：
++
++```text
++manager name = dm-rollback-old
++uuid = dm-rollback-uuid
++inactive table 已加载
++```
++
++执行 rename 到：
++
++```text
++dm-rollback-new
++```
++
++如果 alias rename 返回 `EEXIST`，现在 ktest 锁住结果：
++
++```text
++返回 EEXIST
++manager 仍能通过 dm-rollback-old 查到设备
++manager 不能通过 dm-rollback-new 查到设备
++uuid 仍指向原设备
++设备内部 name 回到 dm-rollback-old
++device status 不变
++```
++
++### 测试
++
++补充 ktest 覆盖：
++
++- rename 成功时 manager/name/uuid 一起更新；
++- rename 到同名是 no-op，不调用 alias rename；
++- alias rename 失败时 manager 和设备内部 name 回滚，status 不变。
++
++## 7. 钉住 active/inactive query flags 语义
++
++涉及文件：
++
++- `kernel/src/device/misc/device_mapper.rs`
++
++### 原来
++
++`DM_DEV_STATUS` 的 target count 选择逻辑直接写在 `device_status()` 中，需要通过全局 manager lookup 路径才能测试。
++
++### 现在
++
++抽出：
++
++```text
++device_status_for_device(buffer, device)
++```
++
++生产路径仍然通过 `lookup_device()` 找到设备后调用该 helper，行为不变；测试可以直接构造本地 `DmManager` 和 `DmDevice`，验证 `DM_QUERY_INACTIVE_TABLE_FLAG` 对 `DM_DEV_STATUS` 的影响。
++
++### 例子
++
++```text
++active table:   0 4 linear 1:1 100
++inactive table: 0 4 linear 1:2 200
++                4 8 linear 1:3 300
++```
++
++不带 flag：
++
++```text
++DM_DEV_STATUS target_count = 1
++DM_TABLE_STATUS 输出 1:1 100
++DM_TABLE_DEPS 输出 1:1
++```
++
++带 `DM_QUERY_INACTIVE_TABLE_FLAG`：
++
++```text
++DM_DEV_STATUS target_count = 2
++DM_TABLE_STATUS 输出 1:2 200 和 1:3 300
++DM_TABLE_DEPS 输出 1:2 和 1:3
++```
++
++### 测试
++
++补充 ktest 覆盖：
++
++- active table 和 inactive table 同时存在时，不带 flag 查询 active；
++- 带 `DM_QUERY_INACTIVE_TABLE_FLAG` 查询 inactive；
++- `DM_DEV_STATUS` 的 target count 按 selected table 返回；
++- `DM_TABLE_STATUS` 按 selected table 输出 target records；
++- `DM_TABLE_DEPS` 按 selected table 输出 backing deps；
++- active/inactive 不串表。
++
++## 8. 补齐 DM_DEV_WAIT 最小 event 语义
++
++涉及文件：
++
++- `kernel/comps/device-mapper/src/device.rs`
++- `kernel/src/device/misc/device_mapper.rs`
++
++### 原来
++
++`event_nr` 已经会随 table load、resume、suspend 等状态变化递增，并通过 status header 返回，但 ioctl 命令表没有接入 Linux ABI 的 `DM_DEV_WAIT_CMD = 8`。
++
++用户态如果用 wait/event 模型等待 mapper 状态变化，8 号 ioctl 会被当成未支持命令返回 `ENOTTY`。
++
++### 现在
++
++`DmDevice` 增加 event wait queue。`load_table()`、`clear_inactive_table()`、`suspend()`、`resume()` 和 remove 成功路径在 `event_nr` 真实变化后唤醒等待者。
++
++控制面新增 `DM_DEV_WAIT` 最小语义：
++
++```text
++输入 event_nr != 当前 event_nr：立即返回当前 header
++输入 event_nr == 当前 event_nr：等待下一次 event_nr 变化后返回
++```
++
++`DM_DEV_WAIT` 等待期间不持有全局 control lock，避免 wait 阻塞后续能改变 `event_nr` 的 ioctl。
++
++### 测试
++
++补充 ktest 覆盖：
++
++- event 已变化时 `wait_event()` 立即返回；
++- event 未变化时 `wait_event()` 阻塞到状态变化后返回；
++- `DM_DEV_WAIT` helper 返回更新后的 event header；
++- ioctl 解码接受 `DM_DEV_WAIT_CMD = 8`。
++
++## 9. 收口 DM ioctl flags 兼容边界
++
++涉及文件：
++
++- `kernel/src/device/misc/device_mapper.rs`
++
++### 原来
++
++控制面只显式处理少数 flag，例如：
++
++```text
++DM_PERSISTENT_DEV_FLAG
++DM_STATUS_TABLE_FLAG
++DM_QUERY_INACTIVE_TABLE_FLAG
++DM_UUID_FLAG
++DM_SUSPEND_FLAG
++```
++
++其它 Linux DM flag 如果从用户态传入，很多会被自然忽略。这样对无害兼容 flag 可以工作，但对只读、deferred remove、IMA measurement 或未知高位 flag 来说，容易形成“用户态以为支持，内核实际没做到”的错误兼容。
++
++### 现在
++
++补齐 Linux 6.6 `dm-ioctl.h` 中 0..19 位的 flag 常量，并新增统一输入校验：
++
++```text
++未知 flag 位 -> EINVAL
++当前不能安全支持的语义 -> EOPNOTSUPP
++无害兼容 flag -> 显式允许并忽略
++命令专用 flag -> 只在有真实输入语义的 ioctl 中生效；其它命令上的陈旧兼容位按需忽略
++```
++
++当前显式拒绝：
++
++```text
++DM_READONLY_FLAG
++DM_DEFERRED_REMOVE
++DM_IMA_MEASUREMENT_FLAG
++```
++
++当前显式允许并忽略：
++
++```text
++DM_SKIP_BDGET_FLAG
++DM_SKIP_LOCKFS_FLAG
++DM_NOFLUSH_FLAG
++```
++
++`DM_SECURE_DATA_FLAG` 被允许，ioctl 结束后会清零内核临时 buffer。
++
++### 测试
++
++补充 ktest 覆盖：
++
++- 无害兼容 flag 可通过校验；
++- output-only 旧 flag 不影响最终状态；
++- 未知高位 flag 返回 `EINVAL`；
++- 只读、deferred remove、IMA measurement 返回 `EOPNOTSUPP`；
++- persistent/status-table/query-inactive/uuid 等命令专用 flag 只能用于对应 ioctl；
++- 关键 Linux flag 位号保持不变。
++
++## 10. 重构 DM 系统测试脚本体系
++
++涉及文件：
++
++- `myshell/lib/dm_nixos_test.sh`
++- `myshell/run_cross_target_bio_regression.sh`
++- `myshell/run_cross_pv_large_write_test.sh`
++- `myshell/run_lvm2_resize_test.sh`
++- `myshell/run_dm_control_abi_test.sh`
++- `myshell/run_dm_system_tests.sh`
++
++### 原来
++
++三个系统级脚本分别维护 guest 启动、QEMU 占用检查、测试盘重置、root shell 等待、FIFO 注入、summary 和失败上下文输出逻辑。
++
++它们能验证真实 LVM2/DM 路径，但脚本结构是按历史阶段逐步补出来的，公共 host-side 逻辑重复，后续继续加 control ABI 或组合测试时容易复制问题。
++
++### 现在
++
++新增公共库：
++
++```text
++myshell/lib/dm_nixos_test.sh
++```
++
++统一承载：
++
++```text
++QEMU 占用检查
++NixOS 镜像检查
++测试盘重置
++guest shell 等待
++FIFO 注入 guest script
++summary 输出
++失败上下文输出
++单 guest / 双 guest 测试编排
++```
++
++原三个脚本改为复用公共库，并保持原有测试流程和 `HOST_PASS_*` 标记不变。
++
++新增轻量 control ABI smoke：
++
++```text
++myshell/run_dm_control_abi_test.sh
++```
++
++用于通过真实 dmsetup 路径覆盖 `/dev/mapper/control`、target version、create/table/status/deps/info、`DM_DEV_WAIT` stale event 和 `--noflush` suspend/resume。
++
++新增组合入口：
++
++```text
++myshell/run_dm_system_tests.sh --quick
++myshell/run_dm_system_tests.sh --data
++myshell/run_dm_system_tests.sh --lvm2
++myshell/run_dm_system_tests.sh --full
++```
++
++后续可以按改动范围选择系统测试，而不是固定跑三套历史脚本。
++
++### 测试
++
++已执行 shell 语法检查：
++
++```text
++bash -n myshell/lib/dm_nixos_test.sh \
++       myshell/run_cross_target_bio_regression.sh \
++       myshell/run_cross_pv_large_write_test.sh \
++       myshell/run_lvm2_resize_test.sh \
++       myshell/run_dm_control_abi_test.sh \
++       myshell/run_dm_system_tests.sh
++```
++
++首次 `--quick` 运行暴露两个问题：
++
++- 公共 runner 用未锚定 grep 匹配 `TEST_PASS_*`，会被 guest 输入回显里的 `echo TEST_PASS_*` 误导；已改为只接受行首真实 marker，并检查 `TEST_FAIL_*` / `HOST_FAIL_*`；
++- `dmsetup create` 的 `DM_TABLE_LOAD` 会携带 `DM_PERSISTENT_DEV_FLAG` 陈旧位，原 flags 校验过严；已修正为 create 时使用该 flag，其它 ioctl 中兼容忽略。
++
++修正后已重新执行：
++
++```text
++cargo fmt --all
++cargo fmt --all --check
++timeout 1200 cargo osdk test device_mapper
++make nixos
++myshell/run_dm_system_tests.sh --quick
++```
++
++结果：通过，`--quick` 输出：
++
++```text
++CHECK_PASS_DM_VERSION_AND_TARGETS
++CHECK_PASS_DM_STATUS_DEPS_INFO
++CHECK_PASS_DM_WAIT_AND_NOFLUSH
++TEST_PASS_DM_CONTROL_ABI
++CHECK_PASS_MAPPER_READBACK_MD5
++CHECK_PASS_BACKING_SPLIT_MD5
++TEST_PASS_CROSS_TARGET_BIO
++HOST_PASS_DM_SYSTEM_TESTS --quick
++```
++
++## 11. 收口输出类 ioctl buffer 边界
++
++涉及文件：
++
++- `kernel/src/device/misc/device_mapper.rs`
++
++### 原来
++
++输出类 ioctl 已经能在 `DM_TABLE_STATUS`、`DM_TABLE_DEPS`、`DM_LIST_VERSIONS`、`DM_GET_TARGET_VERSION`、`DM_LIST_DEVICES` 等路径里设置 `DM_BUFFER_FULL_FLAG`，但边界行为还没有全部钉牢：
++
++```text
++helper 直接调用时没有统一校验 data_start
++DM_LIST_DEVICES 的 record layout 缺少独立 ktest
++短 buffer 下部分输出路径缺少“不能写半截 record”的断言
++```
++
++### 现在
++
++`data_start(buffer)` 下沉为统一校验点，按当前 buffer 长度复用 ioctl envelope 约束：
++
++```text
++data_start >= DM_IOCTL_HEADER_SIZE
++data_start <= data_size
++data_start 按 8 字节对齐
++```
++
++`table_deps_for_device()` 和 `table_status_for_device()` 改为先校验输出区起点，再写回响应 header，避免 helper 层畸形输入导致先污染 header。
++
++`DM_LIST_DEVICES` 抽出 `list_devices_for_devices()`，生产路径仍使用全局 manager，ktest 可以传入本地 manager 构造的设备列表，精确验证 record layout。
++
++短 buffer 语义保持为：
++
++```text
++不越界写
++不写半截 record
++设置 DM_BUFFER_FULL_FLAG
++已经完整写入的 record 保持可解析
++```
++
++### 测试
++
++补充 ktest 覆盖：
++
++- 畸形 `data_start` 在输出 helper 写 header 前返回 `EINVAL`；
++- `DM_LIST_DEVICES` 多设备输出的 `next` offset、event number、UUID flag 和 UUID 字符串；
++- `DM_GET_TARGET_VERSION` 短 buffer 只设置 `DM_BUFFER_FULL_FLAG`，不写半截 target version record；
++- `DM_LIST_DEVICES` 短 buffer 只设置 `DM_BUFFER_FULL_FLAG`，不写半截 name list record。
++
++本阶段重新执行：
++
++```text
++cargo fmt --all
++cargo fmt --all --check
++timeout 1200 cargo osdk test device_mapper
++```
++
++结果：通过；验证结束后确认 `Cargo.toml` 无 diff。
++
++## 12. 补齐 DM_DEV_RENAME UUID rename 语义
++
++涉及文件：
++
++- `kernel/comps/device-mapper/src/device.rs`
++- `kernel/comps/device-mapper/src/manager.rs`
++- `kernel/src/device/misc/device_mapper.rs`
++
++### 原来
++
++`DM_DEV_RENAME` 只支持 name rename。用户传入 `DM_UUID_FLAG` 时，控制面会识别这是 UUID rename 入口，但返回：
++
++```text
++EOPNOTSUPP
++```
++
++也就是当前明确拒绝修改 DM device UUID。
++
++### 现在
++
++`DmDevice` 的 UUID 改成受锁保护的运行期状态，并提供 UUID 快照和内部更新接口。
++
++`DmManager` 新增 UUID rename 语义：
++
++```text
++按 name 找到设备
++检查新 UUID 是否被其它设备占用
++移除旧 UUID 索引
++写入新 UUID -> name 索引
++更新设备内部 UUID
++```
++
++`DM_DEV_RENAME` 现在按 flag 分支：
++
++```text
++不带 DM_UUID_FLAG：data 区字符串解释为新 name，保持原 name rename 路径
++带 DM_UUID_FLAG：data 区字符串解释为新 UUID，只更新 UUID，不移动 /dev/mapper/<name> alias
++```
++
++成功后保持：
++
++```text
++name 不变
++dev/id 不变
++active/inactive table 不变
++event_nr 不变
++```
++
++重复 UUID 返回 `EEXIST`；空 UUID 返回 `EINVAL`。
++
++### 测试
++
++补充 ktest 覆盖：
++
++- manager 层 UUID rename 成功时 old UUID 失效、new UUID 指向原设备，name/id 不变；
++- 重命名到其它设备已有 UUID 返回 `UuidExists`，两个设备状态都不变；
++- 原本无 UUID 的设备可以通过 UUID rename 设置 UUID；
++- control 层 `DM_DEV_RENAME + DM_UUID_FLAG` 更新 header UUID，且不改变 name/table/status；
++- control 层重复 UUID 和空 UUID 分别返回 `EEXIST` / `EINVAL`。
++
++本阶段重新执行：
++
++```text
++cargo fmt --all
++cargo fmt --all --check
++timeout 1200 cargo osdk test device_mapper
++```
++
++结果：通过；验证结束后确认 `Cargo.toml` 无 diff。
++
++## 13. 扩展真实 dmsetup linear control 边界系统测试
++
++涉及文件：
++
++- `myshell/lib/dm_nixos_test.sh`
++- `myshell/run_dm_control_abi_test.sh`
++
++### 原来
++
++`run_dm_control_abi_test.sh` 主要覆盖单个 linear mapper 的 control ABI smoke：
++
++```text
++dmsetup version/targets
++create/table/status/deps/info
++wait --noflush
++suspend/resume --noflush
++remove
++```
++
++它能证明真实 dmsetup 主路径可用，但对 linear-only 成熟度中更常见的边界还没有系统级覆盖。
++
++### 现在
++
++在同一个 quick/control ABI 脚本中扩展真实 dmsetup 场景：
++
++```text
++name rename 后 table/status 仍可用
++两块 backing disk 组成 multi-target linear table
++multi-target 的 table/status/deps 可查询
++多个 mapper 同时存在时 dmsetup ls 能列出
++busy mapper 的 remove 会失败并保留设备
++remove_all 会清掉非 busy mapper，同时保留 busy mapper
++关闭 busy fd 后可以正常 remove
++```
++
++同时收紧公共 summary 过滤，避免 guest 输入回显中的脚本命令或 `echo TEST_FAIL_*` 文本混入摘要，真实通过/失败判定仍然只认行首 marker。
++
++### 测试
++
++本阶段执行：
++
++```text
++bash -n myshell/lib/dm_nixos_test.sh \
++       myshell/run_dm_control_abi_test.sh \
++       myshell/run_dm_system_tests.sh
++make nixos
++myshell/run_dm_system_tests.sh --quick
++```
++
++结果：通过，新增/保留关键 marker：
++
++```text
++CHECK_PASS_DM_RENAME_NAME
++CHECK_PASS_DM_MULTI_TARGET_STATUS_DEPS
++CHECK_PASS_DM_LIST_MULTIPLE_DEVICES
++CHECK_PASS_DM_BUSY_REMOVE_AND_REMOVE_ALL
++TEST_PASS_DM_CONTROL_ABI
++TEST_PASS_CROSS_TARGET_BIO
++HOST_PASS_DM_SYSTEM_TESTS --quick
++```
++
++说明：本阶段没有新增生产代码；`make nixos` 是为了让 quick 系统测试使用当前内核镜像。
++
++## 14. 支持 linear-only readonly mapper
++
++涉及文件：
++
++- `kernel/comps/device-mapper/src/device.rs`
++- `kernel/comps/device-mapper/src/manager.rs`
++- `kernel/src/device/misc/device_mapper.rs`
++- `myshell/run_dm_control_abi_test.sh`
++
++### 原来
++
++`DM_READONLY_FLAG` 之前被当成未实现语义拒绝；即使后续放开 flag，最初实现也只在 `DM_DEV_CREATE` 消费 readonly 标志。
++
++真实 `dmsetup --readonly create` 暴露出一个问题：libdevmapper 会在 create 后续 reload/table load 路径继续携带 `DM_READONLY_FLAG`。如果只在 create 路径处理，真实 `/dev/mapper/<name>` 写入仍可能成功。
++
++失败时 quick 日志为：
++
++```text
++=== STEP 8: readonly mapper allows read and rejects write ===
++TEST_FAIL_DM_CONTROL_ABI readonly_write_succeeded
++```
++
++### 现在
++
++`DmDevice` 增加 readonly 状态，且该状态可以在运行期置位：
++
++```text
++DM_DEV_CREATE + DM_READONLY_FLAG -> 创建只读 mapper
++DM_TABLE_LOAD 成功且携带 DM_READONLY_FLAG -> 将 mapper 置为只读
++```
++
++数据面行为：
++
++```text
++Read 允许
++Flush 允许
++Write 返回 BioEnqueueError::Refused
++```
++
++control header 写回也会在只读设备上带 `DM_READONLY_FLAG`。
++
++### 测试
++
++补充 ktest 覆盖：
++
++- manager 创建 readonly device；
++- control header 输出 readonly flag；
++- `create_device()` 消费 readonly flag 后 manager 中设备为 readonly；
++- `table_load_for_device()` 带 readonly flag 且 table 成功加载后设备变为 readonly；
++- readonly device 允许 read/flush，拒绝 write。
++
++系统测试扩展 `run_dm_control_abi_test.sh`：
++
++```text
++dmsetup --readonly create dm_control_readonly
++从 /dev/mapper/dm_control_readonly 读取 512B 应成功
++向 /dev/mapper/dm_control_readonly 写入 512B 应失败
++CHECK_PASS_DM_READONLY
++```
++
++本阶段重新执行：
++
++```text
++cargo fmt --all --check
++timeout 1200 cargo osdk test device_mapper
++make nixos
++myshell/run_dm_system_tests.sh --quick
++```
++
++结果：通过；最终 quick marker：
++
++```text
++CHECK_PASS_DM_READONLY
++TEST_PASS_DM_CONTROL_ABI
++TEST_PASS_CROSS_TARGET_BIO
++HOST_PASS_DM_SYSTEM_TESTS --quick
++```
++
++验证结束后确认 `Cargo.toml` 无 diff。
++
++## 15. 收口 table/load/status 错误边界
++
++涉及文件：
++
++- `kernel/src/device/misc/device_mapper.rs`
++- `docs/device-mapper-technical-maintenance.md`
++
++### 原来
++
++linear target 主路径已经可用，`DM_TABLE_LOAD` 也基本遵循“先解析校验，成功后才安装 inactive table”。但下一步要做 striped target 前，还缺少一组边界回归：
++
++```text
++unsupported target 是否明确拒绝
++失败的 table load 是否绝不改变 table/event/readonly 状态
++缺失 backing 和 range/layout 错误是否经 ioctl 路径锁住 errno
++table status/deps exact-fit 和部分 record buffer-full 是否稳定
++```
++
++### 现在
++
++本阶段没有启用 striped，也没有引入通用 target 框架，只补齐 linear-only control 边界测试。
++
++新增 ktest helper：
++
++```text
++write_target_spec(): 构造任意 target type 的 dm_target_spec
++assert_failed_table_load_preserves_state(): 断言失败 load 不改变 status、active table、inactive table
++```
++
++新增覆盖：
++
++```text
++striped / unknown target load 返回 EINVAL 且状态不变
++missing backing 返回 ENODEV 且不安装 table
++带 DM_READONLY_FLAG 的失败 table load 不会把设备置为 readonly
++zero length / logical overflow / backing overflow / backing out-of-bounds 经 ioctl 返回 EINVAL 且状态不变
++first logical start 非 0 / gap / overlap 经 ioctl 返回 EINVAL 且状态不变
++non-final next 为 0、next 过小、不对齐、越界返回 EINVAL 且状态不变
++DM_TABLE_STATUS exact-fit 不设置 DM_BUFFER_FULL_FLAG
++DM_TABLE_STATUS 写完完整第一条 record 后第二条放不下时设置 DM_BUFFER_FULL_FLAG
++DM_TABLE_DEPS exact-fit 不设置 DM_BUFFER_FULL_FLAG
++DM_TABLE_DEPS 畸形 data_start 在写 header 前返回 EINVAL
++```
++
++技术文档同步补充：failed `DM_TABLE_LOAD` 不能改变 active/inactive table、`event_nr` 或 readonly 状态。
++
++### 测试
++
++先执行：
++
++```text
++cargo fmt --all --check
++```
++
++结果：通过。
++
++第一次直接跑：
++
++```text
++timeout 1200 cargo osdk test device_mapper
++```
++
++失败原因不是业务断言，而是多个 osdk QEMU 测试并发抢同一个 initramfs 镜像写锁：
++
++```text
++Failed to get "write" lock
++Is another process using the image [./test/initramfs/build/ext2.img]?
++```
++
++随后临时将根 `Cargo.toml default-members` 缩小到只跑 `kernel`，因为本阶段新增 ktest 均位于 kernel crate，再执行：
++
++```text
++timeout 1200 cargo osdk test device_mapper
++```
++
++结果：通过。验证结束后已恢复 `Cargo.toml`，并确认 `git diff -- Cargo.toml` 无输出。
