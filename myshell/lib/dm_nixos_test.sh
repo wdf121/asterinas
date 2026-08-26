@@ -12,7 +12,7 @@ dm_check_no_qemu() {
     local test_id=$1
     local slug
     slug=$(_dm_test_tmp_slug "${test_id}")
-    if pgrep -af qemu-system | grep -v 'pgrep -af qemu-system' >"/tmp/${slug}-qemu-running.txt" 2>/dev/null; then
+    if pgrep -af '[q]emu-system' >"/tmp/${slug}-qemu-running.txt" 2>/dev/null; then
         echo "HOST_FAIL_${test_id} existing_qemu"
         cat "/tmp/${slug}-qemu-running.txt"
         exit 1
