@@ -13,7 +13,7 @@ Runs a two-guest NixOS regression for an LVM2 LV whose dm table naturally mixes 
 Optional environment variables:
   DM_TEST_IMAGES                         Backing test image list, default "target/nixos/test.img target/nixos/test2.img target/nixos/test3.img"
   DM_MIXED_LVM2_REBOOT_LOG               Host-side log path, default /tmp/dm-mixed-lvm2-reboot-test.log
-  GUEST_READY_TIMEOUT                    Seconds to wait for guest root shell, default 300
+  GUEST_READY_TIMEOUT                    Seconds to wait for guest root shell, default 240
   RESET_DM_TEST_IMAGES                   1 to delete test images before running, default 1
   MIXED_INITIAL_LV_MIB                   Initial linear LV size in MiB, default 256
   MIXED_EXTENDED_LV_MIB                  Extended mixed LV size in MiB, default 512
@@ -39,7 +39,7 @@ test "$#" -eq 3
 DM_TEST_IMAGE=$1
 DM_TEST_IMAGE_2=$2
 DM_TEST_IMAGE_3=$3
-GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-300}
+GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-240}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 MIXED_INITIAL_LV_MIB=${MIXED_INITIAL_LV_MIB:-256}
 MIXED_EXTENDED_LV_MIB=${MIXED_EXTENDED_LV_MIB:-512}
@@ -58,19 +58,6 @@ echo "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
 echo "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
 echo "HOST_INFO_${TEST_ID} disk3=${DM_TEST_IMAGE_3} serial=vdmtest3"
 echo "HOST_INFO_${TEST_ID} initial_lv_mib=${MIXED_INITIAL_LV_MIB} extended_lv_mib=${MIXED_EXTENDED_LV_MIB} base_file_mib=${MIXED_BASE_FILE_MIB} grow_file_mib=${MIXED_GROW_FILE_MIB} chunk_kib=${MIXED_STRIPED_CHUNK_KIB}"
-
-wrap_guest_script() {
-    local script_file=$1 guest_path=$2 wrapped_file
-
-    wrapped_file=$(mktemp "${script_file}.wrapped.XXXXXX")
-    {
-        printf 'stty -echo 2>/dev/null || true\n'
-        printf "cat >%s <<'DM_MIXED_LVM2_GUEST_SCRIPT'\n" "${guest_path}"
-        cat "${script_file}"
-        printf "\nDM_MIXED_LVM2_GUEST_SCRIPT\nbash %s\n" "${guest_path}"
-    } >"${wrapped_file}"
-    mv "${wrapped_file}" "${script_file}"
-}
 
 FIRST_GUEST_SCRIPT=$(mktemp /tmp/dm-mixed-lvm2-first.XXXXXX)
 cat >"${FIRST_GUEST_SCRIPT}" <<'GUEST_SCRIPT'
@@ -358,8 +345,6 @@ for script in "${FIRST_GUEST_SCRIPT}" "${SECOND_GUEST_SCRIPT}"; do
         -e "s/__MIXED_STRIPED_CHUNK_KIB__/${MIXED_STRIPED_CHUNK_KIB}/g" \
         "${script}"
 done
-wrap_guest_script "${FIRST_GUEST_SCRIPT}" /tmp/dm-mixed-lvm2-first.sh
-wrap_guest_script "${SECOND_GUEST_SCRIPT}" /tmp/dm-mixed-lvm2-second.sh
 
 SUMMARY_INCLUDE='^TEST_|^CHECK_PASS_|^=== STEP|^=== CHECK|^TEST_DISK=|^TEST_DISK2=|^TEST_DISK3=|^DEV1=|^DEV2=|^DEV3=|^DM_TABLE_LVM2_MIXED|^linear[[:space:]]|^striped[[:space:]]|^0 [0-9]+ linear |^[0-9]+ [0-9]+ striped |^[0-9]+ dependencies|base[0-9]+\.bin: OK|grow[0-9]+\.bin: OK|No space left|Input/output error|Command failed|Kernel panic|panicked|records in|records out|bytes .* copied'
 dm_run_two_guest_test \
