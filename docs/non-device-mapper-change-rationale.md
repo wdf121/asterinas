@@ -4,9 +4,12 @@
 
 说明范围：
 
-- 代码级说明不展开 `kernel/comps/device-mapper/**`、`kernel/src/device/misc/device_mapper.rs`、Device Mapper 专项文档和日志。
-- 非代码级说明单独整理 Nix、Makefile、QEMU/NixOS shell、`myshell/` 系统验收脚本等改动。
+- 代码级说明不展开 `kernel/core/comps/device-mapper/**`、`kernel/core/src/device/misc/device_mapper.rs`、Device Mapper 专项文档和日志。
+- 内核外说明单独整理 Nix、Makefile、QEMU/NixOS shell、`myshell/` 系统验收脚本等改动。
 - 关注支撑 DM/LVM2 的通用内核能力、Linux 兼容接口、测试基础设施和回归用例。
+- 暂不把 udev rules、systemd 自动激活和完整 Linux 设备管理生态作为本文验收前提；本文只说明当前分支为了真实 LVM2 路径已经补齐的最小支撑面。
+
+Review 时建议按以下顺序阅读：先看内核外测试基础设施，确认系统验收命令和预期结果是否可信；再看通用内核支撑改动，确认每一项是否确实服务于 LVM2 路径，而不是把 DM scope 无限制外扩。
 
 ## 总体背景
 
@@ -22,9 +25,9 @@ LVM2 会依赖一组 Linux 兼容行为：
 
 因此，分支中有一批非 DM 专属改动，本质是补齐 Linux block / procfs / devtmpfs / NixOS 测试链路，让 DM core 能被真实 LVM2 路径验证。
 
-## 非代码级别改动单独整理
+## 第一部分：内核外测试基础设施改动
 
-本节只整理 Nix、Makefile 和 shell 层面的改动。这些改动不属于内核功能实现，但决定了真实 LVM2 系统验收能否稳定运行。
+本部分只整理 Nix、Makefile 和 shell 层面的改动。这些改动不属于内核功能实现，但决定了真实 LVM2 系统验收能否稳定运行。
 
 ### A. NixOS 镜像内容改动：把 LVM2 验收工具静态放进 guest
 
@@ -155,18 +158,29 @@ LVM2 会依赖一组 Linux 兼容行为：
 
 改动内容：
 
-新增统一入口，支持：
+新增统一入口，支持规范 suite：
 
 - `--quick`
-- `--data`
-- `--striped`
+- `--linear-data`
+- `--striped-data`
+- `--linear-lvm2`
 - `--striped-lvm2`
+- `--linear-lvm2-resize`
+- `--striped-lvm2-resize`
+- `--striped-lvm2-extended`
+- `--mixed-lvm2`
+- `--full`
+
+并保留兼容或窄跑 suite：
+
+- `--linear-lvm2-reboot`，兼容 `--linear-lvm2`
+- `--striped-lvm2-reboot`，兼容 `--striped-lvm2`
+- `--data`，兼容 `--linear-data`
+- `--striped`，兼容 `--striped-data`
+- `--lvm2`，保留 linear LVM2 历史 bundle 语义
+- `--linear-flow`
 - `--striped-lvm2-3pv`
 - `--striped-lvm2-multi-segment`
-- `--mixed-lvm2`
-- `--lvm2`
-- `--linear-flow`
-- `--full`
 
 为什么要改：
 
@@ -194,7 +208,7 @@ LVM2 会依赖一组 Linux 兼容行为：
 
 - 覆盖 DM control ioctl 基础路径。
 - 覆盖 raw cross-target BIO 回归。
-- 覆盖 linear LVM2 cross-PV 大文件写入。
+- 覆盖 linear LVM2 多 backing 大文件写入历史专项。
 - 覆盖 LVM2 resize / extend / shrink。
 - 覆盖单 guest linear 端到端流程。
 
@@ -258,13 +272,17 @@ LVM2 会依赖一组 Linux 兼容行为：
 - 验证第一段 linear、第二段 striped 的 deps/status/table 都符合预期。
 - 验证写入跨越 mixed LV 扩展区域的数据，重启后仍能通过 md5 复查。
 
+## 第二部分：通用内核支撑改动
+
+本部分说明 DM/LVM2 路径依赖的通用内核能力。它们不属于 `device-mapper` target 实现本身，但真实用户态会通过这些 Linux ABI 和 block/VFS 生命周期语义间接触发。
+
 ## 1. Block BIO：支持 stacked block device 的 remap、split 和完成聚合
 
 相关文件：
 
-- [bio.rs](../kernel/comps/block/src/bio.rs)
-- [request_queue.rs](../kernel/comps/block/src/request_queue.rs)
-- [partition.rs](../kernel/comps/block/src/partition.rs)
+- [bio.rs](../kernel/core/comps/block/src/bio.rs)
+- [request_queue.rs](../kernel/core/comps/block/src/request_queue.rs)
+- [partition.rs](../kernel/core/comps/block/src/partition.rs)
 
 ### 原来缺什么
 
@@ -315,10 +333,10 @@ LVM2 会依赖一组 Linux 兼容行为：
 
 相关文件：
 
-- [lib.rs](../kernel/comps/block/src/lib.rs)
-- [device_id.rs](../kernel/comps/block/src/device_id.rs)
-- [block.rs](../kernel/src/device/registry/block.rs)
-- [registry/mod.rs](../kernel/src/device/registry/mod.rs)
+- [lib.rs](../kernel/core/comps/block/src/lib.rs)
+- [device_id.rs](../kernel/core/comps/block/src/device_id.rs)
+- [block.rs](../kernel/core/src/device/registry/block.rs)
+- [registry/mod.rs](../kernel/core/src/device/registry/mod.rs)
 
 ### 原来缺什么
 
@@ -366,9 +384,9 @@ DM 设备不同：
 
 相关文件：
 
-- [device/mod.rs](../kernel/src/device/mod.rs)
-- [dentry.rs](../kernel/src/fs/vfs/path/dentry.rs)
-- [path/mod.rs](../kernel/src/fs/vfs/path/mod.rs)
+- [device/mod.rs](../kernel/core/src/device/mod.rs)
+- [dentry.rs](../kernel/core/src/fs/vfs/path/dentry.rs)
+- [path/mod.rs](../kernel/core/src/fs/vfs/path/mod.rs)
 
 ### 原来缺什么
 
@@ -411,8 +429,8 @@ LVM2 的常规访问路径是 `/dev/mapper/<vg-lv>`。这组改动让 DM 设备�
 
 相关文件：
 
-- [devices.rs](../kernel/src/fs/fs_impls/procfs/devices.rs)
-- [procfs/mod.rs](../kernel/src/fs/fs_impls/procfs/mod.rs)
+- [devices.rs](../kernel/core/src/fs/fs_impls/procfs/devices.rs)
+- [procfs/mod.rs](../kernel/core/src/fs/fs_impls/procfs/mod.rs)
 - [procfs/devices.c](../test/initramfs/src/regression/fs/procfs/devices.c)
 - [fs/run_test.sh](../test/initramfs/src/regression/fs/run_test.sh)
 
@@ -445,7 +463,7 @@ DM core 可以自己管理 major/minor，但 LVM2 是外部用户态程序。它
 
 相关文件：
 
-- [block.rs](../kernel/src/device/registry/block.rs)
+- [block.rs](../kernel/core/src/device/registry/block.rs)
 - [block_device.c](../test/initramfs/src/regression/io/file_io/block_device.c)
 
 ### 原来缺什么
@@ -485,12 +503,12 @@ DM core 可以自己管理 major/minor，但 LVM2 是外部用户态程序。它
 
 相关文件：
 
-- [registry.rs](../kernel/src/fs/vfs/fs_apis/registry.rs)
-- [ext2/fs.rs](../kernel/src/fs/fs_impls/ext2/fs.rs)
-- [ext2/fs_type.rs](../kernel/src/fs/fs_impls/ext2/fs_type.rs)
-- [ext2/test_utils.rs](../kernel/src/fs/fs_impls/ext2/test_utils.rs)
-- [exfat/fs.rs](../kernel/src/fs/fs_impls/exfat/fs.rs)
-- [utils.rs](../kernel/src/vm/page_cache/tests/utils.rs)
+- [registry.rs](../kernel/core/src/fs/vfs/fs_apis/registry.rs)
+- [ext2/fs.rs](../kernel/core/src/fs/fs_impls/ext2/fs.rs)
+- [ext2/fs_type.rs](../kernel/core/src/fs/fs_impls/ext2/fs_type.rs)
+- [ext2/test_utils.rs](../kernel/core/src/fs/fs_impls/ext2/test_utils.rs)
+- [exfat/fs.rs](../kernel/core/src/fs/fs_impls/exfat/fs.rs)
+- [utils.rs](../kernel/core/src/vm/page_cache/tests/utils.rs)
 
 ### 原来缺什么
 
@@ -527,13 +545,13 @@ DM / LVM2 场景里常见流程是：
 
 相关文件：
 
-- [virtio block mod.rs](../kernel/comps/virtio/src/device/block/mod.rs)
-- [virtio block device.rs](../kernel/comps/virtio/src/device/block/device.rs)
-- [virtio lib.rs](../kernel/comps/virtio/src/lib.rs)
-- [nvme block_device.rs](../kernel/comps/nvme/src/device/block_device.rs)
-- [nvme lib.rs](../kernel/comps/nvme/src/lib.rs)
-- [mlsdisk.rs](../kernel/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs)
-- [mlsdisk lib.rs](../kernel/comps/mlsdisk/src/lib.rs)
+- [virtio block mod.rs](../kernel/core/comps/virtio/src/device/block/mod.rs)
+- [virtio block device.rs](../kernel/core/comps/virtio/src/device/block/device.rs)
+- [virtio lib.rs](../kernel/core/comps/virtio/src/lib.rs)
+- [nvme block_device.rs](../kernel/core/comps/nvme/src/device/block_device.rs)
+- [nvme lib.rs](../kernel/core/comps/nvme/src/lib.rs)
+- [mlsdisk.rs](../kernel/core/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs)
+- [mlsdisk lib.rs](../kernel/core/comps/mlsdisk/src/lib.rs)
 
 ### 原来缺什么
 
@@ -608,7 +626,7 @@ NixOS guest 内的测试 helper 可以按 serial 找到 `vdmtest`、`vdmtest2`�
 
 这组改动解决的是“能否跑真实系统验收”的问题：
 
-- linear LVM2 cross-PV resize。
+- linear LVM2 resize 触发多 segment/table。
 - striped create/grow/shrink/reboot。
 - 3PV / 3-way striped reboot。
 - multi-segment striped reboot。
@@ -622,7 +640,7 @@ NixOS guest 内的测试 helper 可以按 serial 找到 `vdmtest`、`vdmtest2`�
 
 - [Cargo.toml](../Cargo.toml)
 - [Cargo.lock](../Cargo.lock)
-- [kernel/Cargo.toml](../kernel/Cargo.toml)
+- [kernel/core/Cargo.toml](../kernel/core/Cargo.toml)
 - [Makefile](../Makefile)
 - [.gitignore](../.gitignore)
 - [device/run_test.sh](../test/initramfs/src/regression/device/run_test.sh)
@@ -677,6 +695,20 @@ sysfs/procfs/devtmpfs 上的设备发现信息
 - 为 LVM2 判断设备类型和生成过滤规则提供输入。
 
 因此，新增 `/proc/devices` 不是为了 DM core 内部使用，而是为了让真实 Linux 用户态工具能发现并接受 Asterinas 暴露的 block device。
+
+## Review 检查清单
+
+后续 review 非 DM 专属改动时，建议按以下标准判断是否应该保留在本分支：
+
+- **必要性**：该改动是否直接服务于真实 `dmsetup` / LVM2 / ext2 / reboot recovery 路径；如果只是泛化 Linux 兼容能力，需要确认没有超出当前 DM 验收边界。
+- **边界**：`--full` 仍保持 linear 全量语义；striped、3PV、multi-segment、mixed 这类慢速系统验收应通过独立入口窄跑。
+- **启动协议**：NixOS 系统测试使用 OVMF 的约束应限制在 NixOS run 路径，不能影响 ktest 或其他启动协议。
+- **设备安全**：多测试盘逻辑必须防止误用根盘、重复挂同一镜像、依赖不稳定 `/dev/vdX` 顺序。
+- **生命周期**：动态注册、租约、devtmpfs runtime node 改动需要保证 open/mount 期间 remove 返回 busy，删除节点时不能误删后来的同名对象。
+- **用户态兼容**：`/proc/devices` 和 block ioctl 改动应以真实 Linux 用户态工具需要的 ABI 为边界，不把无关 procfs/sysfs 能力混入当前阶段。
+- **验证证据**：每类支撑改动都应能对应到 ktest、initramfs regression 或 `myshell/run_dm_system_tests.sh` 的某个窄入口；没有验证入口的改动应单独标为风险。
+
+当前暂不把 udev rules、systemd 自动激活和完整设备发现生态作为验收要求；文中涉及 devtmpfs，是因为 `/dev/dm-*` 和 `/dev/mapper/*` runtime node 已经是当前 LVM2 路径可用性的必要前提。
 
 ## 结论
 

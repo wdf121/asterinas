@@ -173,7 +173,7 @@ default-members = [
 然后执行：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_kernel::device::misc::device_mapper::tests::<test_name>"'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_core::device::misc::device_mapper::tests::<test_name>"'
 ```
 
 用途：
@@ -198,38 +198,36 @@ git diff -- Cargo.toml
 统一入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh <suite>'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh <suite>'
 ```
 
-可用 suite：
+可用规范 suite：
 
 ```bash
 myshell/run_dm_system_tests.sh --quick
-myshell/run_dm_system_tests.sh --data
-myshell/run_dm_system_tests.sh --striped
+myshell/run_dm_system_tests.sh --linear-data
+myshell/run_dm_system_tests.sh --striped-data
+myshell/run_dm_system_tests.sh --linear-lvm2
 myshell/run_dm_system_tests.sh --striped-lvm2
-myshell/run_dm_system_tests.sh --striped-lvm2-3pv
-myshell/run_dm_system_tests.sh --striped-lvm2-multi-segment
+myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment
+myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
 myshell/run_dm_system_tests.sh --mixed-lvm2
-myshell/run_dm_system_tests.sh --lvm2
-myshell/run_dm_system_tests.sh --linear-flow
-myshell/run_dm_system_tests.sh --full
 ```
+
+当前入口要求显式传入 suite；不保留无参数默认运行、`--full` 或旧兼容别名。
 
 ### 4.1 suite 与功能对应关系
 
 | suite | 子脚本 | 主要验证功能 |
 |---|---|---|
-| `--quick` | [run_control_abi_test.sh](../myshell/dm_linear/run_control_abi_test.sh)、[run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh) | linear 控制面 smoke、raw cross-target BIO 回归。 |
-| `--data` | [run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh) | 只验证 raw cross-target BIO split/remap。 |
-| `--striped` | [run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh) | raw `dmsetup striped` BIO split/remap 和 backing 分布。 |
-| `--striped-lvm2` | [run_lvm2_striped_io_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh) | 2PV / 2-way LVM2 striped create、I/O、grow、shrink、reboot recovery。 |
-| `--striped-lvm2-3pv` | [run_lvm2_striped_3pv_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh) | 3PV / 3-way striped create、I/O、reboot recovery。 |
-| `--striped-lvm2-multi-segment` | [run_lvm2_striped_multi_segment_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_multi_segment_reboot_test.sh) | 多段 striped table、ext2 I/O、reboot recovery。 |
+| `--quick` | [run_control_abi_test.sh](../myshell/dm_linear/run_control_abi_test.sh)、[run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh)、[run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh) | control ABI smoke、raw linear cross-target BIO、raw striped BIO split/remap 与 backing 分布。 |
+| `--linear-data` | [run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh) | raw linear cross-target BIO split/remap。 |
+| `--striped-data` | [run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh) | raw striped BIO split/remap 和 backing 分布。 |
+| `--linear-lvm2` | [run_lvm2_linear_reboot_test.sh](../myshell/dm_linear/run_lvm2_linear_reboot_test.sh) | 单 PV、单 linear segment、同盘 grow/shrink、ext2 I/O、reboot recovery。 |
+| `--striped-lvm2` | [run_lvm2_striped_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_reboot_test.sh) | N PV / N-way 单 striped segment、同组盘 grow/shrink、ext2 I/O、reboot recovery。 |
+| `--linear-lvm2-cross-segment` | [run_lvm2_linear_cross_segment_test.sh](../myshell/dm_linear/run_lvm2_linear_cross_segment_test.sh) | 独立 linear cross-segment table、reboot recovery、shrink 回单段。 |
+| `--striped-lvm2-cross-segment` | [run_lvm2_striped_cross_segment_test.sh](../myshell/dm_striped/run_lvm2_striped_cross_segment_test.sh) | 独立 striped N-to-2N cross-segment table、reboot recovery、shrink 回单段。 |
 | `--mixed-lvm2` | [run_lvm2_linear_striped_mixed_reboot_test.sh](../myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh) | 同一 LV 内 linear + striped mixed table、ext2 I/O、reboot recovery。 |
-| `--lvm2` | [run_cross_pv_large_write_test.sh](../myshell/dm_linear/run_cross_pv_large_write_test.sh)、[run_lvm2_resize_test.sh](../myshell/dm_linear/run_lvm2_resize_test.sh) | linear LVM2 cross-PV 大文件写入和 resize。 |
-| `--linear-flow` | [run_linear_full_flow_test.sh](../myshell/dm_linear/run_linear_full_flow_test.sh) | 单 guest linear 端到端流程。 |
-| `--full` | 多个 linear 子脚本 | 当前 linear 全量系统回归；不默认包含 striped / mixed 慢测试。 |
 
 ### 4.2 测试盘和 guest 启动
 
@@ -427,7 +425,7 @@ dmsetup deps <mapper> | tee /tmp/deps.txt
 - backing dependencies 数量正确。
 - linear 单 backing：`1 dependencies`。
 - 2-way striped 或双 PV linear：`2 dependencies`。
-- 3PV striped / multi-segment / mixed：`3 dependencies`。
+- striped 基础 N-way 场景 deps 等于 `STRIPED_PV_COUNT`；mixed 为 `3 dependencies`；striped cross-segment 缩回单段后 deps 等于 `STRIPED_CS_PV_COUNT`。
 - deps 中包含预期 backing major:minor。
 
 ### 5.9 `dmsetup info`
@@ -596,17 +594,21 @@ vgchange --config "$LVM_CONFIG" ...
 创建 PV：
 
 ```bash
+pvcreate "$TEST_DISK"
 pvcreate "$TEST_DISK" "$TEST_DISK2"
-pvcreate "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
-pvcreate "$TEST_DISK3"
+pvcreate "${DISKS[@]}"
+pvcreate "${BASE_DISKS[@]}"
+pvcreate "$TEST_DISK2" "$TEST_DISK3"
 ```
 
 用途：
 
 - 初始化测试盘为 LVM PV。
-- 2PV linear / striped 使用两块盘。
-- 3PV striped / mixed 使用三块盘。
-- multi-segment 测试中后续单独加入第三块 PV。
+- linear 基础测试使用单 PV，并只在同一块 PV 内 grow/shrink。
+- linear cross-segment 测试先使用 PV1，再通过 `vgextend` 加入 PV2 追加第二个 linear segment。
+- striped 基础测试使用 `STRIPED_PV_COUNT` 块 PV，默认 2，也可参数化为 3-way 等。
+- striped cross-segment 测试使用 `STRIPED_CS_PV_COUNT * 2` 块 PV，前 N 块创建第一段，后 N 块追加第二段。
+- mixed 测试先使用 PV1 创建 linear segment，再加入 PV2/PV3 追加 striped segment。
 
 扫描 PV：
 
@@ -629,46 +631,38 @@ pvs -o pv_name,pv_size,vg_name
 - 输出 PV 名称、大小、所属 VG。
 - 辅助确认测试盘被正确纳入 VG。
 
-清理 PV：
-
-```bash
-pvremove -y "$TEST_DISK" "$TEST_DISK2"
-```
-
-用途：
-
-- linear full flow cleanup 中清理 PV 元数据。
-
 ### 6.2 VG 命令
 
 创建 VG：
 
 ```bash
-vgcreate test_vg "$TEST_DISK" "$TEST_DISK2"
-vgcreate large_vg "$TEST_DISK" "$TEST_DISK2"
-vgcreate striped_vg "$TEST_DISK" "$TEST_DISK2"
-vgcreate striped3_vg "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
+vgcreate linear_base_vg "$TEST_DISK"
+vgcreate linear_cs_vg "$TEST_DISK"
+vgcreate striped_base_vg "${DISKS[@]}"
+vgcreate striped_cs_vg "${BASE_DISKS[@]}"
 vgcreate mixed_vg "$TEST_DISK"
 ```
 
 用途：
 
-- `test_vg`：linear resize。
-- `large_vg`：linear cross-PV large write。
-- `striped_vg`：2-way striped。
-- `striped3_vg`：3-way striped。
-- `mixed_vg`：先在 PV1 上创建 linear LV，后续扩展 PV2+PV3。
+- `linear_base_vg`：linear 基础单 PV、单 segment、同盘 grow/shrink。
+- `linear_cs_vg`：linear cross-segment，初始 PV1，扩容时加入 PV2。
+- `striped_base_vg`：N-way striped 基础单 segment，同一组 PV 内 grow/shrink。
+- `striped_cs_vg`：striped N-to-2N cross-segment，扩容时加入第二组 PV。
+- `mixed_vg`：先在 PV1 上创建 linear LV，后续扩展 PV2+PV3 生成 striped segment。
 
 扩展 VG：
 
 ```bash
-vgextend striped_ms_vg "$TEST_DISK3"
+vgextend linear_cs_vg "$TEST_DISK2"
+vgextend striped_cs_vg "${GROW_DISKS[@]}"
 vgextend mixed_vg "$TEST_DISK2" "$TEST_DISK3"
 ```
 
 用途：
 
-- multi-segment striped：初始 PV1+PV2，扩容时加入 PV3。
+- linear cross-segment：加入 PV2 后追加第二个 linear segment。
+- striped cross-segment：加入第二组 PV 后追加第二个 striped segment。
 - mixed：初始 PV1 linear，扩容时加入 PV2+PV3 生成 striped segment。
 
 扫描 VG：
@@ -710,79 +704,60 @@ vgs -o vg_name,vg_size,vg_free,pv_count,lv_count
 
 - 输出 VG 容量、空闲空间、PV 数、LV 数。
 
-删除 VG：
-
-```bash
-vgremove --config "$LVM_CONFIG" -y full_vg
-```
-
-用途：
-
-- linear full flow cleanup。
-
 ### 6.3 LV 命令
 
 创建 linear LV：
 
 ```bash
-lvcreate --config "$LVM_CONFIG" --type linear -L 400M -n test_lv test_vg "$TEST_DISK"
-lvcreate --config "$LVM_CONFIG" --type linear -L 900M -n large_lv large_vg "$TEST_DISK" "$TEST_DISK2"
+lvcreate --config "$LVM_CONFIG" --type linear -L "${LINEAR_INITIAL_LV_MIB}M" -n linear_base_lv linear_base_vg "$TEST_DISK"
+lvcreate --config "$LVM_CONFIG" --type linear -L "${LINEAR_CS_INITIAL_LV_MIB}M" -n linear_cs_lv linear_cs_vg "$TEST_DISK"
 lvcreate --config "$LVM_CONFIG" --type linear -L "${MIXED_INITIAL_LV_MIB}M" -n mixed_lv mixed_vg "$TEST_DISK"
 ```
 
 用途：
 
-- 400M linear LV：resize 测试。
-- 900M linear LV：跨 PV large write。
-- mixed 初始 LV：先创建 PV1 上的 linear segment。
+- `linear_base_lv`：基础 linear 单 segment，默认 256 MiB，后续在同盘扩到 384 MiB 再缩回 256 MiB。
+- `linear_cs_lv`：进阶 linear cross-segment，默认 256 MiB，扩到 512 MiB 形成第二段，再缩回单段。
+- `mixed_lv`：mixed 初始 LV，先创建 PV1 上的 linear segment。
 
 创建 striped LV：
 
 ```bash
-lvcreate --config "$LVM_CONFIG" --type striped -i 2 -I "${STRIPED_CHUNK_KIB}K" -L "${STRIPED_INITIAL_LV_MIB}M" -n striped_lv striped_vg "$TEST_DISK" "$TEST_DISK2"
-```
-
-创建 3-way striped LV：
-
-```bash
-lvcreate --config "$LVM_CONFIG" --type striped -i 3 -I "${STRIPED3_CHUNK_KIB}K" -L "${STRIPED3_LV_MIB}M" -n striped3_lv striped3_vg "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
+lvcreate --config "$LVM_CONFIG" --type striped -i "${STRIPED_PV_COUNT}" -I "${STRIPED_CHUNK_KIB}K" -L "${STRIPED_INITIAL_LV_MIB}M" -n striped_base_lv striped_base_vg "${DISKS[@]}"
+lvcreate --config "$LVM_CONFIG" --type striped -i "${STRIPED_CS_PV_COUNT}" -I "${STRIPED_CS_CHUNK_KIB}K" -L "${STRIPED_CS_INITIAL_LV_MIB}M" -n striped_cs_lv striped_cs_vg "${BASE_DISKS[@]}"
 ```
 
 参数含义：
 
 - `--type striped`：让 LVM2 生成 striped DM target。
-- `-i 2` / `-i 3`：stripe count。
+- `-i <count>`：stripe count；基础测试默认 2，可通过 `STRIPED_PV_COUNT=3` 等参数化。
 - `-I <size>K`：stripe chunk size。
 
-linear 扩容：
+linear 基础同盘扩容：
 
 ```bash
-lvextend --config "$LVM_CONFIG" -L 700M test_vg/test_lv "$TEST_DISK2"
+lvextend --config "$LVM_CONFIG" -L "${LINEAR_EXTENDED_LV_MIB}M" linear_base_vg/linear_base_lv "$TEST_DISK"
 ```
 
-用途：
-
-- 把 linear LV 扩到第二块 PV。
-- 触发 active table reload/resume。
-- 验证多 target linear table。
-
-striped 扩容：
+linear cross-segment 扩容：
 
 ```bash
-lvextend --config "$LVM_CONFIG" -i 2 -I "${STRIPED_CHUNK_KIB}K" -L "${STRIPED_EXTENDED_LV_MIB}M" striped_vg/striped_lv "$TEST_DISK" "$TEST_DISK2"
+vgextend linear_cs_vg "$TEST_DISK2"
+lvextend --config "$LVM_CONFIG" -L "${LINEAR_CS_EXTENDED_LV_MIB}M" linear_cs_vg/linear_cs_lv "$TEST_DISK2"
 ```
 
-multi-segment striped 扩容：
+striped 基础同组盘扩容：
 
 ```bash
-lvextend --config "$LVM_CONFIG" -i 2 -I "${STRIPED_MS_CHUNK_KIB}K" -L "${STRIPED_MS_EXTENDED_LV_MIB}M" striped_ms_vg/striped_ms_lv "$TEST_DISK2" "$TEST_DISK3"
+lvextend --config "$LVM_CONFIG" -i "${STRIPED_PV_COUNT}" -I "${STRIPED_CHUNK_KIB}K" -L "${STRIPED_EXTENDED_LV_MIB}M" striped_base_vg/striped_base_lv "${DISKS[@]}"
 ```
 
-用途：
+striped cross-segment 扩容：
 
-- 初始 segment 使用 PV1+PV2。
-- 扩容 segment 使用 PV2+PV3。
-- 验证 multi-segment striped table 和 deps 去重。
+```bash
+vgextend striped_cs_vg "${GROW_DISKS[@]}"
+lvextend --config "$LVM_CONFIG" -i "${STRIPED_CS_PV_COUNT}" -I "${STRIPED_CS_CHUNK_KIB}K" -L "${STRIPED_CS_EXTENDED_LV_MIB}M" striped_cs_vg/striped_cs_lv "${GROW_DISKS[@]}"
+```
 
 mixed 扩容：
 
@@ -792,21 +767,17 @@ lvextend --config "$LVM_CONFIG" --type striped -i 2 -I "${MIXED_STRIPED_CHUNK_KI
 
 用途：
 
-- 在已有 linear LV 后追加 striped segment。
-- 生成同一个 LV 内的 linear + striped mixed table。
+- 基础测试只验证同一个 target segment 的 grow/shrink。
+- cross-segment 测试验证扩容追加新 segment，shrink 前删除 grow 文件后再缩回单段。
+- mixed 测试验证已有 linear LV 后追加 striped segment，生成同一个 LV 内的 linear + striped mixed table。
 
-缩容 linear LV：
-
-```bash
-resize2fs "$MAPPER_DEVICE" 300M
-lvreduce --config "$LVM_CONFIG" -y -L 300M test_vg/test_lv
-```
-
-缩容 striped LV：
+缩容 LV：
 
 ```bash
+resize2fs "$MAPPER_DEVICE" "${LINEAR_SHRUNK_LV_MIB}M"
+lvreduce --config "$LVM_CONFIG" -y -L "${LINEAR_SHRUNK_LV_MIB}M" linear_base_vg/linear_base_lv
 resize2fs "$MAPPER_DEVICE" "${STRIPED_SHRUNK_LV_MIB}M"
-lvreduce --config "$LVM_CONFIG" -y -L "${STRIPED_SHRUNK_LV_MIB}M" striped_vg/striped_lv
+lvreduce --config "$LVM_CONFIG" -y -L "${STRIPED_SHRUNK_LV_MIB}M" striped_base_vg/striped_base_lv
 ```
 
 注意：shrink 顺序是先 shrink 文件系统，再 shrink LV。
@@ -828,16 +799,6 @@ lvs --segments -o lv_name,seg_start,seg_size,segtype,stripes,stripesize,devices 
 - 查看 segment type。
 - 查看 stripe count / stripe size。
 - 查看每段使用哪些 PV。
-
-删除 LV：
-
-```bash
-lvremove --config "$LVM_CONFIG" -y full_vg/full_lv
-```
-
-用途：
-
-- linear full flow cleanup。
 
 ## 7. 文件系统和数据校验命令
 
@@ -1008,7 +969,7 @@ du -sh "$MOUNT_DIR" "$MOUNT_DIR/base64.bin" "$MOUNT_DIR/grow256.bin"
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --quick'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --quick'
 ```
 
 关键命令：
@@ -1044,7 +1005,7 @@ dmsetup remove dm_control_renamed
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --data'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --linear-data'
 ```
 
 核心 table：
@@ -1082,97 +1043,84 @@ md5sum ...
 - 原始 BIO 最终完成状态聚合正确。
 - mapper 读回与 backing 分布都正确。
 
-### 8.3 linear LVM2 resize
+### 8.3 linear LVM2 基础 reboot
 
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --linear-lvm2'
+```
+
+验证功能：
+
+- 单 PV、单 linear segment。
+- LVM2 创建基础 linear LV。
+- ext2 写入和只读挂载校验。
+- reboot 后 PV/VG/LV、DM table 和文件数据恢复正确。
+
+### 8.4 linear LVM2 cross-segment table
+
+入口：
+
+```bash
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment'
 ```
 
 关键命令：
 
 ```bash
-pvcreate "$TEST_DISK" "$TEST_DISK2"
-vgcreate test_vg "$TEST_DISK" "$TEST_DISK2"
-lvcreate --config "$LVM_CONFIG" --type linear -L 400M -n test_lv test_vg "$TEST_DISK"
-dmsetup table test_vg-test_lv
+pvcreate "$TEST_DISK"
+vgcreate linear_cs_vg "$TEST_DISK"
+lvcreate --config "$LVM_CONFIG" --type linear -L "${LINEAR_CS_INITIAL_LV_MIB}M" -n linear_cs_lv linear_cs_vg "$TEST_DISK"
+dmsetup table linear_cs_vg-linear_cs_lv
 mkfs.ext2 -F -b 4096 "$MAPPER_DEVICE"
-mount -t ext2 "$MAPPER_DEVICE" /mnt/dmtest
-lvextend --config "$LVM_CONFIG" -L 700M test_vg/test_lv "$TEST_DISK2"
-dmsetup table test_vg-test_lv
-umount /mnt/dmtest
+mount -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
+vgextend linear_cs_vg "$TEST_DISK2"
+lvextend --config "$LVM_CONFIG" -L "${LINEAR_CS_EXTENDED_LV_MIB}M" linear_cs_vg/linear_cs_lv "$TEST_DISK2"
+dmsetup table linear_cs_vg-linear_cs_lv
+umount "$MOUNT_DIR"
 e2fsck -f -y "$MAPPER_DEVICE"
 resize2fs "$MAPPER_DEVICE"
 e2fsck -f -y "$MAPPER_DEVICE"
-resize2fs "$MAPPER_DEVICE" 300M
-lvreduce --config "$LVM_CONFIG" -y -L 300M test_vg/test_lv
-dmsetup table test_vg-test_lv
-vgchange --config "$LVM_CONFIG" -an test_vg
+```
+
+shrink 前处理：
+
+```bash
+mount -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
+rm "grow${LINEAR_CS_GROW_FILE_MIB}.bin" grow-marker.txt
+md5sum "base${LINEAR_CS_BASE_FILE_MIB}.bin" base-marker.txt > linear-cs.md5
+umount "$MOUNT_DIR"
+e2fsck -f -y "$MAPPER_DEVICE"
+resize2fs "$MAPPER_DEVICE" "${LINEAR_CS_SHRUNK_LV_MIB}M"
+lvreduce --config "$LVM_CONFIG" -y -L "${LINEAR_CS_SHRUNK_LV_MIB}M" linear_cs_vg/linear_cs_lv
 ```
 
 reboot recovery：
 
 ```bash
 pvscan
-vgscan
-vgchange --config "$LVM_CONFIG" -ay test_vg
-dmsetup table test_vg-test_lv
-mount -t ext2 -o ro /dev/mapper/test_vg-test_lv /mnt/dmtest
-```
-
-验证功能：
-
-- LVM2 创建 linear LV。
-- linear LV 扩容后生成多 target table。
-- ext2 grow 后数据仍正确。
-- shrink 顺序正确：先 shrink ext2，再 shrink LV。
-- reboot 后 PV/VG/LV 可恢复。
-
-### 8.4 linear cross-PV large write
-
-入口：
-
-```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --lvm2'
-```
-
-关键命令：
-
-```bash
-pvcreate "$TEST_DISK" "$TEST_DISK2"
-vgcreate large_vg "$TEST_DISK" "$TEST_DISK2"
-lvcreate --config "$LVM_CONFIG" --type linear -L 900M -n large_lv large_vg "$TEST_DISK" "$TEST_DISK2"
-dmsetup table large_vg-large_lv
-mkfs.ext2 -F -b 4096 "$MAPPER_DEVICE"
-mount -t ext2 "$MAPPER_DEVICE" /mnt/dmlarge
-dd if=/dev/urandom of=/mnt/dmlarge/file700.bin bs=1M count="$LARGE_WRITE_MIB" conv=fsync
-md5sum file700.bin > file700.md5
-vgchange --config "$LVM_CONFIG" -an large_vg
-```
-
-reboot recovery：
-
-```bash
 vgscan --mknodes
-vgchange --config "$LVM_CONFIG" -ay large_vg
-dmsetup table large_vg-large_lv
-mount -o ro -t ext2 "$MAPPER_DEVICE" /mnt/dmlarge
-md5sum -c file700.md5
+vgchange --config "$LVM_CONFIG" -ay linear_cs_vg
+dmsetup table linear_cs_vg-linear_cs_lv
+mount -o ro -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
+md5sum -c linear-cs.md5
 ```
 
 验证功能：
 
-- linear LV 跨 PV。
-- 大文件写入跨越多个 backing 区域。
-- reboot 后 table 和文件数据恢复正确。
+- 初始 LV 是单 PV、单 linear segment。
+- 扩容后追加第二个 linear segment，形成 cross-segment table。
+- grow 文件默认让写入范围超过初始 LV，覆盖扩容后的新段区域。
+- shrink 前删除 grow 文件，只保留 base 文件后缩回单段。
+- reboot 后 PV/VG/LV、DM table 和文件数据恢复正确。
 
 ### 8.5 striped raw BIO
 
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --striped-data'
 ```
 
 核心 table：
@@ -1214,178 +1162,122 @@ backing2 = B + D
 - chunk 按 stripe 顺序落到不同 backing。
 - mapper 读回数据和 backing 分布均正确。
 
-### 8.6 2-way striped LVM2
+### 8.6 striped LVM2 基础 reboot
 
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --striped-lvm2'
 ```
 
 创建：
 
 ```bash
-pvcreate "$TEST_DISK" "$TEST_DISK2"
-vgcreate striped_vg "$TEST_DISK" "$TEST_DISK2"
-lvcreate --config "$LVM_CONFIG" --type striped -i 2 -I "${STRIPED_CHUNK_KIB}K" -L "${STRIPED_INITIAL_LV_MIB}M" -n striped_lv striped_vg "$TEST_DISK" "$TEST_DISK2"
-dmsetup table striped_vg-striped_lv
-dmsetup status striped_vg-striped_lv
-dmsetup deps striped_vg-striped_lv
+pvcreate "${DISKS[@]}"
+vgcreate striped_base_vg "${DISKS[@]}"
+lvcreate --config "$LVM_CONFIG" --type striped -i "${STRIPED_PV_COUNT}" -I "${STRIPED_CHUNK_KIB}K" -L "${STRIPED_INITIAL_LV_MIB}M" -n striped_base_lv striped_base_vg "${DISKS[@]}"
+dmsetup table striped_base_vg-striped_base_lv
+dmsetup status striped_base_vg-striped_base_lv
+dmsetup deps striped_base_vg-striped_base_lv
 ```
 
-文件系统和写入：
+文件系统、同组盘扩容和缩容：
 
 ```bash
 mkfs.ext2 -F -b 4096 "$MAPPER_DEVICE"
 mount -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
 dd if=/dev/urandom of="$MOUNT_DIR/base${STRIPED_BASE_FILE_MIB}.bin" bs=1M count="$STRIPED_BASE_FILE_MIB" conv=fsync status=none
-md5sum -c striped.md5
-```
-
-扩容：
-
-```bash
-lvextend --config "$LVM_CONFIG" -i 2 -I "${STRIPED_CHUNK_KIB}K" -L "${STRIPED_EXTENDED_LV_MIB}M" striped_vg/striped_lv "$TEST_DISK" "$TEST_DISK2"
-e2fsck -f -y "$MAPPER_DEVICE"
+umount "$MOUNT_DIR"
+lvextend --config "$LVM_CONFIG" -i "${STRIPED_PV_COUNT}" -I "${STRIPED_CHUNK_KIB}K" -L "${STRIPED_EXTENDED_LV_MIB}M" striped_base_vg/striped_base_lv "${DISKS[@]}"
 resize2fs "$MAPPER_DEVICE"
-e2fsck -f -y "$MAPPER_DEVICE"
-```
-
-缩容：
-
-```bash
 resize2fs "$MAPPER_DEVICE" "${STRIPED_SHRUNK_LV_MIB}M"
-lvreduce --config "$LVM_CONFIG" -y -L "${STRIPED_SHRUNK_LV_MIB}M" striped_vg/striped_lv
+lvreduce --config "$LVM_CONFIG" -y -L "${STRIPED_SHRUNK_LV_MIB}M" striped_base_vg/striped_base_lv
 ```
 
 reboot recovery：
 
 ```bash
-vgchange --config "$LVM_CONFIG" -an striped_vg
+vgchange --config "$LVM_CONFIG" -an striped_base_vg
 pvscan
 vgscan --mknodes
-vgchange --config "$LVM_CONFIG" -ay striped_vg
+vgchange --config "$LVM_CONFIG" -ay striped_base_vg
 mount -o ro -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
 md5sum -c striped.md5
 ```
 
 验证功能：
 
-- LVM2 真实生成 striped table。
-- 2-way stripe count 正确。
-- chunk size 正确。
-- deps 为两个 backing。
-- grow / shrink 后 table 正确。
+- N PV / N-way 单 striped segment，默认 2-way，可通过 `STRIPED_PV_COUNT=3` 等参数化。
+- grow/shrink 都在同一组 PV 内完成，不追加第二个 segment。
+- stripe count、chunk size 和 deps 与 PV 数一致。
 - reboot 后 table/status/deps 和数据均恢复正确。
 
-### 8.7 3PV / 3-way striped LVM2
+### 8.7 striped LVM2 cross-segment table
 
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-3pv'
-```
-
-关键命令：
-
-```bash
-pvcreate "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
-vgcreate striped3_vg "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
-lvcreate --config "$LVM_CONFIG" --type striped -i 3 -I "${STRIPED3_CHUNK_KIB}K" -L "${STRIPED3_LV_MIB}M" -n striped3_lv striped3_vg "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
-dmsetup table striped3_vg-striped3_lv
-dmsetup status striped3_vg-striped3_lv
-dmsetup deps striped3_vg-striped3_lv
-mkfs.ext2 -F -b 4096 "$MAPPER_DEVICE"
-mount -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
-md5sum -c striped3.md5
-```
-
-reboot recovery：
-
-```bash
-vgchange --config "$LVM_CONFIG" -an striped3_vg
-pvscan
-vgscan --mknodes
-vgchange --config "$LVM_CONFIG" -ay striped3_vg
-dmsetup table striped3_vg-striped3_lv
-mount -o ro -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
-md5sum -c striped3.md5
-```
-
-验证功能：
-
-- stripe count > 2。
-- 三个 backing deps。
-- 3PV table/status/deps 正确。
-- reboot 后 3-way striped LV 可恢复。
-
-### 8.8 multi-segment striped LVM2
-
-入口：
-
-```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-multi-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
 ```
 
 初始创建：
 
 ```bash
-pvcreate "$TEST_DISK" "$TEST_DISK2"
-vgcreate striped_ms_vg "$TEST_DISK" "$TEST_DISK2"
-lvcreate --config "$LVM_CONFIG" --type striped -i 2 -I "${STRIPED_MS_CHUNK_KIB}K" -L "${STRIPED_MS_INITIAL_LV_MIB}M" -n striped_ms_lv striped_ms_vg "$TEST_DISK" "$TEST_DISK2"
+pvcreate "${BASE_DISKS[@]}"
+vgcreate striped_cs_vg "${BASE_DISKS[@]}"
+lvcreate --config "$LVM_CONFIG" --type striped -i "${STRIPED_CS_PV_COUNT}" -I "${STRIPED_CS_CHUNK_KIB}K" -L "${STRIPED_CS_INITIAL_LV_MIB}M" -n striped_cs_lv striped_cs_vg "${BASE_DISKS[@]}"
+dmsetup table striped_cs_vg-striped_cs_lv
+dmsetup status striped_cs_vg-striped_cs_lv
+dmsetup deps striped_cs_vg-striped_cs_lv
 ```
 
 扩成第二个 segment：
 
 ```bash
-pvcreate "$TEST_DISK3"
-vgextend striped_ms_vg "$TEST_DISK3"
-lvextend --config "$LVM_CONFIG" -i 2 -I "${STRIPED_MS_CHUNK_KIB}K" -L "${STRIPED_MS_EXTENDED_LV_MIB}M" striped_ms_vg/striped_ms_lv "$TEST_DISK2" "$TEST_DISK3"
+pvcreate "${GROW_DISKS[@]}"
+vgextend striped_cs_vg "${GROW_DISKS[@]}"
+lvextend --config "$LVM_CONFIG" -i "${STRIPED_CS_PV_COUNT}" -I "${STRIPED_CS_CHUNK_KIB}K" -L "${STRIPED_CS_EXTENDED_LV_MIB}M" striped_cs_vg/striped_cs_lv "${GROW_DISKS[@]}"
+dmsetup table striped_cs_vg-striped_cs_lv
 ```
 
-验证 table：
+shrink 前处理：
 
 ```bash
-dmsetup table striped_ms_vg-striped_ms_lv
-dmsetup status striped_ms_vg-striped_ms_lv
-dmsetup deps striped_ms_vg-striped_ms_lv
-```
-
-预期：
-
-- 初始 table 使用 PV1+PV2。
-- 扩容后 table 至少两段。
-- 第二段使用 PV2+PV3。
-- deps 为 3 dependencies，且 backing 去重。
-- 每段 logical start 连续。
-
-文件系统和恢复：
-
-```bash
-mkfs.ext2 -F -b 4096 "$MAPPER_DEVICE"
 mount -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
-md5sum -c striped-ms.md5
-vgchange --config "$LVM_CONFIG" -an striped_ms_vg
+rm "grow${STRIPED_CS_GROW_FILE_MIB}.bin" grow-marker.txt
+md5sum "base${STRIPED_CS_BASE_FILE_MIB}.bin" base-marker.txt > striped-cs.md5
+umount "$MOUNT_DIR"
+e2fsck -f -y "$MAPPER_DEVICE"
+resize2fs "$MAPPER_DEVICE" "${STRIPED_CS_SHRUNK_LV_MIB}M"
+lvreduce --config "$LVM_CONFIG" -y -L "${STRIPED_CS_SHRUNK_LV_MIB}M" striped_cs_vg/striped_cs_lv
+```
+
+reboot recovery：
+
+```bash
 pvscan
 vgscan --mknodes
-vgchange --config "$LVM_CONFIG" -ay striped_ms_vg
+vgchange --config "$LVM_CONFIG" -ay striped_cs_vg
+dmsetup table striped_cs_vg-striped_cs_lv
 mount -o ro -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"
-md5sum -c striped-ms.md5
+md5sum -c striped-cs.md5
 ```
 
 验证功能：
 
-- 多段 striped table。
-- 不同 segment 使用不同 PV 组合。
-- deps 去重。
-- reboot recovery 后多段 table 保持正确。
+- 初始 table 是 N PV / N-way striped 单 segment。
+- 扩容默认追加第二组 N 块 PV，形成 N-to-2N cross-segment table。
+- grow 文件默认让写入范围超过初始 LV，覆盖扩容后的第二段区域。
+- shrink 前删除 grow 文件，只保留 base 文件后缩回单段。
+- 可通过 `STRIPED_CS_PV_COUNT=3` 验证 3-way 到 6 盘的 cross-segment 场景。
+- 不保留重叠 PV 的 striped 实验入口。
 
-### 8.9 mixed linear + striped LVM2
+### 8.8 mixed linear + striped LVM2
 
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --mixed-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --mixed-lvm2'
 ```
 
 初始 linear：
@@ -1465,58 +1357,152 @@ docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make
 只改 ioctl 控制面：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_kernel::device::misc::device_mapper::tests::<test_name>"'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_core::device::misc::device_mapper::tests::<test_name>"'
 ```
 
-只验证 linear control + cross-target BIO：
+只验证 quick smoke：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --quick'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --quick'
+```
+
+只验证 linear raw BIO：
+
+```bash
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --linear-data'
 ```
 
 只验证 striped raw BIO：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --striped-data'
 ```
 
-验证 LVM2 linear resize 和 cross-PV large write：
+验证基础 LVM2 linear：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --linear-lvm2'
 ```
 
-验证 2-way striped LVM2：
+验证 linear cross-segment：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment'
 ```
 
-验证 3PV / 3-way striped：
+验证基础 N-way striped LVM2：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-3pv'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --striped-lvm2'
 ```
 
-验证 multi-segment striped：
+验证 3-way striped 基础场景：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-multi-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && STRIPED_PV_COUNT=3 GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --striped-lvm2'
+```
+
+验证 striped N-to-2N cross-segment：
+
+```bash
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
+```
+
+验证 3-way 到 6 盘 striped cross-segment：
+
+```bash
+docker exec myAsterinas bash -lc 'cd /root/asterinas && STRIPED_CS_PV_COUNT=3 GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
 ```
 
 验证 mixed linear + striped：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --mixed-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --mixed-lvm2'
 ```
 
-阶段验收 linear 全量：
+阶段验收时按相关路径显式组合上述 suite；当前不提供无参数默认运行或 `--full` 聚合入口。
+
+## 10. 日志与失败排查
+
+系统验收脚本已经在公共 harness 中统一处理日志和失败上下文，主要入口在 [dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh)。每个脚本启动时都会打印 host 侧日志路径：
+
+```text
+HOST_INFO_<TEST_ID> log=/tmp/<test-log>.log
+```
+
+常见默认日志文件：
+
+| suite | 默认日志 |
+|---|---|
+| `--quick` 中 control ABI | `/tmp/dm-control-abi-test.log` |
+| `--linear-data` | `/tmp/cross-target-bio-regression.log` |
+| `--striped-data` | `/tmp/dm-striped-raw-bio-test.log` |
+| `--linear-lvm2` | `/tmp/dm-linear-lvm2-reboot-test.log` |
+| `--striped-lvm2` | `/tmp/dm-striped-lvm2-reboot-test.log` |
+| `--linear-lvm2-cross-segment` | `/tmp/dm-linear-lvm2-cross-segment-test.log` |
+| `--striped-lvm2-cross-segment` | `/tmp/dm-striped-lvm2-cross-segment-test.log` |
+| `--mixed-lvm2` | `/tmp/dm-mixed-lvm2-reboot-test.log` |
+
+脚本结束时会先打印 summary。summary 会保留关键阶段和检查输出，例如：
+
+```text
+=== STEP ...
+=== CHECK ...
+TEST_DISK=...
+DEV1=...
+DM_TABLE_...
+CHECK_PASS_...
+TEST_PASS_...
+HOST_PASS_...
+```
+
+LVM2 类脚本还会把关键状态写进 summary，包括：
+
+- 测试盘和 guest 内 block device 对应关系。
+- `dmsetup table` 中的 linear / striped segment。
+- `dmsetup deps` 的 backing dependency 数量。
+- `resize2fs` / `e2fsck` 的关键输出。
+- `md5sum -c` 的文件校验结果。
+- `dd` 写入/读回的 records 和 copied 结果。
+
+失败时，公共 harness 会再次打印日志路径，并从完整日志中提取最近的失败上下文：
+
+```text
+TEST_FAIL_...
+HOST_FAIL_...
+ERROR:
+assertion failed
+panic
+panicked
+Error <code>
+No space left
+Input/output error
+Command failed
+```
+
+如果当前目录下存在 `qemu-serial.log`，还会额外提取其中的 panic / assertion / ERROR 片段。
+
+排查失败时建议按下面顺序看：
+
+1. 先看终端输出里的 `HOST_FAIL_...` 或 `TEST_FAIL_...`，确认失败发生在 host harness、first guest 还是 second guest。
+2. 打开 `HOST_INFO_<TEST_ID> log=...` 指向的完整日志，搜索最后一个 `=== STEP` 或 `=== CHECK`。
+3. 如果是 LVM2 布局问题，重点看 `DM_TABLE_...`、`dmsetup deps`、`lvs --segments`、`pvs`、`vgs` 输出。
+4. 如果是文件系统或数据问题，重点看 `e2fsck`、`resize2fs`、`mount`、`md5sum -c`、`No space left`、`Input/output error`。
+5. 如果是 QEMU ready 超时，检查是否有残留 QEMU、容器资源压力、镜像锁冲突或 NixOS image 问题。
+
+常用只读排查命令：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --full'
+pgrep -af '[q]emu-system'
+free -h
+uptime
+docker exec myAsterinas bash -lc 'free -h && uptime'
+git diff -- Cargo.toml
 ```
 
-## 10. 输出标记
+需要重新跑系统测试前，先确认没有其他 QEMU/ktest/NixOS 测试正在运行；不要为了“优化”测试主动释放 page cache 或 buffer cache。
+
+## 11. 输出标记
 
 系统脚本会用固定输出标记判断通过，例如：
 
