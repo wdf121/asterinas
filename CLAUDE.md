@@ -1,154 +1,66 @@
-See [AGENTS.md](AGENTS.md).
+0# Claude 协作偏好
 
-# Asterinas dm 分支实时工作说明
+本文只记录可跨项目复用的协作偏好。项目背景、构建方式、测试入口和当前进度应放在项目自己的说明文件中，例如 `AGENTS.md`、`README.md` 或 `log/` 下的项目进度文档。
 
-本文是可持续修正的项目交接文件。新对话开始时，先阅读本文件，再按需阅读 `AGENTS.md` 和相关源码；如果本文件与当前代码不一致，以当前代码和实际命令结果为准，并及时修正本文件。
-
-## 交流与协作偏好
+## 交流方式
 
 - 始终使用简体中文交流，技术解释和必要代码注释也使用简体中文。
 - 汇报要精简，只保留卡点、失败原因、关键验证结果和最终状态。
+- 不要复述大段无关背景；优先给出下一步可执行建议。
+
+## 协作流程
+
 - 新功能或新小阶段开始前，先说明“原来行为 / 目标行为 / 示例差异”，等用户确认后再实现。
-- 用户说“继续”时，在当前优先级和边界内自主推进；不要擅自扩大到慢速系统验收或框架集成。
+- 用户说“继续”时，在当前优先级和边界内自主推进；不要擅自扩大范围。
 - 用户说“分点提交”表示按逻辑点拆成多个 commit，不是一个 commit 里写分点说明。
 - 默认不 push；只有用户明确要求 push 才推送。
 - 小阶段通常由 Claude 实现并验证，通过后由用户决定是否提交；用户明确要求提交时再提交。
-- 不要创建大段临时规划文档；阶段性工程日志写入 `log/YYYY-M-D.md`，写入前先用 `date +%F` 核对当天日期。
 
-## 执行环境与安全边界
+## 文档与记录
 
-- 仓库：`/root/atom/asterinas`。
-- 当前工作分支：`dm`。
-- 容器：`myAsterinas`。
-- 容器内项目路径：`/root/asterinas`。
-- 构建、ktest、NixOS/LVM2 系统测试优先在容器内执行：
+- 不要创建大段临时规划文档；优先在对话中说明计划。
+- 若项目要求写阶段日志，写入前先核对当天日期，并只记录实际工程改动和验证。
+- 如果文档、记忆或历史说明与当前代码或实际命令结果不一致，以当前代码和命令结果为准，并及时提醒或修正文档。
 
-```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && <command>'
-```
+## 技术与设计文档写作
 
-- QEMU、ktest、NixOS 系统测试必须串行运行，避免 `test/initramfs/build/ext2.img` 等镜像锁冲突。
-- ktest / QEMU 超过约 3 分钟未命中目标测试或没有关键进展，默认怀疑命令过滤、default-members、残留进程或镜像锁异常；应主动检查输出和进程状态，必要时终止自己启动的异常任务并换窄跑方式。
-- 不要擅自修改 KVM、RELEASE、QEMU、NixOS 启动协议、`myshell/br.sh`。
-- 不要把 `--full` 扩大为 striped 全量；新增系统入口需保持现有 `--full` 语义。
-- 有框架依赖的内容，例如 udev、devtmpfs、systemd 自动联动，放在后续低优先级，不要混入 DM core 收敛任务。
+- 编写技术方案、系统设计、架构设计、API 设计、产品设计、UI/UX 设计或实施方案时，默认以资深技术架构师、产品设计师和技术文档作者的标准输出。
+- 如果输入信息不完整，基于合理假设继续完成，并在“假设与边界”或“待确认事项”中明确说明；不要因非关键参数缺失而停止。
+- 文档默认使用 Markdown 和简体中文，先给结论和执行摘要，再展开背景、目标、设计、风险、验收和附录等内容。
+- 关键设计决策要说明：选择了什么、为什么选择、替代方案、权衡和风险。
+- 不虚构业务事实、测试结果或性能数据；如需估算，标注为“估算值”并说明依据。
+- 技术描述要具体、可实施、可验证；保持术语、模块名、接口名一致。
+- 需要图文并茂的文档时，优先通过 `baoyu-article-illustrator` 规划文章配图；只有单独生成封面图、概念图或用户明确要求直接生成图片时，才直接使用 `baoyu-image-gen`。
+- 配图应服务理解，不做纯装饰；优先表达系统架构、模块关系、核心流程、数据流、部署拓扑、用户操作流程、方案对比、生命周期或实施阶段。
+- 技术配图默认采用简洁、专业、现代的信息图风格，白色或浅色背景，蓝色、青色或紫色强调色，模块标签简短清晰。
+- 图片中文字尽量少；如果中文文字不稳定，使用编号或英文短标签，并在图注中解释编号含义。
+- Markdown 技术文档中的 Mermaid 图默认使用中文节点、中文连线和中文说明；保留必要的代码标识、命令名、协议名和专有名词。
+- 正文必须引用并解释图片；不要引用不存在的图片，也不要生成正文未解释的图片。
+- 最终文档输出前检查：结构是否合理、方案是否可实施、事实/假设/建议是否区分、图片是否与正文一致、风险和验收标准是否完整。
 
-## 常用验证命令
+## 指令冲突与规则维护
 
-快速静态检查：
+执行任何任务前，检查：
 
-```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --check'
-git diff --check
-git diff -- Cargo.toml
-git status --short
-```
+1. 当前要求是否与 `CLAUDE.md` 冲突；
+2. 当前要求是否与用户之前的要求冲突；
+3. 用户要求是否与当前代码实际实现冲突；
+4. 多个要求是否无法同时满足。
 
-窄跑 `aster-device-mapper` crate ktest 时，临时把根 `Cargo.toml` 的 `default-members` 缩减为：
+发现实质性冲突时，不要静默选择，不要猜测用户意图。先明确列出：
 
-```toml
-default-members = [
-    "kernel/comps/device-mapper",
-]
-```
+- 冲突的两项要求；
+- 冲突原因；
+- 对结果的影响；
+- 可选处理方案；
+- 推荐方案。
 
-然后运行，例如：
+等待用户确认后再执行不可逆修改或生成最终结果。
 
-```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_device_mapper::table::tests::<test_name>"'
-```
+如果用户的新要求看起来是长期规则，主动询问：
 
-窄跑 `aster-kernel` ioctl 层 ktest 时，临时把根 `Cargo.toml` 的 `default-members` 缩减为：
+“这项要求只用于当前任务，还是需要写入 CLAUDE.md 作为项目长期规则？”
 
-```toml
-default-members = [
-    "kernel",
-]
-```
+默认不要自动修改 `CLAUDE.md`。需要修改时，先提供 diff 和影响说明；只有用户明确确认后才应用修改。
 
-然后运行，例如：
-
-```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_kernel::device::misc::device_mapper::tests::<test_name>"'
-```
-
-验证完成后必须还原 `Cargo.toml`，并用 `git diff -- Cargo.toml` 确认无输出。
-
-相关系统验收只在对应链路变更或阶段验收时运行，例如：
-
-```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-3pv'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --striped-lvm2-multi-segment'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=300 myshell/run_dm_system_tests.sh --mixed-lvm2'
-```
-
-## 当前 Device Mapper 状态
-
-截至 2026-08-24，`dm` 分支最近相关提交：
-
-```text
-8426e405a 补充 Device Mapper mixed 与 striped 边界 ktest
-2e1a3350f 记录 dm 分支协作说明
-8f00dec97 补充 Device Mapper mixed table ktest
-fd94cd2c7 补充 Device Mapper table-load 非法输入 ktest
-49ef85c72 修复 Device Mapper table remap ktest
-```
-
-当前已完成并验证的范围：
-
-- Device Mapper linear 多 target 已支持 LVM2 跨 PV 扩容 / 缩容相关路径。
-- Device Mapper striped 已覆盖 raw BIO、2-way LVM2、3PV / 3-way、multi-segment reboot recovery；ktest 已补 3-way partial final row range 拆分和 BIO 恰好结束在 striped target 末尾的边界。
-- LVM2 已覆盖同一 LV 内 linear + striped mixed table 的 create、ext2 I/O、grow 和 reboot recovery，入口为 `myshell/run_dm_system_tests.sh --mixed-lvm2`。
-- 同一 DM device / 同一 LV 内的 BIO 可以跨 target 边界拆分；这不是跨 LV。
-- 一个 BIO 不应跨两个不同 LV；BIO 是发给某一个 block device 的。
-- `DmTable` 数据面支持：
-  - 单段 linear remap。
-  - 多段 linear target。
-  - striped target 内跨 stripe chunk 拆分。
-  - linear + striped mixed target 的跨边界拆分。
-  - split child enqueue 失败或 child 完成 `IoError` 时，原 BIO 聚合返回 `IoError`。
-- ioctl 控制面支持并已测：
-  - `DM_TABLE_LOAD` 多 target linear。
-  - `DM_TABLE_LOAD` striped。
-  - `DM_TABLE_LOAD` linear + striped mixed table。
-  - mixed inactive table 的 `DM_DEV_STATUS.target_count`。
-  - mixed table 的 `DM_TABLE_STATUS` type / params / next offset。
-  - mixed table 的 `DM_TABLE_DEPS` backing 顺序。
-  - running device 中 active linear table 被 ioctl-loaded mixed table 替换后的 active / inactive 查询、resume 切换和 deps 切换。
-- table-load 非法输入已补 ktest：
-  - linear 参数缺失、额外字段、bad major/minor、bad start、start 溢出。
-  - striped 参数字段数、zero stripes、zero chunk、非数字 stripe_count/chunk_size、bad dev/start。
-  - unsupported target：`unknown`、`error`、`snapshot`。
-  - target type 空字符串、缺少 NUL 终止符。
-  - `dm_target_spec.next` 的非最后 0、too-small、unaligned、out-of-bounds，以及 final target 非法 next。
-
-## 当前功能边界
-
-- “跨 target”指同一个 DM table 内逻辑地址跨过相邻 target，例如：
-
-```text
-0..100    linear  -> vda
-100..500  striped -> vdb/vdc
-```
-
-一个 `start=96, len=8` 的 BIO 会被拆成 linear 段和 striped 段后分别下发。
-
-- “跨 LV”不是当前应支持场景；不同 LV 是不同 block device，不应出现单个 BIO 同时覆盖两个 LV 逻辑地址空间。
-- 当前 DM core 收敛优先通过 ktest 覆盖，不优先新增慢速 NixOS/LVM2 系统矩阵。
-- udev、devtmpfs、systemd、LVM 自动扫描/自动激活这类用户态或框架集成，后续最后考虑。
-
-## 后续可做优先级
-
-1. 复查当前 mixed / split / striped boundary / mixed-lvm2 系统验收是否需要拆分或补充说明；如果用户要求，可按逻辑点继续拆 commit 或补日志。
-2. udev / devtmpfs / systemd 自动联动放最后。
-
-## 工程日志规则
-
-- 写日志前先用 `date +%F` 核对当前日期，按当天日期写入 `log/YYYY-M-D.md`。
-- 每天的日志阶段号都从 1 开始，不沿用前一天的阶段编号。
-- `log/2026-8-21.md` 已记录当天 DM 小阶段 1 到 6；`log/2026-8-24.md` 从第 1 阶段开始记录当天改动，当前已到第 3 阶段。
-- 日志按小阶段顺序写：背景、改动、测试。
-- 不按“生产代码 / ktest”分类。
-- 只记录实际工程改动和验证；单纯讨论、复核、规划不写入日志。
+编写技术文档时，以当前代码为事实来源。无法从代码确认的信息必须标记为“推断”“建议”或“待确认”，不得虚构为当前实现。

@@ -41,6 +41,119 @@ Key Makefile targets:
 
 Set `TARGET_ARCH` to `x86_64` (default), `riscv64`, or `loongarch64`.
 
+## dm Branch Local Workflow
+
+This branch keeps Device Mapper project progress in `log/device-mapper-progress.md`.
+Stage-by-stage engineering changes are recorded in `log/YYYY-M-D.md`.
+
+Local environment:
+
+- Repository path: `/root/atom/asterinas`.
+- Working branch: `dm`.
+- Docker container: `myAsterinas`.
+- Container project path: `/root/asterinas`.
+- Prefer running builds, ktests, and NixOS/LVM2 system tests inside the container:
+
+```bash
+docker exec myAsterinas bash -lc 'cd /root/asterinas && <command>'
+```
+
+Resource checks before commands that may consume noticeable CPU or memory,
+especially builds, ktests, QEMU/NixOS runs, patch generation, and large document
+rewrites:
+
+```bash
+free -h
+uptime
+ps -eo pid,ppid,comm,%mem,%cpu,rss --sort=-rss | head -15
+docker exec myAsterinas bash -lc 'free -h && uptime'
+```
+
+Interpretation rules:
+
+- Low `free` memory alone is not a blocker on Linux; check `available` because
+  page cache under `buff/cache` is reclaimable.
+- If `available` is below about 2 GiB, swap usage is growing, or load average is
+  higher than the available CPU cores, avoid starting new parallel build/test
+  jobs and report the resource pressure.
+- If a long-running command stalls, inspect memory, CPU, and the top processes
+  before retrying; only stop processes that were started for the current run.
+
+Quick checks:
+
+```bash
+docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --check'
+git diff --check
+git diff -- Cargo.toml
+git status --short
+```
+
+To narrowly run `aster-device-mapper` crate ktests, temporarily reduce the root
+`Cargo.toml` `default-members` to:
+
+```toml
+default-members = [
+    "kernel/core/comps/device-mapper",
+]
+```
+
+Then run, for example:
+
+```bash
+docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_device_mapper::table::tests::<test_name>"'
+```
+
+To narrowly run `aster-core` ioctl-layer ktests, temporarily reduce the root
+`Cargo.toml` `default-members` to:
+
+```toml
+default-members = [
+    "kernel/core",
+]
+```
+
+Then run, for example:
+
+```bash
+docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_core::device::misc::device_mapper::tests::<test_name>"'
+```
+
+After any temporary `Cargo.toml` default-member change, restore `Cargo.toml` and
+confirm `git diff -- Cargo.toml` has no output.
+
+Run QEMU, ktest, and NixOS system tests serially to avoid image lock conflicts,
+especially around `test/initramfs/build/ext2.img`. For NixOS system tests, set
+`GUEST_READY_TIMEOUT=240` so each QEMU guest boot has a four-minute shell-ready
+timeout. If a ktest/QEMU/NixOS run makes no relevant progress for about three
+minutes, suspect command filtering, default-members, leftover processes, or
+image-lock issues; inspect output and processes, stop only processes started for
+the current run if needed, and retry with a narrower command.
+
+Do not modify KVM, RELEASE, QEMU, NixOS boot protocol, or `myshell/br.sh` unless
+explicitly requested. Run DM system tests through explicit suite entries; do not
+reintroduce a default all-in-one suite, and keep linear/striped LVM2 execution
+aligned as base plus cross-segment entries.
+
+Run slower system tests only when the corresponding path changes or during stage
+acceptance, for example:
+
+```bash
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --linear-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --striped-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --mixed-lvm2'
+```
+
+Project logging rules:
+
+- Before writing a dated log, run `date +%F` and write to `log/YYYY-M-D.md`.
+- Restart stage numbering from 1 each day.
+- Log by small stage in this order: background, changes, tests.
+- Do not split logs by “production code / ktest”.
+- Record only actual engineering changes and validation; do not log discussion,
+  review-only work, or planning-only work.
+
 ## Toolchain
 
 - **Rust nightly** pinned in `rust-toolchain.toml`.
