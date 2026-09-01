@@ -15,13 +15,29 @@ use crate::{
 /// The frequency in Hz of the Time Stamp Counter (TSC).
 pub(in crate::arch) static TSC_FREQ: AtomicU64 = AtomicU64::new(0);
 
-pub(in crate::arch) fn init_tsc_freq() {
-    use super::kvm_clock::determine_tsc_freq as determine_tsc_freq_via_kvmclock;
-    use crate::arch::cpu::cpuid::query_tsc_freq as determine_tsc_freq_via_cpuid;
+pub fn init_tsc_freq() {
+    use crate::arch::cpu::cpuid::{
+        query_hypervisor_tsc_freq, query_is_running_in_qemu, query_processor_base_freq,
+        query_tsc_freq as determine_tsc_freq_via_cpuid,
+    };
 
-    let tsc_freq = determine_tsc_freq_via_kvmclock()
-        .or_else(determine_tsc_freq_via_cpuid)
-        .unwrap_or_else(determine_tsc_freq_via_pit);
+    const MAX_PLAUSIBLE_TSC_FREQ: u64 = 10_000_000_000;
+    const QEMU_FALLBACK_TSC_FREQ: u64 = 2_500_000_000;
+
+    fn plausible(freq: u64) -> Option<u64> {
+        (freq <= MAX_PLAUSIBLE_TSC_FREQ).then_some(freq)
+    }
+
+    let tsc_freq = if query_is_running_in_qemu() {
+        query_hypervisor_tsc_freq()
+            .and_then(plausible)
+            .or_else(|| query_processor_base_freq().and_then(plausible))
+            .or_else(|| determine_tsc_freq_via_cpuid().and_then(plausible))
+            .or_else(|| plausible(determine_tsc_freq_via_pit()))
+            .unwrap_or(QEMU_FALLBACK_TSC_FREQ)
+    } else {
+        determine_tsc_freq_via_cpuid().unwrap_or_else(determine_tsc_freq_via_pit)
+    };
     TSC_FREQ.store(tsc_freq, Ordering::Relaxed);
     info!("TSC frequency: {:?} Hz", tsc_freq);
 }
