@@ -5,13 +5,15 @@ use core::ops::Range;
 use aster_block::{BlockDevice, id::Sid};
 use device_id::DeviceId;
 
-use self::{linear::LinearTarget, striped::StripedTarget};
+use self::{error::ErrorTarget, linear::LinearTarget, striped::StripedTarget};
 
+pub mod error;
 pub mod linear;
 pub mod striped;
 
 #[derive(Debug)]
 pub enum DmTarget {
+    Error(ErrorTarget),
     Linear(LinearTarget),
     Striped(StripedTarget),
 }
@@ -19,6 +21,7 @@ pub enum DmTarget {
 impl DmTarget {
     pub fn logical_range(&self) -> &Range<Sid> {
         match self {
+            Self::Error(target) => target.logical_range(),
             Self::Linear(target) => target.logical_range(),
             Self::Striped(target) => target.logical_range(),
         }
@@ -26,6 +29,7 @@ impl DmTarget {
 
     pub fn length(&self) -> u64 {
         match self {
+            Self::Error(target) => target.length(),
             Self::Linear(target) => target.length(),
             Self::Striped(target) => target.length(),
         }
@@ -34,19 +38,20 @@ impl DmTarget {
     pub fn backing_start(&self) -> Option<Sid> {
         match self {
             Self::Linear(target) => Some(target.backing_start()),
-            Self::Striped(_) => None,
+            Self::Error(_) | Self::Striped(_) => None,
         }
     }
 
     pub fn backing_id(&self) -> Option<DeviceId> {
         match self {
             Self::Linear(target) => Some(target.backing_id()),
-            Self::Striped(_) => None,
+            Self::Error(_) | Self::Striped(_) => None,
         }
     }
 
     pub fn for_each_backing_id(&self, mut f: impl FnMut(DeviceId)) {
         match self {
+            Self::Error(_) => {}
             Self::Linear(target) => f(target.backing_id()),
             Self::Striped(target) => target.for_each_backing_id(f),
         }
@@ -55,12 +60,13 @@ impl DmTarget {
     pub fn backing(&self) -> Option<&dyn BlockDevice> {
         match self {
             Self::Linear(target) => Some(target.backing()),
-            Self::Striped(_) => None,
+            Self::Error(_) | Self::Striped(_) => None,
         }
     }
 
     pub fn for_each_backing<'a>(&'a self, mut f: impl FnMut(&'a dyn BlockDevice)) {
         match self {
+            Self::Error(_) => {}
             Self::Linear(target) => f(target.backing()),
             Self::Striped(target) => target.for_each_backing(f),
         }
@@ -69,7 +75,7 @@ impl DmTarget {
     pub fn map_sector(&self, logical: Sid) -> Option<Sid> {
         match self {
             Self::Linear(target) => target.map_sector(logical),
-            Self::Striped(_) => None,
+            Self::Error(_) | Self::Striped(_) => None,
         }
     }
 

@@ -2,7 +2,7 @@
 
 //! Asterinas 的 Device Mapper 核心组件。
 //!
-//! 支持由一条或多条 linear target 组成的映射表。Linux ioctl ABI 和
+//! 支持由 error、linear、striped target 组成的映射表。Linux ioctl ABI 和
 //! `/dev/mapper/control` 位于内核设备层，本组件只负责映射表、设备状态与 I/O 转发。
 
 #![no_std]
