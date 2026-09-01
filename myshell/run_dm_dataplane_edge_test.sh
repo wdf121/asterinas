@@ -9,7 +9,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
 Usage: myshell/run_dm_dataplane_edge_test.sh
 
 Runs one NixOS guest pass for Device Mapper data-plane edge cases:
-three-segment linear remap and non-chunk-aligned striped writes.
+three-segment linear remap, non-chunk-aligned striped writes, and zero target reads.
 
 Optional environment variables:
   DM_TEST_IMAGES            Space-separated backing image paths, default four test images
@@ -44,6 +44,7 @@ stty -echo 2>/dev/null || true
 set -eu
 
 cleanup_dm() {
+    dmsetup remove dm_zero_edge >/dev/null 2>&1 || true
     dmsetup remove dm_striped_edge >/dev/null 2>&1 || true
     dmsetup remove dm_linear_edge >/dev/null 2>&1 || true
 }
@@ -188,7 +189,33 @@ echo CHECK_PASS_STRIPED_EDGE_BACKING_READ
 compare_file STRIPED_EDGE_BACKING_D1 /tmp/striped-expected-d1.bin /tmp/striped-actual-d1.bin
 compare_file STRIPED_EDGE_BACKING_D2 /tmp/striped-expected-d2.bin /tmp/striped-actual-d2.bin
 
-echo '=== STEP 4: cleanup ==='
+echo '=== STEP 4: zero target returns zeroes and discards writes ==='
+printf '0 8 zero\n' | dmsetup create dm_zero_edge
+
+echo 'DM_TABLE_ZERO_EDGE_BEGIN'
+dmsetup table dm_zero_edge | tee /tmp/zero-edge-table.txt | sed 's/^/DM_TABLE_ZERO_EDGE /'
+echo 'DM_TABLE_ZERO_EDGE_END'
+grep -F -x -q '0 8 zero ' /tmp/zero-edge-table.txt
+
+dmsetup status dm_zero_edge | tee /tmp/zero-edge-status.txt
+grep -q 'zero' /tmp/zero-edge-status.txt
+dmsetup deps dm_zero_edge | tee /tmp/zero-edge-deps.txt
+grep -q '0 dependencies' /tmp/zero-edge-deps.txt
+
+dd if=/dev/mapper/dm_zero_edge of=/tmp/zero-edge-read.bin bs=512 count=1 status=none
+cmp -n 512 /tmp/zero-edge-read.bin /dev/zero
+echo CHECK_PASS_ZERO_EDGE_READ_ZERO
+
+dd if=/dev/urandom of=/dev/mapper/dm_zero_edge bs=512 count=1 conv=fsync status=none
+echo CHECK_PASS_ZERO_EDGE_WRITE_DISCARDED
+
+dd if=/dev/mapper/dm_zero_edge of=/tmp/zero-edge-read-after-write.bin bs=512 count=1 status=none
+cmp -n 512 /tmp/zero-edge-read-after-write.bin /dev/zero
+echo CHECK_PASS_ZERO_EDGE_READ_AFTER_WRITE_ZERO
+
+dmsetup remove dm_zero_edge
+
+echo '=== STEP 5: cleanup ==='
 cleanup_dm
 sync
 

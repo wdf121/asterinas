@@ -12,7 +12,7 @@ Canonical suites:
   --quick                         Run control ABI smoke plus raw linear and striped data regressions.
   --dmsetup-cli                   Run dmsetup CLI control-plane semantics audit with backing disks.
   --lvm2-cli                      Run LVM2 CLI control-plane semantics audit with test disks.
-  --dataplane-edge                Run raw DM data-plane edge remap and stripe-boundary audit.
+  --dataplane-edge                Run raw DM data-plane edge remap, stripe-boundary, and zero target audit.
   --linear-data                   Run raw linear cross-target BIO split/remap regression.
   --striped-data                  Run raw striped BIO split/remap and backing distribution regression.
   --linear-lvm2                   Run single-PV LVM2 linear create, same-PV grow/shrink, file I/O, and reboot recovery.

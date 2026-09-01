@@ -16,6 +16,7 @@ use aster_device_mapper::{
         error::ErrorTarget,
         linear::LinearTarget,
         striped::{StripedTarget, StripedTargetParams},
+        zero::ZeroTarget,
     },
 };
 use device_id::{DeviceId, MajorId, MinorId};
@@ -87,6 +88,10 @@ const TARGET_VERSIONS: &[TargetVersion] = &[
     TargetVersion {
         name: "striped",
         version: [1, 6, 0],
+    },
+    TargetVersion {
+        name: "zero",
+        version: [1, 1, 0],
     },
 ];
 
@@ -619,6 +624,20 @@ fn table_load_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
                     ErrorTarget::new(Sid::new(logical_start), length).map_err(map_table_error)?,
                 )
             }
+            "zero" => {
+                if !params.trim().is_empty() {
+                    return_errno_with_message!(Errno::EINVAL, "zero target 不接受参数");
+                }
+                ostd::info!(
+                    "[dm] table_load: name={}, type=zero, logical_start={}, length={}",
+                    device.name(),
+                    logical_start,
+                    length
+                );
+                DmTarget::Zero(
+                    ZeroTarget::new(Sid::new(logical_start), length).map_err(map_table_error)?,
+                )
+            }
             "linear" => {
                 let (backing_id, backing_start) = parse_linear_params(&params)?;
                 ostd::info!(
@@ -771,6 +790,7 @@ fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     for target in table.targets() {
         let (target_type, params) = match target {
             DmTarget::Error(_) => ("error", String::new()),
+            DmTarget::Zero(_) => ("zero", String::new()),
             DmTarget::Linear(target) => {
                 let params = if flags & DM_STATUS_TABLE_FLAG != 0 {
                     let backing = target.backing_id();
@@ -932,6 +952,10 @@ where
 }
 
 fn lookup_device(buffer: &[u8]) -> Result<Arc<DmDevice>> {
+    lookup_device_in_manager(buffer, manager())
+}
+
+fn lookup_device_in_manager(buffer: &[u8], manager: &DmManager) -> Result<Arc<DmDevice>> {
     let raw_dev = read_u64(buffer, OFF_DEV)?;
     let name = optional_c_string(buffer, OFF_NAME, DM_NAME_LEN, "设备名称")?;
     let uuid = optional_c_string(buffer, OFF_UUID, DM_UUID_LEN, "设备 UUID")?;
@@ -940,13 +964,13 @@ fn lookup_device(buffer: &[u8]) -> Result<Arc<DmDevice>> {
     // 因此不能把多个 selector 的并存视为畸形输入，否则会拒绝标准客户端的
     // 冗余字段。每次仅按最高优先级的 selector 查找。
     let device = if let Some(uuid) = uuid {
-        manager().lookup_uuid(&uuid)
+        manager.lookup_uuid(&uuid)
     } else if let Some(name) = name {
-        manager().lookup_name(&name)
+        manager.lookup_name(&name)
     } else if raw_dev != 0 {
         let id = DeviceId::from_encoded_u64(raw_dev)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "Device Mapper dev 编码无效"))?;
-        manager().lookup_id(id)
+        manager.lookup_id(id)
     } else {
         return_errno_with_message!(Errno::EINVAL, "必须指定 Device Mapper 设备");
     };
@@ -1402,10 +1426,29 @@ mod tests {
         write_target_spec(buffer, record, start, length, next, "error", "");
     }
 
+    fn write_zero_target_spec(
+        buffer: &mut [u8],
+        record: usize,
+        start: u64,
+        length: u64,
+        next: u32,
+    ) {
+        write_target_spec(buffer, record, start, length, next, "zero", "");
+    }
+
     fn single_error_table(length: u64) -> Arc<DmTable> {
         Arc::new(
             DmTable::new_targets(vec![DmTarget::Error(
                 ErrorTarget::new(Sid::new(0), length).unwrap(),
+            )])
+            .unwrap(),
+        )
+    }
+
+    fn single_zero_table(length: u64) -> Arc<DmTable> {
+        Arc::new(
+            DmTable::new_targets(vec![DmTarget::Zero(
+                ZeroTarget::new(Sid::new(0), length).unwrap(),
             )])
             .unwrap(),
         )
@@ -1448,6 +1491,13 @@ mod tests {
     fn error_target(table: &DmTable, index: usize) -> &ErrorTarget {
         let DmTarget::Error(target) = &table.targets()[index] else {
             panic!("expected error target");
+        };
+        target
+    }
+
+    fn zero_target(table: &DmTable, index: usize) -> &ZeroTarget {
+        let DmTarget::Zero(target) = &table.targets()[index] else {
+            panic!("expected zero target");
         };
         target
     }
@@ -1707,6 +1757,55 @@ mod tests {
                 )
                 .unwrap(),
                 "error"
+            );
+            assert_eq!(
+                c_string_until(
+                    &buffer,
+                    DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                    DM_IOCTL_HEADER_SIZE + 48,
+                    "target 参数"
+                )
+                .unwrap(),
+                ""
+            );
+        }
+
+        let mut deps = test_buffer(DM_IOCTL_HEADER_SIZE + 8);
+        write_u32(&mut deps, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        table_deps_for_device(&mut deps, &device).unwrap();
+        assert_eq!(read_u32(&deps, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
+        assert_eq!(read_u32(&deps, DM_IOCTL_HEADER_SIZE + 4).unwrap(), 0);
+    }
+
+    #[ktest]
+    fn reports_zero_table_status_with_empty_params_and_no_deps() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-zero-status-test".to_string(), None, None)
+            .unwrap();
+        device.load_table(single_zero_table(8));
+
+        for flags in [
+            DM_QUERY_INACTIVE_TABLE_FLAG,
+            DM_QUERY_INACTIVE_TABLE_FLAG | DM_STATUS_TABLE_FLAG,
+        ] {
+            let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+            write_u32(&mut buffer, OFF_FLAGS, flags).unwrap();
+            table_status_for_device(&mut buffer, &device).unwrap();
+
+            assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 1);
+            assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
+            assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 8).unwrap(), 8);
+            assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 20).unwrap(), 48);
+            assert_eq!(
+                c_string_until(
+                    &buffer,
+                    DM_IOCTL_HEADER_SIZE + 24,
+                    DM_IOCTL_HEADER_SIZE + 40,
+                    "target 类型"
+                )
+                .unwrap(),
+                "zero"
             );
             assert_eq!(
                 c_string_until(
@@ -2203,8 +2302,7 @@ mod tests {
             .unwrap();
 
         let mut fresh_status = test_buffer(DM_IOCTL_HEADER_SIZE);
-        write_u64(&mut fresh_status, OFF_DEV, device.id().as_encoded_u64()).unwrap();
-        device_status(&mut fresh_status).unwrap();
+        device_status_for_device(&mut fresh_status, &device).unwrap();
         assert_eq!(read_u32(&fresh_status, OFF_TARGET_COUNT).unwrap(), 0);
         assert_eq!(read_u32(&fresh_status, OFF_FLAGS).unwrap(), DM_EXISTS_FLAG);
     }
@@ -2532,10 +2630,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        device.load_table(single_linear_table(4, 100, 1));
         let status_before = device.status();
         let id = device.id();
-        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 16);
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 32);
         write_u32(&mut buffer, OFF_FLAGS, DM_UUID_FLAG).unwrap();
         write_u64(&mut buffer, OFF_DEV, id.as_encoded_u64()).unwrap();
         write_c_string(&mut buffer, DM_IOCTL_HEADER_SIZE, "dm-uuid-rename-new").unwrap();
@@ -2655,17 +2752,26 @@ mod tests {
         write_c_string_fixed(&mut buffer, OFF_NAME, DM_NAME_LEN, &name_device.name()).unwrap();
         write_c_string_fixed(&mut buffer, OFF_UUID, DM_UUID_LEN, &uuid).unwrap();
         write_u64(&mut buffer, OFF_DEV, name_device.id().as_encoded_u64()).unwrap();
-        assert_eq!(lookup_device(&buffer).unwrap().id(), uuid_device.id());
+        assert_eq!(
+            lookup_device_in_manager(&buffer, &manager).unwrap().id(),
+            uuid_device.id()
+        );
 
         write_c_string_fixed(&mut buffer, OFF_UUID, DM_UUID_LEN, "").unwrap();
-        assert_eq!(lookup_device(&buffer).unwrap().id(), name_device.id());
+        assert_eq!(
+            lookup_device_in_manager(&buffer, &manager).unwrap().id(),
+            name_device.id()
+        );
 
         write_c_string_fixed(&mut buffer, OFF_NAME, DM_NAME_LEN, "").unwrap();
-        assert_eq!(lookup_device(&buffer).unwrap().id(), name_device.id());
+        assert_eq!(
+            lookup_device_in_manager(&buffer, &manager).unwrap().id(),
+            name_device.id()
+        );
     }
 
     #[ktest]
-    fn rejects_zero_target_table_load_before_state_changes() {
+    fn rejects_empty_target_table_load_before_state_changes() {
         let manager = DmManager::new().unwrap();
         let device = manager
             .create("dm-zero-target-test".to_string(), None, None)
@@ -2710,6 +2816,25 @@ mod tests {
     }
 
     #[ktest]
+    fn loads_single_zero_target_through_ioctl() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-zero-load-test".to_string(), None, None)
+            .unwrap();
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(0).unwrap());
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+        write_zero_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 8, 0);
+
+        table_load_for_device(&mut buffer, &device).unwrap();
+        let table = device.inactive_table().unwrap();
+        assert_eq!(table.target_count(), 1);
+        let target = zero_target(&table, 0);
+        assert_eq!(target.logical_range(), &(Sid::new(0)..Sid::new(8)));
+        assert_eq!(table.metadata().nr_sectors, 8);
+        assert_eq!(table.metadata().max_nr_segments_per_bio, usize::MAX);
+    }
+
+    #[ktest]
     fn rejects_error_target_params_before_state_changes() {
         let manager = DmManager::new().unwrap();
         let device = manager
@@ -2720,6 +2845,21 @@ mod tests {
             test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
         write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
         write_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 8, 0, "error", params);
+
+        assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
+    }
+
+    #[ktest]
+    fn rejects_zero_target_params_before_state_changes() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-zero-param-test".to_string(), None, None)
+            .unwrap();
+        let params = "unexpected";
+        let mut buffer =
+            test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+        write_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 8, 0, "zero", params);
 
         assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
     }
@@ -3507,9 +3647,9 @@ mod tests {
         assert_eq!(id.major().get(), 8);
         assert_eq!(id.minor().get(), 1);
         assert_eq!(start, 2048);
-        let (id, start) = parse_linear_params("  510:4294967295\t0\n").unwrap();
+        let (id, start) = parse_linear_params("  510:1048575\t0\n").unwrap();
         assert_eq!(id.major().get(), 510);
-        assert_eq!(id.minor().get(), u32::MAX);
+        assert_eq!(id.minor().get(), 0x000f_ffff);
         assert_eq!(start, 0);
 
         for params in [
@@ -3523,6 +3663,7 @@ mod tests {
             "8: 0",
             "8:1:2 0",
             "65536:1 0",
+            "8:1048576 0",
             "8:4294967296 0",
             "8:1 18446744073709551616",
             "8:1 -1",
@@ -3766,7 +3907,7 @@ mod tests {
         .unwrap();
         validate_input_flags(DM_DEV_STATUS_CMD, &buffer).unwrap();
 
-        write_u32(&mut buffer, OFF_FLAGS, 1 << 31).unwrap();
+        write_u32(&mut buffer, OFF_FLAGS, 1_u32 << 31).unwrap();
         assert_eq!(
             validate_input_flags(DM_DEV_STATUS_CMD, &buffer)
                 .unwrap_err()
@@ -3843,14 +3984,15 @@ mod tests {
     }
 
     #[ktest]
-    fn lists_error_linear_and_striped_target_versions() {
-        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 72);
+    fn lists_error_linear_striped_and_zero_target_versions() {
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 96);
         list_versions(&mut buffer).unwrap();
 
         for (index, (name, version, next)) in [
             ("error", [1, 6, 0], 24),
-            ("linear", [1, 4, 0], 48),
-            ("striped", [1, 6, 0], 0),
+            ("linear", [1, 4, 0], 24),
+            ("striped", [1, 6, 0], 24),
+            ("zero", [1, 1, 0], 0),
         ]
         .into_iter()
         .enumerate()
@@ -3889,6 +4031,7 @@ mod tests {
             ("error", [1, 6, 0]),
             ("linear", [1, 4, 0]),
             ("striped", [1, 6, 0]),
+            ("zero", [1, 1, 0]),
         ] {
             let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 24);
             write_c_string_fixed(&mut buffer, OFF_NAME, DM_NAME_LEN, name).unwrap();

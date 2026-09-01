@@ -606,7 +606,6 @@ impl DeviceInner {
             resp_slice
         };
 
-        // One descriptor for the input `req_slice`, one for the output `resp_slice`.
         let num_used_descs = 2;
         loop {
             let mut queue = self.queue.disable_irq().lock();
@@ -620,7 +619,6 @@ impl DeviceInner {
                 queue.notify();
             }
 
-            // Records the submitted request
             let submitted_request = SubmittedRequest::new(id as u16, bio_request);
             self.submitted_requests
                 .disable_irq()

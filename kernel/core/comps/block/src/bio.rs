@@ -62,11 +62,35 @@ impl Bio {
         let nsectors = segments
             .iter()
             .map(|segment| segment.nsectors().to_raw())
-            .sum();
+            .try_fold(0_u64, u64::checked_add)
+            .expect("BIO sector count overflow");
 
+        Self::new_with_nsectors_unchecked(type_, start_sid, nsectors, segments, complete_fn)
+    }
+
+    fn new_with_nsectors_unchecked(
+        type_: BioType,
+        start_sid: Sid,
+        nsectors: u64,
+        segments: Vec<BioSegment>,
+        complete_fn: Option<BioCompleteFn>,
+    ) -> Self {
+        let end = start_sid
+            .to_raw()
+            .checked_add(nsectors)
+            .expect("BIO sector range overflow");
+        Self::new_with_sid_range(type_, start_sid..Sid::new(end), segments, complete_fn)
+    }
+
+    fn new_with_sid_range(
+        type_: BioType,
+        sid_range: Range<Sid>,
+        segments: Vec<BioSegment>,
+        complete_fn: Option<BioCompleteFn>,
+    ) -> Self {
         let metadata = Arc::new(BioMetadata {
             type_,
-            sid_range: start_sid..start_sid + nsectors,
+            sid_range: sid_range.clone(),
             status: AtomicU32::new(BioStatus::Init as u32),
             wait_queue: WaitQueue::new(),
         });
@@ -95,6 +119,29 @@ impl Bio {
     /// Returns the status.
     pub fn status(&self) -> BioStatus {
         self.metadata.status()
+    }
+
+    #[cfg(ktest)]
+    pub fn submit_for_test(self) -> SubmittedBio {
+        let Self {
+            metadata,
+            complete_fn,
+            segments,
+        } = self;
+        let result = metadata.status.compare_exchange(
+            BioStatus::Init as u32,
+            BioStatus::Submit as u32,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+        assert!(result.is_ok());
+        let current_sid_range = metadata.sid_range().clone();
+        SubmittedBio {
+            metadata,
+            current_sid_range,
+            complete_fn,
+            segments,
+        }
     }
 
     /// Submits self to the `block_device` asynchronously.
@@ -527,7 +574,12 @@ pub enum BioType {
     Write = 1,
     /// Flush the volatile write cache.
     Flush = 2,
-    // TODO: Add support for other BIO types, such as discarding sectors.
+}
+
+impl BioType {
+    pub fn is_write_like(self) -> bool {
+        matches!(self, Self::Write)
+    }
 }
 
 /// The status of `Bio`.
@@ -958,39 +1010,6 @@ mod tests {
 
         assert_eq!(bio.add_sid_offset(9), Err(BioEnqueueError::Refused));
         assert_eq!(bio.sid_range(), &original);
-    }
-
-    #[ktest]
-    fn split_child_segments_can_cross_original_segment_boundary() {
-        let sid_range = Sid::new(0)..Sid::new(16);
-        let bio = SubmittedBio {
-            metadata: Arc::new(BioMetadata {
-                type_: BioType::Read,
-                sid_range: sid_range.clone(),
-                status: AtomicU32::new(BioStatus::Submit as u32),
-                wait_queue: WaitQueue::new(),
-            }),
-            current_sid_range: sid_range,
-            complete_fn: None,
-            segments: vec![
-                BioSegment::alloc(1, BioDirection::FromDevice),
-                BioSegment::alloc(1, BioDirection::FromDevice),
-            ],
-        };
-
-        let (children, _) = bio
-            .split(vec![
-                Sid::new(0)..Sid::new(4),
-                Sid::new(4)..Sid::new(12),
-                Sid::new(12)..Sid::new(16),
-            ])
-            .unwrap();
-
-        assert_eq!(children[1].segments().len(), 2);
-        assert_eq!(children[1].segments()[0].nsectors(), Sid::new(4));
-        assert_eq!(children[1].segments()[0].offset_within_first_block(), 2_048);
-        assert_eq!(children[1].segments()[1].nsectors(), Sid::new(4));
-        assert_eq!(children[1].segments()[1].offset_within_first_block(), 0);
     }
 }
 
