@@ -1,0 +1,12 @@
+diff --git a/kernel/core/Cargo.toml b/kernel/core/Cargo.toml
+index b17add1c5..2e9e1becf 100644
+--- a/kernel/core/Cargo.toml
++++ b/kernel/core/Cargo.toml
+@@ -11,6 +11,7 @@ aster-bigtcp.workspace = true
+ aster-block.workspace = true
+ aster-cmdline.workspace = true
+ aster-console.workspace = true
++aster-device-mapper.workspace = true
+ aster-framebuffer.workspace = true
+ aster-fuse.workspace = true
+ aster-i8042.workspace = true
