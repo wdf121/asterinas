@@ -15,8 +15,10 @@ enum Leaf {
     Base = 0x00,
     Xstate = 0x0d,
     Tsc = 0x15,
+    ProcessorFreq = 0x16,
 
     HypervisorBase = 0x40000000,
+    HypervisorTiming = 0x40000010,
     ExtBase = 0x80000000,
 }
 
@@ -81,6 +83,28 @@ pub(in crate::arch) fn query_tsc_freq() -> Option<u64> {
     }
 
     Some((crystal_freq as u64) * (numerator as u64) / (denominator as u64))
+}
+
+/// Queries the processor base frequency in Hz.
+pub(in crate::arch) fn query_processor_base_freq() -> Option<u64> {
+    let CpuidResult { eax: base_mhz, .. } = cpuid(Leaf::ProcessorFreq as u32, 0)?;
+
+    if base_mhz == 0 {
+        return None;
+    }
+
+    Some((base_mhz as u64) * 1_000_000)
+}
+
+/// Queries the hypervisor-reported TSC frequency in Hz.
+pub(in crate::arch) fn query_hypervisor_tsc_freq() -> Option<u64> {
+    let CpuidResult { eax: tsc_khz, .. } = cpuid(Leaf::HypervisorTiming as u32, 0)?;
+
+    if tsc_khz == 0 {
+        return None;
+    }
+
+    Some((tsc_khz as u64) * 1_000)
 }
 
 /// Queries the supported XSTATE features, i.e., the supported bits of `XCR0` and `IA32_XSS`.
