@@ -13,7 +13,7 @@ Runs an independent two-guest NixOS regression for LVM2 striped N-to-2N cross-se
 Optional environment variables:
   DM_TEST_IMAGES                          Backing test image list. When unset, generated from STRIPED_CS_PV_COUNT * 2.
   DM_STRIPED_LVM2_CROSS_SEGMENT_LOG       Host-side log path, default /tmp/dm-striped-lvm2-cross-segment-test.log
-  GUEST_READY_TIMEOUT                     Seconds to wait for guest root shell, default 240
+  GUEST_READY_TIMEOUT                     Seconds to allow one full QEMU guest lifecycle, default 180
   RESET_DM_TEST_IMAGES                    1 to delete test images before running, default 1
   STRIPED_CS_PV_COUNT                     Number of PVs per striped segment, default 2
   STRIPED_CS_INITIAL_LV_MIB               Initial LV size in MiB, default STRIPED_CS_PV_COUNT * 256
@@ -40,7 +40,7 @@ STRIPED_CS_SHRUNK_LV_MIB=${STRIPED_CS_SHRUNK_LV_MIB:-${STRIPED_CS_INITIAL_LV_MIB
 STRIPED_CS_BASE_FILE_MIB=${STRIPED_CS_BASE_FILE_MIB:-$((STRIPED_CS_PV_COUNT * 64))}
 STRIPED_CS_GROW_FILE_MIB=${STRIPED_CS_GROW_FILE_MIB:-$((STRIPED_CS_PV_COUNT * 240))}
 STRIPED_CS_CHUNK_KIB=${STRIPED_CS_CHUNK_KIB:-4}
-GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-240}
+GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-180}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
 test "${STRIPED_CS_PV_COUNT}" -ge 2

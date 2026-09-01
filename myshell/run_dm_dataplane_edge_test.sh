@@ -1,0 +1,200 @@
+#!/bin/bash
+
+# SPDX-License-Identifier: MPL-2.0
+
+set -euo pipefail
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<'EOF'
+Usage: myshell/run_dm_dataplane_edge_test.sh
+
+Runs one NixOS guest pass for Device Mapper data-plane edge cases:
+three-segment linear remap and non-chunk-aligned striped writes.
+
+Optional environment variables:
+  DM_TEST_IMAGES            Space-separated backing image paths, default four test images
+  DM_DATAPLANE_EDGE_LOG     Host-side log path, default /tmp/dm-dataplane-edge-test.log
+  GUEST_QEMU_TIMEOUT        Full QEMU lifecycle timeout in seconds, default 180
+  GUEST_READY_TIMEOUT       Compatibility alias if GUEST_QEMU_TIMEOUT is unset
+  RESET_DM_TEST_IMAGES      1 to delete test images before running, default 1
+EOF
+    exit 0
+fi
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/..")
+source "${SCRIPT_DIR}/lib/dm_nixos_test.sh"
+
+TEST_ID=DM_DATAPLANE_EDGE
+LOG=${DM_DATAPLANE_EDGE_LOG:-/tmp/dm-dataplane-edge-test.log}
+DM_TEST_IMAGE=${DM_TEST_IMAGE:-target/nixos/test.img}
+DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
+DM_TEST_IMAGES=${DM_TEST_IMAGES:-target/nixos/test.img target/nixos/test2.img target/nixos/test3.img target/nixos/test4.img}
+GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-${GUEST_READY_TIMEOUT:-180}}
+RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
+
+cd "${ASTERINAS_DIR}"
+dm_prepare_nixos_test "${TEST_ID}"
+echo "HOST_INFO_${TEST_ID} disks=${DM_TEST_IMAGES} serials=vdmtest,vdmtest2,vdmtest3,vdmtest4"
+echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
+
+GUEST_SCRIPT_FILE=$(mktemp /tmp/dm-dataplane-edge-guest.XXXXXX)
+cat >"${GUEST_SCRIPT_FILE}" <<'GUEST_SCRIPT'
+stty -echo 2>/dev/null || true
+set -eu
+
+cleanup_dm() {
+    dmsetup remove dm_striped_edge >/dev/null 2>&1 || true
+    dmsetup remove dm_linear_edge >/dev/null 2>&1 || true
+}
+
+fail_exit() {
+    status=$?
+    echo TEST_FAIL_DM_DATAPLANE_EDGE status=$status
+    cleanup_dm
+    sync
+    poweroff
+    exit $status
+}
+trap fail_exit ERR
+
+devno() {
+    printf '%d:%d' "0x$(stat -c '%t' "$1")" "0x$(stat -c '%T' "$1")"
+}
+
+make_sector() {
+    char=$1
+    output=$2
+    head -c 512 /dev/zero | tr '\000' "$char" > "$output"
+}
+
+compare_file() {
+    label=$1
+    expected=$2
+    actual=$3
+    md5sum "$expected" "$actual" > "/tmp/${label}.md5"
+    awk 'NR == 1 { expected = $1 } NR > 1 && $1 != expected { exit 1 }' "/tmp/${label}.md5"
+    echo "CHECK_PASS_${label}"
+}
+
+build_linear_payload() {
+    : > /tmp/linear-payload.bin
+    for char in A B C D E F G H I J K L M N O P; do
+        make_sector "$char" "/tmp/linear-sector-${char}.bin"
+        cat "/tmp/linear-sector-${char}.bin" >> /tmp/linear-payload.bin
+    done
+}
+
+build_striped_payload() {
+    head -c 512 /dev/zero > /tmp/zero-sector.bin
+    : > /tmp/striped-payload.bin
+    for char in a b c d e f g h i j k l; do
+        make_sector "$char" "/tmp/striped-sector-${char}.bin"
+        cat "/tmp/striped-sector-${char}.bin" >> /tmp/striped-payload.bin
+    done
+}
+
+echo '=== STEP 1: locate data-plane edge test disks ==='
+DISK1=$(aster-dm-disk-locator)
+DISK2=$(aster-dm-disk-locator vdmtest2)
+DISK3=$(aster-dm-disk-locator vdmtest3)
+printf 'TEST_DISK1=%s\nTEST_DISK2=%s\nTEST_DISK3=%s\n' "$DISK1" "$DISK2" "$DISK3"
+test "$DISK1" != "$DISK2"
+test "$DISK1" != "$DISK3"
+test "$DISK2" != "$DISK3"
+test -b "$DISK1"
+test -b "$DISK2"
+test -b "$DISK3"
+DEV1=$(devno "$DISK1")
+DEV2=$(devno "$DISK2")
+DEV3=$(devno "$DISK3")
+printf 'DEV1=%s\nDEV2=%s\nDEV3=%s\n' "$DEV1" "$DEV2" "$DEV3"
+cleanup_dm
+
+echo '=== STEP 2: linear three-segment remap with non-zero backing starts ==='
+dd if=/dev/zero of="$DISK1" bs=4096 count=4 conv=fsync status=none
+dd if=/dev/zero of="$DISK2" bs=4096 count=4 conv=fsync status=none
+dd if=/dev/zero of="$DISK3" bs=4096 count=4 conv=fsync status=none
+printf '0 3 linear %s 5\n3 5 linear %s 7\n8 8 linear %s 11\n' "$DEV1" "$DEV2" "$DEV3" | dmsetup create dm_linear_edge
+
+echo 'DM_TABLE_LINEAR_EDGE_BEGIN'
+dmsetup table dm_linear_edge | tee /tmp/linear-edge-table.txt | sed 's/^/DM_TABLE_LINEAR_EDGE /'
+echo 'DM_TABLE_LINEAR_EDGE_END'
+grep -F -x -q "0 3 linear $DEV1 5" /tmp/linear-edge-table.txt
+grep -F -x -q "3 5 linear $DEV2 7" /tmp/linear-edge-table.txt
+grep -F -x -q "8 8 linear $DEV3 11" /tmp/linear-edge-table.txt
+
+dmsetup deps dm_linear_edge | tee /tmp/linear-edge-deps.txt
+grep -q '3 dependencies' /tmp/linear-edge-deps.txt
+build_linear_payload
+dd if=/tmp/linear-payload.bin of=/dev/mapper/dm_linear_edge bs=512 count=16 conv=fsync status=none
+dd if=/dev/mapper/dm_linear_edge of=/tmp/linear-readback.bin bs=512 count=16 status=none
+compare_file LINEAR_EDGE_MAPPER_READBACK /tmp/linear-payload.bin /tmp/linear-readback.bin
+
+dd if=/tmp/linear-payload.bin of=/tmp/linear-expected-d1.bin bs=512 count=3 status=none
+dd if=/tmp/linear-payload.bin of=/tmp/linear-expected-d2.bin bs=512 skip=3 count=5 status=none
+dd if=/tmp/linear-payload.bin of=/tmp/linear-expected-d3.bin bs=512 skip=8 count=8 status=none
+dd if="$DISK1" of=/tmp/linear-actual-d1.bin bs=512 skip=5 count=3 status=none
+dd if="$DISK2" of=/tmp/linear-actual-d2.bin bs=512 skip=7 count=5 status=none
+dd if="$DISK3" of=/tmp/linear-actual-d3.bin bs=512 skip=11 count=8 status=none
+compare_file LINEAR_EDGE_BACKING_D1 /tmp/linear-expected-d1.bin /tmp/linear-actual-d1.bin
+compare_file LINEAR_EDGE_BACKING_D2 /tmp/linear-expected-d2.bin /tmp/linear-actual-d2.bin
+compare_file LINEAR_EDGE_BACKING_D3 /tmp/linear-expected-d3.bin /tmp/linear-actual-d3.bin
+
+dmsetup remove dm_linear_edge
+
+echo '=== STEP 3: striped write starts inside a chunk and spans stripe boundaries ==='
+dd if=/dev/zero of="$DISK1" bs=4096 count=4 conv=fsync status=none
+dd if=/dev/zero of="$DISK2" bs=4096 count=4 conv=fsync status=none
+printf '0 24 striped 2 4 %s 0 %s 0\n' "$DEV1" "$DEV2" | dmsetup create dm_striped_edge
+
+echo 'DM_TABLE_STRIPED_EDGE_BEGIN'
+dmsetup table dm_striped_edge | tee /tmp/striped-edge-table.txt | sed 's/^/DM_TABLE_STRIPED_EDGE /'
+echo 'DM_TABLE_STRIPED_EDGE_END'
+grep -F -x -q "0 24 striped 2 4 $DEV1 0 $DEV2 0" /tmp/striped-edge-table.txt
+
+dmsetup status dm_striped_edge | tee /tmp/striped-edge-status.txt
+grep -q 'striped' /tmp/striped-edge-status.txt
+dmsetup deps dm_striped_edge | tee /tmp/striped-edge-deps.txt
+grep -q '2 dependencies' /tmp/striped-edge-deps.txt
+build_striped_payload
+dd if=/tmp/striped-payload.bin of=/dev/mapper/dm_striped_edge bs=512 seek=2 count=12 conv=fsync status=none
+dd if=/dev/mapper/dm_striped_edge of=/tmp/striped-readback.bin bs=512 skip=2 count=12 status=none
+compare_file STRIPED_EDGE_MAPPER_READBACK /tmp/striped-payload.bin /tmp/striped-readback.bin
+
+echo '=== CHECK: build striped backing expectations ==='
+: > /tmp/striped-expected-d1.bin
+for file in \
+    /tmp/zero-sector.bin /tmp/zero-sector.bin \
+    /tmp/striped-sector-a.bin /tmp/striped-sector-b.bin \
+    /tmp/striped-sector-g.bin /tmp/striped-sector-h.bin \
+    /tmp/striped-sector-i.bin /tmp/striped-sector-j.bin; do
+    cat "$file" >> /tmp/striped-expected-d1.bin
+done
+: > /tmp/striped-expected-d2.bin
+for file in \
+    /tmp/striped-sector-c.bin /tmp/striped-sector-d.bin \
+    /tmp/striped-sector-e.bin /tmp/striped-sector-f.bin \
+    /tmp/striped-sector-k.bin /tmp/striped-sector-l.bin \
+    /tmp/zero-sector.bin /tmp/zero-sector.bin; do
+    cat "$file" >> /tmp/striped-expected-d2.bin
+done
+echo CHECK_PASS_STRIPED_EDGE_EXPECTATIONS_BUILT
+
+echo '=== CHECK: read striped backing disks ==='
+dd if="$DISK1" of=/tmp/striped-actual-d1.bin bs=512 count=8 status=none
+dd if="$DISK2" of=/tmp/striped-actual-d2.bin bs=512 count=8 status=none
+echo CHECK_PASS_STRIPED_EDGE_BACKING_READ
+compare_file STRIPED_EDGE_BACKING_D1 /tmp/striped-expected-d1.bin /tmp/striped-actual-d1.bin
+compare_file STRIPED_EDGE_BACKING_D2 /tmp/striped-expected-d2.bin /tmp/striped-actual-d2.bin
+
+echo '=== STEP 4: cleanup ==='
+cleanup_dm
+sync
+
+echo TEST_PASS_DM_DATAPLANE_EDGE
+poweroff
+GUEST_SCRIPT
+
+SUMMARY_INCLUDE='^(TEST_|CHECK_PASS_|=== STEP|=== CHECK|TEST_DISK[0-9]=|DEV[0-9]=|DM_TABLE_.*_EDGE|[0-9]+ dependencies|Command failed|Kernel panic|panicked)'
+dm_run_single_guest_test "${TEST_ID}" "${GUEST_SCRIPT_FILE}" TEST_PASS_DM_DATAPLANE_EDGE "${SUMMARY_INCLUDE}"

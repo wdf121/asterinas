@@ -64,9 +64,10 @@ dm_run_guest_script() {
     local script_file=$2
     local log_mode=$3
     local label=$4
-    local slug fifo start_line qemu_pid waited status dm_test_images
+    local slug fifo start_line qemu_pid status dm_test_images start_ts elapsed timeout_seconds
 
     dm_test_images=$(dm_test_images_env)
+    timeout_seconds=${GUEST_QEMU_TIMEOUT:-${GUEST_READY_TIMEOUT:-180}}
     slug=$(_dm_test_tmp_slug "${test_id}")
     fifo=$(mktemp -u "/tmp/${slug}-stdin.XXXXXX")
     mkfifo "${fifo}"
@@ -77,6 +78,7 @@ dm_run_guest_script() {
         start_line=0
     fi
 
+    start_ts=$(date +%s)
     if [ "${log_mode}" = "append" ]; then
         DM_TEST_IMAGES="${dm_test_images}" \
         DM_TEST_IMAGE="${DM_TEST_IMAGE}" \
@@ -93,7 +95,6 @@ dm_run_guest_script() {
     exec 3>"${fifo}"
     rm -f "${fifo}"
 
-    waited=0
     while ! tail -n "+$((start_line + 1))" "${LOG}" | grep -aq 'root@asterinas'; do
         if ! kill -0 "${qemu_pid}" 2>/dev/null; then
             exec 3>&-
@@ -105,26 +106,43 @@ dm_run_guest_script() {
             echo "HOST_FAIL_${test_id} ${label}_guest_exited_before_shell status=${status}"
             return "${status}"
         fi
-        if [ "${waited}" -ge "${GUEST_READY_TIMEOUT}" ]; then
-            echo "HOST_FAIL_${test_id} ${label}_guest_shell_timeout=${GUEST_READY_TIMEOUT}s"
+        elapsed=$(($(date +%s) - start_ts))
+        if [ "${elapsed}" -ge "${timeout_seconds}" ]; then
+            echo "HOST_FAIL_${test_id} ${label}_guest_lifecycle_timeout=${timeout_seconds}s"
             exec 3>&-
             kill -- "-${qemu_pid}" 2>/dev/null || kill "${qemu_pid}" 2>/dev/null || true
             wait "${qemu_pid}" || true
             return 124
         fi
         sleep 1
-        waited=$((waited + 1))
     done
 
-    echo "HOST_INFO_${test_id} ${label}_guest_ready_after=${waited}s"
-    cat "${script_file}" >&3
+    elapsed=$(($(date +%s) - start_ts))
+    echo "HOST_INFO_${test_id} ${label}_guest_ready_after=${elapsed}s"
+    if [ -n "${GUEST_INPUT_LINE_DELAY:-}" ] && [ "${GUEST_INPUT_LINE_DELAY}" != "0" ]; then
+        while IFS= read -r line || [ -n "${line}" ]; do
+            printf '%s\n' "${line}" >&3
+            sleep "${GUEST_INPUT_LINE_DELAY}"
+        done <"${script_file}"
+    else
+        cat "${script_file}" >&3
+    fi
     exec 3>&-
 
-    if wait "${qemu_pid}"; then
-        return 0
-    else
-        return $?
-    fi
+    while kill -0 "${qemu_pid}" 2>/dev/null; do
+        elapsed=$(($(date +%s) - start_ts))
+        if [ "${elapsed}" -ge "${timeout_seconds}" ]; then
+            echo "HOST_FAIL_${test_id} ${label}_guest_lifecycle_timeout=${timeout_seconds}s"
+            kill -- "-${qemu_pid}" 2>/dev/null || kill "${qemu_pid}" 2>/dev/null || true
+            wait "${qemu_pid}" || true
+            return 124
+        fi
+        sleep 1
+    done
+
+    status=0
+    wait "${qemu_pid}" || status=$?
+    return "${status}"
 }
 
 dm_print_summary() {

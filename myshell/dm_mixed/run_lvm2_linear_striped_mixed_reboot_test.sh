@@ -13,7 +13,7 @@ Runs a two-guest NixOS regression for an LVM2 LV whose dm table naturally mixes 
 Optional environment variables:
   DM_TEST_IMAGES                         Backing test image list, default "target/nixos/test.img target/nixos/test2.img target/nixos/test3.img"
   DM_MIXED_LVM2_REBOOT_LOG               Host-side log path, default /tmp/dm-mixed-lvm2-reboot-test.log
-  GUEST_READY_TIMEOUT                    Seconds to wait for guest root shell, default 240
+  GUEST_READY_TIMEOUT                    Seconds to allow one full QEMU guest lifecycle, default 180
   RESET_DM_TEST_IMAGES                   1 to delete test images before running, default 1
   MIXED_INITIAL_LV_MIB                   Initial linear LV size in MiB, default 256
   MIXED_EXTENDED_LV_MIB                  Extended mixed LV size in MiB, default 512
@@ -39,7 +39,7 @@ test "$#" -eq 3
 DM_TEST_IMAGE=$1
 DM_TEST_IMAGE_2=$2
 DM_TEST_IMAGE_3=$3
-GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-240}
+GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-180}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 MIXED_INITIAL_LV_MIB=${MIXED_INITIAL_LV_MIB:-256}
 MIXED_EXTENDED_LV_MIB=${MIXED_EXTENDED_LV_MIB:-512}
