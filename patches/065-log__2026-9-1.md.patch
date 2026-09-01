@@ -1,9 +1,9 @@
 diff --git a/log/2026-9-1.md b/log/2026-9-1.md
 new file mode 100644
-index 000000000..437772a10
+index 000000000..8015773e5
 --- /dev/null
 +++ b/log/2026-9-1.md
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,390 @@
 +# 2026-9-1 工程改动日志
 +
 +本文按小阶段记录今天实际发生的工程改动。单纯解释、规划和未落地尝试不写入本日志；测试和验证结果跟随对应小阶段记录。
@@ -352,4 +352,45 @@ index 000000000..437772a10
 +CHECK_PASS_ZERO_EDGE_READ_AFTER_WRITE_ZERO
 +TEST_PASS_DM_DATAPLANE_EDGE
 +HOST_PASS_DM_SYSTEM_TESTS --dataplane-edge
++```
++
++## 5. 增强 patches 应用结果验证
++
++### 背景
++
++用户要求在 push 前确认 patches 不只是能应用，还能从原始 main 还原当前分支的非 patches 内容。
++
++### 改动
++
++```text
++patches/apply_patches.sh
++patches/generate_patches.sh
++```
++
++主要行为：
++
++```text
++新增 --verify-tree 模式。
++支持 --base <ref> 指定验证基准，默认 main。
++验证时基于 base 创建临时 detached worktree，应用 numbered patches。
++暂存临时 worktree 中除 patches/ 外的结果，确保新增文件参与比对。
++比对“base + patches 后的非 patches diff”和“当前分支相对 base 的非 patches diff”。
++验证成功后自动清理临时 worktree；失败时保留路径便于排查。
++generate_patches.sh 对相对 base 已删除但当前分支不存在的文件改用 git diff 生成删除补丁，避免漏掉删除文件。
++```
++
++### 验证
++
++```text
++bash -n patches/apply_patches.sh
++patches/apply_patches.sh --verify-tree --base main
++```
++
++结果：
++
++```text
++verify_tree=1
++base_ref=main
++patch_count=93
++patched tree matches current branch outside patches/
 +```

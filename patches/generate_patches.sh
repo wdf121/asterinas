@@ -134,7 +134,7 @@ for file in "${files[@]}"; do
     patch_name=$(printf '%03d-%s.patch' "$count" "$(sanitize_path "$file")")
     patch_path="$output_dir/$patch_name"
 
-    if git ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+    if git ls-files --error-unmatch -- "$file" >/dev/null 2>&1 || git cat-file -e "$base_ref:$file" 2>/dev/null; then
         git diff --binary "$base_ref" -- "$file" > "$patch_path"
     else
         git diff --binary --no-index -- /dev/null "$file" > "$patch_path" || true
