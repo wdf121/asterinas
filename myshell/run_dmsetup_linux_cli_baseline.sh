@@ -249,6 +249,7 @@ run_capture STATIC_TARGETS dmsetup targets || true
 run_capture TARGET_VERSION_ERROR dmsetup target-version error || true
 run_capture TARGET_VERSION_LINEAR dmsetup target-version linear || true
 run_capture TARGET_VERSION_STRIPED dmsetup target-version striped || true
+run_capture TARGET_VERSION_ZERO dmsetup target-version zero || true
 run_capture TARGET_VERSION_UNKNOWN dmsetup target-version aster_unknown || true
 
 if [ "${DIRTY_DM}" -eq 0 ]; then
@@ -313,6 +314,18 @@ run_capture ERROR_DEPS dmsetup deps "${error_name}" || true
 run_shell_capture ERROR_READ "timeout 5 dd if=/dev/mapper/${error_name} of=/dev/null bs=512 count=1 status=none" || true
 run_shell_capture ERROR_WRITE "timeout 5 dd if=/dev/zero of=/dev/mapper/${error_name} bs=512 count=1 status=none" || true
 run_capture ERROR_REMOVE dmsetup remove "${error_name}" || true
+
+zero_name=$(name zero)
+run_capture ZERO_CREATE dmsetup create "${zero_name}" --table "0 8 zero" || true
+record_nodes ZERO_CREATE "${zero_name}"
+run_capture ZERO_INFO dmsetup info "${zero_name}" || true
+run_capture ZERO_TABLE dmsetup table "${zero_name}" || true
+run_capture ZERO_STATUS dmsetup status "${zero_name}" || true
+run_capture ZERO_DEPS dmsetup deps "${zero_name}" || true
+run_shell_capture ZERO_READ_ALL_ZERO "timeout 5 sh -c 'dd if=/dev/mapper/${zero_name} of=${TMPDIR_PATH}/zero-read.bin bs=512 count=1 status=none && cmp -n 512 ${TMPDIR_PATH}/zero-read.bin /dev/zero'" || true
+run_shell_capture ZERO_WRITE "timeout 5 dd if=/dev/urandom of=/dev/mapper/${zero_name} bs=512 count=1 status=none" || true
+run_shell_capture ZERO_READ_AFTER_WRITE_ALL_ZERO "timeout 5 sh -c 'dd if=/dev/mapper/${zero_name} of=${TMPDIR_PATH}/zero-read-after-write.bin bs=512 count=1 status=none && cmp -n 512 ${TMPDIR_PATH}/zero-read-after-write.bin /dev/zero'" || true
+run_capture ZERO_REMOVE dmsetup remove "${zero_name}" || true
 
 table_name=$(name table_lifecycle)
 run_capture TABLE_LIFECYCLE_CREATE dmsetup create "${table_name}" --table "0 8 linear ${DEV1} 0" || true

@@ -63,8 +63,6 @@ enum ReqType {
     Out = 1,
     Flush = 4,
     GetId = 8,
-    Discard = 11,
-    WriteZeroes = 13,
 }
 
 #[repr(u8)]

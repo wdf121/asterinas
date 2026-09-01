@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: MPL-2.0
+
+use core::{fmt::Debug, ops::Range};
+
+use aster_block::id::Sid;
+
+use crate::TableError;
+
+/// 读返回零、写丢弃并成功完成的 zero target。
+#[derive(Debug)]
+pub struct ZeroTarget {
+    logical_range: Range<Sid>,
+}
+
+impl ZeroTarget {
+    pub fn new(logical_start: Sid, length: u64) -> Result<Self, TableError> {
+        if length == 0 {
+            return Err(TableError::ZeroLength);
+        }
+
+        let logical_end = logical_start
+            .to_raw()
+            .checked_add(length)
+            .ok_or(TableError::LogicalRangeOverflow)?;
+
+        Ok(Self {
+            logical_range: logical_start..Sid::new(logical_end),
+        })
+    }
+
+    pub fn logical_range(&self) -> &Range<Sid> {
+        &self.logical_range
+    }
+
+    pub fn length(&self) -> u64 {
+        self.logical_range.end.to_raw() - self.logical_range.start.to_raw()
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn validates_target_range() {
+        assert_eq!(
+            ZeroTarget::new(Sid::new(0), 0).unwrap_err(),
+            TableError::ZeroLength
+        );
+        assert_eq!(
+            ZeroTarget::new(Sid::new(u64::MAX), 1).unwrap_err(),
+            TableError::LogicalRangeOverflow
+        );
+
+        let target = ZeroTarget::new(Sid::new(4), 8).unwrap();
+        assert_eq!(target.logical_range(), &(Sid::new(4)..Sid::new(12)));
+        assert_eq!(target.length(), 8);
+    }
+}

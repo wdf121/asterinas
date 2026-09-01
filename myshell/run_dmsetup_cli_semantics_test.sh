@@ -48,7 +48,7 @@ cat >/tmp/dmsetup_cli_semantics_guest.sh <<'DMSETUP_GUEST_BODY'
 set -u
 
 PREFIX=dm_cli_sem
-names='stdin notable linear_major linear_path striped_major striped_path error table_lifecycle state_event rename rename_existing renamed remove_active remove_tableless remove_all_a remove_all_b'
+names='stdin notable linear_major linear_path striped_major striped_path error zero table_lifecycle state_event rename rename_existing renamed remove_active remove_tableless remove_all_a remove_all_b'
 GUEST_TEST_START=$(date +%s)
 STEP_START=${GUEST_TEST_START}
 STEP_LABEL=START
@@ -327,9 +327,11 @@ run_expect_success STATIC_TARGETS dmsetup targets
 grep_expect STATIC_TARGETS_HAS_ERROR '^error' /tmp/STATIC_TARGETS.out
 grep_expect STATIC_TARGETS_HAS_LINEAR '^linear' /tmp/STATIC_TARGETS.out
 grep_expect STATIC_TARGETS_HAS_STRIPED '^striped' /tmp/STATIC_TARGETS.out
+grep_expect STATIC_TARGETS_HAS_ZERO '^zero' /tmp/STATIC_TARGETS.out
 run_expect_success TARGET_VERSION_ERROR dmsetup target-version error
 run_expect_success TARGET_VERSION_LINEAR dmsetup target-version linear
 run_expect_success TARGET_VERSION_STRIPED dmsetup target-version striped
+run_expect_success TARGET_VERSION_ZERO dmsetup target-version zero
 run_expect_failure TARGET_VERSION_UNKNOWN dmsetup target-version aster_unknown
 echo CHECK_PASS_DMSETUP_STATIC_VERSION_TARGETS
 
@@ -403,7 +405,7 @@ expect_deps_count "${striped_path}" 2 STRIPED_PATH_DEPS
 run_expect_success STRIPED_PATH_REMOVE dmsetup remove "${striped_path}"
 echo CHECK_PASS_DMSETUP_STRIPED_CREATE
 
-step '=== STEP 6: error create query and io ==='
+step '=== STEP 6: error and zero create query and io ==='
 error_name=$(name error)
 run_expect_success ERROR_CREATE dmsetup create "${error_name}" --table "0 8 error"
 record_nodes ERROR_CREATE "${error_name}"
@@ -414,7 +416,18 @@ expect_deps_count "${error_name}" 0 ERROR_DEPS
 run_shell_expect_failure ERROR_READ "timeout 5 dd if=/dev/mapper/${error_name} of=/dev/null bs=512 count=1 status=none"
 run_shell_expect_failure ERROR_WRITE "timeout 5 dd if=/dev/zero of=/dev/mapper/${error_name} bs=512 count=1 status=none"
 run_expect_success ERROR_REMOVE dmsetup remove "${error_name}"
-echo CHECK_PASS_DMSETUP_ERROR_CREATE_IO
+zero_name=$(name zero)
+run_expect_success ZERO_CREATE dmsetup create "${zero_name}" --table "0 8 zero"
+record_nodes ZERO_CREATE "${zero_name}"
+run_expect_success ZERO_INFO dmsetup info "${zero_name}"
+expect_table_line "${zero_name}" "0 8 zero " ZERO_TABLE
+run_expect_success ZERO_STATUS dmsetup status "${zero_name}"
+expect_deps_count "${zero_name}" 0 ZERO_DEPS
+run_shell_expect_success ZERO_READ_ALL_ZERO "timeout 5 sh -c 'dd if=/dev/mapper/${zero_name} of=/tmp/zero-read.bin bs=512 count=1 status=none && cmp -n 512 /tmp/zero-read.bin /dev/zero'"
+run_shell_expect_success ZERO_WRITE "timeout 5 dd if=/dev/urandom of=/dev/mapper/${zero_name} bs=512 count=1 status=none"
+run_shell_expect_success ZERO_READ_AFTER_WRITE_ALL_ZERO "timeout 5 sh -c 'dd if=/dev/mapper/${zero_name} of=/tmp/zero-read-after-write.bin bs=512 count=1 status=none && cmp -n 512 /tmp/zero-read-after-write.bin /dev/zero'"
+run_expect_success ZERO_REMOVE dmsetup remove "${zero_name}"
+echo CHECK_PASS_DMSETUP_ERROR_ZERO_CREATE_IO
 
 step '=== STEP 7: table lifecycle ==='
 table_name=$(name table_lifecycle)
@@ -495,5 +508,5 @@ sh /tmp/dmsetup_cli_semantics_guest.sh
 
 GUEST_SCRIPT
 
-SUMMARY_INCLUDE='TEST_|CHECK_PASS_|OBSERVE_|=== STEP|SCENARIO_|CMD_|STATUS_|DURATION_|STEP_DURATION_|GUEST_DURATION_|SUMMARY_GAP_|STDOUT_|STDERR_|TRIGGER_|EVENT_|NODE_|TEST_DISK=|TEST_DISK2=|DEV=|DEV2=|Name:|State:|UUID:|Tables present:|linear|striped|error|dependencies|Command failed|Invalid argument|Input/output error|No such device|No devices found|Kernel panic|panicked'
+SUMMARY_INCLUDE='TEST_|CHECK_PASS_|OBSERVE_|=== STEP|SCENARIO_|CMD_|STATUS_|DURATION_|STEP_DURATION_|GUEST_DURATION_|SUMMARY_GAP_|STDOUT_|STDERR_|TRIGGER_|EVENT_|NODE_|TEST_DISK=|TEST_DISK2=|DEV=|DEV2=|Name:|State:|UUID:|Tables present:|linear|striped|error|zero|dependencies|Command failed|Invalid argument|Input/output error|No such device|No devices found|Kernel panic|panicked'
 dm_run_single_guest_test "${TEST_ID}" "${GUEST_SCRIPT_FILE}" TEST_PASS_DMSETUP_CLI_SEMANTICS "${SUMMARY_INCLUDE}"

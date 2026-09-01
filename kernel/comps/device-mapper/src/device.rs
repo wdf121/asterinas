@@ -252,7 +252,7 @@ impl BlockDevice for DmDevice {
             if state.phase != DmDevicePhase::Running {
                 return Err(BioEnqueueError::Refused);
             }
-            if self.is_readonly() && bio.type_() == BioType::Write {
+            if self.is_readonly() && bio.type_().is_write_like() {
                 return Err(BioEnqueueError::Refused);
             }
             let table = state.active.clone().ok_or(BioEnqueueError::Refused)?;
@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[ktest]
-    fn readonly_device_refuses_write_but_allows_read_and_flush() {
+    fn readonly_device_refuses_write_like_bios_but_allows_read_and_flush() {
         let manager = DmManager::new().unwrap();
         let device = manager
             .create_with_readonly("dm-readonly-test".to_string(), None, None, true)

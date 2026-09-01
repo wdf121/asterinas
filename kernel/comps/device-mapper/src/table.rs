@@ -12,7 +12,7 @@ use aster_block::{
     id::Sid,
 };
 use device_id::DeviceId;
-use ostd::sync::SpinLock;
+use ostd::{mm::io::util::HasVmReaderWriter, sync::SpinLock};
 
 use crate::{
     TableError,
@@ -35,12 +35,17 @@ enum MappedBioPart<'a> {
     Error {
         logical_range: Range<Sid>,
     },
+    Zero {
+        logical_range: Range<Sid>,
+    },
 }
 
 impl MappedBioPart<'_> {
     fn logical_range(&self) -> &Range<Sid> {
         match self {
-            Self::Backing { logical_range, .. } | Self::Error { logical_range } => logical_range,
+            Self::Backing { logical_range, .. }
+            | Self::Error { logical_range }
+            | Self::Zero { logical_range } => logical_range,
         }
     }
 }
@@ -173,6 +178,10 @@ impl DmTable {
                     bio.complete(BioStatus::IoError);
                     return Ok(());
                 }
+                MappedBioPart::Zero { .. } => {
+                    complete_zero_bio(bio);
+                    return Ok(());
+                }
             }
         }
 
@@ -197,6 +206,7 @@ impl DmTable {
                     }
                 }
                 MappedBioPart::Error { .. } => child.complete(BioStatus::IoError),
+                MappedBioPart::Zero { .. } => complete_zero_bio(child),
             }
         }
         Ok(())
@@ -235,6 +245,11 @@ impl DmTable {
                 }
                 DmTarget::Error(_) => {
                     mapped_parts.push(MappedBioPart::Error {
+                        logical_range: range,
+                    });
+                }
+                DmTarget::Zero(_) => {
+                    mapped_parts.push(MappedBioPart::Zero {
                         logical_range: range,
                     });
                 }
@@ -306,6 +321,17 @@ impl DmTable {
     }
 }
 
+fn complete_zero_bio(bio: SubmittedBio) {
+    if bio.type_() == BioType::Read {
+        for segment in bio.segments() {
+            let mut writer = segment.inner_dma_slice().writer().unwrap();
+            let written = writer.fill_zeros(segment.nbytes());
+            debug_assert_eq!(written, segment.nbytes());
+        }
+    }
+    bio.complete(BioStatus::Complete);
+}
+
 struct FlushCompletion {
     remaining: AtomicUsize,
     status: AtomicU32,
@@ -355,12 +381,13 @@ mod tests {
         bio::{BioDirection, BioSegment},
     };
     use device_id::{MajorId, MinorId};
-    use ostd::{prelude::ktest, sync::Mutex};
+    use ostd::{mm::VmIo, prelude::ktest, sync::Mutex};
 
     use super::*;
     use crate::target::{
         error::ErrorTarget,
         striped::{StripedTarget, StripedTargetParams},
+        zero::ZeroTarget,
     };
 
     #[derive(Debug)]
@@ -368,6 +395,7 @@ mod tests {
         id: DeviceId,
         last_range: Mutex<Option<Range<Sid>>>,
         submitted_ranges: Mutex<Vec<Range<Sid>>>,
+        submitted_types: Mutex<Vec<BioType>>,
         flush_count: Mutex<usize>,
         bio_status: BioStatus,
         fail_bio_enqueue: bool,
@@ -441,6 +469,7 @@ mod tests {
                 id: DeviceId::new(MajorId::new(1), MinorId::new(minor)),
                 last_range: Mutex::new(None),
                 submitted_ranges: Mutex::new(Vec::new()),
+                submitted_types: Mutex::new(Vec::new()),
                 flush_count: Mutex::new(0),
                 bio_status,
                 fail_bio_enqueue,
@@ -460,6 +489,7 @@ mod tests {
                 *self.flush_count.lock() += 1;
                 *self.last_range.lock() = Some(bio.sid_range().clone());
                 self.submitted_ranges.lock().push(bio.sid_range().clone());
+                self.submitted_types.lock().push(bio.type_());
                 bio.complete(self.flush_status);
                 return Ok(());
             }
@@ -468,6 +498,7 @@ mod tests {
             }
             *self.last_range.lock() = Some(bio.sid_range().clone());
             self.submitted_ranges.lock().push(bio.sid_range().clone());
+            self.submitted_types.lock().push(bio.type_());
             bio.complete(self.bio_status);
             Ok(())
         }
@@ -947,6 +978,68 @@ mod tests {
         let table = Arc::new(
             DmTable::new_targets(vec![DmTarget::Error(
                 ErrorTarget::new(Sid::new(0), 8).unwrap(),
+            )])
+            .unwrap(),
+        );
+        let flush = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
+
+        assert_eq!(
+            flush.submit_and_wait(&TableDevice(table)).unwrap(),
+            BioStatus::Complete
+        );
+    }
+
+    #[ktest]
+    fn zero_target_reports_capacity_without_backing_limits() {
+        let table = DmTable::new_targets(vec![DmTarget::Zero(
+            ZeroTarget::new(Sid::new(0), 8).unwrap(),
+        )])
+        .unwrap();
+
+        assert_eq!(table.length(), 8);
+        assert_eq!(table.metadata().nr_sectors, 8);
+        assert_eq!(table.metadata().max_nr_segments_per_bio, usize::MAX);
+        assert!(table.backing_ids().is_empty());
+    }
+
+    #[ktest]
+    fn zero_target_completes_read_with_zeroes_and_write_successfully() {
+        let table = Arc::new(
+            DmTable::new_targets(vec![DmTarget::Zero(
+                ZeroTarget::new(Sid::new(0), 8).unwrap(),
+            )])
+            .unwrap(),
+        );
+        let read_segment = BioSegment::alloc(1, BioDirection::FromDevice);
+        let read = Bio::new(BioType::Read, Sid::new(0), vec![read_segment.clone()], None);
+        let write = Bio::new(
+            BioType::Write,
+            Sid::new(0),
+            vec![BioSegment::alloc(1, BioDirection::ToDevice)],
+            None,
+        );
+
+        assert_eq!(
+            read.submit_and_wait(&TableDevice(table.clone())).unwrap(),
+            BioStatus::Complete
+        );
+        let mut buffer = [0xffu8; 512];
+        read_segment
+            .inner_dma_slice()
+            .read_bytes(0, &mut buffer)
+            .unwrap();
+        assert!(buffer.iter().all(|byte| *byte == 0));
+        assert_eq!(
+            write.submit_and_wait(&TableDevice(table)).unwrap(),
+            BioStatus::Complete
+        );
+    }
+
+    #[ktest]
+    fn zero_target_completes_flush_successfully() {
+        let table = Arc::new(
+            DmTable::new_targets(vec![DmTarget::Zero(
+                ZeroTarget::new(Sid::new(0), 8).unwrap(),
             )])
             .unwrap(),
         );
