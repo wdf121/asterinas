@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-截至 2026-08-31，`dm` 分支当前重点已从 LVM2 慢系统脚本整理，推进到 `dmsetup` / LVM2 控制面语义对齐、raw DM 数据面边界实测和 `error` target 功能拓展。当前不声明完整 Device Mapper 或完整 LVM2 兼容；已确认的是当前实现范围内的 `error`、`linear`、`striped` 以及 LVM2 生成的 linear/striped/mixed table 在测试场景下通过。
+截至 2026-09-01，`dm` 分支当前重点已从 LVM2 慢系统脚本整理，推进到 `dmsetup` / LVM2 控制面语义对齐、raw DM 数据面边界实测和基础 target 功能拓展。当前不声明完整 Device Mapper 或完整 LVM2 兼容；已确认的是当前实现范围内的 `error`、`linear`、`striped`、`zero` 以及 LVM2 生成的 linear/striped/mixed table 在测试场景下通过。
 
 当前可用的系统测试入口集中在：
 
@@ -35,6 +35,7 @@ log/device-mapper-progress.md
 log/2026-8-31.md
 docs/test.md
 docs/study.md
+docs/device-mapper-technical-maintenance.md
 ```
 
 阅读重点：
@@ -44,9 +45,10 @@ docs/study.md
 - `log/device-mapper-progress.md`：当前项目滚动状态和下一步优先级，是接手时的主入口。
 - `log/2026-8-31.md`：最近已完成并验证的小阶段，避免重复做控制面对齐和 `--dataplane-edge`。
 - `docs/test.md`：实际运行命令、suite 列表和 QEMU 生命周期约束。
-- `docs/study.md`：`dmsetup` / LVM2 控制面对齐矩阵和当前未纳入范围。
+- `docs/study.md`：`/dev/mapper/control` 注册主线和适合复盘的学习材料。
+- `docs/device-mapper-technical-maintenance.md`：DM 技术维护主文档；附录集中维护 `dmsetup` / LVM2 控制面对齐矩阵。
 
-当前接手结论：`dmsetup` 和 LVM2 控制面对齐已完成，`--dataplane-edge` 已通过，`error` target 已完成核心 ktest、ioctl 层定向 ktest 和 `--dmsetup-cli` 覆盖。flush 数据面已通过现有 core ktest 收口确认；discard / write zeroes 当前属于明确非目标，不应补 guest 假测。下一步优先串行跑现有数据面和慢系统回归，或继续选择小而独立的 DM target 功能拓展。
+当前接手结论：`dmsetup` 和 LVM2 控制面对齐已完成，`--dataplane-edge` 已通过，`error` / `zero` target 已完成核心 ktest、ioctl 层定向 ktest 和 guest 脚本覆盖。flush 数据面已通过现有 core ktest 收口确认；discard / write zeroes 当前属于明确非目标，不应补 guest 假测。下一步优先串行跑现有数据面和慢系统回归，或继续选择小而独立的 DM target 功能拓展。
 
 本节是上下文交接入口；后续每完成一个小阶段，应同步更新阅读清单、当前接手结论和下一步优先级。
 
@@ -66,8 +68,9 @@ myshell/run_dm_system_tests.sh --dmsetup-cli
 
 - `dmsetup version`、`targets`、`target-version`。
 - tableless `create`、`--notable`、`ls`、`info`、`remove`。
-- linear / striped / error `create`、`table`、`status`、`deps`、`info`、`remove`。
+- linear / striped / error / zero `create`、`table`、`status`、`deps`、`info`、`remove`。
 - error target 覆盖区间内 Read / Write 返回 I/O error，flush 对无 backing table 成功完成。
+- zero target 读取返回全 0，写入丢弃并成功完成，flush 对无 backing table 成功完成。
 - active / inactive table 的 `load`、`reload`、`clear`、`resume`。
 - `suspend`、`resume`、`wait --noflush`。
 - `rename OLD NEW`、`rename NAME NAME`、重复名 rename、`rename --setuuid`、`info -u UUID`。
@@ -80,10 +83,10 @@ myshell/run_dm_system_tests.sh --dmsetup-cli
 - `dmsetup rename NAME NAME` 改为返回 `EBUSY`，状态不变化。
 - ioctl wait 路径改用 signal-aware pause，使 `timeout 3 dmsetup wait ...` 可被信号中断。
 
-2026-08-31 重建 NixOS 后，`--dmsetup-cli` 已通过。新增 `error` target 后，180 秒默认生命周期两次因 guest ready 分别 118s / 169s 导致外层超时，但日志无语义 GAP；使用 300 秒兜底完成验证：
+2026-09-01 重建 NixOS 后，`--dmsetup-cli` 已通过，新增 `zero` target 无语义 GAP：
 
 ```text
-CHECK_PASS_DMSETUP_ERROR_CREATE_IO
+CHECK_PASS_DMSETUP_ERROR_ZERO_CREATE_IO
 SUMMARY_GAP_DMSETUP_CLI_SEMANTICS: 0
 TEST_PASS_DMSETUP_CLI_SEMANTICS
 HOST_PASS_DMSETUP_CLI_SEMANTICS
@@ -145,8 +148,9 @@ myshell/run_dm_system_tests.sh --dataplane-edge
 - mapper readback 与三个 backing 落点校验。
 - `striped 2 4` 从 chunk 内部偏移开始写。
 - 跨多个 stripe 边界后的 mapper readback 与两个 backing 分布校验。
+- `zero` target 读全 0、写入丢弃成功、写后再次读取仍为全 0。
 
-2026-08-31 已通过：
+2026-09-01 已通过：
 
 ```text
 CHECK_PASS_LINEAR_EDGE_MAPPER_READBACK
@@ -156,6 +160,9 @@ CHECK_PASS_LINEAR_EDGE_BACKING_D3
 CHECK_PASS_STRIPED_EDGE_MAPPER_READBACK
 CHECK_PASS_STRIPED_EDGE_BACKING_D1
 CHECK_PASS_STRIPED_EDGE_BACKING_D2
+CHECK_PASS_ZERO_EDGE_READ_ZERO
+CHECK_PASS_ZERO_EDGE_WRITE_DISCARDED
+CHECK_PASS_ZERO_EDGE_READ_AFTER_WRITE_ZERO
 TEST_PASS_DM_DATAPLANE_EDGE
 HOST_PASS_DM_SYSTEM_TESTS --dataplane-edge
 ```
@@ -184,15 +191,17 @@ test result: ok. 52 passed; 0 failed; 0 filtered out.
 
 ## 当前文档状态
 
-- `docs/study.md` 已重写 `dmsetup` 控制面命令对齐矩阵，并新增 LVM2 控制面命令对齐矩阵。
+- `docs/device-mapper-technical-maintenance.md` 已更新到 2026-09-01 状态，正文覆盖 error/zero/linear/striped/mixed 设计；第 8 章集中说明 Read/Write remap/direct completion、split 聚合、Flush fan-out/direct completion 与 discard/write zeroes 非目标边界；附录集中维护 `dmsetup` 和 LVM2 控制面对齐矩阵。
+- `docs/study.md` 已精简为 `/dev/mapper/control` 注册主线，不再保留命令矩阵迁移记录。
 - `docs/test.md` 已记录 LVM2 host baseline、guest `--lvm2-cli` 和 raw 数据面 `--dataplane-edge` 入口。
-- LVM2 表格当前按命令模板和前置条件判断结论；整体限定范围放在表格前说明中，不把所有行都写成“限定场景已对齐”。
+- LVM2 表格当前按命令模板和前置条件判断结论；整体适用边界放在表格前说明中，不把所有行都写成“限定场景已对齐”，也不从单行“已对齐”外推到裸 LVM2 / 默认 udev 体验。
 
 ## 当前功能边界
 
-当前重点仍限于已实现的 `error`、`linear` 和 `striped` target：
+当前重点仍限于已实现的 `error`、`linear`、`striped` 和 `zero` target：
 
 - `error`：无 backing 参数，Read / Write 稳定返回 I/O error，flush 对无 backing table 成功完成，deps 为空。
+- `zero`：无 backing 参数，Read 返回全 0，Write 丢弃并成功完成，flush 对无 backing table 成功完成，deps 为空。
 - `linear`：offset 平移、多 segment、跨 segment split、非零 backing start。
 - `striped`：chunk 轮转分布、跨 chunk split、非 chunk 起点写入、backing 分布校验。
 - mixed：由 LVM2 生成同一 LV 内 linear + striped segments，用现有慢 suite 验证文件 I/O 和 reboot recovery。
@@ -205,12 +214,12 @@ test result: ok. 52 passed; 0 failed; 0 filtered out.
 - queue limit / alignment / topology。
 - 并发 I/O 和压力场景。
 
-当前明确不纳入：snapshot、thin、cache、crypt、mirror、raid、zero 等 target 族，以及完整 udev/systemd 自动激活生态语义。
+当前明确不纳入：snapshot、thin、cache、crypt、mirror、raid 等 target 族，以及完整 udev/systemd 自动激活生态语义。
 
 ## 后续可做优先级
 
 1. 先串行跑现有数据面和慢系统回归：`--linear-data`、`--striped-data`、`--linear-lvm2`、`--striped-lvm2`、`--linear-lvm2-cross-segment`、`--striped-lvm2-cross-segment`、`--mixed-lvm2`。
-2. 若继续拓展 DM target 功能，优先选择同样边界清晰的 `zero` target；snapshot/thin/cache 等需要另起大阶段设计。
+2. 若继续拓展 DM target 功能，snapshot/thin/cache 等需要另起大阶段设计；更小的基础 target 也应先做 host baseline 与最小 guest 语义脚本。
 3. 若继续做数据面语义增强，可审计 queue limit / alignment / topology 的当前实现和测试覆盖；这属于“当前实现自洽性”审计，不声明完整 Linux DM queue stacking 对齐。
 4. backing I/O error / partial completion 已有 core 模拟测试；新增 `error` target 可支持 guest 侧稳定 I/O error 场景，但不等于真实 backing fault injection。
 5. discard / write zeroes 当前是明确非目标；要做需先扩展通用 block `BioType`、backing driver 和 DM table fan-out/remap，不作为当前小阶段。
@@ -221,3 +230,4 @@ test result: ok. 52 passed; 0 failed; 0 filtered out.
 
 - `log/2026-8-24.md`：mixed active/inactive ktest、striped 几何边界 ktest、mixed LVM2 系统验收、合入当前 main 并适配 `kernel/core` 目录迁移。
 - `log/2026-8-31.md`：dmsetup 控制面语义对齐、LVM2 控制面 baseline/guest 同构、raw DM 数据面边界 guest 审计。
+- `log/2026-9-1.md`：guest 启动慢排查修复、`zero` target 核心/控制面/数据面覆盖。
