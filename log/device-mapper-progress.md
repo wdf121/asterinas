@@ -4,105 +4,220 @@
 
 ## 当前状态
 
-截至 2026-08-26，`dm` 分支已合入当前 `main`，并完成上游 `kernel/core` 目录迁移适配。当前重点从继续扩慢系统矩阵，转为把 linear / striped LVM2 系统验收脚本分层理清楚：基础 reboot 只负责生成并恢复单 segment 基础产物，resize / 扩容测试应基于基础产物恢复后继续扩容/缩容，避免重复创建基础 LV。
+截至 2026-08-31，`dm` 分支当前重点已从 LVM2 慢系统脚本整理，推进到 `dmsetup` / LVM2 控制面语义对齐、raw DM 数据面边界实测和 `error` target 功能拓展。当前不声明完整 Device Mapper 或完整 LVM2 兼容；已确认的是当前实现范围内的 `error`、`linear`、`striped` 以及 LVM2 生成的 linear/striped/mixed table 在测试场景下通过。
 
-最近相关提交：
-
-```text
-41d51bdcb 合入 main 并适配 Device Mapper 目录迁移
-0703e3e25 补充 Device Mapper 分支文档和 patch 工具
-f53236cd0 新增 Device Mapper mixed LVM2 系统验收
-8426e405a 补充 Device Mapper mixed 与 striped 边界 ktest
-2e1a3350f 记录 dm 分支协作说明
-8f00dec97 补充 Device Mapper mixed table ktest
-fd94cd2c7 补充 Device Mapper table-load 非法输入 ktest
-49ef85c72 修复 Device Mapper table remap ktest
-```
-
-当前 DM 相关路径已迁移到上游新布局：
+当前可用的系统测试入口集中在：
 
 ```text
-kernel/core/comps/device-mapper
-kernel/core/src/device/misc/device_mapper.rs
-kernel/core/src/fs/fs_impls/procfs/devices.rs
+myshell/run_dm_system_tests.sh --quick
+myshell/run_dm_system_tests.sh --dmsetup-cli
+myshell/run_dm_system_tests.sh --lvm2-cli
+myshell/run_dm_system_tests.sh --dataplane-edge
+myshell/run_dm_system_tests.sh --linear-data
+myshell/run_dm_system_tests.sh --striped-data
+myshell/run_dm_system_tests.sh --linear-lvm2
+myshell/run_dm_system_tests.sh --striped-lvm2
+myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment
+myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
+myshell/run_dm_system_tests.sh --mixed-lvm2
 ```
+
+系统测试仍要求串行执行；单个 QEMU guest 从启动到退出的完整生命周期默认 180 秒，超过约 3 分钟按异常处理。
+
+## 新对话接手阅读清单
+
+新开对话或上下文压缩后，优先阅读以下文件即可快速恢复当前工作状态：
+
+```text
+CLAUDE.md
+AGENTS.md
+log/device-mapper-progress.md
+log/2026-8-31.md
+docs/test.md
+docs/study.md
+```
+
+阅读重点：
+
+- `CLAUDE.md`：协作规则，包括简体中文、精简汇报、新阶段先说明差异、默认不 push。
+- `AGENTS.md`：项目路径、容器路径、测试入口、系统测试串行和临时 ktest 约束。
+- `log/device-mapper-progress.md`：当前项目滚动状态和下一步优先级，是接手时的主入口。
+- `log/2026-8-31.md`：最近已完成并验证的小阶段，避免重复做控制面对齐和 `--dataplane-edge`。
+- `docs/test.md`：实际运行命令、suite 列表和 QEMU 生命周期约束。
+- `docs/study.md`：`dmsetup` / LVM2 控制面对齐矩阵和当前未纳入范围。
+
+当前接手结论：`dmsetup` 和 LVM2 控制面对齐已完成，`--dataplane-edge` 已通过，`error` target 已完成核心 ktest、ioctl 层定向 ktest 和 `--dmsetup-cli` 覆盖。flush 数据面已通过现有 core ktest 收口确认；discard / write zeroes 当前属于明确非目标，不应补 guest 假测。下一步优先串行跑现有数据面和慢系统回归，或继续选择小而独立的 DM target 功能拓展。
+
+本节是上下文交接入口；后续每完成一个小阶段，应同步更新阅读清单、当前接手结论和下一步优先级。
 
 ## 已完成并验证的范围
 
-- Device Mapper linear / striped / mixed 的核心数据面和 ioctl 语义已通过 ktest 与系统脚本分层覆盖。
-- 同一 DM device / 同一 LV 内的 BIO 可以跨 target 边界拆分；这不是跨 LV。
-- 一个 BIO 不应跨两个不同 LV；BIO 是发给某一个 block device 的。
-- `DmTable` 数据面支持：
-  - 单段 linear remap。
-  - 多段 linear target。
-  - striped target 内跨 stripe chunk 拆分。
-  - linear + striped mixed target 的跨边界拆分。
-  - split child enqueue 失败或 child 完成 `IoError` 时，原 BIO 聚合返回 `IoError`。
-- ioctl 控制面支持并已测：
-  - `DM_TABLE_LOAD` 多 target linear。
-  - `DM_TABLE_LOAD` striped。
-  - `DM_TABLE_LOAD` linear + striped mixed table。
-  - mixed inactive table 的 `DM_DEV_STATUS.target_count`。
-  - mixed table 的 `DM_TABLE_STATUS` type / params / next offset。
-  - mixed table 的 `DM_TABLE_DEPS` backing 顺序。
-  - running device 中 active linear table 被 ioctl-loaded mixed table 替换后的 active / inactive 查询、resume 切换和 deps 切换。
-- table-load 非法输入已补 ktest：
-  - linear 参数缺失、额外字段、bad major/minor、bad start、start 溢出。
-  - striped 参数字段数、zero stripes、zero chunk、非数字 stripe_count/chunk_size、bad dev/start。
-  - unsupported target：`unknown`、`error`、`snapshot`。
-  - target type 空字符串、缺少 NUL 终止符。
-  - `dm_target_spec.next` 的非最后 0、too-small、unaligned、out-of-bounds，以及 final target 非法 next。
+### dmsetup 控制面语义
 
-## 当前脚本改动状态
-
-- `myshell/run_dm_system_tests.sh` 已把系统入口分为 canonical suites 与 compatibility / narrow suites：
-  - 基础入口：`--linear-lvm2`、`--striped-lvm2`。
-  - resize 入口：`--linear-lvm2-resize`、`--striped-lvm2-resize`。
-  - striped 补充入口：`--striped-lvm2-extended`，内部包含 3PV / 3-way 与 multi-segment。
-  - mixed 入口：`--mixed-lvm2`。
-  - 兼容入口保留：`--linear-lvm2-reboot`、`--striped-lvm2-reboot`、`--data`、`--striped`、`--lvm2`、`--striped-lvm2-3pv`、`--striped-lvm2-multi-segment`。
-  - `--full` 没有扩大到 striped / mixed，仍是 linear 系统回归集合。
-- 新增 `myshell/dm_linear/run_lvm2_linear_reboot_test.sh`：单 PV、单 segment linear LV，两 guest 验证 create、ext2 I/O、reboot recovery、table/status/deps。
-- 新增 `myshell/dm_striped/run_lvm2_striped_reboot_test.sh`：2PV / 2-way、单 segment striped LV，两 guest 验证 create、ext2 I/O、reboot recovery、table/status/deps。
-- `myshell/dm_linear/run_lvm2_resize_test.sh` 和 `myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh` 已收窄 summary 过滤，避免把 guest 脚本源码误摘进 host summary；但这两个脚本当前仍会从零创建基础 LV，和最新目标不一致，后续需要改为“基于基础 reboot 产物恢复后继续扩容/缩容”。
-- `myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh` 已收窄 summary 过滤；它是 striped 几何补充，仍可作为独立 3PV / 3-way 初始创建测试。
-- `myshell/dm_striped/run_lvm2_striped_multi_segment_reboot_test.sh` 已删除导致 serial shell 卡在 heredoc 续行提示的二次包装逻辑，并降低默认数据规模；但修复后尚未拿到完整通过结果，不能算最终验收通过。
-
-## 最近验证结果
-
-- 已通过：`myshell/run_dm_system_tests.sh --linear-lvm2`。
-- 已通过：`myshell/run_dm_system_tests.sh --striped-lvm2`。
-- 曾通过但需重构语义后重跑：`--linear-lvm2-resize`、`--striped-lvm2-resize`。原因是它们当前会重复创建基础 LV，不符合“复用基础产物再扩容/缩容”的分层目标。
-- 部分通过：`--striped-lvm2-extended` 中的 3PV / 3-way 子项已通过；multi-segment 子项修复后还没有完整通过记录。
-- 待复跑：`--mixed-lvm2`，用于确认当前脚本整理后 mixed 基础组合仍然稳定。
-- 待补齐：每个系统脚本的 wall-clock 执行时间基准；此前只记录了部分 guest ready 时间，不能替代完整脚本耗时。
-
-## 功能边界
-
-“跨 target”指同一个 DM table 内逻辑地址跨过相邻 target，例如：
+已新增并使用主机 Linux/OpenEuler 基准脚本与 Asterinas guest 同构脚本：
 
 ```text
-0..100    linear  -> vda
-100..500  striped -> vdb/vdc
+myshell/run_dmsetup_linux_cli_baseline.sh
+myshell/run_dmsetup_cli_semantics_test.sh
+myshell/run_dm_system_tests.sh --dmsetup-cli
 ```
 
-一个 `start=96, len=8` 的 BIO 会被拆成 linear 段和 striped 段后分别下发。
+已覆盖并对齐的用户可见语义包括：
 
-“跨 LV”不是当前应支持场景；不同 LV 是不同 block device，不应出现单个 BIO 同时覆盖两个 LV 逻辑地址空间。
+- `dmsetup version`、`targets`、`target-version`。
+- tableless `create`、`--notable`、`ls`、`info`、`remove`。
+- linear / striped / error `create`、`table`、`status`、`deps`、`info`、`remove`。
+- error target 覆盖区间内 Read / Write 返回 I/O error，flush 对无 backing table 成功完成。
+- active / inactive table 的 `load`、`reload`、`clear`、`resume`。
+- `suspend`、`resume`、`wait --noflush`。
+- `rename OLD NEW`、`rename NAME NAME`、重复名 rename、`rename --setuuid`、`info -u UUID`。
+- `remove`、限定场景下的 `remove_all`。
 
-当前系统验收不再把重点写成“跨 PV”，而是写成“跨 segment/table”。PV 数量只是 LVM2 生成不同 table 形态的手段，DM review 重点是 table 形态、target 边界、BIO split/remap、status/deps、flush 和 reboot recovery。
+本轮修复过的控制面 GAP：
 
-udev、systemd、LVM 自动扫描/自动激活这类完整生态集成，后续最后考虑；当前只把最小 `/dev/dm-*` 和 `/dev/mapper/*` runtime node 作为真实用户态链路所需支撑。
+- striped `dmsetup status` 输出改为标准 Linux 风格的运行状态参数。
+- `dmsetup wait` 不再被 load/suspend/resume 等普通状态操作错误唤醒。
+- `dmsetup rename NAME NAME` 改为返回 `EBUSY`，状态不变化。
+- ioctl wait 路径改用 signal-aware pause，使 `timeout 3 dmsetup wait ...` 可被信号中断。
+
+2026-08-31 重建 NixOS 后，`--dmsetup-cli` 已通过。新增 `error` target 后，180 秒默认生命周期两次因 guest ready 分别 118s / 169s 导致外层超时，但日志无语义 GAP；使用 300 秒兜底完成验证：
+
+```text
+CHECK_PASS_DMSETUP_ERROR_CREATE_IO
+SUMMARY_GAP_DMSETUP_CLI_SEMANTICS: 0
+TEST_PASS_DMSETUP_CLI_SEMANTICS
+HOST_PASS_DMSETUP_CLI_SEMANTICS
+HOST_PASS_DM_SYSTEM_TESTS --dmsetup-cli
+```
+
+宿主机存在非测试 DM 设备时，空环境 `dmsetup remove_all` 仍不在宿主执行全局破坏性验证；对应结论以 guest 和安全边界说明为准。
+
+### LVM2 控制面语义
+
+已新增并使用主机 Linux/OpenEuler LVM2 baseline 与 Asterinas guest 同构 suite：
+
+```text
+myshell/run_lvm2_linux_cli_baseline.sh
+myshell/run_lvm2_cli_semantics_test.sh
+myshell/run_dm_system_tests.sh --lvm2-cli
+```
+
+当前覆盖的命令子集：
+
+- 查询：`pvs`、`vgs`、`lvs`、`lvs --segments`。
+- PV/VG 生命周期：`pvcreate`、`vgcreate`、`vgextend`、`pvscan`、`vgscan --mknodes`、`vgchange -ay/-an`。
+- LV：`lvcreate --type linear`、`lvcreate --type striped`、`lvextend`、`lvreduce`。
+- 删除闭环：`lvremove`、`vgremove`、`pvremove`。
+- 辅助判定：`dmsetup table/status/deps`。
+
+重要边界：表格里的 LVM2 命令是正常命令模板；实测时 host/guest 都追加测试隔离参数，包括只允许测试盘的 `--config`，以及 LVM2 支持时的 `--devices <测试盘列表>`。这用于保护宿主已有 PV/VG/LV，并关闭 udev 同步依赖；不是日常裸 LVM2 命令体验对齐。
+
+2026-08-31 已验证：
+
+```text
+PREFLIGHT_PASS_LVM2_LINUX_CLI_BASELINE
+SUMMARY_GAP_LVM2_LINUX_BASELINE: 0
+BASELINE_PASS_LVM2_LINUX_CLI_BASELINE
+SUMMARY_GAP_LVM2_CLI_SEMANTICS: 0
+TEST_PASS_LVM2_CLI_SEMANTICS
+HOST_PASS_DM_SYSTEM_TESTS --lvm2-cli
+```
+
+### raw DM 数据面边界实测
+
+已有基础数据面脚本：
+
+```text
+myshell/run_dm_system_tests.sh --linear-data
+myshell/run_dm_system_tests.sh --striped-data
+```
+
+新增边界审计入口：
+
+```text
+myshell/run_dm_system_tests.sh --dataplane-edge
+```
+
+该入口覆盖：
+
+- 三段 `linear` table。
+- 非零 backing start remap。
+- mapper readback 与三个 backing 落点校验。
+- `striped 2 4` 从 chunk 内部偏移开始写。
+- 跨多个 stripe 边界后的 mapper readback 与两个 backing 分布校验。
+
+2026-08-31 已通过：
+
+```text
+CHECK_PASS_LINEAR_EDGE_MAPPER_READBACK
+CHECK_PASS_LINEAR_EDGE_BACKING_D1
+CHECK_PASS_LINEAR_EDGE_BACKING_D2
+CHECK_PASS_LINEAR_EDGE_BACKING_D3
+CHECK_PASS_STRIPED_EDGE_MAPPER_READBACK
+CHECK_PASS_STRIPED_EDGE_BACKING_D1
+CHECK_PASS_STRIPED_EDGE_BACKING_D2
+TEST_PASS_DM_DATAPLANE_EDGE
+HOST_PASS_DM_SYSTEM_TESTS --dataplane-edge
+```
+
+### Flush 数据面收口
+
+2026-08-31 已 review 现有 flush 覆盖，未新增重复测试。当前 `aster-device-mapper` crate 已覆盖：
+
+- linear table flush 对 backing device 去重后每个 backing 只 flush 一次。
+- striped table flush fan-out 到每个 stripe backing。
+- linear + striped mixed table 中 shared backing flush 去重。
+- flush completion failure 返回 `IoError`。
+- backing enqueue flush 失败返回 `IoError`。
+- readonly mapper 允许 Read / Flush，拒绝 Write。
+- suspend 会等待已提交 flush 完成，并拒绝 suspend 期间的新 flush。
+
+已通过定向收窄后的 device-mapper crate ktest：
+
+```text
+docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2"'
+
+test result: ok. 52 passed; 0 failed; 0 filtered out.
+```
+
+首次尝试用 `flush` 和 `aster_device_mapper::table::tests::` 作为过滤条件时均未匹配到测试，结果是 `0 passed; 52 filtered out`；有效验证以上述全 crate ktest 为准。
+
+## 当前文档状态
+
+- `docs/study.md` 已重写 `dmsetup` 控制面命令对齐矩阵，并新增 LVM2 控制面命令对齐矩阵。
+- `docs/test.md` 已记录 LVM2 host baseline、guest `--lvm2-cli` 和 raw 数据面 `--dataplane-edge` 入口。
+- LVM2 表格当前按命令模板和前置条件判断结论；整体限定范围放在表格前说明中，不把所有行都写成“限定场景已对齐”。
+
+## 当前功能边界
+
+当前重点仍限于已实现的 `error`、`linear` 和 `striped` target：
+
+- `error`：无 backing 参数，Read / Write 稳定返回 I/O error，flush 对无 backing table 成功完成，deps 为空。
+- `linear`：offset 平移、多 segment、跨 segment split、非零 backing start。
+- `striped`：chunk 轮转分布、跨 chunk split、非 chunk 起点写入、backing 分布校验。
+- mixed：由 LVM2 生成同一 LV 内 linear + striped segments，用现有慢 suite 验证文件 I/O 和 reboot recovery。
+
+尚未完成的数据面语义：
+
+- discard / write zeroes。
+- backing I/O error 的真实 guest 注入。
+- partial completion 的真实 guest 注入。
+- queue limit / alignment / topology。
+- 并发 I/O 和压力场景。
+
+当前明确不纳入：snapshot、thin、cache、crypt、mirror、raid、zero 等 target 族，以及完整 udev/systemd 自动激活生态语义。
 
 ## 后续可做优先级
 
-1. 先重构 resize / 扩容脚本：`--linear-lvm2-resize` 基于 `--linear-lvm2` 产物恢复后扩容/缩容；`--striped-lvm2-resize` 基于 `--striped-lvm2` 产物恢复后扩容/缩容。单独运行 resize 且缺少基础产物时应快速失败并提示先跑基础入口，不应静默重建基础 LV。
-2. 再串行复跑并记录耗时：基础 linear、linear resize、基础 striped、striped resize、striped 3PV、striped multi-segment、mixed。
-3. 复跑通过后，把实测耗时写入 `docs/test.md` 和 `docs/device-mapper-technical-maintenance.md`；耗时需标注环境与日期，只作为本地容器基准。
-4. 如果需要让 `patches/` 适配合入当前 `main` 后的新基线，另起小阶段处理；旧 patch 已知至少 `003-Cargo.lock.patch` 不能直接套到更新后的 `main`。
-5. udev / systemd / LVM 自动联动放最后。
+1. 先串行跑现有数据面和慢系统回归：`--linear-data`、`--striped-data`、`--linear-lvm2`、`--striped-lvm2`、`--linear-lvm2-cross-segment`、`--striped-lvm2-cross-segment`、`--mixed-lvm2`。
+2. 若继续拓展 DM target 功能，优先选择同样边界清晰的 `zero` target；snapshot/thin/cache 等需要另起大阶段设计。
+3. 若继续做数据面语义增强，可审计 queue limit / alignment / topology 的当前实现和测试覆盖；这属于“当前实现自洽性”审计，不声明完整 Linux DM queue stacking 对齐。
+4. backing I/O error / partial completion 已有 core 模拟测试；新增 `error` target 可支持 guest 侧稳定 I/O error 场景，但不等于真实 backing fault injection。
+5. discard / write zeroes 当前是明确非目标；要做需先扩展通用 block `BioType`、backing driver 和 DM table fan-out/remap，不作为当前小阶段。
+6. 若要对齐日常裸 LVM2 命令体验，另起阶段专门测试默认 devices file、默认 udev/systemd 联动，不混入当前控制面矩阵。
+7. 若后续修改内核数据面，单个 GAP 修完后先跑相关 ktest；全部相关 GAP 修完后再统一跑系统 suite。
 
 ## 相关阶段日志
 
-- `log/2026-8-24.md`：当天第 1 到第 4 阶段，包括 mixed active/inactive ktest、striped 几何边界 ktest、mixed LVM2 系统验收、合入当前 main 并适配 `kernel/core` 目录迁移。
-- `log/device-mapper-progress.md`：滚动记录当前 `dm` 分支 Device Mapper 项目状态、脚本整理进度和下一步优先级。
+- `log/2026-8-24.md`：mixed active/inactive ktest、striped 几何边界 ktest、mixed LVM2 系统验收、合入当前 main 并适配 `kernel/core` 目录迁移。
+- `log/2026-8-31.md`：dmsetup 控制面语义对齐、LVM2 控制面 baseline/guest 同构、raw DM 数据面边界 guest 审计。

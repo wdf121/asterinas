@@ -122,9 +122,7 @@ After any temporary `Cargo.toml` default-member change, restore `Cargo.toml` and
 confirm `git diff -- Cargo.toml` has no output.
 
 Run QEMU, ktest, and NixOS system tests serially to avoid image lock conflicts,
-especially around `test/initramfs/build/ext2.img`. For NixOS system tests, set
-`GUEST_READY_TIMEOUT=240` so each QEMU guest boot has a four-minute shell-ready
-timeout. If a ktest/QEMU/NixOS run makes no relevant progress for about three
+especially around `test/initramfs/build/ext2.img`. For NixOS system tests, set `GUEST_READY_TIMEOUT=180` so each single QEMU guest run has a three-minute full-lifecycle timeout. If a ktest/QEMU/NixOS run makes no relevant progress for about three
 minutes, suspect command filtering, default-members, leftover processes, or
 image-lock issues; inspect output and processes, stop only processes started for
 the current run if needed, and retry with a narrower command.
@@ -138,11 +136,11 @@ Run slower system tests only when the corresponding path changes or during stage
 acceptance, for example:
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --linear-lvm2'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --striped-lvm2'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=240 myshell/run_dm_system_tests.sh --mixed-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2'
 ```
 
 Project logging rules:
@@ -194,18 +192,25 @@ that encapsulates `unsafe` Rust code within safe APIs.
 `unsafe` Rust code is confined to OSTD (`ostd/`);
 kernel code under `kernel/` must remain safe Rust.
 
-The kernel code under `kernel/` is written using `ostd` APIs
-and is organized as an acyclic graph of kernel crates
-arranged in layers, from highest to lowest:
+The kernel code under `kernel/` is written using `ostd` APIs.
+In the current repository layout, the top-level `asterinas` crate
+under `kernel/src/` is a thin assembler crate that enters
+`aster_core::boot()`. Most Linux-compatible kernel semantics live in
+`kernel/core/src/`, while concrete component crates live under
+`kernel/core/comps/`, and reusable kernel libraries live under
+`kernel/libs/`.
 
-1. The assembler crate (`kernel/src/`).
-2. High-level component crates (`kernel/comps/`).
-3. The `aster-core` crate (`kernel/core/`).
-4. Low-level component crates (`kernel/core/comps/`).
-5. Kernel libraries (`kernel/libs/`).
+A practical dependency model is:
 
-A kernel crate may depend on crates in the same layer
-or any lower layer.
+1. The assembler crate (`kernel/src/`) depends on `aster-core` and `ostd`.
+2. The `aster-core` crate (`kernel/core/`) depends on component crates and libraries.
+3. Component crates (`kernel/core/comps/`) provide concrete kernel subsystems.
+4. Kernel libraries (`kernel/libs/`) provide reusable support crates.
+5. OSTD (`ostd/`) provides the lower-half OS framework and safe APIs over unsafe internals.
+
+Higher-level crates may depend on lower-level crates. Lower-level crates
+should not depend on higher-level Linux semantics such as syscalls, VFS,
+or Device Mapper ioctl behavior.
 
 ## CI
 
