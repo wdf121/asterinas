@@ -15,7 +15,8 @@ use crate::{
 static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<dyn Device>>> = Mutex::new(BTreeMap::new());
 
 /// Registers a new char device.
-pub fn register(device: Arc<dyn Device>) -> Result<()> {
+/// 将某个对象(拥有DeviceId) 登记到全局字符设备表中
+pub(crate) fn register(device: Arc<dyn Device>) -> Result<()> {
     let mut registry = DEVICE_REGISTRY.lock();
     let id = device.id().to_raw();
     if registry.contains_key(&id) {
@@ -121,4 +122,16 @@ impl Drop for MajorIdOwner {
     fn drop(&mut self) {
         MAJORS.lock().remove(&self.0.get());
     }
+}
+
+//第一个进程 把之前注册好的设备对象 映射成/dev/xxx路径 根据devtmpfs_meta
+pub(super) fn init_in_first_process(path_resolver: &PathResolver) -> Result<()> {
+    for device in collect_all() {
+        if let Some(devtmpfs_meta) = device.devtmpfs_meta() {
+            let dev_id = device.id().as_encoded_u64();
+            add_node(DeviceType::Char, dev_id, &devtmpfs_meta, path_resolver)?;
+        }
+    }
+
+    Ok(())
 }
