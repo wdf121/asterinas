@@ -13,7 +13,7 @@ Runs a two-guest NixOS regression for N-PV LVM2 striped create, same-PV-set grow
 Optional environment variables:
   DM_TEST_IMAGES                    Backing test image list. When unset, generated from STRIPED_PV_COUNT.
   DM_STRIPED_LVM2_REBOOT_LOG        Host-side log path, default /tmp/dm-striped-lvm2-reboot-test.log
-  GUEST_READY_TIMEOUT               Seconds to wait for guest root shell, default 240
+  GUEST_READY_TIMEOUT               Seconds to allow one full QEMU guest lifecycle, default 180
   RESET_DM_TEST_IMAGES              1 to delete test images before running, default 1
   STRIPED_PV_COUNT                  Number of striped PVs, default 2
   STRIPED_INITIAL_LV_MIB            Initial LV size in MiB, default STRIPED_PV_COUNT * 256
@@ -41,7 +41,7 @@ STRIPED_BASE_FILE_MIB=${STRIPED_BASE_FILE_MIB:-$((STRIPED_PV_COUNT * 64))}
 STRIPED_GROW_FILE_MIB=${STRIPED_GROW_FILE_MIB:-$((STRIPED_PV_COUNT * 240))}
 STRIPED_AFTER_SHRINK_FILE_MIB=${STRIPED_AFTER_SHRINK_FILE_MIB:-$((STRIPED_PV_COUNT * 64))}
 STRIPED_CHUNK_KIB=${STRIPED_CHUNK_KIB:-4}
-GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-240}
+GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-180}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
 test "${STRIPED_PV_COUNT}" -ge 2

@@ -10,6 +10,9 @@ Usage: myshell/run_dm_system_tests.sh <suite>
 
 Canonical suites:
   --quick                         Run control ABI smoke plus raw linear and striped data regressions.
+  --dmsetup-cli                   Run dmsetup CLI control-plane semantics audit with backing disks.
+  --lvm2-cli                      Run LVM2 CLI control-plane semantics audit with test disks.
+  --dataplane-edge                Run raw DM data-plane edge remap and stripe-boundary audit.
   --linear-data                   Run raw linear cross-target BIO split/remap regression.
   --striped-data                  Run raw striped BIO split/remap and backing distribution regression.
   --linear-lvm2                   Run single-PV LVM2 linear create, same-PV grow/shrink, file I/O, and reboot recovery.
@@ -24,7 +27,7 @@ fi
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 [--quick|--linear-data|--striped-data|--linear-lvm2|--striped-lvm2|--linear-lvm2-cross-segment|--striped-lvm2-cross-segment|--mixed-lvm2]" >&2
+    echo "Usage: $0 [--quick|--dmsetup-cli|--lvm2-cli|--dataplane-edge|--linear-data|--striped-data|--linear-lvm2|--striped-lvm2|--linear-lvm2-cross-segment|--striped-lvm2-cross-segment|--mixed-lvm2]" >&2
     exit 2
 fi
 
@@ -36,6 +39,15 @@ run_suite() {
             "${SCRIPT_DIR}/dm_linear/run_control_abi_test.sh"
             "${SCRIPT_DIR}/dm_linear/run_cross_target_bio_regression.sh"
             "${SCRIPT_DIR}/dm_striped/run_raw_striped_bio_test.sh"
+            ;;
+        --dmsetup-cli)
+            "${SCRIPT_DIR}/run_dmsetup_cli_semantics_test.sh"
+            ;;
+        --lvm2-cli)
+            "${SCRIPT_DIR}/run_lvm2_cli_semantics_test.sh"
+            ;;
+        --dataplane-edge)
+            "${SCRIPT_DIR}/run_dm_dataplane_edge_test.sh"
             ;;
         --linear-data)
             "${SCRIPT_DIR}/dm_linear/run_cross_target_bio_regression.sh"
@@ -59,7 +71,7 @@ run_suite() {
             "${SCRIPT_DIR}/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh"
             ;;
         *)
-            echo "Usage: $0 [--quick|--linear-data|--striped-data|--linear-lvm2|--striped-lvm2|--linear-lvm2-cross-segment|--striped-lvm2-cross-segment|--mixed-lvm2]" >&2
+            echo "Usage: $0 [--quick|--dmsetup-cli|--lvm2-cli|--dataplane-edge|--linear-data|--striped-data|--linear-lvm2|--striped-lvm2|--linear-lvm2-cross-segment|--striped-lvm2-cross-segment|--mixed-lvm2]" >&2
             exit 2
             ;;
     esac

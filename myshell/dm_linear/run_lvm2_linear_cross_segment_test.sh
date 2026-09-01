@@ -14,7 +14,7 @@ Optional environment variables:
   DM_TEST_IMAGE                         First backing test image path, default target/nixos/test.img
   DM_TEST_IMAGE_2                       Second backing test image path, default target/nixos/test2.img
   DM_LINEAR_LVM2_CROSS_SEGMENT_LOG      Host-side log path, default /tmp/dm-linear-lvm2-cross-segment-test.log
-  GUEST_READY_TIMEOUT                   Seconds to wait for guest root shell, default 240
+  GUEST_READY_TIMEOUT                   Seconds to allow one full QEMU guest lifecycle, default 180
   RESET_DM_TEST_IMAGES                  1 to delete test images before running, default 1
   LINEAR_CS_INITIAL_LV_MIB              Initial single-PV LV size in MiB, default 256
   LINEAR_CS_EXTENDED_LV_MIB             Cross-segment extended LV size in MiB, default 512
@@ -34,7 +34,7 @@ LOG=${DM_LINEAR_LVM2_CROSS_SEGMENT_LOG:-/tmp/dm-linear-lvm2-cross-segment-test.l
 DM_TEST_IMAGE=${DM_TEST_IMAGE:-target/nixos/test.img}
 DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
 DM_TEST_IMAGES=${DM_TEST_IMAGES:-${DM_TEST_IMAGE} ${DM_TEST_IMAGE_2}}
-GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-240}
+GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-180}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 LINEAR_CS_INITIAL_LV_MIB=${LINEAR_CS_INITIAL_LV_MIB:-256}
 LINEAR_CS_EXTENDED_LV_MIB=${LINEAR_CS_EXTENDED_LV_MIB:-512}

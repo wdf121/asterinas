@@ -1,0 +1,386 @@
+#!/bin/bash
+
+# SPDX-License-Identifier: MPL-2.0
+
+set -uo pipefail
+export LC_ALL=C
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<'EOF'
+Usage: myshell/run_dmsetup_linux_cli_baseline.sh
+
+Runs a host Linux/OpenEuler dmsetup CLI semantic baseline for the Device Mapper
+commands currently implemented by Asterinas. The script uses temporary loop
+backing files and mapper names with a unique test prefix.
+
+Environment variables:
+  DMSETUP_BASELINE_PREFIX     Mapper name prefix, default aster_cli_sem_<pid>
+  DMSETUP_BASELINE_SIZE       Backing file size, default 64M
+EOF
+    exit 0
+fi
+
+PREFIX=${DMSETUP_BASELINE_PREFIX:-aster_cli_sem_$$}
+BACKING_SIZE=${DMSETUP_BASELINE_SIZE:-64M}
+TMPDIR_PATH=
+LOOP1=
+LOOP2=
+DEV1=
+DEV2=
+DIRTY_DM=0
+
+fail() {
+    echo "BASELINE_FAIL $*" >&2
+    exit 1
+}
+
+require_tool() {
+    command -v "$1" >/dev/null 2>&1 || fail "missing_tool=$1"
+}
+
+name() {
+    printf '%s_%s' "${PREFIX}" "$1"
+}
+
+normalize_line() {
+    local line=$1
+    line=${line//${PREFIX}/NAME}
+    if [ -n "${TMPDIR_PATH:-}" ]; then
+        line=${line//${TMPDIR_PATH}/<TMPDIR>}
+    fi
+    if [ -n "${LOOP1:-}" ]; then
+        line=${line//${LOOP1}/<LOOP1>}
+    fi
+    if [ -n "${LOOP2:-}" ]; then
+        line=${line//${LOOP2}/<LOOP2>}
+    fi
+    if [ -n "${DEV1:-}" ]; then
+        line=${line//${DEV1}/<DEV1>}
+    fi
+    if [ -n "${DEV2:-}" ]; then
+        line=${line//${DEV2}/<DEV2>}
+    fi
+    printf '%s\n' "${line}" | sed -E 's#/dev/dm-[0-9]+#/dev/dm-<N>#g; s/[0-9]+\.[0-9]+\.[0-9]+/<VERSION>/g'
+}
+
+print_stream() {
+    local prefix=$1
+    local label=$2
+    local file=$3
+    local line
+    if [ ! -s "${file}" ]; then
+        echo "${prefix}_${label}: <empty>"
+        return
+    fi
+    while IFS= read -r line || [ -n "${line}" ]; do
+        printf '%s_%s: %s\n' "${prefix}" "${label}" "$(normalize_line "${line}")"
+    done <"${file}"
+}
+
+run_capture() {
+    local label=$1
+    shift
+    local out err status
+    out=$(mktemp "${TMPDIR_PATH}/stdout.${label}.XXXXXX")
+    err=$(mktemp "${TMPDIR_PATH}/stderr.${label}.XXXXXX")
+    echo "SCENARIO_BEGIN_${label}"
+    echo "CMD_${label}: $(normalize_line "$*")"
+    "$@" >"${out}" 2>"${err}"
+    status=$?
+    echo "STATUS_${label}: ${status}"
+    print_stream STDOUT "${label}" "${out}"
+    print_stream STDERR "${label}" "${err}"
+    echo "SCENARIO_END_${label}"
+    return "${status}"
+}
+
+run_shell_capture() {
+    local label=$1
+    local script=$2
+    local out err status
+    out=$(mktemp "${TMPDIR_PATH}/stdout.${label}.XXXXXX")
+    err=$(mktemp "${TMPDIR_PATH}/stderr.${label}.XXXXXX")
+    echo "SCENARIO_BEGIN_${label}"
+    echo "CMD_${label}: $(normalize_line "${script}")"
+    bash -lc "${script}" >"${out}" 2>"${err}"
+    status=$?
+    echo "STATUS_${label}: ${status}"
+    print_stream STDOUT "${label}" "${out}"
+    print_stream STDERR "${label}" "${err}"
+    echo "SCENARIO_END_${label}"
+    return "${status}"
+}
+
+skip_scenario() {
+    local label=$1
+    shift
+    echo "SCENARIO_BEGIN_${label}"
+    echo "STATUS_${label}: SKIPPED"
+    echo "SKIP_${label}: $*"
+    echo "SCENARIO_END_${label}"
+}
+
+existing_dm_names() {
+    dmsetup ls 2>/dev/null | awk 'NF >= 1 && $1 != "No" { print $1 }'
+}
+
+refresh_dirty_dm_state() {
+    local non_test
+    non_test=$(existing_dm_names | awk -v prefix="${PREFIX}_" 'index($0, prefix) != 1 { print }')
+    if [ -n "${non_test}" ]; then
+        DIRTY_DM=1
+        echo "BASELINE_WARN existing_non_test_dm_devices_begin"
+        printf '%s\n' "${non_test}" | sed 's/^/BASELINE_WARN existing_non_test_dm_device=/'
+        echo "BASELINE_WARN existing_non_test_dm_devices_end"
+    else
+        DIRTY_DM=0
+    fi
+}
+
+cleanup_dm() {
+    local dev
+    existing_dm_names | awk -v prefix="${PREFIX}_" 'index($0, prefix) == 1 { print }' | while IFS= read -r dev; do
+        dmsetup remove "${dev}" >/dev/null 2>&1 || true
+    done
+}
+
+cleanup() {
+    cleanup_dm
+    if [ -n "${LOOP1:-}" ]; then
+        losetup -d "${LOOP1}" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${LOOP2:-}" ]; then
+        losetup -d "${LOOP2}" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${TMPDIR_PATH:-}" ]; then
+        rm -rf "${TMPDIR_PATH}"
+    fi
+}
+
+trap cleanup EXIT
+
+devno() {
+    printf '%d:%d' "0x$(stat -c '%t' "$1")" "0x$(stat -c '%T' "$1")"
+}
+
+event_number() {
+    dmsetup info "$1" 2>/dev/null | awk -F: '/Event number/ { gsub(/[[:space:]]/, "", $2); print $2; exit }'
+}
+
+record_nodes() {
+    local label=$1
+    local dev=$2
+    local minor mapper_state primary_state target
+    mapper_state=absent
+    primary_state=unknown
+    target=
+    if [ -e "/dev/mapper/${dev}" ]; then
+        mapper_state=present
+        target=$(readlink -f "/dev/mapper/${dev}" 2>/dev/null || true)
+    fi
+    minor=$(dmsetup info "${dev}" 2>/dev/null | awk -F: '/Major, minor/ { gsub(/[[:space:]]/, "", $2); split($2, a, ","); print a[2]; exit }')
+    if [ -n "${minor}" ]; then
+        if [ -e "/dev/dm-${minor}" ]; then
+            primary_state=present
+        else
+            primary_state=absent
+        fi
+    fi
+    echo "NODE_${label}: mapper=${mapper_state} primary=${primary_state} target=$(normalize_line "${target}")"
+}
+
+run_wait_old_event() {
+    local label=$1
+    local dev=$2
+    local event out err trigger_out trigger_err status wait_pid
+    event=$(event_number "${dev}")
+    out=$(mktemp "${TMPDIR_PATH}/stdout.${label}.XXXXXX")
+    err=$(mktemp "${TMPDIR_PATH}/stderr.${label}.XXXXXX")
+    trigger_out=$(mktemp "${TMPDIR_PATH}/stdout.${label}.trigger.XXXXXX")
+    trigger_err=$(mktemp "${TMPDIR_PATH}/stderr.${label}.trigger.XXXXXX")
+    echo "SCENARIO_BEGIN_${label}"
+    echo "EVENT_BEFORE_${label}: ${event}"
+    echo "CMD_${label}: timeout 3 dmsetup wait --noflush NAME ${event}; trigger=dmsetup suspend --noflush NAME"
+    timeout 3 dmsetup wait --noflush "${dev}" "${event}" >"${out}" 2>"${err}" &
+    wait_pid=$!
+    sleep 1
+    dmsetup suspend --noflush "${dev}" >"${trigger_out}" 2>"${trigger_err}"
+    echo "TRIGGER_STATUS_${label}: $?"
+    wait "${wait_pid}"
+    status=$?
+    echo "STATUS_${label}: ${status}"
+    print_stream STDOUT "${label}" "${out}"
+    print_stream STDERR "${label}" "${err}"
+    print_stream TRIGGER_STDOUT "${label}" "${trigger_out}"
+    print_stream TRIGGER_STDERR "${label}" "${trigger_err}"
+    dmsetup resume --noflush "${dev}" >/dev/null 2>&1 || true
+    echo "SCENARIO_END_${label}"
+    return "${status}"
+}
+
+[ "$(id -u)" -eq 0 ] || fail "must_run_as_root"
+require_tool dmsetup
+require_tool losetup
+require_tool stat
+require_tool timeout
+require_tool truncate
+require_tool awk
+require_tool sed
+require_tool grep
+
+TMPDIR_PATH=$(mktemp -d /tmp/dmsetup-linux-baseline.XXXXXX)
+truncate -s "${BACKING_SIZE}" "${TMPDIR_PATH}/backing1.img" || fail "create_backing1"
+truncate -s "${BACKING_SIZE}" "${TMPDIR_PATH}/backing2.img" || fail "create_backing2"
+LOOP1=$(losetup --find --show "${TMPDIR_PATH}/backing1.img") || fail "setup_loop1"
+LOOP2=$(losetup --find --show "${TMPDIR_PATH}/backing2.img") || fail "setup_loop2"
+DEV1=$(devno "${LOOP1}")
+DEV2=$(devno "${LOOP2}")
+
+refresh_dirty_dm_state
+
+echo "BASELINE_INFO prefix=${PREFIX}"
+echo "BASELINE_INFO tmpdir=<TMPDIR>"
+echo "BASELINE_INFO loop1=<LOOP1> dev1=<DEV1>"
+echo "BASELINE_INFO loop2=<LOOP2> dev2=<DEV2>"
+echo "BASELINE_INFO dirty_dm=${DIRTY_DM}"
+
+run_capture STATIC_VERSION dmsetup version || true
+run_capture STATIC_TARGETS dmsetup targets || true
+run_capture TARGET_VERSION_ERROR dmsetup target-version error || true
+run_capture TARGET_VERSION_LINEAR dmsetup target-version linear || true
+run_capture TARGET_VERSION_STRIPED dmsetup target-version striped || true
+run_capture TARGET_VERSION_UNKNOWN dmsetup target-version aster_unknown || true
+
+if [ "${DIRTY_DM}" -eq 0 ]; then
+    run_capture EMPTY_LS dmsetup ls || true
+else
+    skip_scenario EMPTY_LS existing_non_test_dm_devices
+fi
+
+stdin_name=$(name stdin)
+notable_name=$(name notable)
+run_shell_capture CREATE_STDIN_EOF "timeout 5 dmsetup create ${stdin_name} < /dev/null" || true
+record_nodes CREATE_STDIN_EOF "${stdin_name}"
+run_capture TABLELESS_INFO_STDIN dmsetup info "${stdin_name}" || true
+run_capture CREATE_NOTABLE dmsetup create "${notable_name}" --notable || true
+record_nodes CREATE_NOTABLE "${notable_name}"
+run_capture TABLELESS_INFO_NOTABLE dmsetup info "${notable_name}" || true
+run_capture TABLELESS_LS dmsetup ls || true
+run_capture TABLELESS_REMOVE_STDIN dmsetup remove "${stdin_name}" || true
+run_capture TABLELESS_REMOVE_NOTABLE dmsetup remove "${notable_name}" || true
+
+linear_major=$(name linear_major)
+run_shell_capture LINEAR_CREATE_MAJOR "printf '0 8 linear ${DEV1} 0\\n' | dmsetup create ${linear_major}" || true
+record_nodes LINEAR_CREATE_MAJOR "${linear_major}"
+run_capture LINEAR_INFO dmsetup info "${linear_major}" || true
+run_capture LINEAR_TABLE dmsetup table "${linear_major}" || true
+run_capture LINEAR_STATUS dmsetup status "${linear_major}" || true
+run_capture LINEAR_DEPS dmsetup deps "${linear_major}" || true
+run_capture LINEAR_LS dmsetup ls || true
+run_capture LINEAR_REMOVE dmsetup remove "${linear_major}" || true
+record_nodes LINEAR_REMOVE "${linear_major}"
+
+linear_path=$(name linear_path)
+run_capture LINEAR_CREATE_PATH dmsetup create "${linear_path}" --table "0 8 linear ${LOOP1} 0" || true
+record_nodes LINEAR_CREATE_PATH "${linear_path}"
+run_capture LINEAR_PATH_TABLE dmsetup table "${linear_path}" || true
+run_capture LINEAR_PATH_DEPS dmsetup deps "${linear_path}" || true
+run_capture LINEAR_PATH_REMOVE dmsetup remove "${linear_path}" || true
+
+striped_major=$(name striped_major)
+run_shell_capture STRIPED_CREATE_MAJOR "printf '0 16 striped 2 4 ${DEV1} 0 ${DEV2} 0\\n' | dmsetup create ${striped_major}" || true
+record_nodes STRIPED_CREATE_MAJOR "${striped_major}"
+run_capture STRIPED_INFO dmsetup info "${striped_major}" || true
+run_capture STRIPED_TABLE dmsetup table "${striped_major}" || true
+run_capture STRIPED_STATUS dmsetup status "${striped_major}" || true
+run_capture STRIPED_DEPS dmsetup deps "${striped_major}" || true
+run_capture STRIPED_REMOVE dmsetup remove "${striped_major}" || true
+
+striped_path=$(name striped_path)
+run_capture STRIPED_CREATE_PATH dmsetup create "${striped_path}" --table "0 16 striped 2 4 ${LOOP1} 0 ${LOOP2} 0" || true
+record_nodes STRIPED_CREATE_PATH "${striped_path}"
+run_capture STRIPED_PATH_TABLE dmsetup table "${striped_path}" || true
+run_capture STRIPED_PATH_DEPS dmsetup deps "${striped_path}" || true
+run_capture STRIPED_PATH_REMOVE dmsetup remove "${striped_path}" || true
+
+error_name=$(name error)
+run_capture ERROR_CREATE dmsetup create "${error_name}" --table "0 8 error" || true
+record_nodes ERROR_CREATE "${error_name}"
+run_capture ERROR_INFO dmsetup info "${error_name}" || true
+run_capture ERROR_TABLE dmsetup table "${error_name}" || true
+run_capture ERROR_STATUS dmsetup status "${error_name}" || true
+run_capture ERROR_DEPS dmsetup deps "${error_name}" || true
+run_shell_capture ERROR_READ "timeout 5 dd if=/dev/mapper/${error_name} of=/dev/null bs=512 count=1 status=none" || true
+run_shell_capture ERROR_WRITE "timeout 5 dd if=/dev/zero of=/dev/mapper/${error_name} bs=512 count=1 status=none" || true
+run_capture ERROR_REMOVE dmsetup remove "${error_name}" || true
+
+table_name=$(name table_lifecycle)
+run_capture TABLE_LIFECYCLE_CREATE dmsetup create "${table_name}" --table "0 8 linear ${DEV1} 0" || true
+run_capture LOAD_INACTIVE dmsetup load "${table_name}" --table "0 16 linear ${DEV1} 8" || true
+run_capture TABLE_ACTIVE_AFTER_LOAD dmsetup table "${table_name}" || true
+run_capture TABLE_INACTIVE_AFTER_LOAD dmsetup table --inactive "${table_name}" || true
+run_capture STATUS_INACTIVE_AFTER_LOAD dmsetup status --inactive "${table_name}" || true
+run_capture INFO_AFTER_LOAD dmsetup info "${table_name}" || true
+run_capture CLEAR_INACTIVE dmsetup clear "${table_name}" || true
+run_capture TABLE_INACTIVE_AFTER_CLEAR dmsetup table --inactive "${table_name}" || true
+run_capture RELOAD_INACTIVE dmsetup reload "${table_name}" --table "0 16 linear ${DEV1} 8" || true
+run_capture RESUME_AFTER_RELOAD dmsetup resume "${table_name}" || true
+run_capture TABLE_AFTER_RESUME dmsetup table "${table_name}" || true
+run_capture TABLE_LIFECYCLE_REMOVE dmsetup remove "${table_name}" || true
+
+state_name=$(name state_event)
+run_capture STATE_CREATE dmsetup create "${state_name}" --table "0 8 linear ${DEV1} 0" || true
+echo "EVENT_STATE_AFTER_CREATE: $(event_number "${state_name}")"
+run_capture SUSPEND dmsetup suspend "${state_name}" || true
+run_capture INFO_AFTER_SUSPEND dmsetup info "${state_name}" || true
+run_capture RESUME dmsetup resume "${state_name}" || true
+run_capture INFO_AFTER_RESUME dmsetup info "${state_name}" || true
+run_capture SUSPEND_NOFLUSH dmsetup suspend --noflush "${state_name}" || true
+run_capture RESUME_NOFLUSH dmsetup resume --noflush "${state_name}" || true
+run_capture WAIT_ZERO timeout 3 dmsetup wait --noflush "${state_name}" 0 || true
+run_wait_old_event WAIT_OLD_EVENT "${state_name}" || true
+run_capture STATE_REMOVE dmsetup remove "${state_name}" || true
+
+rename_name=$(name rename)
+existing_name=$(name rename_existing)
+rename_new=$(name renamed)
+uuid_value="asterinas-dmsetup-baseline-uuid-$$"
+run_capture RENAME_CREATE dmsetup create "${rename_name}" --table "0 8 linear ${DEV1} 0" || true
+run_capture RENAME_SAME_NAME dmsetup rename "${rename_name}" "${rename_name}" || true
+run_capture RENAME_EXISTING_CREATE dmsetup create "${existing_name}" --table "0 8 linear ${DEV2} 0" || true
+run_capture RENAME_DUPLICATE dmsetup rename "${rename_name}" "${existing_name}" || true
+run_capture RENAME_NAME dmsetup rename "${rename_name}" "${rename_new}" || true
+record_nodes RENAME_NAME "${rename_new}"
+run_capture INFO_OLD_NAME_AFTER_RENAME dmsetup info "${rename_name}" || true
+run_capture INFO_NEW_NAME_AFTER_RENAME dmsetup info "${rename_new}" || true
+run_capture SET_UUID dmsetup rename "${rename_new}" --setuuid "${uuid_value}" || true
+run_capture INFO_BY_UUID dmsetup info -u "${uuid_value}" || true
+run_capture RENAME_REMOVE_NEW dmsetup remove "${rename_new}" || true
+run_capture RENAME_REMOVE_EXISTING dmsetup remove "${existing_name}" || true
+
+remove_active=$(name remove_active)
+remove_tableless=$(name remove_tableless)
+run_capture REMOVE_ACTIVE_CREATE dmsetup create "${remove_active}" --table "0 8 linear ${DEV1} 0" || true
+run_capture REMOVE_ACTIVE dmsetup remove "${remove_active}" || true
+run_capture INFO_AFTER_REMOVE_ACTIVE dmsetup info "${remove_active}" || true
+run_capture REMOVE_TABLELESS_CREATE dmsetup create "${remove_tableless}" --notable || true
+run_capture REMOVE_TABLELESS dmsetup remove "${remove_tableless}" || true
+run_capture REMOVE_NONEXISTENT dmsetup remove "$(name nonexistent)" || true
+
+if [ "${DIRTY_DM}" -eq 0 ]; then
+    remove_all_a=$(name remove_all_a)
+    remove_all_b=$(name remove_all_b)
+    run_capture REMOVE_ALL_CREATE_A dmsetup create "${remove_all_a}" --table "0 8 linear ${DEV1} 0" || true
+    run_capture REMOVE_ALL_CREATE_B dmsetup create "${remove_all_b}" --table "0 8 linear ${DEV2} 0" || true
+    run_capture REMOVE_ALL_TEST_ONLY dmsetup remove_all || true
+    run_capture REMOVE_ALL_INFO_A dmsetup info "${remove_all_a}" || true
+    run_capture REMOVE_ALL_INFO_B dmsetup info "${remove_all_b}" || true
+    run_capture REMOVE_ALL_EMPTY dmsetup remove_all || true
+else
+    skip_scenario REMOVE_ALL_TEST_ONLY existing_non_test_dm_devices
+    skip_scenario REMOVE_ALL_EMPTY existing_non_test_dm_devices
+fi
+
+cleanup_dm
+
+echo "BASELINE_PASS DMSETUP_LINUX_CLI_BASELINE"
