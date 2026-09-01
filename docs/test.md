@@ -7,7 +7,7 @@
 - 如何编译 Asterinas。
 - 如何执行 DM 相关 ktest 和系统验收。
 - 每类命令验证了什么功能。
-- linear、striped、mixed 等 target 分别怎么测。
+- linear、striped、mixed、error、zero 等 target 分别怎么测。
 
 ## 1. 基本执行环境
 
@@ -259,9 +259,9 @@ myshell/run_dm_system_tests.sh --mixed-lvm2
 | suite | 子脚本 | 主要验证功能 |
 |---|---|---|
 | `--quick` | [run_control_abi_test.sh](../myshell/dm_linear/run_control_abi_test.sh)、[run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh)、[run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh) | control ABI smoke、raw linear cross-target BIO、raw striped BIO split/remap 与 backing 分布。 |
-| `--dmsetup-cli` | [run_dmsetup_cli_semantics_test.sh](../myshell/run_dmsetup_cli_semantics_test.sh) | 对照标准 Linux/OpenEuler 的 dmsetup CLI 控制面语义，覆盖 tableless create、linear/striped/error `/dev/...` table、table/status/deps/info、error target I/O error、rename、suspend/resume、wait、remove_all。 |
+| `--dmsetup-cli` | [run_dmsetup_cli_semantics_test.sh](../myshell/run_dmsetup_cli_semantics_test.sh) | 对照标准 Linux/OpenEuler 的 dmsetup CLI 控制面语义，覆盖 tableless create、linear/striped/error/zero `/dev/...` table、table/status/deps/info、error target I/O error、zero target 读零写丢弃、rename、suspend/resume、wait、remove_all。 |
 | `--lvm2-cli` | [run_lvm2_cli_semantics_test.sh](../myshell/run_lvm2_cli_semantics_test.sh) | 对照标准 Linux/OpenEuler 的 LVM2 CLI 控制面语义，覆盖 PV/VG/LV 查询、linear/striped/mixed LV、扩缩容、scan/activation 和测试对象 remove 闭环。 |
-| `--dataplane-edge` | [run_dm_dataplane_edge_test.sh](../myshell/run_dm_dataplane_edge_test.sh) | raw DM 数据面边界审计，覆盖三段 linear 非零 backing start remap、striped 非 chunk 起点写入、跨 stripe 边界 backing 分布和 mapper readback。 |
+| `--dataplane-edge` | [run_dm_dataplane_edge_test.sh](../myshell/run_dm_dataplane_edge_test.sh) | raw DM 数据面边界审计，覆盖三段 linear 非零 backing start remap、striped 非 chunk 起点写入、跨 stripe 边界 backing 分布、mapper readback，以及 zero target 读零写丢弃。 |
 | `--linear-data` | [run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh) | raw linear cross-target BIO split/remap。 |
 | `--striped-data` | [run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh) | raw striped BIO split/remap 和 backing 分布。 |
 | `--linear-lvm2` | [run_lvm2_linear_reboot_test.sh](../myshell/dm_linear/run_lvm2_linear_reboot_test.sh) | 单 PV、单 linear segment、同盘 grow/shrink、ext2 I/O、reboot recovery。 |
@@ -334,6 +334,7 @@ dmsetup targets | tee /tmp/dm-targets.txt
 grep -q '^error' /tmp/dm-targets.txt
 grep -q '^linear' /tmp/dm-targets.txt
 grep -q '^striped' /tmp/dm-targets.txt
+grep -q '^zero' /tmp/dm-targets.txt
 ```
 
 验证功能：
@@ -341,6 +342,7 @@ grep -q '^striped' /tmp/dm-targets.txt
 - target registry 正确暴露 `linear`。
 - striped 测试中确认暴露 `striped`。
 - error target 测试中确认暴露 `error`。
+- zero target 测试中确认暴露 `zero`。
 - mixed 测试中同时确认 `linear` 和 `striped` 都可见。
 
 ### 5.3 `dmsetup create` 创建 linear mapper
@@ -419,7 +421,32 @@ fi
 - error target 覆盖范围内的 Read / Write 以 I/O error 完成。
 - flush 对无 backing target 可直接成功完成。
 
-### 5.6 readonly mapper
+### 5.6 `dmsetup create` 创建 zero mapper
+
+```bash
+printf '0 8 zero\n' | dmsetup create dm_zero_raw
+```
+
+读零和写丢弃测试：
+
+```bash
+dd if=/dev/mapper/dm_zero_raw of=/tmp/zero-read.bin bs=512 count=1 status=none
+cmp -n 512 /tmp/zero-read.bin /dev/zero
+dd if=/dev/urandom of=/dev/mapper/dm_zero_raw bs=512 count=1 conv=fsync status=none
+dd if=/dev/mapper/dm_zero_raw of=/tmp/zero-read-after-write.bin bs=512 count=1 status=none
+cmp -n 512 /tmp/zero-read-after-write.bin /dev/zero
+```
+
+验证功能：
+
+- zero target 无 backing 参数。
+- `dmsetup table/status` 输出 `zero` target。
+- `dmsetup deps` 返回 `0 dependencies`。
+- zero target 读返回全 0。
+- zero target 写入丢弃并成功完成，后续读取仍为全 0。
+- flush 对无 backing target 可直接成功完成。
+
+### 5.7 readonly mapper
 
 ```bash
 printf '0 8 linear %s 0\n' "$DEV" | dmsetup --readonly create dm_control_readonly
@@ -446,7 +473,7 @@ fi
 - 只读 mapper 允许读。
 - 只读 mapper 拒绝写。
 
-### 5.7 `dmsetup table`
+### 5.8 `dmsetup table`
 
 ```bash
 dmsetup table <mapper> | tee /tmp/table.txt
@@ -459,6 +486,7 @@ dmsetup table <mapper> | tee /tmp/table.txt
 - logical start。
 - target length。
 - backing major:minor。
+- error / zero 的空参数输出。
 - striped 参数。
 - LVM2 resize / reboot recovery 后 table 是否保持预期。
 
@@ -474,7 +502,7 @@ mixed table 示例：
 - `0 524288 linear 253:64 2048`：第一段 linear，映射到 PV1。
 - `524288 524288 striped 2 8 ...`：第二段 striped，2-way，chunk size 为 8 sectors，即 4 KiB。
 
-### 5.8 `dmsetup status`
+### 5.9 `dmsetup status`
 
 ```bash
 dmsetup status <mapper> | tee /tmp/status.txt
@@ -484,9 +512,10 @@ dmsetup status <mapper> | tee /tmp/status.txt
 
 - mapper 状态可查询。
 - status 中 target type 与 table 一致。
+- error / zero 的 status 参数为空。
 - mixed table 中同时能看到 linear 和 striped segment。
 
-### 5.9 `dmsetup deps`
+### 5.10 `dmsetup deps`
 
 ```bash
 dmsetup deps <mapper> | tee /tmp/deps.txt
@@ -495,13 +524,13 @@ dmsetup deps <mapper> | tee /tmp/deps.txt
 验证功能：
 
 - backing dependencies 数量正确。
-- error target 无 backing：`0 dependencies`。
+- error / zero target 无 backing：`0 dependencies`。
 - linear 单 backing：`1 dependencies`。
 - 2-way striped 或双 PV linear：`2 dependencies`。
 - striped 基础 N-way 场景 deps 等于 `STRIPED_PV_COUNT`；mixed 为 `3 dependencies`；striped cross-segment 缩回单段后 deps 等于 `STRIPED_CS_PV_COUNT`。
 - deps 中包含预期 backing major:minor。
 
-### 5.10 `dmsetup info`
+### 5.11 `dmsetup info`
 
 ```bash
 dmsetup info <mapper> | tee /tmp/info.txt
@@ -515,7 +544,7 @@ dmsetup info <mapper> | tee /tmp/info.txt
 - open count / event 信息。
 - busy remove 后 mapper 是否仍存在。
 
-### 5.10 `dmsetup rename`
+### 5.12 `dmsetup rename`
 
 ```bash
 dmsetup rename dm_control_abi dm_control_renamed
@@ -539,7 +568,7 @@ fi
 - rename 不破坏 table/status。
 - `/dev/mapper/<name>` runtime node 维护正确。
 
-### 5.11 `dmsetup suspend` / `dmsetup resume`
+### 5.13 `dmsetup suspend` / `dmsetup resume`
 
 ```bash
 dmsetup suspend --noflush dm_control_renamed
@@ -556,7 +585,7 @@ dmsetup info dm_control_renamed | tee /tmp/control-info-live.txt
 - `--noflush` flag 兼容。
 - active table 继续可用。
 
-### 5.12 `dmsetup wait`
+### 5.14 `dmsetup wait`
 
 ```bash
 timeout 10 dmsetup wait --noflush dm_control_renamed 0
@@ -568,7 +597,7 @@ timeout 10 dmsetup wait --noflush dm_control_renamed 0
 - event number 等待路径。
 - `--noflush` flag 兼容。
 
-### 5.13 `dmsetup ls`
+### 5.15 `dmsetup ls`
 
 ```bash
 dmsetup ls | tee /tmp/control-ls.txt
@@ -579,7 +608,7 @@ dmsetup ls | tee /tmp/control-ls.txt
 - 多个 mapper 可以同时枚举。
 - renamed mapper 和 multi mapper 均可见。
 
-### 5.14 busy remove 和 `dmsetup remove_all`
+### 5.16 busy remove 和 `dmsetup remove_all`
 
 构造 busy mapper：
 
@@ -622,7 +651,7 @@ dmsetup remove dm_control_busy
 - `remove_all` 只删除 non-busy mapper。
 - busy mapper 在引用释放后可删除。
 
-### 5.15 `dmsetup load`
+### 5.17 `dmsetup load`
 
 系统 shell 脚本中没有直接写显式：
 
