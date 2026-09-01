@@ -13,6 +13,7 @@ use aster_device_mapper::{
     DmDevice, DmError, DmManager, DmTable, TableError,
     target::{
         DmTarget,
+        error::ErrorTarget,
         linear::LinearTarget,
         striped::{StripedTarget, StripedTargetParams},
     },
@@ -29,8 +30,11 @@ use crate::{
     },
     events::IoEvents,
     fs::{
-        file::{PerOpenFileOps, StatusFlags},
-        vfs::{inode::FileOps, path::Path},
+        file::{InodeType, PerOpenFileOps, StatusFlags},
+        vfs::{
+            inode::FileOps,
+            path::{FsPath, Path},
+        },
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
@@ -71,6 +75,10 @@ struct TargetVersion {
 }
 
 const TARGET_VERSIONS: &[TargetVersion] = &[
+    TargetVersion {
+        name: "error",
+        version: [1, 6, 0],
+    },
     TargetVersion {
         name: "linear",
         version: [1, 4, 0],
@@ -149,6 +157,7 @@ struct DmControlDevice {
     id: DeviceId,
 }
 
+//控制设备对象的初始化  绑定好majorID与 minorID 即 DeviceID
 impl DmControlDevice {
     fn new() -> Arc<Self> {
         let major = super::MISC_MAJOR.get().unwrap().get();
@@ -411,21 +420,12 @@ fn create_device(buffer: &mut [u8]) -> Result<()> {
         .create_with_readonly(name.clone(), uuid, requested_minor, readonly)
         .map_err(map_dm_error)?;
     ostd::info!("[dm] create_device: created id={:?}", device.id());
-    if let Err(error) = register_block_mapper(device.clone(), &name) {
-        ostd::warn!(
-            "[dm] create_device: register_block_mapper failed: {:?}",
-            error
-        );
-        let _ = manager.remove(&name);
-        return Err(error);
-    }
-    ostd::info!("[dm] create_device: registered successfully");
     fill_device_header(buffer, &device)
 }
 
 fn remove_device(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
-    unregister_block_mapper(device.id(), &&device.name())?;
+    unregister_device_runtime_if_registered(&device)?;
     device.notify_event();
     manager().remove(&&device.name()).map_err(map_dm_error)?;
     clear_device_header(buffer)
@@ -435,7 +435,7 @@ fn remove_all(buffer: &mut [u8]) -> Result<()> {
     // Linux DM_REMOVE_ALL 是 best-effort：busy 设备保留，其余设备继续删除，
     // 单个设备无法删除不会令整个 ioctl 失败。
     for device in manager().devices() {
-        if unregister_block_mapper(device.id(), &&device.name()).is_err() {
+        if unregister_device_runtime_if_registered(&device).is_err() {
             continue;
         }
         device.notify_event();
@@ -483,7 +483,10 @@ fn device_wait_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
 
 fn wait_for_device_event(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let event_nr = read_u32(buffer, OFF_EVENT_NR)?;
-    device.wait_event(event_nr);
+    device.event_queue().pause_until(|| {
+        let status = device.status();
+        (status.event_nr != event_nr).then_some(status)
+    })?;
     Ok(())
 }
 
@@ -500,9 +503,14 @@ fn device_rename(buffer: &mut [u8]) -> Result<()> {
         manager()
             .rename_uuid(&device.name(), value)
             .map_err(map_dm_error)?;
-    } else {
+    } else if is_device_registered_as_block(&device) {
         rename_device_runtime(manager(), &device, &value, rename_block_mapper)?;
+    } else {
+        manager()
+            .rename(&device.name(), &value)
+            .map_err(map_dm_error)?;
     }
+    device.notify_event();
     fill_device_header(buffer, &device)
 }
 
@@ -517,7 +525,10 @@ where
 {
     let old_name = device.name();
     if new_name == old_name {
-        return Ok(());
+        return Err(Error::with_message(
+            Errno::EBUSY,
+            "Device Mapper 设备名称未变化",
+        ));
     }
 
     // manager 索引先更新，若 alias 移动失败则立即回滚，避免 /dev/dm-N、块注册、
@@ -535,6 +546,28 @@ where
         return Err(error);
     }
 
+    Ok(())
+}
+
+fn is_device_registered_as_block(device: &DmDevice) -> bool {
+    block_open_count(device.id()).is_some()
+}
+
+fn register_device_runtime_if_needed(device: &Arc<DmDevice>) -> Result<()> {
+    if is_device_registered_as_block(device) {
+        return Ok(());
+    }
+    if device.active_table().is_none() && device.inactive_table().is_none() {
+        return Ok(());
+    }
+    let name = device.name();
+    register_block_mapper(device.clone(), &name)
+}
+
+fn unregister_device_runtime_if_registered(device: &DmDevice) -> Result<()> {
+    if is_device_registered_as_block(device) {
+        unregister_block_mapper(device.id(), &&device.name())?;
+    }
     Ok(())
 }
 
@@ -572,6 +605,20 @@ fn table_load_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
             required_c_string(buffer, cursor + 24, DM_TARGET_TYPE_LEN, "target 类型")?;
         let params = c_string_until(buffer, spec_end, next_spec, "target 参数")?;
         let target = match target_type.as_str() {
+            "error" => {
+                if !params.trim().is_empty() {
+                    return_errno_with_message!(Errno::EINVAL, "error target 不接受参数");
+                }
+                ostd::info!(
+                    "[dm] table_load: name={}, type=error, logical_start={}, length={}",
+                    device.name(),
+                    logical_start,
+                    length
+                );
+                DmTarget::Error(
+                    ErrorTarget::new(Sid::new(logical_start), length).map_err(map_table_error)?,
+                )
+            }
             "linear" => {
                 let (backing_id, backing_start) = parse_linear_params(&params)?;
                 ostd::info!(
@@ -603,6 +650,7 @@ fn table_load_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
                 )
             }
             "striped" => {
+                let params = normalize_striped_params(&params)?;
                 let striped_params =
                     StripedTargetParams::parse(&params).map_err(map_table_error)?;
                 let mut backings = Vec::new();
@@ -654,7 +702,13 @@ fn device_suspend(buffer: &mut [u8]) -> Result<()> {
     if flags & DM_SUSPEND_FLAG != 0 {
         device.suspend().map_err(map_dm_error)?;
     } else {
-        device.resume().map_err(map_dm_error)?;
+        register_device_runtime_if_needed(&device)?;
+        if let Err(error) = device.resume().map_err(map_dm_error) {
+            if block_open_count(device.id()).is_some() && device.active_table().is_none() {
+                let _ = unregister_block_mapper(device.id(), &&device.name());
+            }
+            return Err(error);
+        }
     }
     fill_device_header(buffer, &device)
 }
@@ -716,6 +770,7 @@ fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let mut cursor = start;
     for target in table.targets() {
         let (target_type, params) = match target {
+            DmTarget::Error(_) => ("error", String::new()),
             DmTarget::Linear(target) => {
                 let params = if flags & DM_STATUS_TABLE_FLAG != 0 {
                     let backing = target.backing_id();
@@ -743,7 +798,19 @@ fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
                     });
                     params
                 } else {
-                    String::new()
+                    let mut params = format!("{}", target.stripe_count());
+                    target.for_each_stripe(|backing, _| {
+                        params.push_str(&format!(
+                            " {}:{}",
+                            backing.major().get(),
+                            backing.minor().get()
+                        ));
+                    });
+                    params.push_str(" 1 ");
+                    for _ in 0..target.stripe_count() {
+                        params.push('A');
+                    }
+                    params
                 };
                 ("striped", params)
             }
@@ -946,23 +1013,83 @@ fn parse_linear_params(params: &str) -> Result<(DeviceId, u64)> {
         return_errno_with_message!(Errno::EINVAL, "linear 参数字段数量无效");
     }
 
-    let (major, minor) = dev
-        .split_once(':')
-        .ok_or_else(|| Error::with_message(Errno::EINVAL, "linear backing 必须采用 major:minor"))?;
-    let major = major
-        .parse::<u16>()
-        .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing major 无效"))?;
-    let minor = minor
-        .parse::<u32>()
-        .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing minor 无效"))?;
-    let major = MajorId::try_from(major)
-        .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing major 超出范围"))?;
-    let minor = MinorId::try_from(minor)
-        .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing minor 超出范围"))?;
+    let backing_id = parse_backing_device_id(dev)?;
     let backing_start = offset_str
         .parse::<u64>()
         .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing 起始扇区无效"))?;
-    Ok((DeviceId::new(major, minor), backing_start))
+    Ok((backing_id, backing_start))
+}
+
+fn parse_backing_device_id(dev: &str) -> Result<DeviceId> {
+    if dev.starts_with('/') {
+        let current_task = ostd::task::Task::current().unwrap();
+        let thread_local = AsThreadLocal::as_thread_local(&current_task).unwrap();
+        let fs_ref = thread_local.borrow_fs();
+        let path_resolver = fs_ref.resolver().read();
+        let path = path_resolver.lookup(&FsPath::try_from(dev)?)?;
+        if path.type_() != InodeType::BlockDevice {
+            return_errno_with_message!(Errno::EINVAL, "linear backing 路径不是块设备");
+        }
+        return path
+            .metadata()?
+            .self_dev_id
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "linear backing 路径缺少设备号"));
+    }
+
+    if let Some((major, minor)) = dev.split_once(':') {
+        let major = major
+            .parse::<u16>()
+            .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing major 无效"))?;
+        let minor = minor
+            .parse::<u32>()
+            .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing minor 无效"))?;
+        let major = MajorId::try_from(major)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing major 超出范围"))?;
+        let minor = MinorId::try_from(minor)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing minor 超出范围"))?;
+        return Ok(DeviceId::new(major, minor));
+    }
+
+    return_errno_with_message!(
+        Errno::EINVAL,
+        "linear backing 必须采用 major:minor 或绝对设备路径"
+    );
+}
+
+fn normalize_striped_params(params: &str) -> Result<String> {
+    let mut fields = params.split_ascii_whitespace();
+    let stripe_count = fields
+        .next()
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "striped 参数缺少 stripe count"))?;
+    let chunk_size = fields
+        .next()
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "striped 参数缺少 chunk size"))?;
+    let stripe_count_value = stripe_count
+        .parse::<usize>()
+        .map_err(|_| Error::with_message(Errno::EINVAL, "striped stripe count 无效"))?;
+    let mut normalized = format!("{} {}", stripe_count, chunk_size);
+
+    for _ in 0..stripe_count_value {
+        let dev = fields
+            .next()
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "striped 参数缺少 backing 设备"))?;
+        let offset = fields.next().ok_or_else(|| {
+            Error::with_message(Errno::EINVAL, "striped 参数缺少 backing 起始扇区")
+        })?;
+        let id = parse_backing_device_id(dev)?;
+        normalized.push_str(&format!(
+            " {}:{} {}",
+            id.major().get(),
+            id.minor().get(),
+            offset
+        ));
+    }
+
+    if fields.next().is_some() {
+        return_errno_with_message!(Errno::EINVAL, "striped 参数字段数量无效");
+    }
+
+    Ok(normalized)
 }
 
 fn validate_target_spec_next(data_start: usize, next: usize, buffer_len: usize) -> Result<usize> {
@@ -1160,7 +1287,10 @@ fn map_table_error(error: TableError) -> Error {
 }
 
 pub(super) fn init_in_first_kthread() {
+    //先初始化全局DM_MANAGER 保证控制设备可见时 用户已经可以使用对应的命令了
     DM_MANAGER.call_once(|| DmManager::new().unwrap());
+
+    //创建control device对象 并绑定好DeviceId 进入注册函数
     char::register(DmControlDevice::new()).unwrap();
 }
 
@@ -1262,6 +1392,25 @@ mod tests {
         write_target_spec(buffer, record, start, length, next, "linear", params);
     }
 
+    fn write_error_target_spec(
+        buffer: &mut [u8],
+        record: usize,
+        start: u64,
+        length: u64,
+        next: u32,
+    ) {
+        write_target_spec(buffer, record, start, length, next, "error", "");
+    }
+
+    fn single_error_table(length: u64) -> Arc<DmTable> {
+        Arc::new(
+            DmTable::new_targets(vec![DmTarget::Error(
+                ErrorTarget::new(Sid::new(0), length).unwrap(),
+            )])
+            .unwrap(),
+        )
+    }
+
     fn single_linear_table(length: u64, backing_start: u64, backing_minor: u32) -> Arc<DmTable> {
         Arc::new(
             DmTable::new_linear(vec![
@@ -1294,6 +1443,13 @@ mod tests {
             )])
             .unwrap(),
         )
+    }
+
+    fn error_target(table: &DmTable, index: usize) -> &ErrorTarget {
+        let DmTarget::Error(target) = &table.targets()[index] else {
+            panic!("expected error target");
+        };
+        target
     }
 
     fn linear_target(table: &DmTable, index: usize) -> &LinearTarget {
@@ -1472,7 +1628,8 @@ mod tests {
             DM_EXISTS_FLAG | DM_READONLY_FLAG
         );
 
-        unregister_block_mapper(device.id(), &&device.name()).unwrap();
+        assert_eq!(block_open_count(device.id()), None);
+
         manager().remove(name).unwrap();
     }
 
@@ -1516,6 +1673,55 @@ mod tests {
         );
 
         let mut deps = test_buffer(DM_IOCTL_HEADER_SIZE + 16);
+        table_deps_for_device(&mut deps, &device).unwrap();
+        assert_eq!(read_u32(&deps, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
+        assert_eq!(read_u32(&deps, DM_IOCTL_HEADER_SIZE + 4).unwrap(), 0);
+    }
+
+    #[ktest]
+    fn reports_error_table_status_with_empty_params_and_no_deps() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-error-status-test".to_string(), None, None)
+            .unwrap();
+        device.load_table(single_error_table(8));
+
+        for flags in [
+            DM_QUERY_INACTIVE_TABLE_FLAG,
+            DM_QUERY_INACTIVE_TABLE_FLAG | DM_STATUS_TABLE_FLAG,
+        ] {
+            let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+            write_u32(&mut buffer, OFF_FLAGS, flags).unwrap();
+            table_status_for_device(&mut buffer, &device).unwrap();
+
+            assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 1);
+            assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
+            assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 8).unwrap(), 8);
+            assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 20).unwrap(), 48);
+            assert_eq!(
+                c_string_until(
+                    &buffer,
+                    DM_IOCTL_HEADER_SIZE + 24,
+                    DM_IOCTL_HEADER_SIZE + 40,
+                    "target 类型"
+                )
+                .unwrap(),
+                "error"
+            );
+            assert_eq!(
+                c_string_until(
+                    &buffer,
+                    DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
+                    DM_IOCTL_HEADER_SIZE + 48,
+                    "target 参数"
+                )
+                .unwrap(),
+                ""
+            );
+        }
+
+        let mut deps = test_buffer(DM_IOCTL_HEADER_SIZE + 8);
+        write_u32(&mut deps, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
         table_deps_for_device(&mut deps, &device).unwrap();
         assert_eq!(read_u32(&deps, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
         assert_eq!(read_u32(&deps, DM_IOCTL_HEADER_SIZE + 4).unwrap(), 0);
@@ -1656,20 +1862,25 @@ mod tests {
     }
 
     #[ktest]
-    fn reports_striped_info_status_with_empty_params() {
+    fn reports_striped_info_status_with_linux_params() {
         let manager = DmManager::new().unwrap();
         let device = manager
             .create("dm-striped-info-status-test".to_string(), None, None)
             .unwrap();
+        let params = "2 1:1 1:2 1 AA";
+        let record_len = table_status_record_len(params.len()).unwrap();
         device.load_table(single_striped_table(16, "2 4 1:1 0 1:2 0", &[1, 2]));
 
-        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + record_len);
         write_u32(&mut buffer, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
         table_status_for_device(&mut buffer, &device).unwrap();
 
         assert_eq!(read_u32(&buffer, OFF_TARGET_COUNT).unwrap(), 1);
         assert_eq!(read_u64(&buffer, DM_IOCTL_HEADER_SIZE + 8).unwrap(), 16);
-        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 20).unwrap(), 48);
+        assert_eq!(
+            read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 20).unwrap(),
+            record_len as u32
+        );
         assert_eq!(
             c_string_until(
                 &buffer,
@@ -1684,11 +1895,11 @@ mod tests {
             c_string_until(
                 &buffer,
                 DM_IOCTL_HEADER_SIZE + DM_TARGET_SPEC_SIZE,
-                DM_IOCTL_HEADER_SIZE + 48,
+                DM_IOCTL_HEADER_SIZE + record_len,
                 "target 参数"
             )
             .unwrap(),
-            ""
+            params
         );
     }
 
@@ -2206,6 +2417,7 @@ mod tests {
         write_u32(&mut buffer, OFF_EVENT_NR, 0).unwrap();
 
         device.load_table(single_linear_table(4, 100, 1));
+        device.notify_event();
         device_wait_for_device(&mut buffer, &device).unwrap();
 
         assert_eq!(read_u32(&buffer, OFF_EVENT_NR).unwrap(), 1);
@@ -2242,25 +2454,31 @@ mod tests {
     }
 
     #[ktest]
-    fn rename_runtime_treats_same_name_as_noop() {
+    fn rename_runtime_rejects_same_name_without_state_change() {
         let manager = DmManager::new().unwrap();
         let device = manager
-            .create("dm-rename-noop".to_string(), None, None)
+            .create("dm-rename-same".to_string(), None, None)
             .unwrap();
+        let status_before = device.status();
         let mut called = false;
 
-        rename_device_runtime(&manager, &device, "dm-rename-noop", |_, _, _| {
-            called = true;
-            Ok(())
-        })
-        .unwrap();
+        assert_eq!(
+            rename_device_runtime(&manager, &device, "dm-rename-same", |_, _, _| {
+                called = true;
+                Ok(())
+            })
+            .unwrap_err()
+            .error(),
+            Errno::EBUSY
+        );
 
         assert!(!called);
         assert_eq!(
-            manager.lookup_name("dm-rename-noop").unwrap().id(),
+            manager.lookup_name("dm-rename-same").unwrap().id(),
             device.id()
         );
-        assert_eq!(device.name(), "dm-rename-noop");
+        assert_eq!(device.name(), "dm-rename-same");
+        assert_eq!(device.status(), status_before);
     }
 
     #[ktest]
@@ -2335,7 +2553,20 @@ mod tests {
             manager().lookup_name("dm-uuid-rename-name").unwrap().id(),
             id
         );
-        assert_eq!(device.status(), status_before);
+        let status_after = device.status();
+        assert_eq!(
+            status_after.event_nr,
+            status_before.event_nr.wrapping_add(1)
+        );
+        assert_eq!(status_after.suspended, status_before.suspended);
+        assert_eq!(
+            status_after.has_active_table,
+            status_before.has_active_table
+        );
+        assert_eq!(
+            status_after.has_inactive_table,
+            status_before.has_inactive_table
+        );
         assert_eq!(read_u64(&buffer, OFF_DEV).unwrap(), id.as_encoded_u64());
         assert_eq!(
             required_c_string(&buffer, OFF_UUID, DM_UUID_LEN, "UUID").unwrap(),
@@ -2457,6 +2688,40 @@ mod tests {
                 event_nr: 0,
             }
         );
+    }
+
+    #[ktest]
+    fn loads_single_error_target_through_ioctl() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-error-load-test".to_string(), None, None)
+            .unwrap();
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(0).unwrap());
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+        write_error_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 8, 0);
+
+        table_load_for_device(&mut buffer, &device).unwrap();
+        let table = device.inactive_table().unwrap();
+        assert_eq!(table.target_count(), 1);
+        let target = error_target(&table, 0);
+        assert_eq!(target.logical_range(), &(Sid::new(0)..Sid::new(8)));
+        assert_eq!(table.metadata().nr_sectors, 8);
+        assert_eq!(table.metadata().max_nr_segments_per_bio, usize::MAX);
+    }
+
+    #[ktest]
+    fn rejects_error_target_params_before_state_changes() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-error-param-test".to_string(), None, None)
+            .unwrap();
+        let params = "unexpected";
+        let mut buffer =
+            test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap());
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+        write_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 8, 0, "error", params);
+
+        assert_failed_table_load_preserves_state(&mut buffer, &device, Errno::EINVAL);
     }
 
     #[ktest]
@@ -3271,6 +3536,20 @@ mod tests {
     }
 
     #[ktest]
+    fn normalizes_exact_striped_parameter_set() {
+        let params = normalize_striped_params("2 4 8:1 0 8:2 16").unwrap();
+        assert_eq!(params, "2 4 8:1 0 8:2 16");
+
+        for params in ["", "2", "bad 4 8:1 0", "2 4 8:1 0", "1 4 8:1 0 extra"] {
+            assert_eq!(
+                normalize_striped_params(params).unwrap_err().error(),
+                Errno::EINVAL,
+                "params={params:?}"
+            );
+        }
+    }
+
+    #[ktest]
     fn rejects_invalid_linear_params_without_changing_device_state() {
         for (name, params) in [
             ("missing-dev", ""),
@@ -3564,44 +3843,33 @@ mod tests {
     }
 
     #[ktest]
-    fn lists_linear_and_striped_target_versions() {
-        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
+    fn lists_error_linear_and_striped_target_versions() {
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 72);
         list_versions(&mut buffer).unwrap();
 
-        assert_eq!(read_u32(&buffer, DM_IOCTL_HEADER_SIZE).unwrap(), 24);
-        assert_eq!(
-            [
-                read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 4).unwrap(),
-                read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 8).unwrap(),
-                read_u32(&buffer, DM_IOCTL_HEADER_SIZE + 12).unwrap(),
-            ],
-            [1, 4, 0]
-        );
-        assert_eq!(
-            c_string_until(
-                &buffer,
-                DM_IOCTL_HEADER_SIZE + 16,
-                DM_IOCTL_HEADER_SIZE + 24,
-                "target 名称"
-            )
-            .unwrap(),
-            "linear"
-        );
-
-        let striped = DM_IOCTL_HEADER_SIZE + 24;
-        assert_eq!(read_u32(&buffer, striped).unwrap(), 0);
-        assert_eq!(
-            [
-                read_u32(&buffer, striped + 4).unwrap(),
-                read_u32(&buffer, striped + 8).unwrap(),
-                read_u32(&buffer, striped + 12).unwrap(),
-            ],
-            [1, 6, 0]
-        );
-        assert_eq!(
-            c_string_until(&buffer, striped + 16, striped + 24, "target 名称").unwrap(),
-            "striped"
-        );
+        for (index, (name, version, next)) in [
+            ("error", [1, 6, 0], 24),
+            ("linear", [1, 4, 0], 48),
+            ("striped", [1, 6, 0], 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let record = DM_IOCTL_HEADER_SIZE + index * 24;
+            assert_eq!(read_u32(&buffer, record).unwrap(), next);
+            assert_eq!(
+                [
+                    read_u32(&buffer, record + 4).unwrap(),
+                    read_u32(&buffer, record + 8).unwrap(),
+                    read_u32(&buffer, record + 12).unwrap(),
+                ],
+                version
+            );
+            assert_eq!(
+                c_string_until(&buffer, record + 16, record + 24, "target 名称").unwrap(),
+                name
+            );
+        }
     }
 
     #[ktest]
@@ -3617,7 +3885,11 @@ mod tests {
 
     #[ktest]
     fn gets_named_target_version_record() {
-        for (name, version) in [("linear", [1, 4, 0]), ("striped", [1, 6, 0])] {
+        for (name, version) in [
+            ("error", [1, 6, 0]),
+            ("linear", [1, 4, 0]),
+            ("striped", [1, 6, 0]),
+        ] {
             let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + 24);
             write_c_string_fixed(&mut buffer, OFF_NAME, DM_NAME_LEN, name).unwrap();
             get_target_version(&mut buffer).unwrap();
