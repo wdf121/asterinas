@@ -26,10 +26,23 @@ pub struct DmTable {
     length: u64,
 }
 
-struct MappedBioPart<'a> {
-    logical_range: Range<Sid>,
-    backing_start: Sid,
-    backing: &'a dyn BlockDevice,
+enum MappedBioPart<'a> {
+    Backing {
+        logical_range: Range<Sid>,
+        backing_start: Sid,
+        backing: &'a dyn BlockDevice,
+    },
+    Error {
+        logical_range: Range<Sid>,
+    },
+}
+
+impl MappedBioPart<'_> {
+    fn logical_range(&self) -> &Range<Sid> {
+        match self {
+            Self::Backing { logical_range, .. } | Self::Error { logical_range } => logical_range,
+        }
+    }
 }
 
 impl DmTable {
@@ -98,7 +111,7 @@ impl DmTable {
             });
         }
         aster_block::BlockDeviceMeta {
-            max_nr_segments_per_bio: max_nr_segments_per_bio.unwrap_or(0),
+            max_nr_segments_per_bio: max_nr_segments_per_bio.unwrap_or(usize::MAX),
             nr_sectors: usize::try_from(self.length()).unwrap_or(usize::MAX),
         }
     }
@@ -147,22 +160,43 @@ impl DmTable {
         let parts = self.mapped_bio_parts(range.start, logical_end)?;
         if parts.len() == 1 {
             let part = parts.into_iter().next().unwrap();
-            bio.remap_sid_start(part.backing_start)?;
-            return part.backing.enqueue(bio);
+            match part {
+                MappedBioPart::Backing {
+                    backing_start,
+                    backing,
+                    ..
+                } => {
+                    bio.remap_sid_start(backing_start)?;
+                    return backing.enqueue(bio);
+                }
+                MappedBioPart::Error { .. } => {
+                    bio.complete(BioStatus::IoError);
+                    return Ok(());
+                }
+            }
         }
 
         let ranges = parts
             .iter()
-            .map(|part| part.logical_range.clone())
+            .map(|part| part.logical_range().clone())
             .collect::<Vec<_>>();
         let (children, completion) = bio.split(ranges)?;
         for (mut child, part) in children.into_iter().zip(parts) {
-            if child.remap_sid_start(part.backing_start).is_err() {
-                completion.complete_child(BioStatus::IoError);
-                continue;
-            }
-            if part.backing.enqueue(child).is_err() {
-                completion.complete_child(BioStatus::IoError);
+            match part {
+                MappedBioPart::Backing {
+                    backing_start,
+                    backing,
+                    ..
+                } => {
+                    if child.remap_sid_start(backing_start).is_err() {
+                        completion.complete_child(BioStatus::IoError);
+                        continue;
+                    }
+                    if backing.enqueue(child).is_err() {
+                        completion.complete_child(BioStatus::IoError);
+                    }
+                }
+                MappedBioPart::Error { .. } => child.complete(BioStatus::IoError),
             }
         }
         Ok(())
@@ -180,7 +214,7 @@ impl DmTable {
                     let backing_start = target
                         .map_sector(range.start)
                         .ok_or(BioEnqueueError::Refused)?;
-                    mapped_parts.push(MappedBioPart {
+                    mapped_parts.push(MappedBioPart::Backing {
                         logical_range: range,
                         backing_start,
                         backing: target.backing(),
@@ -192,12 +226,17 @@ impl DmTable {
                         let backing = target
                             .backing(stripe_part.stripe_index())
                             .ok_or(BioEnqueueError::Refused)?;
-                        mapped_parts.push(MappedBioPart {
+                        mapped_parts.push(MappedBioPart::Backing {
                             logical_range: stripe_part.logical_range().clone(),
                             backing_start: stripe_part.backing_range().start,
                             backing,
                         });
                     }
+                }
+                DmTarget::Error(_) => {
+                    mapped_parts.push(MappedBioPart::Error {
+                        logical_range: range,
+                    });
                 }
             }
         }
@@ -319,7 +358,10 @@ mod tests {
     use ostd::{prelude::ktest, sync::Mutex};
 
     use super::*;
-    use crate::target::striped::{StripedTarget, StripedTargetParams};
+    use crate::target::{
+        error::ErrorTarget,
+        striped::{StripedTarget, StripedTargetParams},
+    };
 
     #[derive(Debug)]
     struct RecordingBlockDevice {
@@ -853,6 +895,101 @@ mod tests {
         assert_eq!(
             table.backing_ids(),
             vec![linear_backing.id(), striped_first.id(), striped_second.id()]
+        );
+    }
+
+    #[ktest]
+    fn error_target_reports_capacity_without_backing_limits() {
+        let table = DmTable::new_targets(vec![DmTarget::Error(
+            ErrorTarget::new(Sid::new(0), 8).unwrap(),
+        )])
+        .unwrap();
+
+        assert_eq!(table.length(), 8);
+        assert_eq!(table.metadata().nr_sectors, 8);
+        assert_eq!(table.metadata().max_nr_segments_per_bio, usize::MAX);
+        assert!(table.backing_ids().is_empty());
+    }
+
+    #[ktest]
+    fn error_target_completes_read_and_write_with_io_error() {
+        let table = Arc::new(
+            DmTable::new_targets(vec![DmTarget::Error(
+                ErrorTarget::new(Sid::new(0), 8).unwrap(),
+            )])
+            .unwrap(),
+        );
+        let read = Bio::new(
+            BioType::Read,
+            Sid::new(0),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        );
+        let write = Bio::new(
+            BioType::Write,
+            Sid::new(0),
+            vec![BioSegment::alloc(1, BioDirection::ToDevice)],
+            None,
+        );
+
+        assert_eq!(
+            read.submit_and_wait(&TableDevice(table.clone())).unwrap(),
+            BioStatus::IoError
+        );
+        assert_eq!(
+            write.submit_and_wait(&TableDevice(table)).unwrap(),
+            BioStatus::IoError
+        );
+    }
+
+    #[ktest]
+    fn error_target_completes_flush_successfully() {
+        let table = Arc::new(
+            DmTable::new_targets(vec![DmTarget::Error(
+                ErrorTarget::new(Sid::new(0), 8).unwrap(),
+            )])
+            .unwrap(),
+        );
+        let flush = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
+
+        assert_eq!(
+            flush.submit_and_wait(&TableDevice(table)).unwrap(),
+            BioStatus::Complete
+        );
+    }
+
+    #[ktest]
+    fn split_bio_across_linear_and_error_targets_reports_io_error() {
+        let backing = RecordingBlockDevice::new(1);
+        let table = Arc::new(
+            DmTable::new_targets(vec![
+                DmTarget::Linear(
+                    LinearTarget::new(
+                        Sid::new(0),
+                        4,
+                        Sid::new(100),
+                        BlockDeviceLease::new_untracked(backing.clone() as Arc<dyn BlockDevice>),
+                    )
+                    .unwrap(),
+                ),
+                DmTarget::Error(ErrorTarget::new(Sid::new(4), 4).unwrap()),
+            ])
+            .unwrap(),
+        );
+        let write = Bio::new(
+            BioType::Write,
+            Sid::new(0),
+            vec![BioSegment::alloc(1, BioDirection::ToDevice)],
+            None,
+        );
+
+        assert_eq!(
+            write.submit_and_wait(&TableDevice(table)).unwrap(),
+            BioStatus::IoError
+        );
+        assert_eq!(
+            *backing.submitted_ranges.lock(),
+            vec![Sid::new(100)..Sid::new(104)]
         );
     }
 

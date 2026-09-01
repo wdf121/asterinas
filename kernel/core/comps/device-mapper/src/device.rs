@@ -138,12 +138,8 @@ impl DmDevice {
 
     /// 将完整验证的映射表安装为 inactive table。
     pub fn load_table(&self, table: Arc<DmTable>) {
-        {
-            let mut state = self.state.lock();
-            state.inactive = Some(table);
-            state.event_nr = state.event_nr.wrapping_add(1);
-        }
-        self.events.wake_all();
+        let mut state = self.state.lock();
+        state.inactive = Some(table);
     }
 
     /// 清除 inactive table。
@@ -151,42 +147,23 @@ impl DmDevice {
     /// Linux DM 将清除不存在的 inactive table 视为成功，因此该操作在空表上
     /// 幂等，不会改变 event number。
     pub fn clear_inactive_table(&self) -> Result<(), DmError> {
-        let changed = {
-            let mut state = self.state.lock();
-            if state.inactive.take().is_some() {
-                state.event_nr = state.event_nr.wrapping_add(1);
-                true
-            } else {
-                false
-            }
-        };
-        if changed {
-            self.events.wake_all();
-        }
+        let mut state = self.state.lock();
+        state.inactive.take();
         Ok(())
     }
 
     /// 暂停新的 I/O，并等待已经提交到旧 table 的 I/O 完成。
     pub fn suspend(&self) -> Result<(), DmError> {
-        let changed = {
+        {
             let mut state = self.state.lock();
             match state.phase {
                 DmDevicePhase::Suspended => return Ok(()),
                 DmDevicePhase::Suspending => return Err(DmError::InvalidState),
                 DmDevicePhase::Running => {
                     state.phase = DmDevicePhase::Suspending;
-                    if state.active.is_some() {
-                        state.event_nr = state.event_nr.wrapping_add(1);
-                        true
-                    } else {
-                        false
-                    }
                 }
             }
         };
-        if changed {
-            self.events.wake_all();
-        }
 
         self.io
             .drained
@@ -204,7 +181,7 @@ impl DmDevice {
     /// 没有 inactive table 时保持幂等。Suspending 阶段必须先完成 drain，避免
     /// resume 与 suspend 交错使新 I/O 穿过暂停屏障。
     pub fn resume(&self) -> Result<(), DmError> {
-        let changed = {
+        {
             let mut state = self.state.lock();
             if state.phase == DmDevicePhase::Suspending {
                 return Err(DmError::InvalidState);
@@ -213,23 +190,13 @@ impl DmDevice {
                 return Err(DmError::InvalidState);
             }
 
-            let mut changed = false;
             if let Some(table) = state.inactive.take() {
                 state.active = Some(table);
-                changed = true;
             }
             if state.phase == DmDevicePhase::Suspended {
                 state.phase = DmDevicePhase::Running;
-                changed = true;
             }
-            if changed {
-                state.event_nr = state.event_nr.wrapping_add(1);
-            }
-            changed
         };
-        if changed {
-            self.events.wake_all();
-        }
         Ok(())
     }
 
@@ -249,6 +216,11 @@ impl DmDevice {
             let status = self.status();
             (status.event_nr != event_nr).then_some(status)
         })
+    }
+
+    /// 返回事件等待队列，供控制面选择 signal-aware 等待方式。
+    pub fn event_queue(&self) -> &WaitQueue {
+        &self.events
     }
 
     /// 记录一次控制面生命周期事件，并唤醒等待者。
@@ -450,7 +422,7 @@ mod tests {
 
     #[ktest]
     fn wait_event_blocks_until_event_changes() {
-        let (device, table) = create_device_and_table();
+        let (device, _table) = create_device_and_table();
         let started = Arc::new(Mutex::new(false));
         let finished = Arc::new(Mutex::new(false));
         let observed = Arc::new(Mutex::new(None));
@@ -476,7 +448,7 @@ mod tests {
         Task::yield_now();
         assert!(!*finished.lock());
 
-        device.load_table(table);
+        device.notify_event();
         while !*finished.lock() {
             Task::yield_now();
         }
@@ -502,10 +474,10 @@ mod tests {
         device.suspend().unwrap();
 
         device.load_table(table.clone());
-        assert_eq!(device.status().event_nr, 1);
+        assert_eq!(device.status().event_nr, 0);
         assert!(device.inactive_table().is_some());
         device.resume().unwrap();
-        assert_eq!(device.status().event_nr, 2);
+        assert_eq!(device.status().event_nr, 0);
         assert!(!device.status().suspended);
         assert!(device.active_table().is_some());
         assert!(device.inactive_table().is_none());
@@ -513,14 +485,14 @@ mod tests {
         assert_eq!(device.metadata().nr_sectors, 128);
 
         device.resume().unwrap();
-        assert_eq!(device.status().event_nr, 2);
+        assert_eq!(device.status().event_nr, 0);
 
         device.suspend().unwrap();
         device.load_table(table);
         device.clear_inactive_table().unwrap();
-        assert_eq!(device.status().event_nr, 5);
+        assert_eq!(device.status().event_nr, 0);
         device.clear_inactive_table().unwrap();
-        assert_eq!(device.status().event_nr, 5);
+        assert_eq!(device.status().event_nr, 0);
     }
 
     #[ktest]
@@ -547,7 +519,7 @@ mod tests {
             replacement.length()
         );
         assert!(device.inactive_table().is_none());
-        assert_eq!(device.status().event_nr, 4);
+        assert_eq!(device.status().event_nr, 0);
     }
 
     #[ktest]
