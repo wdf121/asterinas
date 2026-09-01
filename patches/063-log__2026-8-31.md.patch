@@ -1,0 +1,413 @@
+diff --git a/log/2026-8-31.md b/log/2026-8-31.md
+new file mode 100644
+index 000000000..5594c40e0
+--- /dev/null
++++ b/log/2026-8-31.md
+@@ -0,0 +1,407 @@
++# 2026-8-31 Device Mapper 工程改动日志
++
++本文按小阶段记录今天实际发生的工程改动。单纯文档解释、代码复核、后续规划不写入本日志；测试和验证结果跟随对应小阶段记录。
++
++## 1. 完成 dmsetup 控制面语义对齐
++
++### 背景
++
++前一阶段已有 Device Mapper ioctl、linear/striped/mixed table 和 LVM2 系统验收基础。本阶段把 `dmsetup` 用户可见控制面语义按标准 Linux/OpenEuler 基准和 Asterinas guest 同构脚本逐项对齐。
++
++### 改动
++
++新增主机基准与 guest 同构脚本：
++
++```text
++myshell/run_dmsetup_linux_cli_baseline.sh
++myshell/run_dmsetup_cli_semantics_test.sh
++```
++
++更新系统测试 harness：
++
++```text
++myshell/run_dm_system_tests.sh --dmsetup-cli
++myshell/lib/dm_nixos_test.sh
++```
++
++主要覆盖：
++
++```text
++dmsetup version / targets / target-version
++tableless create / --notable / ls / info / remove
++linear 与 striped create / table / status / deps / info / remove
++load / reload / clear / resume active-inactive table 生命周期
++suspend / resume / wait
++rename / --setuuid / info -u
++remove / remove_all
++```
++
++本阶段修复的控制面 GAP：
++
++```text
++striped dmsetup status 输出改为 Linux 风格运行状态参数。
++load/suspend/resume 不再错误推进 wait 所依赖的 event。
++dmsetup rename NAME NAME 返回 EBUSY 且不改变状态。
++dmsetup wait ioctl 改用 signal-aware pause，允许 timeout 信号中断阻塞等待。
++```
++
++### 测试
++
++相关 ktest 已按单个 GAP 定向运行；验证完成后恢复临时 `Cargo.toml default-members` 修改。
++
++重建 NixOS 后，`--dmsetup-cli` 通过：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dmsetup-cli'
++
++STATUS_WAIT_ZERO: 124
++STATUS_WAIT_OLD_EVENT: 124
++STATUS_RENAME_SAME_NAME: 1
++SUMMARY_GAP_DMSETUP_CLI_SEMANTICS: 0
++TEST_PASS_DMSETUP_CLI_SEMANTICS
++HOST_PASS_DMSETUP_CLI_SEMANTICS
++HOST_PASS_DM_SYSTEM_TESTS --dmsetup-cli
++```
++
++## 2. 完成 LVM2 控制面基准和 guest 同构验证
++
++### 背景
++
++已有 LVM2 慢系统脚本能证明 linear/striped/mixed LV 创建、扩缩容、文件 I/O 和 reboot recovery，但缺少像 `dmsetup` 一样的逐命令控制面语义矩阵。本阶段新增 host baseline 与 guest 同构 suite。
++
++### 改动
++
++新增脚本：
++
++```text
++myshell/run_lvm2_linux_cli_baseline.sh
++myshell/run_lvm2_cli_semantics_test.sh
++```
++
++注册系统入口：
++
++```text
++myshell/run_dm_system_tests.sh --lvm2-cli
++```
++
++主机 baseline 安全策略：
++
++```text
++只使用本次创建的临时 loop 设备。
++所有 VG/LV/PV 使用唯一前缀。
++所有 destructive cleanup 只处理 manifest 中记录的测试对象。
++不删除、不 deactivate、不清理用户已有 PV/VG/LV。
++LVM filter/global_filter 限定到本次 loop，支持时追加 --devices。
++```
++
++覆盖命令子集：
++
++```text
++pvs / vgs / lvs / lvs --segments
++pvcreate / vgcreate / vgextend / pvscan / vgscan --mknodes / vgchange -ay / vgchange -an
++lvcreate --type linear
++lvcreate --type striped
++lvextend / lvreduce
++lvremove / vgremove / pvremove
++dmsetup table / status / deps
++```
++
++本阶段也更新了 `docs/study.md` 和 `docs/test.md`，明确当前 LVM2 对齐的是“正常命令模板 + 测试隔离参数”，不是日常裸 LVM2 命令体验。
++
++### 测试
++
++主机 preflight 与 baseline 通过：
++
++```text
++sudo myshell/run_lvm2_linux_cli_baseline.sh --preflight
++sudo myshell/run_lvm2_linux_cli_baseline.sh
++
++PREFLIGHT_PASS_LVM2_LINUX_CLI_BASELINE
++SUMMARY_GAP_LVM2_LINUX_BASELINE: 0
++BASELINE_PASS_LVM2_LINUX_CLI_BASELINE
++```
++
++Asterinas guest 同构 suite 通过：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --lvm2-cli'
++
++SUMMARY_GAP_LVM2_CLI_SEMANTICS: 0
++TEST_PASS_LVM2_CLI_SEMANTICS
++HOST_PASS_LVM2_CLI_SEMANTICS
++HOST_PASS_DM_SYSTEM_TESTS --lvm2-cli
++```
++
++## 3. 新增 raw DM 数据面边界 guest 审计
++
++### 背景
++
++已有 `--linear-data` 和 `--striped-data` 覆盖基础 BIO split/remap 与 backing 分布。本阶段不改内核、不改依赖、不改启动设置，只新增 guest 脚本，补更细的数据面边界回归。
++
++### 改动
++
++新增脚本：
++
++```text
++myshell/run_dm_dataplane_edge_test.sh
++```
++
++注册系统入口：
++
++```text
++myshell/run_dm_system_tests.sh --dataplane-edge
++```
++
++更新测试文档：
++
++```text
++docs/test.md
++```
++
++覆盖场景：
++
++```text
++三段 linear table。
++非零 backing start remap。
++mapper readback 与三个 backing 落点校验。
++striped 2-way、4-sector chunk table。
++从 chunk 内部偏移开始写入并跨多个 stripe 边界。
++mapper readback 与两个 backing 分布校验。
++```
++
++### 测试
++
++静态检查通过：
++
++```text
++bash -n myshell/run_dm_dataplane_edge_test.sh myshell/run_dm_system_tests.sh
++git diff --check -- myshell/run_dm_dataplane_edge_test.sh myshell/run_dm_system_tests.sh docs/test.md
++```
++
++guest suite 通过：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dataplane-edge'
++
++CHECK_PASS_LINEAR_EDGE_MAPPER_READBACK
++CHECK_PASS_LINEAR_EDGE_BACKING_D1
++CHECK_PASS_LINEAR_EDGE_BACKING_D2
++CHECK_PASS_LINEAR_EDGE_BACKING_D3
++CHECK_PASS_STRIPED_EDGE_MAPPER_READBACK
++CHECK_PASS_STRIPED_EDGE_BACKING_D1
++CHECK_PASS_STRIPED_EDGE_BACKING_D2
++TEST_PASS_DM_DATAPLANE_EDGE
++HOST_PASS_DM_DATAPLANE_EDGE
++HOST_PASS_DM_SYSTEM_TESTS --dataplane-edge
++```
++
++首次调试时发现两个脚本侧问题，均已修正：
++
++```text
++使用 cmp -s 比较文件时 guest 未返回，改为与既有脚本一致的 md5sum + awk 比较。
++striped 期望文件中的零扇区误生成成字符 Z 扇区，改为真正的 /dev/zero 扇区。
++```
++
++## 4. 文档同步
++
++### 改动
++
++更新文档：
++
++```text
++docs/study.md
++docs/test.md
++log/device-mapper-progress.md
++log/2026-8-31.md
++```
++
++`docs/study.md` 当前包含：
++
++```text
++dmsetup 控制面命令对齐矩阵。
++LVM2 控制面命令对齐矩阵。
++LVM2 common 参数和裸命令边界说明。
++```
++
++`docs/test.md` 当前包含：
++
++```text
++LVM2 host baseline 入口。
++LVM2 guest --lvm2-cli 入口。
++raw DM --dataplane-edge 数据面边界入口。
++```
++
++### 测试
++
++文档和脚本格式检查通过：
++
++```text
++git diff --check -- docs/study.md docs/test.md log/device-mapper-progress.md log/2026-8-31.md myshell/run_dm_dataplane_edge_test.sh myshell/run_dm_system_tests.sh
++```
++
++## 5. Flush 数据面覆盖收口 review
++
++### 背景
++
++准备继续数据面语义增强时，先核对当前技术文档和代码实现边界。`discard / write zeroes` 在技术文档中明确属于当前非目标，block `BioType` 当前也只有 Read / Write / Flush，因此本阶段不新增 guest discard/write-zeroes 脚本。
++
++### 结论
++
++现有 `aster-device-mapper` crate 已覆盖 flush 关键内核语义：
++
++```text
++linear table flush backing 去重。
++striped table flush fan-out。
++linear + striped mixed table shared backing 去重。
++flush completion failure 返回 IoError。
++backing enqueue flush 失败返回 IoError。
++readonly mapper 允许 Read / Flush、拒绝 Write。
++suspend 等待已提交 flush 完成，并拒绝 suspend 期间的新 flush。
++```
++
++本阶段没有新增代码和脚本；只更新滚动进度文档，把下一步从 discard/write-zeroes guest 假测收窄为现有慢系统回归或 queue limit / alignment / topology 审计。
++
++### 测试
++
++临时把根 `Cargo.toml` 的 `default-members` 收窄为 `kernel/core/comps/device-mapper` 后执行；验证完成后已恢复 `Cargo.toml`，并确认 `git diff -- Cargo.toml` 无输出。
++
++有效验证命令：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2"'
++
++test result: ok. 52 passed; 0 failed; 0 filtered out.
++```
++
++无效过滤尝试：
++
++```text
++CARGO_OSDK_TEST_ARGS="... flush"
++CARGO_OSDK_TEST_ARGS="... aster_device_mapper::table::tests::"
++```
++
++这两次均未匹配到测试，结果为 `0 passed; 52 filtered out`，不作为有效验证依据。
++
++## 6. 新增 Device Mapper error target
++
++### 背景
++
++本阶段从现有语义审计转向拓展 Asterinas 上的 DM target 功能。选择先实现边界清晰的 Linux DM `error` target：它不依赖 backing device，能为 guest 侧稳定 I/O error 场景提供基础。
++
++### 改动
++
++新增核心 target：
++
++```text
++kernel/core/comps/device-mapper/src/target/error.rs
++```
++
++更新核心 DM 数据面：
++
++```text
++kernel/core/comps/device-mapper/src/target/mod.rs
++kernel/core/comps/device-mapper/src/table.rs
++kernel/core/comps/device-mapper/src/lib.rs
++```
++
++实现语义：
++
++```text
++error target 无 backing 参数。
++Read / Write 覆盖 error target 时完成为 BioStatus::IoError。
++flush 对无 backing table 直接完成成功。
++deps 为空。
++纯 error table 的 max_nr_segments_per_bio 不因无 backing 变为 0。
++跨 linear + error target 的 BIO 继续使用现有 split completion 聚合为 IoError。
++```
++
++更新 ioctl / dmsetup 控制面：
++
++```text
++kernel/core/src/device/misc/device_mapper.rs
++```
++
++覆盖：
++
++```text
++dmsetup targets 包含 error。
++dmsetup target-version error 返回 v1.6.0。
++dmsetup create NAME --table "0 8 error" 成功。
++dmsetup table/status 输出 error target。
++dmsetup deps 返回 0 dependencies。
++```
++
++更新 host baseline、guest 同构脚本和文档：
++
++```text
++myshell/run_dmsetup_linux_cli_baseline.sh
++myshell/run_dmsetup_cli_semantics_test.sh
++docs/study.md
++docs/test.md
++log/device-mapper-progress.md
++```
++
++### 测试
++
++脚本语法和 Rust 格式检查通过：
++
++```text
++bash -n myshell/run_dmsetup_linux_cli_baseline.sh myshell/run_dmsetup_cli_semantics_test.sh myshell/run_dm_system_tests.sh
++cargo fmt --all --check
++```
++
++`aster-device-mapper` crate ktest 通过：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2"'
++
++test result: ok. 57 passed; 0 failed; 0 filtered out.
++```
++
++`kernel` crate ioctl 层 ktest 尝试使用模块前缀过滤，但该入口只完成构建、未执行匹配测试，因此不作为有效 ktest 结果；构建本身通过。
++
++后续使用精确过滤条件补跑 ioctl 层定向 ktest，通过：
++
++```text
++rejects_error_target_params_before_state_changes
++lists_error_linear_and_striped_target_versions
++marks_partial_target_list_without_dangling_next
++gets_named_target_version_record
++```
++
++其中 `lists_error_linear_and_striped_target_versions` 的过滤输出只保留到测试开始行，但带退出码复核为 `EXIT_STATUS:0`。
++
++NixOS 镜像重建通过：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && make nixos'
++```
++
++host Linux/OpenEuler baseline 通过，且新增 error target 场景符合预期：
++
++```text
++sudo myshell/run_dmsetup_linux_cli_baseline.sh
++
++STATUS_TARGET_VERSION_ERROR: 0
++STATUS_ERROR_CREATE: 0
++STDOUT_ERROR_TABLE: 0 8 error 
++STDOUT_ERROR_STATUS: 0 8 error 
++STDOUT_ERROR_DEPS: 0 dependencies	:
++STATUS_ERROR_READ: 1
++STDERR_ERROR_READ: dd: error reading '/dev/mapper/NAME_error': Input/output error
++STATUS_ERROR_WRITE: 1
++STDERR_ERROR_WRITE: dd: error writing '/dev/mapper/NAME_error': Input/output error
++BASELINE_PASS DMSETUP_LINUX_CLI_BASELINE
++```
++
++Asterinas guest `--dmsetup-cli` 默认 180 秒生命周期两次因 guest ready 过慢超时：ready 分别为 118s 和 169s；日志中 error target 场景已通过且未出现语义 GAP。使用 300 秒兜底完成一次系统验证：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=300 myshell/run_dm_system_tests.sh --dmsetup-cli'
++
++CHECK_PASS_DMSETUP_ERROR_CREATE_IO
++SUMMARY_GAP_DMSETUP_CLI_SEMANTICS: 0
++TEST_PASS_DMSETUP_CLI_SEMANTICS
++HOST_PASS_DMSETUP_CLI_SEMANTICS
++HOST_PASS_DM_SYSTEM_TESTS --dmsetup-cli
++```

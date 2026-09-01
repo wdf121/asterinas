@@ -1,0 +1,68 @@
+diff --git a/kernel/core/src/fs/vfs/fs_apis/registry.rs b/kernel/core/src/fs/vfs/fs_apis/registry.rs
+index 0e6586ce2..7e4638304 100644
+--- a/kernel/core/src/fs/vfs/fs_apis/registry.rs
++++ b/kernel/core/src/fs/vfs/fs_apis/registry.rs
+@@ -2,7 +2,7 @@
+ 
+ use alloc::collections::btree_map::Entry;
+ 
+-use aster_block::BlockDevice;
++use aster_block::{BlockDevice, BlockDeviceLease};
+ use aster_systree::{
+     AttrLessBranchNodeFields, SysNode, SysObj, SysPerms, SysStr, inherit_sys_branch_node,
+ };
+@@ -111,7 +111,7 @@ pub(crate) struct FsCreationCtx<'a> {
+ 
+ enum BlockDeviceResolution<'a> {
+     Pending(&'a Context<'a>),
+-    Resolved(Arc<dyn BlockDevice>),
++    Resolved(BlockDeviceLease),
+ }
+ 
+ impl<'a> FsCreationCtx<'a> {
+@@ -140,7 +140,9 @@ impl<'a> FsCreationCtx<'a> {
+             source: None,
+             flags,
+             args,
+-            block_device: BlockDeviceResolution::Resolved(block_device),
++            block_device: BlockDeviceResolution::Resolved(BlockDeviceLease::new_untracked(
++                block_device,
++            )),
+         }
+     }
+ 
+@@ -160,7 +162,7 @@ impl<'a> FsCreationCtx<'a> {
+     }
+ 
+     /// Resolves the mount source into a block device.
+-    pub(in crate::fs) fn resolve_block_device(&mut self) -> Result<&Arc<dyn BlockDevice>> {
++    pub(in crate::fs) fn resolve_block_device(&mut self) -> Result<&BlockDeviceLease> {
+         if self.block_device().is_none() {
+             self.do_resolve_block_device()?;
+         }
+@@ -168,7 +170,7 @@ impl<'a> FsCreationCtx<'a> {
+         Ok(self.block_device().unwrap())
+     }
+ 
+-    fn block_device(&self) -> Option<&Arc<dyn BlockDevice>> {
++    fn block_device(&self) -> Option<&BlockDeviceLease> {
+         match &self.block_device {
+             BlockDeviceResolution::Pending(_) => None,
+             BlockDeviceResolution::Resolved(block_device) => Some(block_device),
+@@ -192,13 +194,13 @@ impl<'a> FsCreationCtx<'a> {
+             .read()
+             .lookup(&fs_path)?;
+ 
+-        if !path.type_().is_device() {
+-            return_errno_with_message!(Errno::ENODEV, "the path is not a device file");
++        if path.type_() != crate::fs::file::InodeType::BlockDevice {
++            return_errno_with_message!(Errno::ENODEV, "the path is not a block device file");
+         }
+         let id = path.metadata()?.self_dev_id;
+ 
+         let block_device = id
+-            .and_then(aster_block::lookup)
++            .and_then(aster_block::lookup_lease)
+             .ok_or_else(|| Error::with_message(Errno::ENODEV, "the device is not found"))?;
+         self.block_device = BlockDeviceResolution::Resolved(block_device);
+ 

@@ -1,0 +1,28 @@
+diff --git a/kernel/core/src/fs/fs_impls/procfs/mod.rs b/kernel/core/src/fs/fs_impls/procfs/mod.rs
+index 0c2201ae4..50bb4e946 100644
+--- a/kernel/core/src/fs/fs_impls/procfs/mod.rs
++++ b/kernel/core/src/fs/fs_impls/procfs/mod.rs
+@@ -11,6 +11,7 @@ use template::{
+ use self::{
+     cmdline::CmdLineFileOps,
+     cpuinfo::CpuInfoFileOps,
++    devices::DevicesFileOps,
+     loadavg::LoadAvgFileOps,
+     meminfo::MemInfoFileOps,
+     mounts::MountsSymOps,
+@@ -42,6 +43,7 @@ use crate::{
+ 
+ mod cmdline;
+ mod cpuinfo;
++mod devices;
+ mod filesystems;
+ mod loadavg;
+ mod meminfo;
+@@ -153,6 +155,7 @@ impl RootDirOps {
+     const STATIC_ENTRIES: &'static [StaticEntry] = &[
+         ("cmdline", InodeType::File, CmdLineFileOps::new_inode),
+         ("cpuinfo", InodeType::File, CpuInfoFileOps::new_inode),
++        ("devices", InodeType::File, DevicesFileOps::new_inode),
+         (
+             "filesystems",
+             InodeType::File,

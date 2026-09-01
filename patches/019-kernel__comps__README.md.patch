@@ -1,0 +1,7 @@
+diff --git a/kernel/comps/README.md b/kernel/comps/README.md
+deleted file mode 100644
+index 7d351c711..000000000
+--- a/kernel/comps/README.md
++++ /dev/null
+@@ -1 +0,0 @@
+-# High-level Kernel Components

@@ -1,0 +1,49 @@
+diff --git a/kernel/core/src/fs/vfs/path/mod.rs b/kernel/core/src/fs/vfs/path/mod.rs
+index b0067c015..b65d0c91f 100644
+--- a/kernel/core/src/fs/vfs/path/mod.rs
++++ b/kernel/core/src/fs/vfs/path/mod.rs
+@@ -4,7 +4,7 @@
+ 
+ use core::time::Duration;
+ 
+-pub(in crate::fs) use dentry::Dentry;
++pub(crate) use dentry::Dentry;
+ use inherit_methods_macro::inherit_methods;
+ pub(crate) use mount::{MNT_UNIQUE_ID_MIN, Mount, MountPropType, PerMountFlags};
+ use mount::{MountNsFileCopying, MountTopology};
+@@ -123,7 +123,7 @@ impl Path {
+     }
+ 
+     /// Gets the dentry of current `Path`.
+-    pub(in crate::fs) fn dentry(&self) -> &Arc<Dentry> {
++    pub(crate) fn dentry(&self) -> &Arc<Dentry> {
+         &self.dentry
+     }
+ 
+@@ -689,6 +689,26 @@ impl Path {
+         dir_dentry.unlink(name)
+     }
+ 
++    /// 仅当名称仍指向预期路径的 inode 时删除目录项。
++    pub(crate) fn unlink_if_matches(&self, name: &str, expected: &Self) -> Result<()> {
++        if !Arc::ptr_eq(&self.mount, &expected.mount) {
++            return_errno_with_message!(Errno::EXDEV, "the operation cannot cross mounts");
++        }
++        let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
++        self.check_dir_entry_mutation()?;
++        dir_dentry.unlink_if_matches(name, expected.inode())
++    }
++
++    /// 仅当名称仍指向预期路径的 inode 时删除空目录。
++    pub(crate) fn rmdir_if_matches(&self, name: &str, expected: &Self) -> Result<()> {
++        if !Arc::ptr_eq(&self.mount, &expected.mount) {
++            return_errno_with_message!(Errno::EXDEV, "the operation cannot cross mounts");
++        }
++        let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
++        self.check_dir_entry_mutation()?;
++        dir_dentry.rmdir_if_matches(name, expected.inode())
++    }
++
+     /// Removes a directory by `rmdir()` the inner inode.
+     pub(crate) fn rmdir(&self, name: &str) -> Result<()> {
+         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;

@@ -1,0 +1,13 @@
+diff --git a/kernel/core/src/fs/fs_impls/ext2/fs_type.rs b/kernel/core/src/fs/fs_impls/ext2/fs_type.rs
+index c0f24eebb..16c02cb9a 100644
+--- a/kernel/core/src/fs/fs_impls/ext2/fs_type.rs
++++ b/kernel/core/src/fs/fs_impls/ext2/fs_type.rs
+@@ -49,7 +49,7 @@ impl FsType for Ext2Type {
+         let key = fs_creation_ctx
+             .resolve_block_device()
+             .ok()
+-            .map(|disk| disk.id())?;
++            .map(|disk| disk.device().id())?;
+ 
+         Some((key, &self.cache))
+     }
