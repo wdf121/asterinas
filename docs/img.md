@@ -2,6 +2,294 @@
 
 本文只作为技术文档配图草稿，正式位置和正文说明待确认后再合入 [device-mapper-technical-maintenance.md](device-mapper-technical-maintenance.md)。
 
+> 特别说明：图 0 描述的是为 Device Mapper control 接入而对 Asterinas `device` 框架做的更改，不是 DM table/target/BIO 数据面本身。它解释的是 `/dev/mapper/control` 如何在用户态 `dmsetup` 运行前由内核启动期注册出来。图 1 开始进入运行期控制面，描述用户态通过 control ioctl 创建具体 mapper 块设备入口的过程。
+
+## 图 0：启动期 `/dev/mapper/control` 注册链路
+
+```mermaid
+%%{init: {"flowchart": {"htmlLabels": false, "useMaxWidth": false}, "themeCSS": "svg { display: block; margin: 0 auto; } .nodeLabel { text-align: center; }"}}%%
+flowchart TB
+    A["内核启动<br/>first kthread"]
+
+    subgraph MISC["初始化 misc 设备子系统"]
+        direction TB
+        B["占用 misc<br/>major 10"]
+
+        subgraph DM_INIT["初始化 Device Mapper control"]
+            direction TB
+            C["初始化<br/>DM_MANAGER"]
+            D["构造 DM control<br/>字符设备"]
+            E["绑定 Linux ABI<br/>设备号 10:236"]
+            F["声明 devtmpfs 路径<br/>mapper/control"]
+        end
+    end
+
+    subgraph REG["注册字符设备并创建 devtmpfs 节点"]
+        direction TB
+        G["注册到<br/>char registry"]
+        H["devtmpfs 创建<br/>/dev/mapper/control"]
+    end
+
+    I["用户态 dmsetup<br/>open control"]
+    J["后续 ioctl<br/>进入 DM 控制面"]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> G
+    G --> H
+    H --> I
+    I --> J
+
+    classDef boot fill:#e8f3ff,stroke:#2563eb,stroke-width:1px,color:#0f172a;
+    classDef framework fill:#ecfdf5,stroke:#059669,stroke-width:1px,color:#0f172a;
+    classDef dm fill:#fff7ed,stroke:#ea580c,stroke-width:2px,color:#0f172a;
+    classDef result fill:#f8fafc,stroke:#475569,stroke-width:1px,color:#0f172a;
+    classDef group fill:#ffffff,stroke:#94a3b8,stroke-width:1px,color:#334155;
+
+    class A boot;
+    class B,G,H framework;
+    class C,D,E,F dm;
+    class I,J result;
+    class MISC,REG group;
+    class DM_INIT dm;
+```
+
+这条图表达的是启动期的包含关系：内核进入 first kthread 后调用 `misc::init_in_first_kthread()`，而“占用 misc major 10”和“初始化 Device Mapper control”都是 misc 设备子系统初始化内部的动作。DM control 初始化内部再创建 `DM_MANAGER`，构造 `DmControlDevice`，并绑定 Linux Device Mapper ABI 约定的设备号 10:236；随后通过字符设备注册和 devtmpfs runtime node 机制生成 `/dev/mapper/control`。`misc/mod.rs`、`registry/char.rs` 和 `device/mod.rs` 属于 Asterinas 原有 device 框架改动，`device_mapper.rs` 是 DM control 接入点。若 `/dev/mapper/control` 不存在，优先查这条启动期注册链路，而不是 table、target 或 BIO 映射逻辑。
+
+## 图 1：运行期 control ioctl 入口与命令分发链路
+
+```mermaid
+%%{init: {"flowchart": {"htmlLabels": false, "useMaxWidth": false}, "themeCSS": "svg { display: block; margin: 0 auto; } .nodeLabel { text-align: center; }"}}%%
+flowchart TB
+    A["用户态 dmsetup"]
+    B["打开已存在的<br/>/dev/mapper/control"]
+    C["获得 control<br/>打开文件对象"]
+    D["发起 ioctl"]
+
+    subgraph ENTRY["control 文件 ioctl 入口"]
+        direction TB
+        E["读取 raw ioctl<br/>命令号"]
+        F["解码为 DM<br/>命令类型"]
+    end
+
+    subgraph HEADER["读取并校验 dm_ioctl 头部"]
+        direction TB
+        G["读取固定头部"]
+        H["提取 data_size<br/>data_start"]
+        I["提取 name / uuid<br/>dev / flags"]
+        J["校验 buffer<br/>布局"]
+    end
+
+    subgraph BUFFER["读取完整 ioctl buffer 并做通用校验"]
+        direction TB
+        K["读取完整<br/>用户 buffer"]
+        L["校验 client<br/>version"]
+        M["写入内核支持的<br/>version"]
+        N["校验输入<br/>flags"]
+    end
+
+    subgraph DISPATCH["DM 命令分发"]
+        direction TB
+        O["判断是否为<br/>DM_DEV_WAIT"]
+        P["非 wait 命令进入<br/>DM_CONTROL_LOCK"]
+        Q["handle_command<br/>统一分发"]
+        R["识别<br/>DM_DEV_CREATE_CMD"]
+    end
+
+    S["下一步才进入<br/>mapper 设备创建"]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> G
+    G --> H
+    H --> I
+    I --> J
+    J --> K
+    K --> L
+    L --> M
+    M --> N
+    N --> O
+    O --> P
+    P --> Q
+    Q --> R
+    R --> S
+
+    classDef user fill:#f8fafc,stroke:#475569,stroke-width:1px,color:#0f172a;
+    classDef control fill:#e8f3ff,stroke:#2563eb,stroke-width:1px,color:#0f172a;
+    classDef validate fill:#ecfdf5,stroke:#059669,stroke-width:1px,color:#0f172a;
+    classDef dispatch fill:#fff7ed,stroke:#ea580c,stroke-width:2px,color:#0f172a;
+    classDef group fill:#ffffff,stroke:#94a3b8,stroke-width:1px,color:#334155;
+
+    class A,B,C,D,S user;
+    class E,F control;
+    class G,H,I,J,K,L,M,N validate;
+    class O,P,Q,R dispatch;
+    class ENTRY,HEADER,BUFFER,DISPATCH group;
+```
+
+这条图只讲运行期 control ioctl 的通用入口，还没有进入 mapper 设备创建。用户态已经能打开图 0 创建出来的 `/dev/mapper/control` 后，ioctl 会先经过 raw command 解码、`dm_ioctl` 头部读取、buffer 布局校验、版本协商、flags 校验和 `DM_CONTROL_LOCK` 串行化；只有 `handle_command` 识别出 `DM_DEV_CREATE_CMD` 后，下一张图才开始讲具体 mapper 块设备入口的创建。
+
+## Device Mapper 功能到文件索引
+
+这两张表用于从“改了什么功能”快速定位文件、实现函数和优先跑的 `#[ktest]`。第一张表按目录分组，文件列使用完整路径；第二张表只列有直接 `ktest` 覆盖的函数或函数组。
+
+| 功能/场景 | 对应文件完整路径 |
+|---|---|
+| **workspace 接入** |  |
+| workspace 成员与默认 ktest 集合 | [/root/atom/asterinas/Cargo.toml](../Cargo.toml) |
+| `aster-core` 引入 `aster-device-mapper` 依赖 | [/root/atom/asterinas/kernel/core/Cargo.toml](../kernel/core/Cargo.toml) |
+| **DM crate：/root/atom/asterinas/kernel/core/comps/device-mapper** |  |
+| DM crate manifest | [/root/atom/asterinas/kernel/core/comps/device-mapper/Cargo.toml](../kernel/core/comps/device-mapper/Cargo.toml) |
+| DM crate 对外导出 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/lib.rs](../kernel/core/comps/device-mapper/src/lib.rs) |
+| DM device 生命周期、readonly、suspend/load/resume、event、BIO 入口 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/device.rs](../kernel/core/comps/device-mapper/src/device.rs) |
+| DM manager、name/uuid/id/minor 索引、create/remove/rename | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/manager.rs](../kernel/core/comps/device-mapper/src/manager.rs) |
+| DM table 构造、target 顺序、容量、deps、BIO remap/split、flush | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/table.rs](../kernel/core/comps/device-mapper/src/table.rs) |
+| target enum 与 target 通用转发接口 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/target/mod.rs](../kernel/core/comps/device-mapper/src/target/mod.rs) |
+| linear target 构造、范围校验、sector 映射 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/target/linear.rs](../kernel/core/comps/device-mapper/src/target/linear.rs) |
+| striped target 参数解析、容量校验、sector/range 映射 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/target/striped.rs](../kernel/core/comps/device-mapper/src/target/striped.rs) |
+| **原有 block 框架：/root/atom/asterinas/kernel/core/comps/block/src** |  |
+| BIO 当前映射 range、remap、split、completion chain | [/root/atom/asterinas/kernel/core/comps/block/src/bio.rs](../kernel/core/comps/block/src/bio.rs) |
+| `DeviceId`/major/minor 支撑与测试 | [/root/atom/asterinas/kernel/core/comps/block/src/device_id.rs](../kernel/core/comps/block/src/device_id.rs) |
+| block device registry、lease、pending register/unregister、lookup/list | [/root/atom/asterinas/kernel/core/comps/block/src/lib.rs](../kernel/core/comps/block/src/lib.rs) |
+| 分区设备适配 `BlockDeviceLease`/新 block 接口 | [/root/atom/asterinas/kernel/core/comps/block/src/partition.rs](../kernel/core/comps/block/src/partition.rs) |
+| request queue 适配 BIO range/split 语义 | [/root/atom/asterinas/kernel/core/comps/block/src/request_queue.rs](../kernel/core/comps/block/src/request_queue.rs) |
+| **原有块设备驱动：mlsdisk/nvme/virtio** |  |
+| mlsdisk block device 适配新 block 接口 | [/root/atom/asterinas/kernel/core/comps/mlsdisk/src/lib.rs](../kernel/core/comps/mlsdisk/src/lib.rs) |
+| mlsdisk 底层 disk 层适配新 block 接口 | [/root/atom/asterinas/kernel/core/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs](../kernel/core/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs) |
+| nvme block device 适配新 block 接口 | [/root/atom/asterinas/kernel/core/comps/nvme/src/lib.rs](../kernel/core/comps/nvme/src/lib.rs) |
+| nvme block device 实现适配新 block 接口 | [/root/atom/asterinas/kernel/core/comps/nvme/src/device/block_device.rs](../kernel/core/comps/nvme/src/device/block_device.rs) |
+| virtio block module 适配新 block 接口 | [/root/atom/asterinas/kernel/core/comps/virtio/src/lib.rs](../kernel/core/comps/virtio/src/lib.rs) |
+| virtio block 子模块导出/适配 | [/root/atom/asterinas/kernel/core/comps/virtio/src/device/block/mod.rs](../kernel/core/comps/virtio/src/device/block/mod.rs) |
+| virtio block device 实现适配新 block 接口 | [/root/atom/asterinas/kernel/core/comps/virtio/src/device/block/device.rs](../kernel/core/comps/virtio/src/device/block/device.rs) |
+| **原有 device 框架：/root/atom/asterinas/kernel/core/src/device** |  |
+| devtmpfs runtime node/symlink 创建、删除、rename，设备注册入口扩展 | [/root/atom/asterinas/kernel/core/src/device/mod.rs](../kernel/core/src/device/mod.rs) |
+| misc 设备初始化接入 Device Mapper control device | [/root/atom/asterinas/kernel/core/src/device/misc/mod.rs](../kernel/core/src/device/misc/mod.rs) |
+| `/dev/mapper/control` ioctl ABI、create/remove/rename/table/status/deps/list | [/root/atom/asterinas/kernel/core/src/device/misc/device_mapper.rs](../kernel/core/src/device/misc/device_mapper.rs) |
+| block runtime registry、devtmpfs block node、mapper alias、open count | [/root/atom/asterinas/kernel/core/src/device/registry/block.rs](../kernel/core/src/device/registry/block.rs) |
+| block registry 对外导出 `register_block_mapper` 等能力 | [/root/atom/asterinas/kernel/core/src/device/registry/mod.rs](../kernel/core/src/device/registry/mod.rs) |
+| **原有 fs/VFS/page cache：/root/atom/asterinas/kernel/core/src** |  |
+| exfat 挂载改用 `BlockDeviceLease` | [/root/atom/asterinas/kernel/core/src/fs/fs_impls/exfat/fs.rs](../kernel/core/src/fs/fs_impls/exfat/fs.rs) |
+| ext2 挂载改用 `BlockDeviceLease` | [/root/atom/asterinas/kernel/core/src/fs/fs_impls/ext2/fs.rs](../kernel/core/src/fs/fs_impls/ext2/fs.rs) |
+| ext2 fs type 适配 block device lease 解析 | [/root/atom/asterinas/kernel/core/src/fs/fs_impls/ext2/fs_type.rs](../kernel/core/src/fs/fs_impls/ext2/fs_type.rs) |
+| ext2 测试工具适配 block device lease | [/root/atom/asterinas/kernel/core/src/fs/fs_impls/ext2/test_utils.rs](../kernel/core/src/fs/fs_impls/ext2/test_utils.rs) |
+| procfs 接入 `/proc/devices` | [/root/atom/asterinas/kernel/core/src/fs/fs_impls/procfs/mod.rs](../kernel/core/src/fs/fs_impls/procfs/mod.rs) |
+| `/proc/devices` 内容生成 | [/root/atom/asterinas/kernel/core/src/fs/fs_impls/procfs/devices.rs](../kernel/core/src/fs/fs_impls/procfs/devices.rs) |
+| VFS block device 解析改用 lease | [/root/atom/asterinas/kernel/core/src/fs/vfs/fs_apis/registry.rs](../kernel/core/src/fs/vfs/fs_apis/registry.rs) |
+| dentry 条件 unlink/rmdir 支撑 runtime devtmpfs 回滚 | [/root/atom/asterinas/kernel/core/src/fs/vfs/path/dentry.rs](../kernel/core/src/fs/vfs/path/dentry.rs) |
+| Path 暴露条件 unlink/rmdir 接口 | [/root/atom/asterinas/kernel/core/src/fs/vfs/path/mod.rs](../kernel/core/src/fs/vfs/path/mod.rs) |
+| page cache 测试工具适配 block device lease | [/root/atom/asterinas/kernel/core/src/vm/page_cache/tests/utils.rs](../kernel/core/src/vm/page_cache/tests/utils.rs) |
+| **用户态回归测试：/root/atom/asterinas/test/initramfs/src/regression** |  |
+| Device Mapper control ABI 回归测试 C 程序 | [/root/atom/asterinas/test/initramfs/src/regression/device/device_mapper.c](../test/initramfs/src/regression/device/device_mapper.c) |
+| device 回归测试入口接入 DM 测试 | [/root/atom/asterinas/test/initramfs/src/regression/device/run_test.sh](../test/initramfs/src/regression/device/run_test.sh) |
+| `/proc/devices` 回归测试 C 程序 | [/root/atom/asterinas/test/initramfs/src/regression/fs/procfs/devices.c](../test/initramfs/src/regression/fs/procfs/devices.c) |
+| fs 回归测试入口接入 `/proc/devices` 测试 | [/root/atom/asterinas/test/initramfs/src/regression/fs/run_test.sh](../test/initramfs/src/regression/fs/run_test.sh) |
+| block device 文件 I/O 回归测试适配 DM/块设备行为 | [/root/atom/asterinas/test/initramfs/src/regression/io/file_io/block_device.c](../test/initramfs/src/regression/io/file_io/block_device.c) |
+| **DM 系统测试脚本：/root/atom/asterinas/myshell** |  |
+| 本地启动辅助脚本 | [/root/atom/asterinas/myshell/br.sh](../myshell/br.sh) |
+| DM 系统测试统一入口 | [/root/atom/asterinas/myshell/run_dm_system_tests.sh](../myshell/run_dm_system_tests.sh) |
+| DM NixOS 测试公共库 | [/root/atom/asterinas/myshell/lib/dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh) |
+| linear control ABI 系统测试 | [/root/atom/asterinas/myshell/dm_linear/run_control_abi_test.sh](../myshell/dm_linear/run_control_abi_test.sh) |
+| linear 跨 target BIO 回归测试 | [/root/atom/asterinas/myshell/dm_linear/run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh) |
+| linear LVM2 跨 segment 测试 | [/root/atom/asterinas/myshell/dm_linear/run_lvm2_linear_cross_segment_test.sh](../myshell/dm_linear/run_lvm2_linear_cross_segment_test.sh) |
+| linear LVM2 reboot 测试 | [/root/atom/asterinas/myshell/dm_linear/run_lvm2_linear_reboot_test.sh](../myshell/dm_linear/run_lvm2_linear_reboot_test.sh) |
+| striped raw BIO 测试 | [/root/atom/asterinas/myshell/dm_striped/run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh) |
+| striped LVM2 跨 segment 测试 | [/root/atom/asterinas/myshell/dm_striped/run_lvm2_striped_cross_segment_test.sh](../myshell/dm_striped/run_lvm2_striped_cross_segment_test.sh) |
+| striped LVM2 reboot 测试 | [/root/atom/asterinas/myshell/dm_striped/run_lvm2_striped_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_reboot_test.sh) |
+| mixed linear+striped LVM2 reboot 测试 | [/root/atom/asterinas/myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh](../myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh) |
+| **NixOS/QEMU/工具脚本** |  |
+| NixOS 配置接入 DM/LVM2 测试环境 | [/root/atom/asterinas/distro/etc_nixos/configuration.nix](../distro/etc_nixos/configuration.nix) |
+| hello-asterinas overlay 支撑测试镜像包 | [/root/atom/asterinas/distro/etc_nixos/overlays/hello-asterinas/default.nix](../distro/etc_nixos/overlays/hello-asterinas/default.nix) |
+| NixOS 镜像构建脚本适配 DM 测试镜像 | [/root/atom/asterinas/tools/nixos/build_nixos.sh](../tools/nixos/build_nixos.sh) |
+| NixOS/QEMU 运行脚本适配多盘 DM 测试 | [/root/atom/asterinas/tools/nixos/run.sh](../tools/nixos/run.sh) |
+| QEMU 参数脚本适配 DM 多盘场景 | [/root/atom/asterinas/tools/qemu_args.sh](../tools/qemu_args.sh) |
+| **文档与记录** |  |
+| 协作与当前分支说明 | [/root/atom/asterinas/AGENTS.md](../AGENTS.md) |
+| DM 技术维护文档 | [/root/atom/asterinas/docs/device-mapper-technical-maintenance.md](device-mapper-technical-maintenance.md) |
+| DM 配图与定位索引草稿 | [/root/atom/asterinas/docs/img.md](img.md) |
+| 非 DM 内核框架修改说明 | [/root/atom/asterinas/docs/non-device-mapper-change-rationale.md](non-device-mapper-change-rationale.md) |
+| striped 跨 segment 手工说明 | [/root/atom/asterinas/docs/striped-cross-segment-manual.md](striped-cross-segment-manual.md) |
+| DM 测试记录/说明 | [/root/atom/asterinas/docs/test.md](test.md) |
+| DM 分支对比与测试保障文档 | [/root/atom/asterinas/docs/DM分支对比与提交测试保障文档.docx](DM分支对比与提交测试保障文档.docx) |
+| Asterinas DM 分支对比与测试保障文档 | [/root/atom/asterinas/docs/Asterinas_DM_分支对比与提交测试保障文档.docx](Asterinas_DM_分支对比与提交测试保障文档.docx) |
+| 删除过期组件目录说明 | [/root/atom/asterinas/kernel/comps/README.md](../kernel/comps/README.md) |
+
+## Device Mapper 函数到 ktest 索引
+
+<table>
+  <colgroup>
+    <col style="width: 50%;" />
+    <col style="width: 50%;" />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>实现函数</th>
+      <th>对应 ktest 函数</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>SubmittedBio::remap_sid_start</code></td><td><code>remap_sid_start_preserves_length_and_original_range</code><br><code>remap_sid_start_rejects_overflow_without_changing_range</code></td></tr>
+    <tr><td><code>SubmittedBio::add_sid_offset</code></td><td><code>add_sid_offset_composes_multiple_block_layers</code><br><code>add_sid_offset_rejects_overflow_without_changing_range</code></td></tr>
+    <tr><td><code>SubmittedBio::split</code><br><code>SubmittedBio::validate_split_ranges</code><br><code>SubmittedBio::segments_for_child_range</code></td><td><code>split_child_segments_can_cross_original_segment_boundary</code></td></tr>
+    <tr><td><code>BlockDeviceLease</code><br><code>lookup_lease</code><br><code>begin_unregister</code><br><code>commit_unregister</code></td><td><code>lease_blocks_unregistration_until_last_holder_drops</code><br><code>pending_unregistration_blocks_new_holders_and_can_abort</code><br><code>dropped_pending_unregistration_restores_live_state</code></td></tr>
+    <tr><td><code>register_pending</code><br><code>commit_registration</code><br><code>abort_unregister</code></td><td><code>pending_registration_is_hidden_until_commit</code><br><code>dropped_pending_registration_rolls_back_automatically</code></td></tr>
+    <tr><td><code>PendingBlockDeviceRegistration::id</code><br><code>PendingBlockDeviceUnregistration::id</code></td><td><code>caches_device_id_before_locking_registry</code><br><code>dropped_tokens_use_cached_device_id</code></td></tr>
+    <tr><td><code>normalize_devtmpfs_path</code></td><td><code>validates_runtime_devtmpfs_paths</code></td></tr>
+    <tr><td><code>BlockFile::open</code><br><code>BlockFile::stop_accepting_opens</code><br><code>BlockFile::start_accepting_opens</code></td><td><code>blocks_new_opens_while_removing_and_tracks_open_handles</code><br><code>pending_wrapper_rejects_opens_until_registration_commits</code></td></tr>
+    <tr><td><code>validate_mapper_name</code></td><td><code>validates_mapper_names</code></td></tr>
+    <tr><td><code>LinearTarget::new</code></td><td><code>validates_target_ranges</code></td></tr>
+    <tr><td><code>LinearTarget::map_sector</code></td><td><code>maps_end_exclusive_sector_range</code></td></tr>
+    <tr><td><code>StripedTargetParams::parse</code><br><code>parse_device_id</code></td><td><code>parses_exact_striped_parameter_set</code><br><code>rejects_invalid_striped_parameter_sets</code></td></tr>
+    <tr><td><code>StripedTargetParams::required_sectors</code></td><td><code>calculates_required_sectors_for_uneven_stripes</code><br><code>rejects_invalid_required_sector_inputs</code></td></tr>
+    <tr><td><code>StripedTargetParams::validate_backing_ranges</code></td><td><code>validates_backing_ranges_for_striped_targets</code></td></tr>
+    <tr><td><code>StripedTarget::new</code></td><td><code>constructs_striped_target_with_resolved_backings</code><br><code>rejects_invalid_striped_target_construction</code></td></tr>
+    <tr><td><code>StripedTarget::for_each_backing_id</code><br><code>StripedTarget::for_each_stripe</code></td><td><code>iterates_all_striped_backings</code></td></tr>
+    <tr><td><code>StripedTarget::map_sector</code></td><td><code>maps_two_stripe_chunk_boundaries</code><br><code>maps_three_stripe_partial_final_row</code></td></tr>
+    <tr><td><code>StripedTarget::map_range</code></td><td><code>maps_range_inside_single_stripe_chunk</code><br><code>splits_range_at_stripe_chunk_boundaries</code><br><code>maps_range_ending_at_target_end</code><br><code>splits_three_stripe_range_across_partial_final_row</code><br><code>map_range_parts_match_single_sector_mapping</code></td></tr>
+    <tr><td><code>DmTable::new_linear</code><br><code>DmTable::new_targets</code><br><code>DmTable::new_single_linear</code></td><td><code>supports_multiple_contiguous_linear_targets</code><br><code>stores_linear_targets_as_ordered_dm_targets</code><br><code>accepts_mixed_linear_and_striped_targets</code><br><code>refuses_nonzero_or_gapped_logical_start</code></td></tr>
+    <tr><td><code>DmTable::length</code><br><code>DmTable::metadata</code><br><code>DmTable::backing_ids</code></td><td><code>reports_capacity_and_queue_limits_from_linear_targets</code><br><code>stores_striped_targets_and_reports_all_backings</code></td></tr>
+    <tr><td><code>DmTable::enqueue</code><br><code>DmTable::mapped_bio_parts</code><br><code>DmTable::bio_parts</code></td><td><code>remaps_bio_start_to_backing_device</code><br><code>splits_bio_across_linear_target_boundary</code><br><code>maps_bio_within_single_striped_chunk</code><br><code>splits_bio_across_striped_chunk_boundaries</code><br><code>splits_bio_across_linear_and_striped_targets</code></td></tr>
+    <tr><td><code>DmTable::enqueue</code><br><code>SplitBioCompletion::complete_one</code></td><td><code>reports_io_error_when_split_child_enqueue_fails</code><br><code>reports_io_error_when_split_child_completes_with_error</code></td></tr>
+    <tr><td><code>DmTable::enqueue_flush</code></td><td><code>flushes_each_backing_device_once</code><br><code>flushes_each_striped_backing_once</code><br><code>deduplicates_flush_backings_across_linear_and_striped_targets</code><br><code>propagates_flush_completion_failure</code><br><code>completes_flush_with_error_when_backing_enqueue_fails</code></td></tr>
+    <tr><td><code>DmManager::create</code><br><code>DmManager::lookup_name</code><br><code>DmManager::lookup_uuid</code><br><code>DmManager::lookup_id</code></td><td><code>manages_indexes_and_requested_minors</code></td></tr>
+    <tr><td><code>DmManager::create_with_readonly</code><br><code>DmDevice::set_readonly</code><br><code>DmDevice::status</code></td><td><code>creates_readonly_device_when_requested</code><br><code>readonly_device_refuses_write_but_allows_read_and_flush</code></td></tr>
+    <tr><td><code>DmManager::rename</code><br><code>DmManager::rename_uuid</code><br><code>DmDevice::rename</code></td><td><code>renames_name_and_uuid_indexes_together</code><br><code>renames_uuid_index_without_touching_name_or_id</code><br><code>rejects_duplicate_uuid_rename_without_changing_state</code><br><code>sets_uuid_on_device_created_without_uuid</code></td></tr>
+    <tr><td><code>DmDevice::suspend</code><br><code>DmDevice::load_table</code><br><code>DmDevice::resume</code><br><code>DmDevice::clear_inactive_table</code></td><td><code>enforces_suspend_load_resume_state_machine</code><br><code>running_resume_replaces_active_table</code></td></tr>
+    <tr><td><code>DmDevice::suspend</code><br><code>DmDevice::enqueue</code></td><td><code>suspend_waits_for_submitted_io_and_blocks_new_io</code></td></tr>
+    <tr><td><code>DmDevice::wait_event</code><br><code>DmDevice::notify_event</code></td><td><code>wait_event_returns_when_event_has_already_changed</code><br><code>wait_event_blocks_until_event_changes</code></td></tr>
+    <tr><td><code>ControlDevice::ioctl</code><br><code>decode_command</code><br><code>handle_command</code></td><td><code>validates_ioctl_encoding_and_alignment</code><br><code>validates_ioctl_input_flags</code></td></tr>
+    <tr><td><code>validate_ioctl_buffer_layout</code><br><code>data_start</code><br><code>require_range</code></td><td><code>rejects_invalid_ioctl_buffer_layouts</code><br><code>accepts_only_complete_aligned_ioctl_envelopes</code></td></tr>
+    <tr><td><code>required_c_string</code><br><code>optional_c_string</code><br><code>c_string_until</code></td><td><code>rejects_invalid_utf8_strings</code><br><code>rejects_unterminated_and_out_of_bounds_strings</code></td></tr>
+    <tr><td><code>create_device</code><br><code>remove_device</code><br><code>remove_all</code></td><td><code>create_device_honors_readonly_flag</code><br><code>fills_device_header_from_runtime_state</code><br><code>fills_readonly_flag_for_readonly_device</code></td></tr>
+    <tr><td><code>lookup_device</code><br><code>fill_device_header</code></td><td><code>selects_uuid_then_name_then_device_id</code></td></tr>
+    <tr><td><code>device_rename</code><br><code>rename_device_runtime</code></td><td><code>rename_runtime_updates_manager_and_device_name</code><br><code>rename_runtime_treats_same_name_as_noop</code><br><code>device_rename_with_uuid_flag_updates_uuid_not_name</code><br><code>device_rename_rejects_duplicate_and_empty_uuid_without_state_change</code></td></tr>
+    <tr><td><code>table_load</code><br><code>table_load_for_device</code><br><code>parse_linear_params</code><br><code>validate_target_spec_next</code></td><td><code>loads_multiple_targets_using_dm_target_spec_next_offsets</code><br><code>loads_single_striped_target_through_ioctl</code><br><code>loads_mixed_linear_and_striped_targets_through_ioctl</code><br><code>parses_exact_linear_parameter_set</code></td></tr>
+    <tr><td><code>table_load_for_device</code><br><code>map_table_error</code></td><td><code>rejects_zero_target_table_load_before_state_changes</code><br><code>rejects_unsupported_table_targets_without_changing_device_state</code><br><code>rejects_missing_backing_without_setting_readonly_or_table</code><br><code>rejects_invalid_linear_params_without_changing_device_state</code></td></tr>
+    <tr><td><code>device_suspend</code><br><code>selected_table</code></td><td><code>resume_ioctl_activates_inactive_table_for_active_queries</code><br><code>resume_ioctl_replaces_active_linear_table_with_ioctl_loaded_mixed_table</code><br><code>query_flags_select_active_or_inactive_tables_consistently</code></td></tr>
+    <tr><td><code>table_status</code><br><code>table_status_for_device</code><br><code>table_status_record_len</code></td><td><code>reports_three_table_status_records_with_linux_next_offsets</code><br><code>reports_linear_info_status_with_empty_params</code><br><code>reports_striped_table_status_with_canonical_params</code><br><code>reports_status_target_count_for_selected_table</code></td></tr>
+    <tr><td><code>table_deps</code><br><code>table_deps_for_device</code></td><td><code>reports_table_deps_with_duplicate_backing_devices_deduplicated</code><br><code>reports_table_deps_from_mixed_linear_and_striped_targets</code></td></tr>
+    <tr><td><code>list_devices</code><br><code>list_devices_for_devices</code></td><td><code>lists_devices_with_linux_next_offsets_and_uuid_flags</code><br><code>marks_short_output_buffers_without_overwriting_records</code></td></tr>
+    <tr><td><code>list_versions</code><br><code>get_target_version</code><br><code>write_target_version</code></td><td><code>lists_linear_and_striped_target_versions</code><br><code>gets_named_target_version_record</code><br><code>marks_partial_target_list_without_dangling_next</code></td></tr>
+    <tr><td><code>set_buffer_full</code><br><code>table_status_for_device</code><br><code>table_deps_for_device</code></td><td><code>marks_table_status_buffer_full_when_first_record_does_not_fit</code><br><code>marks_table_deps_buffer_full_when_deps_do_not_fit</code><br><code>reports_table_status_without_buffer_full_on_exact_fit</code><br><code>reports_table_deps_without_buffer_full_on_exact_fit</code></td></tr>
+    <tr><td><code>table_load_for_device</code><br><code>device_suspend</code><br><code>DmDevice::enqueue</code><br><code>DmTable::enqueue</code></td><td><code>submits_bio_across_ioctl_loaded_mixed_linear_and_striped_targets</code></td></tr>
+  </tbody>
+</table>
+
+### ktest 运行粒度
+
+| 改动范围 | 优先命令策略 | 说明 |
+|---|---|---|
+| 单个函数 | `make ktest CARGO_OSDK_TEST_ARGS="完整测试函数名"` | 最快确认当前函数对应场景，例如只跑 `aster_device_mapper::target::linear::tests::maps_end_exclusive_sector_range`。 |
+| 单个模块 | `make ktest CARGO_OSDK_TEST_ARGS="模块路径或测试名前缀"` | 适合改 `linear.rs`、`striped.rs`、`table.rs` 这类模块。 |
+| 整个 DM crate | 临时只保留 `default-members = ["kernel/core/comps/device-mapper"]` 后跑 `make ktest` | 覆盖 DM crate 内部 ktest；跑完必须恢复 [Cargo.toml](../Cargo.toml)，确认 `git diff -- Cargo.toml` 无残留。 |
+| ioctl ABI 或完整控制面 | 临时只保留 `default-members = ["kernel/core"]` 后过滤 `aster_core::device::misc::device_mapper::tests` | 覆盖 core ioctl 层 ktest，验证 `/dev/mapper/control` 的 Linux ABI 语义。 |
+| 阶段验收 | 跑对应 NixOS/LVM2 系统测试 | 验证 `dmsetup`/LVM2 用户态工具到 block I/O 的完整链路。 |
+
 ## 整体取舍建议
 
 - 建议正式文档保留图 1：它是唯一从用户态到 backing block device 的总览图，也是区分 Device Mapper 专属改动与 Asterinas 内核框架改动的入口图。
