@@ -8,7 +8,7 @@ use core::{
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta,
-    bio::{BioEnqueueError, BioType, SubmittedBio},
+    bio::{BioEnqueueError, SubmittedBio},
 };
 use device_id::DeviceId;
 use ostd::sync::{Mutex, WaitQueue};
@@ -62,7 +62,7 @@ impl Default for DmDeviceState {
     }
 }
 
-/// 可供控制面查询的 Device Mapper 设备状态快照。
+/// A Device Mapper device status snapshot exposed to the control plane.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DmDeviceStatus {
     pub suspended: bool,
@@ -72,7 +72,7 @@ pub struct DmDeviceStatus {
     pub event_nr: u32,
 }
 
-/// 一个运行期 Device Mapper 块设备。
+/// A runtime Device Mapper block device.
 pub struct DmDevice {
     id_owner: DmDeviceIdOwner,
     name: Mutex<String>,
@@ -101,58 +101,60 @@ impl DmDevice {
         }
     }
 
-    /// 返回设备名称的克隆（rename 后读取此值可得到最新名称）。
+    /// Returns a cloned device name, including updates after rename.
     pub fn name(&self) -> String {
         self.name.lock().clone()
     }
 
-    /// 重命名 DM 设备。
+    /// Renames the DM device.
     ///
-    /// 仅更新设备内部名称，不影响 I/O 状态。调用方（控制面）负责同步更新
-    /// manager 索引与块设备注册。
+    /// This only updates the device's internal name and does not affect I/O
+    /// state. The control plane is responsible for synchronizing the manager
+    /// index and block device registration.
     pub fn rename(&self, new_name: String) {
         let mut name = self.name.lock();
         *name = new_name;
     }
 
-    /// 返回 Device Mapper UUID；创建时未指定则返回 `None`。
+    /// Returns the Device Mapper UUID, or `None` if creation omitted it.
     pub fn uuid(&self) -> Option<String> {
         self.uuid.lock().clone()
     }
 
-    /// 更新 DM 设备 UUID。
+    /// Updates the DM device UUID.
     pub(crate) fn rename_uuid(&self, new_uuid: String) {
         let mut uuid = self.uuid.lock();
         *uuid = Some(new_uuid);
     }
 
-    /// 返回设备是否为只读 mapper。
+    /// Returns whether the device is a read-only mapper.
     pub fn is_readonly(&self) -> bool {
         self.readonly.load(Ordering::Acquire)
     }
 
-    /// 将设备切换为只读 mapper。
+    /// Switches the device to a read-only mapper.
     pub fn set_readonly(&self) {
         self.readonly.store(true, Ordering::Release);
     }
 
-    /// 将完整验证的映射表安装为 inactive table。
+    /// Installs a fully validated mapping table as the inactive table.
     pub fn load_table(&self, table: Arc<DmTable>) {
         let mut state = self.state.lock();
         state.inactive = Some(table);
     }
 
-    /// 清除 inactive table。
+    /// Clears the inactive table.
     ///
-    /// Linux DM 将清除不存在的 inactive table 视为成功，因此该操作在空表上
-    /// 幂等，不会改变 event number。
+    /// Linux DM treats clearing a missing inactive table as success, so this
+    /// operation is idempotent for an empty inactive slot and does not change
+    /// the event number.
     pub fn clear_inactive_table(&self) -> Result<(), DmError> {
         let mut state = self.state.lock();
         state.inactive.take();
         Ok(())
     }
 
-    /// 暂停新的 I/O，并等待已经提交到旧 table 的 I/O 完成。
+    /// Suspends new I/O and waits until I/O submitted to the old table finishes.
     pub fn suspend(&self) -> Result<(), DmError> {
         {
             let mut state = self.state.lock();
@@ -175,11 +177,12 @@ impl DmDevice {
         Ok(())
     }
 
-    /// 激活 inactive table（若存在）并恢复 I/O。
+    /// Activates the inactive table, if any, and resumes I/O.
     ///
-    /// 对运行中的设备，带 inactive table 的 resume 会原子替换 active table；
-    /// 没有 inactive table 时保持幂等。Suspending 阶段必须先完成 drain，避免
-    /// resume 与 suspend 交错使新 I/O 穿过暂停屏障。
+    /// On a running device, resuming with an inactive table atomically replaces
+    /// the active table; without an inactive table it remains idempotent. The
+    /// suspending phase must finish draining first so interleaved `resume` and
+    /// `suspend` cannot let new I/O cross the suspension barrier.
     pub fn resume(&self) -> Result<(), DmError> {
         {
             let mut state = self.state.lock();
@@ -200,17 +203,18 @@ impl DmDevice {
         Ok(())
     }
 
-    /// 返回 active table 的不可变快照。
+    /// Returns an immutable snapshot of the active table.
     pub fn active_table(&self) -> Option<Arc<DmTable>> {
         self.state.lock().active.clone()
     }
 
-    /// 返回 inactive table 的不可变快照。
+    /// Returns an immutable snapshot of the inactive table.
     pub fn inactive_table(&self) -> Option<Arc<DmTable>> {
         self.state.lock().inactive.clone()
     }
 
-    /// 等待事件序号不同于给定值，并返回新的状态快照。
+    /// Waits until the event number differs from the given value and returns a
+    /// new status snapshot.
     pub fn wait_event(&self, event_nr: u32) -> DmDeviceStatus {
         self.events.wait_until(|| {
             let status = self.status();
@@ -218,12 +222,13 @@ impl DmDevice {
         })
     }
 
-    /// 返回事件等待队列，供控制面选择 signal-aware 等待方式。
+    /// Returns the event wait queue so the control plane can choose
+    /// signal-aware waiting.
     pub fn event_queue(&self) -> &WaitQueue {
         &self.events
     }
 
-    /// 记录一次控制面生命周期事件，并唤醒等待者。
+    /// Records one control-plane lifecycle event and wakes waiters.
     pub fn notify_event(&self) {
         {
             let mut state = self.state.lock();
@@ -232,7 +237,7 @@ impl DmDevice {
         self.events.wake_all();
     }
 
-    /// 返回当前状态快照。
+    /// Returns the current status snapshot.
     pub fn status(&self) -> DmDeviceStatus {
         let state = self.state.lock();
         DmDeviceStatus {
@@ -253,6 +258,9 @@ impl BlockDevice for DmDevice {
                 return Err(BioEnqueueError::Refused);
             }
             if self.is_readonly() && bio.type_().is_write_like() {
+                // Discard and write-zeroes are write-like because they can
+                // change persistent contents even though they carry no data
+                // segments.
                 return Err(BioEnqueueError::Refused);
             }
             let table = state.active.clone().ok_or(BioEnqueueError::Refused)?;
@@ -263,7 +271,8 @@ impl BlockDevice for DmDevice {
         let io = self.io.clone();
         let table_for_completion = table.clone();
         bio.chain_complete_fn(move |_status| {
-            // 此 Arc 同时确保被替换的 table 及其 backing lease 直到真正完成才释放。
+            // This `Arc` also keeps the replaced table and its backing leases alive
+            // until the actual lower-level completion.
             let _table = table_for_completion;
             io.finish();
         });
@@ -306,7 +315,7 @@ mod tests {
 
     use aster_block::{
         BlockDeviceLease,
-        bio::{Bio, BioDirection, BioSegment, BioStatus},
+        bio::{Bio, BioDirection, BioSegment, BioStatus, BioType},
         id::Sid,
     };
     use device_id::{MajorId, MinorId};
@@ -621,6 +630,15 @@ mod tests {
                 None,
             )
             .submit_and_wait(device.as_ref()),
+            Err(BioEnqueueError::Refused)
+        );
+        assert_eq!(
+            Bio::new_range(BioType::Discard, Sid::new(0), 8, None).submit_and_wait(device.as_ref()),
+            Err(BioEnqueueError::Refused)
+        );
+        assert_eq!(
+            Bio::new_range(BioType::WriteZeroes, Sid::new(0), 8, None)
+                .submit_and_wait(device.as_ref()),
             Err(BioEnqueueError::Refused)
         );
     }

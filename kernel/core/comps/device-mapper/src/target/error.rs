@@ -6,7 +6,7 @@ use aster_block::id::Sid;
 
 use crate::TableError;
 
-/// 总是以 I/O error 完成普通读写的 error target。
+/// An `error` target that always completes normal reads and writes with I/O error.
 #[derive(Debug)]
 pub struct ErrorTarget {
     logical_range: Range<Sid>,

@@ -134,6 +134,11 @@ impl NvmeBlockDevice {
             BioType::Read => self.device.read(request),
             BioType::Write => self.device.write(request),
             BioType::Flush => self.device.flush(request),
+            BioType::Discard | BioType::WriteZeroes => {
+                for bio in request.into_bios() {
+                    bio.complete(BioStatus::NotSupported);
+                }
+            }
         }
     }
 }

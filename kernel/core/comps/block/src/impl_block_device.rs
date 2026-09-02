@@ -74,6 +74,48 @@ impl dyn BlockDevice {
         bio.submit(self, io_batch)
     }
 
+    /// Synchronously discards contiguous sectors starting from the `sid`.
+    pub fn discard_sectors(&self, sid: Sid, nsectors: u64) -> Result<BioStatus, BioEnqueueError> {
+        let bio = Bio::new_range(BioType::Discard, sid, nsectors, None);
+        let status = bio.submit_and_wait(self)?;
+        Ok(status)
+    }
+
+    /// Asynchronously discards contiguous sectors starting from the `sid`.
+    pub fn discard_sectors_async(
+        &self,
+        sid: Sid,
+        nsectors: u64,
+        complete_fn: Option<BioCompleteFn>,
+        io_batch: &mut IoBatch,
+    ) -> Result<(), BioEnqueueError> {
+        let bio = Bio::new_range(BioType::Discard, sid, nsectors, complete_fn);
+        bio.submit(self, io_batch)
+    }
+
+    /// Synchronously writes zeroes to contiguous sectors starting from the `sid`.
+    pub fn write_zeroes_sectors(
+        &self,
+        sid: Sid,
+        nsectors: u64,
+    ) -> Result<BioStatus, BioEnqueueError> {
+        let bio = Bio::new_range(BioType::WriteZeroes, sid, nsectors, None);
+        let status = bio.submit_and_wait(self)?;
+        Ok(status)
+    }
+
+    /// Asynchronously writes zeroes to contiguous sectors starting from the `sid`.
+    pub fn write_zeroes_sectors_async(
+        &self,
+        sid: Sid,
+        nsectors: u64,
+        complete_fn: Option<BioCompleteFn>,
+        io_batch: &mut IoBatch,
+    ) -> Result<(), BioEnqueueError> {
+        let bio = Bio::new_range(BioType::WriteZeroes, sid, nsectors, complete_fn);
+        bio.submit(self, io_batch)
+    }
+
     /// Issues a sync request
     pub fn sync(&self) -> Result<BioStatus, BioEnqueueError> {
         let bio = Bio::new(BioType::Flush, Sid::from(Bid::from_offset(0)), vec![], None);

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Linux Device Mapper 控制设备。
+//! Linux Device Mapper control device.
 //!
-//! 该模块实现 `/dev/mapper/control` 的第一版 ioctl 控制面。所有变长 ABI
-//! 数据先复制到有上限的内核缓冲区，再使用显式的小端字段读写进行解析，避免
-//! 直接解释未对齐或畸形的用户空间结构。
+//! This module implements the first ioctl control plane for
+//! `/dev/mapper/control`. Variable-length ABI data is first copied into a
+//! bounded kernel buffer and then parsed through explicit little-endian field
+//! accesses, avoiding direct interpretation of unaligned or malformed user-space
+//! structures.
 
 use alloc::{format, vec};
 
@@ -44,9 +46,10 @@ use crate::{
 
 const DM_CONTROL_MINOR: u32 = 236;
 const DM_IOCTL_MAGIC: u32 = 0xfd;
-// `struct dm_ioctl` 的可变 data 成员在 C 布局中的起始偏移是 305，但
-// `sizeof(struct dm_ioctl)` 会因 u64 对齐扩展到 312。第一版只接受完整的
-// 对齐 envelope，并将 305..312 的 padding 作为响应 header 的一部分清零。
+// The variable data member of `struct dm_ioctl` starts at byte 305 in the C
+// layout, but `sizeof(struct dm_ioctl)` is extended to 312 by `u64` alignment.
+// This first implementation only accepts the full aligned envelope and clears
+// bytes 305..312 as part of the response header padding.
 const DM_IOCTL_FIXED_PREFIX_SIZE: usize = 305;
 const DM_IOCTL_HEADER_SIZE: usize = 312;
 const DM_IOCTL_MAX_SIZE: usize = 1024 * 1024;
@@ -84,7 +87,7 @@ const TARGET_VERSIONS: &[TargetVersion] = &[
         name: "linear",
         version: [1, 4, 0],
     },
-    // LVM2 在创建 LV 前会检查 striped target 是否可用。
+    // LVM2 checks whether the `striped` target is available before creating an LV.
     TargetVersion {
         name: "striped",
         version: [1, 6, 0],
@@ -162,7 +165,7 @@ struct DmControlDevice {
     id: DeviceId,
 }
 
-//控制设备对象的初始化  绑定好majorID与 minorID 即 DeviceID
+// Initializes the control device object and binds it to its major/minor `DeviceId`.
 impl DmControlDevice {
     fn new() -> Arc<Self> {
         let major = super::MISC_MAJOR.get().unwrap().get();
@@ -437,8 +440,9 @@ fn remove_device(buffer: &mut [u8]) -> Result<()> {
 }
 
 fn remove_all(buffer: &mut [u8]) -> Result<()> {
-    // Linux DM_REMOVE_ALL 是 best-effort：busy 设备保留，其余设备继续删除，
-    // 单个设备无法删除不会令整个 ioctl 失败。
+    // Linux `DM_REMOVE_ALL` is best effort: busy devices are kept while the rest
+    // continue to be removed, and a single removal failure does not fail the
+    // whole ioctl.
     for device in manager().devices() {
         if unregister_device_runtime_if_registered(&device).is_err() {
             continue;
@@ -536,8 +540,9 @@ where
         ));
     }
 
-    // manager 索引先更新，若 alias 移动失败则立即回滚，避免 /dev/dm-N、块注册、
-    // open gate 或 backing lease 被注销重建。
+    // Update the manager index first and roll back immediately if the alias move
+    // fails, avoiding unregister/re-register churn for `/dev/dm-N`, block
+    // registration, the open gate, or backing leases.
     manager.rename(&old_name, new_name).map_err(map_dm_error)?;
     if let Err(error) = rename_alias(device.id(), &old_name, new_name) {
         if let Err(rollback_error) = manager.rename(new_name, &old_name) {
@@ -960,9 +965,10 @@ fn lookup_device_in_manager(buffer: &[u8], manager: &DmManager) -> Result<Arc<Dm
     let name = optional_c_string(buffer, OFF_NAME, DM_NAME_LEN, "设备名称")?;
     let uuid = optional_c_string(buffer, OFF_UUID, DM_UUID_LEN, "设备 UUID")?;
 
-    // Linux ABI 规定 UUID selector 优先于 name；dev 仅在两者均未指定时使用。
-    // 因此不能把多个 selector 的并存视为畸形输入，否则会拒绝标准客户端的
-    // 冗余字段。每次仅按最高优先级的 selector 查找。
+    // The Linux ABI gives the UUID selector priority over name, and uses `dev`
+    // only when neither is specified. Treating multiple selectors as malformed
+    // would reject standard clients that populate redundant fields, so each
+    // lookup uses only the highest-priority selector.
     let device = if let Some(uuid) = uuid {
         manager.lookup_uuid(&uuid)
     } else if let Some(name) = name {
@@ -1117,7 +1123,8 @@ fn normalize_striped_params(params: &str) -> Result<String> {
 }
 
 fn validate_target_spec_next(data_start: usize, next: usize, buffer_len: usize) -> Result<usize> {
-    // next == 0 表示这是最后一个 target spec，参数延伸到缓冲区末尾
+    // `next == 0` means this is the last target spec, so parameters extend to
+    // the end of the buffer.
     if next == 0 {
         return Ok(buffer_len);
     }
@@ -1311,10 +1318,11 @@ fn map_table_error(error: TableError) -> Error {
 }
 
 pub(super) fn init_in_first_kthread() {
-    //先初始化全局DM_MANAGER 保证控制设备可见时 用户已经可以使用对应的命令了
+    // Initialize the global `DM_MANAGER` before exposing the control device, so
+    // user commands can use the manager as soon as the device is visible.
     DM_MANAGER.call_once(|| DmManager::new().unwrap());
 
-    //创建control device对象 并绑定好DeviceId 进入注册函数
+    // Create and register the control device object with its bound `DeviceId`.
     char::register(DmControlDevice::new()).unwrap();
 }
 

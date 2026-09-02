@@ -11,7 +11,7 @@ use crate::{
     prelude::*,
 };
 
-/// 表示 `/proc/devices` 的 inode 操作。
+/// Inode operations for `/proc/devices`.
 pub struct DevicesFileOps;
 
 impl DevicesFileOps {
@@ -30,8 +30,9 @@ impl ProcFileOps for DevicesFileOps {
         writeln!(printer, "Character devices:")?;
         writeln!(printer)?;
         writeln!(printer, "Block devices:")?;
-        // LVM2 通过此表把主设备号归类为可扫描的块设备。块组件维护的快照
-        // 覆盖所有已持有的块 major，避免按 VirtIO 或 Device Mapper 特例枚举。
+        // LVM2 classifies scan-worthy block devices through this table. The
+        // block component snapshot covers every acquired block major instead
+        // of special-casing VirtIO or Device Mapper here.
         for (major, name) in aster_block::major_devices() {
             writeln!(printer, "{major:3} {name}")?;
         }

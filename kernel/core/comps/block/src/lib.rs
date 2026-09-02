@@ -76,7 +76,8 @@ enum RegistrationStatus {
     Removing,
 }
 
-/// 阻止一个已注册块设备在长期使用期间被注销的租约。
+/// A lease that prevents a registered block device from being unregistered while
+/// it is in long-term use.
 #[derive(Debug)]
 pub struct BlockDeviceLease {
     device: Arc<dyn BlockDevice>,
@@ -84,12 +85,13 @@ pub struct BlockDeviceLease {
 }
 
 impl BlockDeviceLease {
-    /// 返回租约保护的底层块设备。
+    /// Returns the block device protected by this lease.
     pub fn device(&self) -> &Arc<dyn BlockDevice> {
         &self.device
     }
 
-    /// 为不参与注册表生命周期的预解析设备创建租约。
+    /// Creates a lease for a pre-resolved device that does not participate in
+    /// registry lifetime tracking.
     pub fn new_untracked(device: Arc<dyn BlockDevice>) -> Self {
         Self {
             device,
@@ -135,27 +137,28 @@ impl Drop for BlockDeviceLease {
     }
 }
 
-/// 尚未向查找者发布的块设备注册令牌。
+/// A block device registration token that has not been published to lookups yet.
 #[derive(Debug)]
 pub struct PendingBlockDeviceRegistration {
     registered: Arc<RegisteredBlockDevice>,
 }
 
 impl PendingBlockDeviceRegistration {
-    /// 返回待发布设备的 ID。
+    /// Returns the ID of the pending device.
     pub fn id(&self) -> DeviceId {
         self.registered.id
     }
 }
 
-/// 已停止新查找、等待外部资源清理的块设备注销令牌。
+/// A block device unregistration token after new lookups have stopped and
+/// external resources are being cleaned up.
 #[derive(Debug)]
 pub struct PendingBlockDeviceUnregistration {
     registered: Arc<RegisteredBlockDevice>,
 }
 
 impl PendingBlockDeviceUnregistration {
-    /// 返回待注销设备的 ID。
+    /// Returns the ID of the device pending unregistration.
     pub fn id(&self) -> DeviceId {
         self.registered.id
     }
@@ -260,15 +263,16 @@ pub enum Error {
     IdAcquired,
     /// Id Exhausted
     IdExhausted,
-    /// 设备仍在使用中，或正在切换生命周期状态。
+    /// The device is in use or transitioning between lifecycle states.
     Busy,
 }
 
-/// 开始注册块设备，但暂不向查询者发布。
+/// Begins registering a block device without publishing it to lookups yet.
 pub fn register_pending(
     device: Arc<dyn BlockDevice>,
 ) -> Result<PendingBlockDeviceRegistration, Error> {
-    // 公开 trait 回调必须在注册表锁外执行，避免实现重入注册表时自死锁。
+    // Public trait callbacks must run outside the registry lock to avoid
+    // self-deadlock if an implementation reenters the registry.
     let id = device.id();
     let registered = Arc::new(RegisteredBlockDevice {
         id,
@@ -287,7 +291,7 @@ pub fn register_pending(
     Ok(PendingBlockDeviceRegistration { registered })
 }
 
-/// 发布一个待提交的块设备注册。
+/// Commits a pending block device registration.
 pub fn commit_registration(registration: &PendingBlockDeviceRegistration) -> Result<(), Error> {
     let registry = DEVICE_REGISTRY.lock();
     let current = registry
@@ -305,7 +309,7 @@ pub fn commit_registration(registration: &PendingBlockDeviceRegistration) -> Res
     Ok(())
 }
 
-/// 取消一个尚未发布的块设备注册。
+/// Aborts a block device registration that has not been published yet.
 pub fn abort_registration(
     registration: PendingBlockDeviceRegistration,
 ) -> Result<Arc<dyn BlockDevice>, Error> {
@@ -326,13 +330,13 @@ pub fn abort_registration(
     Ok(registered.device.clone())
 }
 
-/// 注册新的块设备。
+/// Registers a new block device.
 pub fn register(device: Arc<dyn BlockDevice>) -> Result<(), Error> {
     let registration = register_pending(device)?;
     commit_registration(&registration)
 }
 
-/// 开始注销一个已发布的块设备，并阻止新的查询和租约。
+/// Begins unregistering a published block device and stops new lookups and leases.
 pub fn begin_unregister(id: DeviceId) -> Result<PendingBlockDeviceUnregistration, Error> {
     let registry = DEVICE_REGISTRY.lock();
     let registered = registry.get(&id.to_raw()).ok_or(Error::NotFound)?;
@@ -348,7 +352,7 @@ pub fn begin_unregister(id: DeviceId) -> Result<PendingBlockDeviceUnregistration
     })
 }
 
-/// 提交一个待完成的块设备注销。
+/// Commits a pending block device unregistration.
 pub fn commit_unregister(
     unregistration: PendingBlockDeviceUnregistration,
 ) -> Result<Arc<dyn BlockDevice>, Error> {
@@ -368,7 +372,7 @@ pub fn commit_unregister(
     Ok(registered.device.clone())
 }
 
-/// 取消待完成的注销，并重新发布同一个设备。
+/// Aborts a pending unregistration and republishes the same device.
 pub fn abort_unregister(unregistration: PendingBlockDeviceUnregistration) -> Result<(), Error> {
     let registry = DEVICE_REGISTRY.lock();
     let current = registry
@@ -385,13 +389,13 @@ pub fn abort_unregister(unregistration: PendingBlockDeviceUnregistration) -> Res
     Ok(())
 }
 
-/// 注销现有块设备，并在成功时返回该设备。
+/// Unregisters an existing block device and returns it on success.
 pub fn unregister(id: DeviceId) -> Result<Arc<dyn BlockDevice>, Error> {
     let unregistration = begin_unregister(id)?;
     commit_unregister(unregistration)
 }
 
-/// 收集所有已发布的块设备。
+/// Collects all published block devices.
 pub fn collect_all() -> Vec<Arc<dyn BlockDevice>> {
     DEVICE_REGISTRY
         .lock()
@@ -403,7 +407,7 @@ pub fn collect_all() -> Vec<Arc<dyn BlockDevice>> {
         .collect()
 }
 
-/// 按设备 ID 查找已发布的块设备。
+/// Looks up a published block device by device ID.
 pub fn lookup(id: DeviceId) -> Option<Arc<dyn BlockDevice>> {
     let registry = DEVICE_REGISTRY.lock();
     let registered = registry.get(&id.to_raw())?;
@@ -411,9 +415,10 @@ pub fn lookup(id: DeviceId) -> Option<Arc<dyn BlockDevice>> {
     (state.status == RegistrationStatus::Live).then(|| registered.device.clone())
 }
 
-/// 获取一个已发布块设备的租约。
+/// Gets a lease for a published block device.
 ///
-/// 挂载文件系统等长期使用者必须在整个可发起 I/O 的期间持有该租约。
+/// Long-term users such as mounted filesystems must hold the lease for the whole
+/// period in which they can issue I/O.
 pub fn lookup_lease(id: DeviceId) -> Option<BlockDeviceLease> {
     let registry = DEVICE_REGISTRY.lock();
     let registered = registry.get(&id.to_raw())?;
@@ -458,7 +463,7 @@ pub fn scan_partitions() {
 static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<RegisteredBlockDevice>>> =
     Mutex::new(BTreeMap::new());
 
-/// 返回所有已注册块设备的 major:minor 列表，用于诊断。
+/// Returns all registered block device major:minor pairs for diagnostics.
 pub fn list() -> Vec<(u16, u32)> {
     let registry = DEVICE_REGISTRY.lock();
     registry

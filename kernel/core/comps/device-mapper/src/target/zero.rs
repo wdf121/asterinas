@@ -6,7 +6,7 @@ use aster_block::id::Sid;
 
 use crate::TableError;
 
-/// 读返回零、写丢弃并成功完成的 zero target。
+/// A `zero` target that returns zeroes for reads and discards writes successfully.
 #[derive(Debug)]
 pub struct ZeroTarget {
     logical_range: Range<Sid>,

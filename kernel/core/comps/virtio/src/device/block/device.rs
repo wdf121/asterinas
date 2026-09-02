@@ -123,10 +123,12 @@ impl BlockDevice {
             BioType::Read => self.device.read(request),
             BioType::Write => self.device.write(request),
             BioType::Flush => self.device.flush(request),
+            BioType::Discard => self.device.discard(request),
+            BioType::WriteZeroes => self.device.write_zeroes(request),
         }
     }
 
-    /// 返回 Host 提供的固定长度块设备标识符。
+    /// Returns the fixed-length block device identifier provided by the host.
     pub fn host_id(&self) -> Option<&VirtioBlockId> {
         self.host_id.as_ref()
     }
@@ -209,6 +211,7 @@ struct DeviceInner {
     queue: SpinLock<VirtQueue>,
     transport: SpinLock<DeviceTransport>,
     block_requests: Arc<DmaStream>,
+    block_range_requests: Arc<DmaStream>,
     block_responses: Arc<DmaStream>,
     id_allocator: SyncIdAlloc,
     submitted_requests: SpinLock<BTreeMap<u16, SubmittedRequest>>,
@@ -256,6 +259,8 @@ impl DeviceInner {
 
         let block_requests =
             Arc::new(DmaStream::alloc(1, false).map_err(VirtioDeviceError::ResourceAlloc)?);
+        let block_range_requests =
+            Arc::new(DmaStream::alloc(1, false).map_err(VirtioDeviceError::ResourceAlloc)?);
         let block_responses =
             Arc::new(DmaStream::alloc(1, false).map_err(VirtioDeviceError::ResourceAlloc)?);
         const {
@@ -269,6 +274,7 @@ impl DeviceInner {
             queue: SpinLock::new(queue),
             transport: SpinLock::new(device_transport),
             block_requests,
+            block_range_requests,
             block_responses,
             id_allocator: SyncIdAlloc::with_capacity(Self::QUEUE_SIZE as usize),
             submitted_requests: SpinLock::new(BTreeMap::new()),
@@ -289,8 +295,8 @@ impl DeviceInner {
             transport.finish_init();
         }
 
-        // GET_ID 在普通队列中断回调注册前同步完成，避免初始化请求的 token
-        // 被只认识 BIO 请求的中断处理器抢先消费。
+        // Complete `GET_ID` before registering the normal queue IRQ callback so
+        // the initialization token is not consumed by the BIO-only interrupt handler.
         let host_id = device.query_host_id();
 
         {
@@ -302,10 +308,10 @@ impl DeviceInner {
         Ok((device, host_id))
     }
 
-    /// 查询一次 Host 提供的块设备标识符。
+    /// Queries the block device identifier provided by the host once.
     ///
-    /// GET_ID 是可选能力；设备拒绝请求或返回异常结果时仅忽略标识符，
-    /// 不影响普通块设备继续注册和读写。
+    /// `GET_ID` is optional; a rejected request or malformed response is ignored
+    /// so normal block device registration and I/O can continue.
     fn query_host_id(&self) -> Option<VirtioBlockId> {
         const ID_OFFSET: usize = RESP_SIZE;
         const ID_END: usize = ID_OFFSET + VIRTIO_BLOCK_ID_BYTES;
@@ -575,6 +581,119 @@ impl DeviceInner {
         }
     }
 
+    fn discard(&self, bio_request: BioRequest) {
+        // VirtIO range operations are optional features. If the host did not
+        // negotiate support, complete the `Bio` as unsupported instead of
+        // silently emulating discard semantics in the guest.
+        if !self.features.contains(BlockFeatures::DISCARD) {
+            complete_unsupported(bio_request);
+            return;
+        }
+
+        let alignment = self.config_manager.discard_sector_alignment().max(1) as u64;
+        let range = bio_request.sid_range();
+        // VirtIO advertises discard alignment in 512-byte sectors. Rejecting
+        // misaligned requests before queue submission keeps the block-layer
+        // completion deterministic even when the host would reject the command.
+        if !range.start.to_raw().is_multiple_of(alignment)
+            || !(range.end.to_raw() - range.start.to_raw()).is_multiple_of(alignment)
+        {
+            complete_unsupported(bio_request);
+            return;
+        }
+
+        self.submit_range_request(
+            bio_request,
+            ReqType::Discard,
+            self.config_manager.max_discard_sectors(),
+        );
+    }
+
+    fn write_zeroes(&self, bio_request: BioRequest) {
+        // The host must explicitly advertise write-zeroes support; otherwise
+        // callers need to observe `NotSupported` and choose their own fallback.
+        if !self.features.contains(BlockFeatures::WRITE_ZEROES) {
+            complete_unsupported(bio_request);
+            return;
+        }
+
+        self.submit_range_request(
+            bio_request,
+            ReqType::WriteZeroes,
+            self.config_manager.max_write_zeroes_sectors(),
+        );
+    }
+
+    fn submit_range_request(&self, bio_request: BioRequest, req_type: ReqType, max_sectors: u32) {
+        let range = bio_request.sid_range();
+        let nsectors = range.end.to_raw() - range.start.to_raw();
+        if nsectors > max_sectors as u64 || nsectors > u32::MAX as u64 {
+            // VirtIO encodes a range length in `u32` sectors, and the host may
+            // advertise a tighter per-command maximum in the device config.
+            complete_unsupported(bio_request);
+            return;
+        }
+
+        let id = self.id_allocator.alloc();
+        // VirtIO discard and write-zeroes commands use a request header with
+        // `sector` set to zero, followed by one or more range descriptors. This
+        // driver emits one descriptor because the block layer has already kept
+        // the `BioRequest` contiguous.
+        let req_slice = {
+            let req_slice = Slice::new(&self.block_requests, id * REQ_SIZE..(id + 1) * REQ_SIZE);
+            let req = BlockReq {
+                type_: req_type as _,
+                reserved: 0,
+                sector: 0,
+            };
+            req_slice.write_val(0, &req).unwrap();
+            req_slice.sync_to_device().unwrap();
+            req_slice
+        };
+        let range_slice = {
+            let range_slice = Slice::new(
+                &self.block_range_requests,
+                id * RANGE_SIZE..(id + 1) * RANGE_SIZE,
+            );
+            let range = BlockRange {
+                sector: range.start.to_raw(),
+                num_sectors: nsectors as u32,
+                flags: 0,
+            };
+            range_slice.write_val(0, &range).unwrap();
+            range_slice.sync_to_device().unwrap();
+            range_slice
+        };
+        let resp_slice = {
+            let resp_slice =
+                Slice::new(&self.block_responses, id * RESP_SIZE..(id + 1) * RESP_SIZE);
+            resp_slice.write_val(0, &BlockResp::default()).unwrap();
+            resp_slice.sync_to_device().unwrap();
+            resp_slice
+        };
+
+        let num_used_descs = 3;
+        loop {
+            let mut queue = self.queue.disable_irq().lock();
+            if num_used_descs > queue.available_desc() {
+                continue;
+            }
+            let token = queue
+                .add_dma_bufs(&[&req_slice, &range_slice], &[&resp_slice])
+                .expect("add queue failed");
+            if queue.should_notify() {
+                queue.notify();
+            }
+
+            let submitted_request = SubmittedRequest::new(id as u16, bio_request);
+            self.submitted_requests
+                .disable_irq()
+                .lock()
+                .insert(token, submitted_request);
+            return;
+        }
+    }
+
     /// Flushes any cached data from the guest to the persistent storage on the host.
     /// This will be ignored if the device doesn't support the `VIRTIO_BLK_F_FLUSH` feature.
     fn flush(&self, bio_request: BioRequest) {
@@ -629,6 +748,12 @@ impl DeviceInner {
     }
 }
 
+fn complete_unsupported(bio_request: BioRequest) {
+    for bio in bio_request.into_bios() {
+        bio.complete(BioStatus::NotSupported);
+    }
+}
+
 /// A submitted bio request for callback.
 #[derive(Debug)]
 struct SubmittedRequest {
@@ -652,6 +777,16 @@ struct BlockReq {
 }
 
 const REQ_SIZE: usize = size_of::<BlockReq>();
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod)]
+struct BlockRange {
+    sector: u64,
+    num_sectors: u32,
+    flags: u32,
+}
+
+const RANGE_SIZE: usize = size_of::<BlockRange>();
 
 /// Response of a VirtIOBlock request.
 #[repr(C)]

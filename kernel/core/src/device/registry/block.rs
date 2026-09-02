@@ -2,13 +2,14 @@
 
 use alloc::format;
 
-use aster_block::{BLOCK_SIZE, BlockDevice, SECTOR_SIZE};
+use aster_block::{BLOCK_SIZE, BlockDevice, SECTOR_SIZE, bio::BioStatus, id::Sid};
 use aster_nvme::NvmeBlockDevice;
 use aster_virtio::device::block::device::BlockDevice as VirtIoBlockDevice;
 use device_id::DeviceId;
 use ostd::mm::VmIo;
 
 use crate::{
+    context::current_userspace,
     device::{
         Device, DeviceType, DevtmpfsInodeMeta, add_node, add_runtime_node,
         remove_owned_runtime_node,
@@ -85,7 +86,7 @@ pub(super) fn init_in_first_process(path_resolver: &PathResolver) -> Result<()> 
 mod ioctl_defs {
     use aster_virtio::device::block::VIRTIO_BLOCK_ID_BYTES;
 
-    use crate::util::ioctl::{OutData, ioc};
+    use crate::util::ioctl::{NoData, OutData, ioc};
 
     // Reference: <https://elixir.bootlin.com/linux/v6.18/source/include/uapi/linux/fs.h>
 
@@ -115,9 +116,25 @@ mod ioctl_defs {
     /// correctly for the device but still hit `EINVAL` at the filesystem.
     pub(super) type BlkGetSectorSize = ioc!(BLKSSZGET, 0x12, 104, OutData<i32>);
 
-    /// 返回 VirtIO Host 提供的原始 20 字节设备标识符。
+    /// Returns the logical sector size of the block device.
     ///
-    /// 这是 Asterinas 内部测试使用的窄接口，不属于 Linux block ioctl ABI。
+    /// Linux: _IO(0x12, 104). Some user programs, including util-linux
+    /// `blkdiscard`, use this legacy command encoding instead of the typed
+    /// `_IOR(0x12, 104, int)` form above.
+    pub(super) type BlkGetSectorSizeLegacy = ioc!(BLKSSZGET_LEGACY, 0x1268, NoData);
+
+    /// Discards a byte range described by two u64 values: start and length.
+    /// Linux: _IO(0x12, 119).
+    pub(super) type BlkDiscard = ioc!(BLKDISCARD, 0x1277, NoData);
+
+    /// Writes zeroes to a byte range described by two u64 values: start and length.
+    /// Linux: _IO(0x12, 127).
+    pub(super) type BlkZeroout = ioc!(BLKZEROOUT, 0x127F, NoData);
+
+    /// Returns the raw 20-byte device identifier provided by the VirtIO host.
+    ///
+    /// This is a narrow Asterinas-internal test interface, not part of the Linux
+    /// block ioctl ABI.
     pub(super) type AsterVirtioBlkGetId =
         ioc!(ASTER_VIRTIO_BLK_GET_ID, b'A', 0x01, OutData<[u8; VIRTIO_BLOCK_ID_BYTES]>);
 }
@@ -334,6 +351,40 @@ impl FileOps for OpenBlockFile {
     }
 }
 
+fn write_sector_size_ioctl(device_range_addr: usize) -> Result<()> {
+    let sector_size = SECTOR_SIZE.max(BLOCK_SIZE) as i32;
+    current_userspace!().write_val(device_range_addr, &sector_size)?;
+    Ok(())
+}
+
+fn read_range_ioctl_arg(device_range_addr: usize, device: &dyn BlockDevice) -> Result<(Sid, u64)> {
+    let [start, len] = current_userspace!().read_val::<[u64; 2]>(device_range_addr)?;
+    let sector_size = SECTOR_SIZE as u64;
+    if start % sector_size != 0 || len % sector_size != 0 {
+        return_errno_with_message!(Errno::EINVAL, "the block range is not sector-aligned");
+    }
+
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "the block range overflows"))?;
+    let device_size = (device.metadata().nr_sectors as u64)
+        .checked_mul(sector_size)
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "the block device size overflows"))?;
+    if end > device_size {
+        return_errno_with_message!(Errno::EINVAL, "the block range is beyond the device");
+    }
+
+    Ok((Sid::new(start / sector_size), len / sector_size))
+}
+
+fn complete_range_ioctl(status: BioStatus) -> Result<()> {
+    match status {
+        BioStatus::Complete => Ok(()),
+        BioStatus::NotSupported | BioStatus::NoSpace | BioStatus::IoError => Err(status.into()),
+        _ => return_errno_with_message!(Errno::EIO, "the range I/O did not complete"),
+    }
+}
+
 impl Pollable for OpenBlockFile {
     fn poll(&self, mask: IoEvents, _: Option<&mut PollHandle>) -> IoEvents {
         let events = IoEvents::IN | IoEvents::OUT;
@@ -367,6 +418,10 @@ impl PerOpenFileOps for OpenBlockFile {
                 cmd.write(&sector_size)?;
                 Ok(0)
             }
+            BlkGetSectorSizeLegacy => {
+                write_sector_size_ioctl(raw_ioctl.arg())?;
+                Ok(0)
+            }
             cmd @ BlkGetSize64 => {
                 let size = (self.device.metadata().nr_sectors * SECTOR_SIZE) as u64;
                 cmd.write(&size)?;
@@ -380,6 +435,27 @@ impl PerOpenFileOps for OpenBlockFile {
             cmd @ BlkRaGet => {
                 let readahead = 0_u64;
                 cmd.write(&readahead)?;
+                Ok(0)
+            }
+            BlkDiscard => {
+                // Linux passes discard ranges as byte offsets, while the block
+                // layer uses 512-byte sectors. Validate the user ABI boundary
+                // here so drivers only receive sector-aligned `Bio`s.
+                let (start_sid, nsectors) =
+                    read_range_ioctl_arg(raw_ioctl.arg(), self.device.as_ref())?;
+                if nsectors != 0 {
+                    complete_range_ioctl(self.device.discard_sectors(start_sid, nsectors)?)?;
+                }
+                Ok(0)
+            }
+            BlkZeroout => {
+                // `BLKZEROOUT` shares the same `[start, len]` byte-range ABI as
+                // `BLKDISCARD`, but maps to write-zeroes rather than discard.
+                let (start_sid, nsectors) =
+                    read_range_ioctl_arg(raw_ioctl.arg(), self.device.as_ref())?;
+                if nsectors != 0 {
+                    complete_range_ioctl(self.device.write_zeroes_sectors(start_sid, nsectors)?)?;
+                }
                 Ok(0)
             }
             cmd @ AsterVirtioBlkGetId => {
@@ -549,7 +625,8 @@ fn register_runtime_with_alias(
     Ok(())
 }
 
-/// 删除仍属于本次注册的节点；节点已消失或已被替换也视为清理完成。
+/// Removes nodes that still belong to this registration; missing or replaced
+/// nodes are already clean.
 fn remove_owned_node_or_accept_stale(path: &str, expected: &Path) -> Result<()> {
     match remove_owned_runtime_node(path, expected) {
         Ok(()) => Ok(()),

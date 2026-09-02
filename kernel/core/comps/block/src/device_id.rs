@@ -25,7 +25,8 @@ static MAJORS: Mutex<BTreeMap<u16, String>> = Mutex::new(BTreeMap::new());
 /// Acquires a major ID.
 ///
 /// The returned `MajorIdOwner` object represents the ownership to the major ID.
-/// Until the object is dropped, this major ID cannot be acquired via `acquire_major` or `allocate_major` again.
+/// Until the object is dropped, this major ID cannot be acquired via
+/// `acquire_major` or `allocate_major` again.
 pub fn acquire_major(major: MajorId) -> Result<MajorIdOwner, Error> {
     acquire_major_with_name(major, "unknown")
 }
@@ -47,7 +48,8 @@ pub fn acquire_major_with_name(major: MajorId, name: &str) -> Result<MajorIdOwne
 /// Allocates a major ID.
 ///
 /// The returned `MajorIdOwner` object represents the ownership to the major ID.
-/// Until the object is dropped, this major ID cannot be acquired via `acquire_major` or `allocate_major` again.
+/// Until the object is dropped, this major ID cannot be acquired via
+/// `acquire_major` or `allocate_major` again.
 pub fn allocate_major() -> Result<MajorIdOwner, Error> {
     allocate_major_with_name("unknown")
 }
@@ -92,7 +94,8 @@ impl Drop for MajorIdOwner {
     }
 }
 
-/// The major ID used for extended partitions when the number of disk partitions exceeds the standard limit.
+/// The major ID used for extended partitions when the number of disk partitions
+/// exceeds the standard limit.
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v6.13/source/block/partitions/core.c#L352>.
 const EXTENDED_MAJOR: u16 = 259;

@@ -15,7 +15,6 @@ use crate::{
 static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<dyn Device>>> = Mutex::new(BTreeMap::new());
 
 /// Registers a new char device.
-/// 将某个对象(拥有DeviceId) 登记到全局字符设备表中
 pub(crate) fn register(device: Arc<dyn Device>) -> Result<()> {
     let mut registry = DEVICE_REGISTRY.lock();
     let id = device.id().to_raw();
@@ -60,7 +59,8 @@ static MAJORS: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
 /// Acquires a major ID.
 ///
 /// The returned `MajorIdOwner` object represents the ownership to the major ID.
-/// Until the object is dropped, this major ID cannot be acquired via `acquire_major` or `allocate_major` again.
+/// Until the object is dropped, this major ID cannot be acquired via
+/// `acquire_major` or `allocate_major` again.
 pub(crate) fn acquire_major(major: MajorId) -> Result<MajorIdOwner> {
     if major.get() > MAX_MAJOR {
         return_errno_with_message!(Errno::EINVAL, "the major ID is invalid");
@@ -76,7 +76,8 @@ pub(crate) fn acquire_major(major: MajorId) -> Result<MajorIdOwner> {
 /// Allocates a major ID.
 ///
 /// The returned `MajorIdOwner` object represents the ownership to the major ID.
-/// Until the object is dropped, this major ID cannot be acquired via `acquire_major` or `allocate_major` again.
+/// Until the object is dropped, this major ID cannot be acquired via
+/// `acquire_major` or `allocate_major` again.
 #[expect(dead_code)]
 pub(crate) fn allocate_major() -> Result<MajorIdOwner> {
     let mut majors = MAJORS.lock();
@@ -111,7 +112,8 @@ impl Drop for MajorIdOwner {
     }
 }
 
-//第一个进程 把之前注册好的设备对象 映射成/dev/xxx路径 根据devtmpfs_meta
+// The first userspace process materializes pre-registered devices under `/dev`
+// according to their devtmpfs metadata.
 pub(super) fn init_in_first_process(path_resolver: &PathResolver) -> Result<()> {
     for device in collect_all() {
         if let Some(devtmpfs_meta) = device.devtmpfs_meta() {
