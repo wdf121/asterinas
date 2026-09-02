@@ -48,7 +48,7 @@ docs/device-mapper-technical-maintenance.md
 - `docs/study.md`：`/dev/mapper/control` 注册主线和适合复盘的学习材料。
 - `docs/device-mapper-technical-maintenance.md`：DM 技术维护主文档；附录集中维护 `dmsetup` / LVM2 控制面对齐矩阵。
 
-当前接手结论：`dmsetup` 和 LVM2 控制面对齐已完成，`--dataplane-edge` 已通过，`error` / `zero` target 已完成核心 ktest、ioctl 层定向 ktest 和 guest 脚本覆盖。flush 数据面已通过现有 core ktest 收口确认；discard / write zeroes 当前属于明确非目标，不应补 guest 假测。下一步优先串行跑现有数据面和慢系统回归，或继续选择小而独立的 DM target 功能拓展。
+当前接手结论：`dmsetup` 和 LVM2 控制面对齐已完成，`--dataplane-edge` 已通过，`error` / `zero` target 已完成核心 ktest、ioctl 层定向 ktest 和 guest 脚本覆盖。flush 数据面已通过现有 core ktest 收口确认；discard / write zeroes 已作为通用 block range BIO 增量接入，DM 可对 linear/striped remap，对 error 返回 I/O error，对 zero direct-complete，block ioctl 已支持 BLKDISCARD/BLKZEROOUT，virtio 后端按协商能力下发，NVMe 后端仍返回不支持。下一步优先串行跑现有数据面和慢系统回归，或审计 queue limit / alignment / topology。
 
 本节是上下文交接入口；后续每完成一个小阶段，应同步更新阅读清单、当前接手结论和下一步优先级。
 
@@ -70,7 +70,7 @@ myshell/run_dm_system_tests.sh --dmsetup-cli
 - tableless `create`、`--notable`、`ls`、`info`、`remove`。
 - linear / striped / error / zero `create`、`table`、`status`、`deps`、`info`、`remove`。
 - error target 覆盖区间内 Read / Write 返回 I/O error，flush 对无 backing table 成功完成。
-- zero target 读取返回全 0，写入丢弃并成功完成，flush 对无 backing table 成功完成。
+- zero target 读取返回全 0，写入丢弃并成功完成，flush 对无 backing table 成功完成，BLKDISCARD/BLKZEROOUT 成功完成。
 - active / inactive table 的 `load`、`reload`、`clear`、`resume`。
 - `suspend`、`resume`、`wait --noflush`。
 - `rename OLD NEW`、`rename NAME NAME`、重复名 rename、`rename --setuuid`、`info -u UUID`。
@@ -149,6 +149,7 @@ myshell/run_dm_system_tests.sh --dataplane-edge
 - `striped 2 4` 从 chunk 内部偏移开始写。
 - 跨多个 stripe 边界后的 mapper readback 与两个 backing 分布校验。
 - `zero` target 读全 0、写入丢弃成功、写后再次读取仍为全 0。
+- `zero` target 上 `blkdiscard` / `blkdiscard -z` 成功，覆盖 BLKDISCARD/BLKZEROOUT 到 range BIO direct-complete 路径。
 
 2026-09-01 已通过：
 
@@ -163,6 +164,8 @@ CHECK_PASS_STRIPED_EDGE_BACKING_D2
 CHECK_PASS_ZERO_EDGE_READ_ZERO
 CHECK_PASS_ZERO_EDGE_WRITE_DISCARDED
 CHECK_PASS_ZERO_EDGE_READ_AFTER_WRITE_ZERO
+CHECK_PASS_ZERO_EDGE_BLKDISCARD
+CHECK_PASS_ZERO_EDGE_BLKZEROOUT
 TEST_PASS_DM_DATAPLANE_EDGE
 HOST_PASS_DM_SYSTEM_TESTS --dataplane-edge
 ```
@@ -191,24 +194,26 @@ test result: ok. 52 passed; 0 failed; 0 filtered out.
 
 ## 当前文档状态
 
-- `docs/device-mapper-technical-maintenance.md` 已更新到 2026-09-01 状态，正文覆盖 error/zero/linear/striped/mixed 设计；第 8 章集中说明 Read/Write remap/direct completion、split 聚合、Flush fan-out/direct completion 与 discard/write zeroes 非目标边界；附录集中维护 `dmsetup` 和 LVM2 控制面对齐矩阵。
+- `docs/device-mapper-technical-maintenance.md` 已更新到 2026-09-01 状态，正文覆盖 error/zero/linear/striped/mixed 设计；第 8 章集中说明 Read/Write remap/direct completion、split 聚合、Flush fan-out/direct completion，以及 discard/write zeroes 通用 range BIO 的 DM 映射边界；附录集中维护 `dmsetup` 和 LVM2 控制面对齐矩阵。
 - `docs/study.md` 已精简为 `/dev/mapper/control` 注册主线，不再保留命令矩阵迁移记录。
 - `docs/test.md` 已记录 LVM2 host baseline、guest `--lvm2-cli` 和 raw 数据面 `--dataplane-edge` 入口。
 - LVM2 表格当前按命令模板和前置条件判断结论；整体适用边界放在表格前说明中，不把所有行都写成“限定场景已对齐”，也不从单行“已对齐”外推到裸 LVM2 / 默认 udev 体验。
 
 ## 当前功能边界
 
-当前重点仍限于已实现的 `error`、`linear`、`striped` 和 `zero` target：
+当前重点仍限于已实现的 `error`、`linear`、`striped` 和 `zero` target，以及基于既有 block/BIO/driver/ioctl 抽象增量接入的 discard / write zeroes range I/O：
 
-- `error`：无 backing 参数，Read / Write 稳定返回 I/O error，flush 对无 backing table 成功完成，deps 为空。
-- `zero`：无 backing 参数，Read 返回全 0，Write 丢弃并成功完成，flush 对无 backing table 成功完成，deps 为空。
-- `linear`：offset 平移、多 segment、跨 segment split、非零 backing start。
-- `striped`：chunk 轮转分布、跨 chunk split、非 chunk 起点写入、backing 分布校验。
+- `error`：无 backing 参数，Read / Write 稳定返回 I/O error，Flush 对无 backing table 成功完成，Discard / WriteZeroes 返回 I/O error，deps 为空。
+- `zero`：无 backing 参数，Read 返回全 0，Write 丢弃并成功完成，Flush / Discard / WriteZeroes 对无 backing table 成功完成，deps 为空。
+- `linear`：offset 平移、多 segment、跨 segment split、非零 backing start，Read / Write / Discard / WriteZeroes remap 到 backing。
+- `striped`：chunk 轮转分布、跨 chunk split、非 chunk 起点写入、backing 分布校验，Read / Write / Discard / WriteZeroes 按 stripe chunk remap 到 backing。
 - mixed：由 LVM2 生成同一 LV 内 linear + striped segments，用现有慢 suite 验证文件 I/O 和 reboot recovery。
+- block ioctl：支持 BLKDISCARD / BLKZEROOUT；legacy BLKSSZGET 已覆盖 util-linux `blkdiscard` 的前置查询。
+- backing driver：virtio block 按协商能力下发 discard / write-zeroes；NVMe 后端暂明确返回 NotSupported。
 
 尚未完成的数据面语义：
 
-- discard / write zeroes。
+- NVMe discard / write zeroes 真实后端命令接入。
 - backing I/O error 的真实 guest 注入。
 - partial completion 的真实 guest 注入。
 - queue limit / alignment / topology。
@@ -222,7 +227,7 @@ test result: ok. 52 passed; 0 failed; 0 filtered out.
 2. 若继续拓展 DM target 功能，snapshot/thin/cache 等需要另起大阶段设计；更小的基础 target 也应先做 host baseline 与最小 guest 语义脚本。
 3. 若继续做数据面语义增强，可审计 queue limit / alignment / topology 的当前实现和测试覆盖；这属于“当前实现自洽性”审计，不声明完整 Linux DM queue stacking 对齐。
 4. backing I/O error / partial completion 已有 core 模拟测试；新增 `error` target 可支持 guest 侧稳定 I/O error 场景，但不等于真实 backing fault injection。
-5. discard / write zeroes 当前是明确非目标；要做需先扩展通用 block `BioType`、backing driver 和 DM table fan-out/remap，不作为当前小阶段。
+5. NVMe discard / write zeroes 当前仅在 block/DM 语义层返回 NotSupported；真实 NVMe Dataset Management / Write Zeroes 命令接入需另起小阶段。
 6. 若要对齐日常裸 LVM2 命令体验，另起阶段专门测试默认 devices file、默认 udev/systemd 联动，不混入当前控制面矩阵。
 7. 若后续修改内核数据面，单个 GAP 修完后先跑相关 ktest；全部相关 GAP 修完后再统一跑系统 suite。
 
@@ -230,4 +235,5 @@ test result: ok. 52 passed; 0 failed; 0 filtered out.
 
 - `log/2026-8-24.md`：mixed active/inactive ktest、striped 几何边界 ktest、mixed LVM2 系统验收、合入当前 main 并适配 `kernel/core` 目录迁移。
 - `log/2026-8-31.md`：dmsetup 控制面语义对齐、LVM2 控制面 baseline/guest 同构、raw DM 数据面边界 guest 审计。
-- `log/2026-9-1.md`：guest 启动慢排查修复、`zero` target 核心/控制面/数据面覆盖。
+- `log/2026-9-1.md`：guest 启动慢排查修复、`zero` target 核心/控制面/数据面覆盖、discard / write zeroes 通用 range BIO 与 DM 映射接入。
+- `log/2026-9-2.md`：面向 upstream/review 收敛 DM 相关源码注释为英文，项目日志和中文技术文档仍保持中文。

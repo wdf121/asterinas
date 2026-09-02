@@ -233,7 +233,7 @@ git diff -- Cargo.toml
 统一入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh <suite>'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh <suite>'
 ```
 
 可用规范 suite：
@@ -259,9 +259,9 @@ myshell/run_dm_system_tests.sh --mixed-lvm2
 | suite | 子脚本 | 主要验证功能 |
 |---|---|---|
 | `--quick` | [run_control_abi_test.sh](../myshell/dm_linear/run_control_abi_test.sh)、[run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh)、[run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh) | control ABI smoke、raw linear cross-target BIO、raw striped BIO split/remap 与 backing 分布。 |
-| `--dmsetup-cli` | [run_dmsetup_cli_semantics_test.sh](../myshell/run_dmsetup_cli_semantics_test.sh) | 对照标准 Linux/OpenEuler 的 dmsetup CLI 控制面语义，覆盖 tableless create、linear/striped/error/zero `/dev/...` table、table/status/deps/info、error target I/O error、zero target 读零写丢弃、rename、suspend/resume、wait、remove_all。 |
+| `--dmsetup-cli` | [run_dmsetup_cli_semantics_test.sh](../myshell/run_dmsetup_cli_semantics_test.sh) | 对照标准 Linux/OpenEuler 的 dmsetup CLI 控制面语义，覆盖 tableless create、linear/striped/error/zero `/dev/...` table、table/status/deps/info、error target I/O error、zero target 读零写丢弃和 BLKDISCARD/BLKZEROOUT、rename、suspend/resume、wait、remove_all。 |
 | `--lvm2-cli` | [run_lvm2_cli_semantics_test.sh](../myshell/run_lvm2_cli_semantics_test.sh) | 对照标准 Linux/OpenEuler 的 LVM2 CLI 控制面语义，覆盖 PV/VG/LV 查询、linear/striped/mixed LV、扩缩容、scan/activation 和测试对象 remove 闭环。 |
-| `--dataplane-edge` | [run_dm_dataplane_edge_test.sh](../myshell/run_dm_dataplane_edge_test.sh) | raw DM 数据面边界审计，覆盖三段 linear 非零 backing start remap、striped 非 chunk 起点写入、跨 stripe 边界 backing 分布、mapper readback，以及 zero target 读零写丢弃。 |
+| `--dataplane-edge` | [run_dm_dataplane_edge_test.sh](../myshell/run_dm_dataplane_edge_test.sh) | raw DM 数据面边界审计，覆盖三段 linear 非零 backing start remap、striped 非 chunk 起点写入、跨 stripe 边界 backing 分布、mapper readback，以及 zero target 读零写丢弃和 BLKDISCARD/BLKZEROOUT。 |
 | `--linear-data` | [run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh) | raw linear cross-target BIO split/remap。 |
 | `--striped-data` | [run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh) | raw striped BIO split/remap 和 backing 分布。 |
 | `--linear-lvm2` | [run_lvm2_linear_reboot_test.sh](../myshell/dm_linear/run_lvm2_linear_reboot_test.sh) | 单 PV、单 linear segment、同盘 grow/shrink、ext2 I/O、reboot recovery。 |
@@ -272,7 +272,7 @@ myshell/run_dm_system_tests.sh --mixed-lvm2
 
 ### 4.2 测试盘和 guest 启动
 
-单个 QEMU guest 从启动到退出的完整生命周期默认 180 秒；超过 3 分钟视为异常，应优先排查 guest 卡死、命令阻塞、残留 QEMU、资源压力或镜像锁冲突。
+单个 QEMU guest 从启动到退出的完整生命周期默认 180 秒；新系统 suite 统一使用 `GUEST_QEMU_TIMEOUT` 配置该完整生命周期超时，`GUEST_READY_TIMEOUT` 仅作为旧脚本兼容 alias。超过 3 分钟视为异常，应优先排查 guest 卡死、命令阻塞、残留 QEMU、资源压力或镜像锁冲突。
 
 系统验收脚本通过 NixOS guest 运行真实用户态工具。测试盘由 [tools/nixos/run.sh](../tools/nixos/run.sh) 挂入 QEMU。
 
@@ -444,6 +444,7 @@ cmp -n 512 /tmp/zero-read-after-write.bin /dev/zero
 - `dmsetup deps` 返回 `0 dependencies`。
 - zero target 读返回全 0。
 - zero target 写入丢弃并成功完成，后续读取仍为全 0。
+- zero target 上 `blkdiscard` / `blkdiscard -z` 成功，验证 BLKDISCARD/BLKZEROOUT ioctl 到 range BIO 的 direct-complete 路径。
 - flush 对无 backing target 可直接成功完成。
 
 ### 5.7 readonly mapper
@@ -1071,7 +1072,7 @@ du -sh "$MOUNT_DIR" "$MOUNT_DIR/base64.bin" "$MOUNT_DIR/grow256.bin"
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --quick'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --quick'
 ```
 
 关键命令：
@@ -1107,7 +1108,7 @@ dmsetup remove dm_control_renamed
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-data'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-data'
 ```
 
 核心 table：
@@ -1150,7 +1151,7 @@ md5sum ...
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2'
 ```
 
 验证功能：
@@ -1165,7 +1166,7 @@ docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment'
 ```
 
 关键命令：
@@ -1222,7 +1223,7 @@ md5sum -c linear-cs.md5
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-data'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-data'
 ```
 
 核心 table：
@@ -1269,7 +1270,7 @@ backing2 = B + D
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2'
 ```
 
 创建：
@@ -1319,7 +1320,7 @@ md5sum -c striped.md5
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
 ```
 
 初始创建：
@@ -1379,7 +1380,7 @@ md5sum -c striped-cs.md5
 入口：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2'
 ```
 
 初始 linear：
@@ -1465,61 +1466,61 @@ docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make
 只验证 quick smoke：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --quick'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --quick'
 ```
 
 只验证 linear raw BIO：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-data'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-data'
 ```
 
 只验证 striped raw BIO：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-data'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-data'
 ```
 
 验证基础 LVM2 linear：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2'
 ```
 
 验证 linear cross-segment：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment'
 ```
 
 验证基础 N-way striped LVM2：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2'
 ```
 
 验证 3-way striped 基础场景：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && STRIPED_PV_COUNT=3 GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && STRIPED_PV_COUNT=3 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2'
 ```
 
 验证 striped N-to-2N cross-segment：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
 ```
 
 验证 3-way 到 6 盘 striped cross-segment：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && STRIPED_CS_PV_COUNT=3 GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && STRIPED_CS_PV_COUNT=3 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
 ```
 
 验证 mixed linear + striped：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2'
 ```
 
 阶段验收时按相关路径显式组合上述 suite；当前不提供无参数默认运行或 `--full` 聚合入口。

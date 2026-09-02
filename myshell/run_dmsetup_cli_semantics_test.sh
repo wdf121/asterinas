@@ -426,6 +426,8 @@ expect_deps_count "${zero_name}" 0 ZERO_DEPS
 run_shell_expect_success ZERO_READ_ALL_ZERO "timeout 5 sh -c 'dd if=/dev/mapper/${zero_name} of=/tmp/zero-read.bin bs=512 count=1 status=none && cmp -n 512 /tmp/zero-read.bin /dev/zero'"
 run_shell_expect_success ZERO_WRITE "timeout 5 dd if=/dev/urandom of=/dev/mapper/${zero_name} bs=512 count=1 status=none"
 run_shell_expect_success ZERO_READ_AFTER_WRITE_ALL_ZERO "timeout 5 sh -c 'dd if=/dev/mapper/${zero_name} of=/tmp/zero-read-after-write.bin bs=512 count=1 status=none && cmp -n 512 /tmp/zero-read-after-write.bin /dev/zero'"
+run_shell_expect_success ZERO_BLKDISCARD "timeout 5 blkdiscard /dev/mapper/${zero_name}"
+run_shell_expect_success ZERO_BLKZEROOUT "timeout 5 blkdiscard -z /dev/mapper/${zero_name}"
 run_expect_success ZERO_REMOVE dmsetup remove "${zero_name}"
 echo CHECK_PASS_DMSETUP_ERROR_ZERO_CREATE_IO
 
