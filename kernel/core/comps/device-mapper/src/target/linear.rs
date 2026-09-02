@@ -24,18 +24,8 @@ impl LinearTarget {
         backing_start: Sid,
         backing: BlockDeviceLease,
     ) -> Result<Self, TableError> {
-        if length == 0 {
-            return Err(TableError::ZeroLength);
-        }
-
-        let logical_end = logical_start
-            .to_raw()
-            .checked_add(length)
-            .ok_or(TableError::LogicalRangeOverflow)?;
-        let backing_end = backing_start
-            .to_raw()
-            .checked_add(length)
-            .ok_or(TableError::BackingRangeOverflow)?;
+        let (logical_end, backing_end) =
+            Self::validate_geometry(logical_start, length, backing_start)?;
         let backing_capacity = u64::try_from(backing.metadata().nr_sectors)
             .map_err(|_| TableError::BackingRangeOverflow)?;
         if backing_end > backing_capacity {
@@ -48,6 +38,26 @@ impl LinearTarget {
             backing_id: backing.id(),
             backing,
         })
+    }
+
+    pub(super) fn validate_geometry(
+        logical_start: Sid,
+        length: u64,
+        backing_start: Sid,
+    ) -> Result<(u64, u64), TableError> {
+        if length == 0 {
+            return Err(TableError::ZeroLength);
+        }
+
+        let logical_end = logical_start
+            .to_raw()
+            .checked_add(length)
+            .ok_or(TableError::LogicalRangeOverflow)?;
+        let backing_end = backing_start
+            .to_raw()
+            .checked_add(length)
+            .ok_or(TableError::BackingRangeOverflow)?;
+        Ok((logical_end, backing_end))
     }
 
     /// Returns the logical sector range covered by this target.

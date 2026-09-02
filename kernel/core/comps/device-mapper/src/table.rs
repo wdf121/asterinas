@@ -271,19 +271,19 @@ impl DmTable {
         let mut cursor = start.to_raw();
         let mut parts = Vec::new();
         while cursor < end {
-            let target = self
-                .targets
-                .iter()
-                .find(|target| {
-                    cursor >= target.logical_range().start.to_raw()
-                        && cursor < target.logical_range().end.to_raw()
-                })
-                .ok_or(BioEnqueueError::Refused)?;
+            let target = self.target_at(cursor).ok_or(BioEnqueueError::Refused)?;
             let part_end = core::cmp::min(end, target.logical_range().end.to_raw());
             parts.push((Sid::new(cursor)..Sid::new(part_end), target));
             cursor = part_end;
         }
         Ok(parts)
+    }
+
+    fn target_at(&self, sector: u64) -> Option<&DmTarget> {
+        self.targets.iter().find(|target| {
+            sector >= target.logical_range().start.to_raw()
+                && sector < target.logical_range().end.to_raw()
+        })
     }
 
     fn enqueue_flush(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {

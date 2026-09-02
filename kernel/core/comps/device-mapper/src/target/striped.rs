@@ -6,6 +6,7 @@ use core::ops::Range;
 use aster_block::{BlockDevice, BlockDeviceLease, id::Sid};
 use device_id::{DeviceId, MajorId, MinorId};
 
+use super::DmTargetParseError;
 use crate::TableError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,39 +34,9 @@ pub struct StripedTargetParams {
 
 impl StripedTargetParams {
     pub fn parse(params: &str) -> Result<Self, TableError> {
-        let fields = params.split_ascii_whitespace().collect::<Vec<_>>();
-        if fields.len() < 2 {
-            return Err(TableError::InvalidTargetParams);
-        }
-
-        let stripe_count = fields[0]
-            .parse::<usize>()
-            .map_err(|_| TableError::InvalidTargetParams)?;
-        if stripe_count == 0 {
-            return Err(TableError::InvalidTargetParams);
-        }
-
-        let chunk_size = fields[1]
-            .parse::<u64>()
-            .map_err(|_| TableError::InvalidTargetParams)?;
-        if chunk_size == 0 {
-            return Err(TableError::InvalidTargetParams);
-        }
-
-        let expected_fields = stripe_count
-            .checked_mul(2)
-            .and_then(|value| value.checked_add(2))
-            .ok_or(TableError::InvalidTargetParams)?;
-        if fields.len() != expected_fields {
-            return Err(TableError::InvalidTargetParams);
-        }
-
+        let fields = parse_striped_fields(params)?;
         let mut stripes = Vec::new();
-        for index in 0..stripe_count {
-            let dev = fields[2 + index * 2];
-            let backing_start = fields[3 + index * 2]
-                .parse::<u64>()
-                .map_err(|_| TableError::InvalidTargetParams)?;
+        for (dev, backing_start) in fields.stripes {
             stripes.push(StripedBacking {
                 id: parse_device_id(dev)?,
                 backing_start: Sid::new(backing_start),
@@ -73,8 +44,8 @@ impl StripedTargetParams {
         }
 
         Ok(Self {
-            stripe_count,
-            chunk_size,
+            stripe_count: stripes.len(),
+            chunk_size: fields.chunk_size,
             stripes,
         })
     }
@@ -92,34 +63,7 @@ impl StripedTargetParams {
     }
 
     pub fn required_sectors(&self, stripe_index: usize, length: u64) -> Result<u64, TableError> {
-        if length == 0 {
-            return Err(TableError::ZeroLength);
-        }
-        if stripe_index >= self.stripe_count {
-            return Err(TableError::InvalidTargetParams);
-        }
-
-        let stripe_count =
-            u64::try_from(self.stripe_count).map_err(|_| TableError::InvalidTargetParams)?;
-        let stripe_width = stripe_count
-            .checked_mul(self.chunk_size)
-            .ok_or(TableError::BackingRangeOverflow)?;
-        let full_rows = length / stripe_width;
-        let remainder = length % stripe_width;
-        let base = full_rows
-            .checked_mul(self.chunk_size)
-            .ok_or(TableError::BackingRangeOverflow)?;
-        let stripe_remainder_start = u64::try_from(stripe_index)
-            .map_err(|_| TableError::InvalidTargetParams)?
-            .checked_mul(self.chunk_size)
-            .ok_or(TableError::BackingRangeOverflow)?;
-        let extra = if remainder > stripe_remainder_start {
-            core::cmp::min(self.chunk_size, remainder - stripe_remainder_start)
-        } else {
-            0
-        };
-        base.checked_add(extra)
-            .ok_or(TableError::BackingRangeOverflow)
+        required_sectors(self.stripe_count, self.chunk_size, stripe_index, length)
     }
 
     pub fn validate_backing_ranges(
@@ -217,28 +161,68 @@ impl StripedRangeMap {
 }
 
 impl StripedTarget {
+    pub(super) fn parse_with<E>(
+        logical_start: Sid,
+        length: u64,
+        params: &str,
+        parse_backing: &mut impl FnMut(&str) -> Result<DeviceId, E>,
+        resolve_backing: &mut impl FnMut(DeviceId) -> Result<BlockDeviceLease, E>,
+    ) -> Result<Self, DmTargetParseError<E>> {
+        let fields = parse_striped_fields(params)?;
+        validate_striped_geometry(
+            logical_start,
+            length,
+            fields.stripes.len(),
+            fields.chunk_size,
+        )?;
+        validate_backing_range_arithmetic(
+            length,
+            fields.stripes.len(),
+            fields.chunk_size,
+            fields
+                .stripes
+                .iter()
+                .map(|(_, backing_start)| *backing_start),
+        )?;
+
+        let mut stripes = Vec::new();
+        for (dev, backing_start) in fields.stripes {
+            let id = parse_backing(dev).map_err(DmTargetParseError::ResolveBacking)?;
+            stripes.push(StripedBacking {
+                id,
+                backing_start: Sid::new(backing_start),
+            });
+        }
+        let params = StripedTargetParams {
+            stripe_count: stripes.len(),
+            chunk_size: fields.chunk_size,
+            stripes,
+        };
+        let mut backings = Vec::new();
+        for stripe in params.stripes() {
+            let backing =
+                resolve_backing(stripe.id()).map_err(DmTargetParseError::ResolveBacking)?;
+            backings.push(backing);
+        }
+        Self::new(logical_start, length, params, backings).map_err(Into::into)
+    }
+
     pub fn new(
         logical_start: Sid,
         length: u64,
         params: StripedTargetParams,
         backings: Vec<BlockDeviceLease>,
     ) -> Result<Self, TableError> {
-        if length == 0 {
-            return Err(TableError::ZeroLength);
-        }
-        let logical_end = logical_start
-            .to_raw()
-            .checked_add(length)
-            .ok_or(TableError::LogicalRangeOverflow)?;
+        let (logical_end, stripe_width) = validate_striped_geometry(
+            logical_start,
+            length,
+            params.stripe_count(),
+            params.chunk_size(),
+        )?;
         if backings.len() != params.stripe_count() {
             return Err(TableError::InvalidTargetParams);
         }
 
-        let stripe_count =
-            u64::try_from(params.stripe_count()).map_err(|_| TableError::InvalidTargetParams)?;
-        let stripe_width = stripe_count
-            .checked_mul(params.chunk_size())
-            .ok_or(TableError::BackingRangeOverflow)?;
         let mut capacities = Vec::new();
         for (stripe, backing) in params.stripes().iter().zip(backings.iter()) {
             if backing.id() != stripe.id() {
@@ -381,6 +365,121 @@ impl StripedTarget {
         }
         Some(parts)
     }
+}
+
+fn required_sectors(
+    stripe_count: usize,
+    chunk_size: u64,
+    stripe_index: usize,
+    length: u64,
+) -> Result<u64, TableError> {
+    if length == 0 {
+        return Err(TableError::ZeroLength);
+    }
+    if stripe_index >= stripe_count {
+        return Err(TableError::InvalidTargetParams);
+    }
+
+    let stripe_count = u64::try_from(stripe_count).map_err(|_| TableError::InvalidTargetParams)?;
+    let stripe_width = stripe_count
+        .checked_mul(chunk_size)
+        .ok_or(TableError::BackingRangeOverflow)?;
+    let full_rows = length / stripe_width;
+    let remainder = length % stripe_width;
+    let base = full_rows
+        .checked_mul(chunk_size)
+        .ok_or(TableError::BackingRangeOverflow)?;
+    let stripe_remainder_start = u64::try_from(stripe_index)
+        .map_err(|_| TableError::InvalidTargetParams)?
+        .checked_mul(chunk_size)
+        .ok_or(TableError::BackingRangeOverflow)?;
+    let extra = if remainder > stripe_remainder_start {
+        core::cmp::min(chunk_size, remainder - stripe_remainder_start)
+    } else {
+        0
+    };
+    base.checked_add(extra)
+        .ok_or(TableError::BackingRangeOverflow)
+}
+
+fn validate_backing_range_arithmetic(
+    length: u64,
+    stripe_count: usize,
+    chunk_size: u64,
+    backing_starts: impl Iterator<Item = u64>,
+) -> Result<(), TableError> {
+    for (index, backing_start) in backing_starts.enumerate() {
+        let required = required_sectors(stripe_count, chunk_size, index, length)?;
+        backing_start
+            .checked_add(required)
+            .ok_or(TableError::BackingRangeOverflow)?;
+    }
+    Ok(())
+}
+
+fn validate_striped_geometry(
+    logical_start: Sid,
+    length: u64,
+    stripe_count: usize,
+    chunk_size: u64,
+) -> Result<(u64, u64), TableError> {
+    if length == 0 {
+        return Err(TableError::ZeroLength);
+    }
+    let logical_end = logical_start
+        .to_raw()
+        .checked_add(length)
+        .ok_or(TableError::LogicalRangeOverflow)?;
+    let stripe_count = u64::try_from(stripe_count).map_err(|_| TableError::InvalidTargetParams)?;
+    let stripe_width = stripe_count
+        .checked_mul(chunk_size)
+        .ok_or(TableError::BackingRangeOverflow)?;
+    Ok((logical_end, stripe_width))
+}
+
+struct ParsedStripedFields<'a> {
+    chunk_size: u64,
+    stripes: Vec<(&'a str, u64)>,
+}
+
+fn parse_striped_fields(params: &str) -> Result<ParsedStripedFields<'_>, TableError> {
+    let mut fields = params.split_ascii_whitespace();
+    let stripe_count = fields
+        .next()
+        .ok_or(TableError::InvalidTargetParams)?
+        .parse::<usize>()
+        .map_err(|_| TableError::InvalidTargetParams)?;
+    if stripe_count == 0 {
+        return Err(TableError::InvalidTargetParams);
+    }
+
+    let chunk_size = fields
+        .next()
+        .ok_or(TableError::InvalidTargetParams)?
+        .parse::<u64>()
+        .map_err(|_| TableError::InvalidTargetParams)?;
+    if chunk_size == 0 {
+        return Err(TableError::InvalidTargetParams);
+    }
+
+    let mut stripes = Vec::new();
+    for _ in 0..stripe_count {
+        let dev = fields.next().ok_or(TableError::InvalidTargetParams)?;
+        let backing_start = fields
+            .next()
+            .ok_or(TableError::InvalidTargetParams)?
+            .parse::<u64>()
+            .map_err(|_| TableError::InvalidTargetParams)?;
+        stripes.push((dev, backing_start));
+    }
+    if fields.next().is_some() {
+        return Err(TableError::InvalidTargetParams);
+    }
+
+    Ok(ParsedStripedFields {
+        chunk_size,
+        stripes,
+    })
 }
 
 fn parse_device_id(dev: &str) -> Result<DeviceId, TableError> {
