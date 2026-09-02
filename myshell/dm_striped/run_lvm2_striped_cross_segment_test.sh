@@ -13,7 +13,8 @@ Runs an independent two-guest NixOS regression for LVM2 striped N-to-2N cross-se
 Optional environment variables:
   DM_TEST_IMAGES                          Backing test image list. When unset, generated from STRIPED_CS_PV_COUNT * 2.
   DM_STRIPED_LVM2_CROSS_SEGMENT_LOG       Host-side log path, default /tmp/dm-striped-lvm2-cross-segment-test.log
-  GUEST_READY_TIMEOUT                     Seconds to allow one full QEMU guest lifecycle, default 180
+  GUEST_QEMU_TIMEOUT                      Full QEMU lifecycle timeout in seconds, default 180
+  GUEST_READY_TIMEOUT                     Compatibility alias if GUEST_QEMU_TIMEOUT is unset
   RESET_DM_TEST_IMAGES                    1 to delete test images before running, default 1
   STRIPED_CS_PV_COUNT                     Number of PVs per striped segment, default 2
   STRIPED_CS_INITIAL_LV_MIB               Initial LV size in MiB, default STRIPED_CS_PV_COUNT * 256
@@ -22,6 +23,11 @@ Optional environment variables:
   STRIPED_CS_BASE_FILE_MIB                Base test file size in MiB, default STRIPED_CS_PV_COUNT * 64
   STRIPED_CS_GROW_FILE_MIB                Post-cross-segment test file size in MiB, default STRIPED_CS_PV_COUNT * 240
   STRIPED_CS_CHUNK_KIB                    LVM stripe chunk size in KiB, default 4
+
+Expected success markers:
+  TEST_PASS_DM_STRIPED_LVM2_CROSS_SEGMENT_FIRST
+  TEST_PASS_DM_STRIPED_LVM2_CROSS_SEGMENT_SECOND
+  HOST_PASS_DM_STRIPED_LVM2_CROSS_SEGMENT
 EOF
     exit 0
 fi
@@ -40,7 +46,7 @@ STRIPED_CS_SHRUNK_LV_MIB=${STRIPED_CS_SHRUNK_LV_MIB:-${STRIPED_CS_INITIAL_LV_MIB
 STRIPED_CS_BASE_FILE_MIB=${STRIPED_CS_BASE_FILE_MIB:-$((STRIPED_CS_PV_COUNT * 64))}
 STRIPED_CS_GROW_FILE_MIB=${STRIPED_CS_GROW_FILE_MIB:-$((STRIPED_CS_PV_COUNT * 240))}
 STRIPED_CS_CHUNK_KIB=${STRIPED_CS_CHUNK_KIB:-4}
-GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-180}
+GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-${GUEST_READY_TIMEOUT:-180}}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
 test "${STRIPED_CS_PV_COUNT}" -ge 2
@@ -78,6 +84,7 @@ DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
+echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 index=1
 for image_path in ${DM_TEST_IMAGES}; do
     if [ "${index}" -eq 1 ]; then

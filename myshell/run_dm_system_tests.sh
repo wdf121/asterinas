@@ -20,6 +20,9 @@ Canonical suites:
   --linear-lvm2-cross-segment     Run independent linear cross-segment table, reboot recovery, and shrink regression.
   --striped-lvm2-cross-segment    Run independent striped N-to-2N cross-segment, reboot recovery, and shrink regression.
   --mixed-lvm2                    Run LVM2 linear + striped mixed table file I/O and reboot recovery regression.
+
+Expected success markers:
+  HOST_PASS_DM_SYSTEM_TESTS <suite>
 EOF
     exit 0
 fi

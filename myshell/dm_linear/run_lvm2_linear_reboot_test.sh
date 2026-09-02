@@ -13,7 +13,8 @@ Runs a two-guest NixOS regression for single-PV LVM2 linear create, same-PV grow
 Optional environment variables:
   DM_TEST_IMAGE                    Backing test image path, default target/nixos/test.img
   DM_LINEAR_LVM2_REBOOT_LOG        Host-side log path, default /tmp/dm-linear-lvm2-reboot-test.log
-  GUEST_READY_TIMEOUT              Seconds to allow one full QEMU guest lifecycle, default 180
+  GUEST_QEMU_TIMEOUT               Full QEMU lifecycle timeout in seconds, default 180
+  GUEST_READY_TIMEOUT              Compatibility alias if GUEST_QEMU_TIMEOUT is unset
   RESET_DM_TEST_IMAGES             1 to delete test images before running, default 1
   LINEAR_INITIAL_LV_MIB            Initial LV size in MiB, default 256
   LINEAR_EXTENDED_LV_MIB           Same-PV extended LV size in MiB, default 384
@@ -21,6 +22,11 @@ Optional environment variables:
   LINEAR_BASE_FILE_MIB             Base test file size in MiB, default 64
   LINEAR_GROW_FILE_MIB             Transient post-grow test file size in MiB, default 240
   LINEAR_AFTER_SHRINK_FILE_MIB     Post-shrink test file size in MiB, default 64
+
+Expected success markers:
+  TEST_PASS_DM_LINEAR_LVM2_REBOOT_FIRST
+  TEST_PASS_DM_LINEAR_LVM2_REBOOT_SECOND
+  HOST_PASS_DM_LINEAR_LVM2_REBOOT
 EOF
     exit 0
 fi
@@ -34,7 +40,7 @@ LOG=${DM_LINEAR_LVM2_REBOOT_LOG:-/tmp/dm-linear-lvm2-reboot-test.log}
 DM_TEST_IMAGE=${DM_TEST_IMAGE:-target/nixos/test.img}
 DM_TEST_IMAGES=${DM_TEST_IMAGES:-${DM_TEST_IMAGE}}
 DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
-GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-180}
+GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-${GUEST_READY_TIMEOUT:-180}}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 LINEAR_INITIAL_LV_MIB=${LINEAR_INITIAL_LV_MIB:-256}
 LINEAR_EXTENDED_LV_MIB=${LINEAR_EXTENDED_LV_MIB:-384}
@@ -51,6 +57,7 @@ test $((LINEAR_BASE_FILE_MIB + LINEAR_GROW_FILE_MIB)) -lt "${LINEAR_EXTENDED_LV_
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
+echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 echo "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
 echo "HOST_INFO_${TEST_ID} initial_lv_mib=${LINEAR_INITIAL_LV_MIB} extended_lv_mib=${LINEAR_EXTENDED_LV_MIB} shrunk_lv_mib=${LINEAR_SHRUNK_LV_MIB} base_file_mib=${LINEAR_BASE_FILE_MIB} grow_file_mib=${LINEAR_GROW_FILE_MIB} after_shrink_file_mib=${LINEAR_AFTER_SHRINK_FILE_MIB}"
 
