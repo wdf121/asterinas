@@ -14,8 +14,13 @@ Optional environment variables:
   DM_TEST_IMAGE              First backing test image path, default target/nixos/test.img
   DM_TEST_IMAGE_2            Second backing test image path, default target/nixos/test2.img
   DM_STRIPED_RAW_BIO_LOG     Host-side log path, default /tmp/dm-striped-raw-bio-test.log
-  GUEST_READY_TIMEOUT        Seconds to wait for guest root shell, default 120
+  GUEST_QEMU_TIMEOUT         Full QEMU lifecycle timeout in seconds, default 120
+  GUEST_READY_TIMEOUT        Compatibility alias if GUEST_QEMU_TIMEOUT is unset
   RESET_DM_TEST_IMAGES       1 to delete test images before running, default 1
+
+Expected success markers:
+  TEST_PASS_DM_STRIPED_RAW_BIO
+  HOST_PASS_DM_STRIPED_RAW_BIO
 EOF
     exit 0
 fi
@@ -28,11 +33,12 @@ TEST_ID=DM_STRIPED_RAW_BIO
 LOG=${DM_STRIPED_RAW_BIO_LOG:-/tmp/dm-striped-raw-bio-test.log}
 DM_TEST_IMAGE=${DM_TEST_IMAGE:-target/nixos/test.img}
 DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
-GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-120}
+GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-${GUEST_READY_TIMEOUT:-120}}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
+echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 echo "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
 echo "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
 

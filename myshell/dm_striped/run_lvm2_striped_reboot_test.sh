@@ -13,7 +13,8 @@ Runs a two-guest NixOS regression for N-PV LVM2 striped create, same-PV-set grow
 Optional environment variables:
   DM_TEST_IMAGES                    Backing test image list. When unset, generated from STRIPED_PV_COUNT.
   DM_STRIPED_LVM2_REBOOT_LOG        Host-side log path, default /tmp/dm-striped-lvm2-reboot-test.log
-  GUEST_READY_TIMEOUT               Seconds to allow one full QEMU guest lifecycle, default 180
+  GUEST_QEMU_TIMEOUT                Full QEMU lifecycle timeout in seconds, default 180
+  GUEST_READY_TIMEOUT               Compatibility alias if GUEST_QEMU_TIMEOUT is unset
   RESET_DM_TEST_IMAGES              1 to delete test images before running, default 1
   STRIPED_PV_COUNT                  Number of striped PVs, default 2
   STRIPED_INITIAL_LV_MIB            Initial LV size in MiB, default STRIPED_PV_COUNT * 256
@@ -23,6 +24,11 @@ Optional environment variables:
   STRIPED_GROW_FILE_MIB             Transient post-grow test file size in MiB, default STRIPED_PV_COUNT * 240
   STRIPED_AFTER_SHRINK_FILE_MIB     Post-shrink test file size in MiB, default STRIPED_PV_COUNT * 64
   STRIPED_CHUNK_KIB                 LVM stripe chunk size in KiB, default 4
+
+Expected success markers:
+  TEST_PASS_DM_STRIPED_LVM2_REBOOT_FIRST
+  TEST_PASS_DM_STRIPED_LVM2_REBOOT_SECOND
+  HOST_PASS_DM_STRIPED_LVM2_REBOOT
 EOF
     exit 0
 fi
@@ -41,7 +47,7 @@ STRIPED_BASE_FILE_MIB=${STRIPED_BASE_FILE_MIB:-$((STRIPED_PV_COUNT * 64))}
 STRIPED_GROW_FILE_MIB=${STRIPED_GROW_FILE_MIB:-$((STRIPED_PV_COUNT * 240))}
 STRIPED_AFTER_SHRINK_FILE_MIB=${STRIPED_AFTER_SHRINK_FILE_MIB:-$((STRIPED_PV_COUNT * 64))}
 STRIPED_CHUNK_KIB=${STRIPED_CHUNK_KIB:-4}
-GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-180}
+GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-${GUEST_READY_TIMEOUT:-180}}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
 test "${STRIPED_PV_COUNT}" -ge 2
@@ -77,6 +83,7 @@ DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
+echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 index=1
 for image_path in ${DM_TEST_IMAGES}; do
     if [ "${index}" -eq 1 ]; then

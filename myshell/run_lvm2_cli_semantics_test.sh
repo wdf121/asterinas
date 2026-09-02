@@ -18,6 +18,11 @@ Optional environment variables:
   GUEST_QEMU_TIMEOUT        Full QEMU lifecycle timeout in seconds, default 180
   GUEST_READY_TIMEOUT       Compatibility alias if GUEST_QEMU_TIMEOUT is unset
   RESET_DM_TEST_IMAGES      1 to delete test images before running, default 1
+
+Expected success markers:
+  SUMMARY_GAP_LVM2_CLI_SEMANTICS: 0
+  TEST_PASS_LVM2_CLI_SEMANTICS
+  HOST_PASS_LVM2_CLI_SEMANTICS
 EOF
     exit 0
 fi
