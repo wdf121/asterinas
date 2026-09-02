@@ -1,9 +1,9 @@
 diff --git a/myshell/run_dm_dataplane_edge_test.sh b/myshell/run_dm_dataplane_edge_test.sh
 new file mode 100755
-index 000000000..17c83012a
+index 000000000..c061d3d73
 --- /dev/null
 +++ b/myshell/run_dm_dataplane_edge_test.sh
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,237 @@
 +#!/bin/bash
 +
 +# SPDX-License-Identifier: MPL-2.0
@@ -23,6 +23,10 @@ index 000000000..17c83012a
 +  GUEST_QEMU_TIMEOUT        Full QEMU lifecycle timeout in seconds, default 180
 +  GUEST_READY_TIMEOUT       Compatibility alias if GUEST_QEMU_TIMEOUT is unset
 +  RESET_DM_TEST_IMAGES      1 to delete test images before running, default 1
++
++Expected success markers:
++  TEST_PASS_DM_DATAPLANE_EDGE
++  HOST_PASS_DM_DATAPLANE_EDGE
 +EOF
 +    exit 0
 +fi

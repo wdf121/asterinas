@@ -1,9 +1,9 @@
 diff --git a/docs/test.md b/docs/test.md
 new file mode 100644
-index 000000000..35221950a
+index 000000000..5cd8b89d3
 --- /dev/null
 +++ b/docs/test.md
-@@ -0,0 +1,1646 @@
+@@ -0,0 +1,1665 @@
 +# Device Mapper 编译与测试命令整理
 +
 +本文整理 `dm` 分支中 Asterinas 编译、静态检查、ktest、NixOS/LVM2 系统验收，以及脚本中实际使用的 `dmsetup`、PV/VG/LV、文件系统和数据校验命令。
@@ -207,7 +207,7 @@ index 000000000..35221950a
 +
 +```toml
 +default-members = [
-+    "kernel",
++    "kernel/core",
 +]
 +```
 +
@@ -1621,6 +1621,25 @@ index 000000000..35221950a
 +TEST_PASS_...
 +HOST_PASS_...
 +```
++
++`TEST_PASS_*` 表示 guest 内测试逻辑已经到达预期终点；`HOST_PASS_*` 表示 host harness 已经确认 guest pass marker、没有失败 marker，并完成日志 summary 检查。`HOST_PASS_DM_SYSTEM_TESTS <suite>` 只表示组合入口里的子脚本已完成，不替代子脚本自己的语义 marker。
++
++常见系统 suite 的最终通过标记：
++
++| suite / script | 关键 pass marker |
++|---|---|
++| `run_dm_system_tests.sh <suite>` | `HOST_PASS_DM_SYSTEM_TESTS <suite>` |
++| `--quick` | `HOST_PASS_DM_CONTROL_ABI`、`HOST_PASS_CROSS_TARGET_BIO`、`HOST_PASS_DM_STRIPED_RAW_BIO`、`HOST_PASS_DM_SYSTEM_TESTS --quick` |
++| `--dmsetup-cli` | `SUMMARY_GAP_DMSETUP_CLI_SEMANTICS: 0`、`TEST_PASS_DMSETUP_CLI_SEMANTICS`、`HOST_PASS_DMSETUP_CLI_SEMANTICS` |
++| `--lvm2-cli` | `SUMMARY_GAP_LVM2_CLI_SEMANTICS: 0`、`TEST_PASS_LVM2_CLI_SEMANTICS`、`HOST_PASS_LVM2_CLI_SEMANTICS` |
++| `--dataplane-edge` | `TEST_PASS_DM_DATAPLANE_EDGE`、`HOST_PASS_DM_DATAPLANE_EDGE` |
++| `--linear-data` | `TEST_PASS_CROSS_TARGET_BIO`、`HOST_PASS_CROSS_TARGET_BIO` |
++| `--striped-data` | `TEST_PASS_DM_STRIPED_RAW_BIO`、`HOST_PASS_DM_STRIPED_RAW_BIO` |
++| `--linear-lvm2` | `TEST_PASS_DM_LINEAR_LVM2_REBOOT_FIRST`、`TEST_PASS_DM_LINEAR_LVM2_REBOOT_SECOND`、`HOST_PASS_DM_LINEAR_LVM2_REBOOT` |
++| `--striped-lvm2` | `TEST_PASS_DM_STRIPED_LVM2_REBOOT_FIRST`、`TEST_PASS_DM_STRIPED_LVM2_REBOOT_SECOND`、`HOST_PASS_DM_STRIPED_LVM2_REBOOT` |
++| `--linear-lvm2-cross-segment` | `TEST_PASS_DM_LINEAR_LVM2_CROSS_SEGMENT_FIRST`、`TEST_PASS_DM_LINEAR_LVM2_CROSS_SEGMENT_SECOND`、`HOST_PASS_DM_LINEAR_LVM2_CROSS_SEGMENT` |
++| `--striped-lvm2-cross-segment` | `TEST_PASS_DM_STRIPED_LVM2_CROSS_SEGMENT_FIRST`、`TEST_PASS_DM_STRIPED_LVM2_CROSS_SEGMENT_SECOND`、`HOST_PASS_DM_STRIPED_LVM2_CROSS_SEGMENT` |
++| `--mixed-lvm2` | `TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_FIRST`、`TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_SECOND`、`HOST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT` |
 +
 +失败常见标记：
 +

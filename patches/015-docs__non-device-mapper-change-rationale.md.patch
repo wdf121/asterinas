@@ -1,9 +1,9 @@
 diff --git a/docs/non-device-mapper-change-rationale.md b/docs/non-device-mapper-change-rationale.md
 new file mode 100644
-index 000000000..482185d77
+index 000000000..0d28388d0
 --- /dev/null
 +++ b/docs/non-device-mapper-change-rationale.md
-@@ -0,0 +1,723 @@
+@@ -0,0 +1,711 @@
 +# 非 Device Mapper 专属改动说明
 +
 +本文整理 `dm` 分支中不属于 Device Mapper core 本身、但为 Device Mapper / LVM2 路径提供支撑的改动。重点说明：为什么需要这些改动、原来缺什么、解决了什么问题。
@@ -164,59 +164,49 @@ index 000000000..482185d77
 +
 +改动内容：
 +
-+新增统一入口，支持规范 suite：
++新增统一入口，当前仅支持显式传入规范 suite：
 +
 +- `--quick`
++- `--dmsetup-cli`
++- `--lvm2-cli`
++- `--dataplane-edge`
 +- `--linear-data`
 +- `--striped-data`
 +- `--linear-lvm2`
 +- `--striped-lvm2`
-+- `--linear-lvm2-resize`
-+- `--striped-lvm2-resize`
-+- `--striped-lvm2-extended`
++- `--linear-lvm2-cross-segment`
++- `--striped-lvm2-cross-segment`
 +- `--mixed-lvm2`
-+- `--full`
 +
-+并保留兼容或窄跑 suite：
-+
-+- `--linear-lvm2-reboot`，兼容 `--linear-lvm2`
-+- `--striped-lvm2-reboot`，兼容 `--striped-lvm2`
-+- `--data`，兼容 `--linear-data`
-+- `--striped`，兼容 `--striped-data`
-+- `--lvm2`，保留 linear LVM2 历史 bundle 语义
-+- `--linear-flow`
-+- `--striped-lvm2-3pv`
-+- `--striped-lvm2-multi-segment`
++当前不保留无参数默认运行、`--full` 或旧兼容别名；阶段验收按受影响路径显式组合窄入口。
 +
 +为什么要改：
 +
 +- 随着系统验收增多，需要一个稳定入口给开发、阶段验收和文档引用。
 +- 不同测试耗时不同，需要按场景选择窄跑，而不是每次都跑全量。
-+- `--full` 需要保持原 linear 全量语义，不能因为新增 striped / mixed 慢测试而变慢。
++- 显式 suite 能避免 `--full` 这类历史 bundle 语义继续误导当前覆盖范围。
 +
 +解决的问题：
 +
 +- 统一系统测试命令，减少记忆成本。
 +- 支持按链路窄跑，避免无关慢测试扩大验证范围。
-+- 保持 `--full` 语义稳定，避免影响既有使用者。
++- 让文档中的验收矩阵和 `myshell/run_dm_system_tests.sh --help` 保持一致。
 +
 +### F. `myshell/dm_linear`：linear 和基础控制面系统验收脚本
 +
 +相关文件：
 +
 +- [run_control_abi_test.sh](../myshell/dm_linear/run_control_abi_test.sh)
-+- [run_cross_pv_large_write_test.sh](../myshell/dm_linear/run_cross_pv_large_write_test.sh)
 +- [run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh)
-+- [run_linear_full_flow_test.sh](../myshell/dm_linear/run_linear_full_flow_test.sh)
-+- [run_lvm2_resize_test.sh](../myshell/dm_linear/run_lvm2_resize_test.sh)
++- [run_lvm2_linear_reboot_test.sh](../myshell/dm_linear/run_lvm2_linear_reboot_test.sh)
++- [run_lvm2_linear_cross_segment_test.sh](../myshell/dm_linear/run_lvm2_linear_cross_segment_test.sh)
 +
 +改动目的：
 +
 +- 覆盖 DM control ioctl 基础路径。
 +- 覆盖 raw cross-target BIO 回归。
-+- 覆盖 linear LVM2 多 backing 大文件写入历史专项。
-+- 覆盖 LVM2 resize / extend / shrink。
-+- 覆盖单 guest linear 端到端流程。
++- 覆盖单 PV、单 linear segment、同盘 grow/shrink、ext2 I/O 和 reboot recovery。
++- 覆盖独立 2PV linear cross-segment table、reboot recovery 和 shrink 回单段。
 +
 +为什么要改：
 +
@@ -233,16 +223,14 @@ index 000000000..482185d77
 +相关文件：
 +
 +- [run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh)
-+- [run_lvm2_striped_io_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_io_reboot_test.sh)
-+- [run_lvm2_striped_3pv_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_3pv_reboot_test.sh)
-+- [run_lvm2_striped_multi_segment_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_multi_segment_reboot_test.sh)
++- [run_lvm2_striped_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_reboot_test.sh)
++- [run_lvm2_striped_cross_segment_test.sh](../myshell/dm_striped/run_lvm2_striped_cross_segment_test.sh)
 +
 +改动目的：
 +
 +- 覆盖 raw striped BIO 拆分。
-+- 覆盖 2-way striped LVM2 create / I/O / grow / shrink / reboot recovery。
-+- 覆盖 3PV / 3-way striped reboot recovery。
-+- 覆盖 multi-segment striped table reboot recovery。
++- 覆盖 N-PV / N-way striped LVM2 create、同组盘 grow/shrink、ext2 I/O 和 reboot recovery。
++- 覆盖独立 striped N-to-2N cross-segment table、reboot recovery 和 shrink 回单段。
 +
 +为什么要改：
 +
@@ -707,7 +695,7 @@ index 000000000..482185d77
 +后续 review 非 DM 专属改动时，建议按以下标准判断是否应该保留在本分支：
 +
 +- **必要性**：该改动是否直接服务于真实 `dmsetup` / LVM2 / ext2 / reboot recovery 路径；如果只是泛化 Linux 兼容能力，需要确认没有超出当前 DM 验收边界。
-+- **边界**：`--full` 仍保持 linear 全量语义；striped、3PV、multi-segment、mixed 这类慢速系统验收应通过独立入口窄跑。
++- **边界**：当前 `run_dm_system_tests.sh` 只接受显式 suite；striped、cross-segment、mixed 这类慢速系统验收应通过独立入口窄跑，不重新引入默认全量或 `--full` 聚合入口。
 +- **启动协议**：NixOS 系统测试使用 OVMF 的约束应限制在 NixOS run 路径，不能影响 ktest 或其他启动协议。
 +- **设备安全**：多测试盘逻辑必须防止误用根盘、重复挂同一镜像、依赖不稳定 `/dev/vdX` 顺序。
 +- **生命周期**：动态注册、租约、devtmpfs runtime node 改动需要保证 open/mount 期间 remove 返回 busy，删除节点时不能误删后来的同名对象。

@@ -1,9 +1,9 @@
 diff --git a/myshell/run_dmsetup_cli_semantics_test.sh b/myshell/run_dmsetup_cli_semantics_test.sh
 new file mode 100755
-index 000000000..f54c67fd4
+index 000000000..17f4cf097
 --- /dev/null
 +++ b/myshell/run_dmsetup_cli_semantics_test.sh
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,519 @@
 +#!/bin/bash
 +
 +# SPDX-License-Identifier: MPL-2.0
@@ -25,6 +25,11 @@ index 000000000..f54c67fd4
 +  GUEST_QEMU_TIMEOUT         Full QEMU lifecycle timeout in seconds, default 180
 +  GUEST_READY_TIMEOUT        Compatibility alias if GUEST_QEMU_TIMEOUT is unset
 +  RESET_DM_TEST_IMAGES       1 to delete test images before running, default 1
++
++Expected success markers:
++  SUMMARY_GAP_DMSETUP_CLI_SEMANTICS: 0
++  TEST_PASS_DMSETUP_CLI_SEMANTICS
++  HOST_PASS_DMSETUP_CLI_SEMANTICS
 +EOF
 +    exit 0
 +fi
