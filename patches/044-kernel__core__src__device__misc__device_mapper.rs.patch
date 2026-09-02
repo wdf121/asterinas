@@ -1,9 +1,9 @@
 diff --git a/kernel/core/src/device/misc/device_mapper.rs b/kernel/core/src/device/misc/device_mapper.rs
 new file mode 100644
-index 000000000..da9d50a79
+index 000000000..3a1fa19d4
 --- /dev/null
 +++ b/kernel/core/src/device/misc/device_mapper.rs
-@@ -0,0 +1,4127 @@
+@@ -0,0 +1,3973 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! Linux Device Mapper control device.
@@ -16,16 +16,10 @@ index 000000000..da9d50a79
 +
 +use alloc::{format, vec};
 +
-+use aster_block::{BlockDevice, id::Sid, lookup_lease};
++use aster_block::{BlockDevice, BlockDeviceLease, id::Sid, lookup_lease};
 +use aster_device_mapper::{
 +    DmDevice, DmError, DmManager, DmTable, TableError,
-+    target::{
-+        DmTarget,
-+        error::ErrorTarget,
-+        linear::LinearTarget,
-+        striped::{StripedTarget, StripedTargetParams},
-+        zero::ZeroTarget,
-+    },
++    target::{DmTarget, DmTargetMetadata, DmTargetParseError, SUPPORTED_TARGETS},
 +};
 +use device_id::{DeviceId, MajorId, MinorId};
 +use ostd::mm::VmIo;
@@ -78,31 +72,6 @@ index 000000000..da9d50a79
 +const DM_GET_TARGET_VERSION_CMD: u8 = 17;
 +
 +const DM_VERSION: [u32; 3] = [4, 48, 0];
-+
-+struct TargetVersion {
-+    name: &'static str,
-+    version: [u32; 3],
-+}
-+
-+const TARGET_VERSIONS: &[TargetVersion] = &[
-+    TargetVersion {
-+        name: "error",
-+        version: [1, 6, 0],
-+    },
-+    TargetVersion {
-+        name: "linear",
-+        version: [1, 4, 0],
-+    },
-+    // LVM2 checks whether the `striped` target is available before creating an LV.
-+    TargetVersion {
-+        name: "striped",
-+        version: [1, 6, 0],
-+    },
-+    TargetVersion {
-+        name: "zero",
-+        version: [1, 1, 0],
-+    },
-+];
 +
 +const DM_READONLY_FLAG: u32 = 1 << 0;
 +const DM_SUSPEND_FLAG: u32 = 1 << 1;
@@ -604,6 +573,8 @@ index 000000000..da9d50a79
 +
 +    let mut cursor = data_start(buffer)?;
 +    let mut targets = Vec::new();
++    let mut parse_backing = parse_backing_device_id;
++    let mut resolve_backing = lookup_backing_device;
 +    for index in 0..target_count {
 +        let spec_end = cursor
 +            .checked_add(DM_TARGET_SPEC_SIZE)
@@ -620,99 +591,22 @@ index 000000000..da9d50a79
 +        let target_type =
 +            required_c_string(buffer, cursor + 24, DM_TARGET_TYPE_LEN, "target 类型")?;
 +        let params = c_string_until(buffer, spec_end, next_spec, "target 参数")?;
-+        let target = match target_type.as_str() {
-+            "error" => {
-+                if !params.trim().is_empty() {
-+                    return_errno_with_message!(Errno::EINVAL, "error target 不接受参数");
-+                }
-+                ostd::info!(
-+                    "[dm] table_load: name={}, type=error, logical_start={}, length={}",
-+                    device.name(),
-+                    logical_start,
-+                    length
-+                );
-+                DmTarget::Error(
-+                    ErrorTarget::new(Sid::new(logical_start), length).map_err(map_table_error)?,
-+                )
-+            }
-+            "zero" => {
-+                if !params.trim().is_empty() {
-+                    return_errno_with_message!(Errno::EINVAL, "zero target 不接受参数");
-+                }
-+                ostd::info!(
-+                    "[dm] table_load: name={}, type=zero, logical_start={}, length={}",
-+                    device.name(),
-+                    logical_start,
-+                    length
-+                );
-+                DmTarget::Zero(
-+                    ZeroTarget::new(Sid::new(logical_start), length).map_err(map_table_error)?,
-+                )
-+            }
-+            "linear" => {
-+                let (backing_id, backing_start) = parse_linear_params(&params)?;
-+                ostd::info!(
-+                    "[dm] table_load: name={}, type=linear, backing={}:{}, start_sector={}, logical_start={}, length={}",
-+                    device.name(),
-+                    backing_id.major().get(),
-+                    backing_id.minor().get(),
-+                    backing_start,
-+                    logical_start,
-+                    length
-+                );
-+                let backing = lookup_lease(backing_id).ok_or_else(|| {
-+                    ostd::warn!(
-+                        "[dm] lookup_lease failed for {}:{}, registered devices: {:?}",
-+                        backing_id.major().get(),
-+                        backing_id.minor().get(),
-+                        aster_block::list()
-+                    );
-+                    Error::with_message(Errno::ENODEV, "linear backing 设备不存在或正在移除")
-+                })?;
-+                DmTarget::Linear(
-+                    LinearTarget::new(
-+                        Sid::new(logical_start),
-+                        length,
-+                        Sid::new(backing_start),
-+                        backing,
-+                    )
-+                    .map_err(map_table_error)?,
-+                )
-+            }
-+            "striped" => {
-+                let params = normalize_striped_params(&params)?;
-+                let striped_params =
-+                    StripedTargetParams::parse(&params).map_err(map_table_error)?;
-+                let mut backings = Vec::new();
-+                for (stripe_index, stripe) in striped_params.stripes().iter().enumerate() {
-+                    let backing_id = stripe.id();
-+                    let backing = lookup_lease(backing_id).ok_or_else(|| {
-+                        ostd::warn!(
-+                            "[dm] lookup_lease failed for striped stripe {} {}:{}, registered devices: {:?}",
-+                            stripe_index,
-+                            backing_id.major().get(),
-+                            backing_id.minor().get(),
-+                            aster_block::list()
-+                        );
-+                        Error::with_message(Errno::ENODEV, "striped backing 设备不存在或正在移除")
-+                    })?;
-+                    backings.push(backing);
-+                }
-+                ostd::info!(
-+                    "[dm] table_load: name={}, type=striped, stripe_count={}, chunk_size={}, logical_start={}, length={}",
-+                    device.name(),
-+                    striped_params.stripe_count(),
-+                    striped_params.chunk_size(),
-+                    logical_start,
-+                    length
-+                );
-+                DmTarget::Striped(
-+                    StripedTarget::new(Sid::new(logical_start), length, striped_params, backings)
-+                        .map_err(map_table_error)?,
-+                )
-+            }
-+            _ => return_errno_with_message!(Errno::EINVAL, "不支持的 target 类型"),
-+        };
++        let target = DmTarget::parse_with(
++            &target_type,
++            Sid::new(logical_start),
++            length,
++            &params,
++            &mut parse_backing,
++            &mut resolve_backing,
++        )
++        .map_err(map_target_parse_error)?;
++        ostd::info!(
++            "[dm] table_load: name={}, type={}, logical_start={}, length={}",
++            device.name(),
++            target.name(),
++            logical_start,
++            length
++        );
 +        targets.push(target);
 +        cursor = next_spec;
 +    }
@@ -799,11 +693,10 @@ index 000000000..da9d50a79
 +
 +    let mut cursor = start;
 +    for target in table.targets() {
-+        let (target_type, params) = match target {
-+            DmTarget::Error(_) => ("error", String::new()),
-+            DmTarget::Zero(_) => ("zero", String::new()),
++        let params = match target {
++            DmTarget::Error(_) | DmTarget::Zero(_) => String::new(),
 +            DmTarget::Linear(target) => {
-+                let params = if flags & DM_STATUS_TABLE_FLAG != 0 {
++                if flags & DM_STATUS_TABLE_FLAG != 0 {
 +                    let backing = target.backing_id();
 +                    format!(
 +                        "{}:{} {}",
@@ -813,11 +706,10 @@ index 000000000..da9d50a79
 +                    )
 +                } else {
 +                    String::new()
-+                };
-+                ("linear", params)
++                }
 +            }
 +            DmTarget::Striped(target) => {
-+                let params = if flags & DM_STATUS_TABLE_FLAG != 0 {
++                if flags & DM_STATUS_TABLE_FLAG != 0 {
 +                    let mut params = format!("{} {}", target.stripe_count(), target.chunk_size());
 +                    target.for_each_stripe(|backing, backing_start| {
 +                        params.push_str(&format!(
@@ -842,8 +734,7 @@ index 000000000..da9d50a79
 +                        params.push('A');
 +                    }
 +                    params
-+                };
-+                ("striped", params)
++                }
 +            }
 +        };
 +        let record_len = table_status_record_len(params.len())?;
@@ -855,30 +746,30 @@ index 000000000..da9d50a79
 +        write_u64(buffer, cursor + 8, target.length())?;
 +        write_u32(buffer, cursor + 16, 0)?;
 +        write_u32(buffer, cursor + 20, cursor + record_len - start)?;
-+        write_c_string_fixed(buffer, cursor + 24, DM_TARGET_TYPE_LEN, target_type)?;
++        write_c_string_fixed(buffer, cursor + 24, DM_TARGET_TYPE_LEN, target.name())?;
 +        write_c_string(buffer, cursor + DM_TARGET_SPEC_SIZE, &params)?;
 +        cursor += record_len;
 +    }
 +    Ok(())
 +}
 +
-+fn target_version_record_len(target: &TargetVersion) -> Result<usize> {
-+    align_up(16 + target.name.len() + 1, 8)
++fn target_version_record_len(target: &DmTargetMetadata) -> Result<usize> {
++    align_up(16 + target.name().len() + 1, 8)
 +}
 +
 +fn write_target_version(
 +    buffer: &mut [u8],
 +    offset: usize,
 +    next: usize,
-+    target: &TargetVersion,
++    target: &DmTargetMetadata,
 +) -> Result<()> {
 +    let record_len = target_version_record_len(target)?;
 +    require_range(buffer, offset, record_len)?;
 +    write_u32(buffer, offset, next)?;
-+    for (index, value) in target.version.into_iter().enumerate() {
++    for (index, value) in target.version().into_iter().enumerate() {
 +        write_u32(buffer, offset + 4 + index * 4, value)?;
 +    }
-+    write_c_string(buffer, offset + 16, target.name)
++    write_c_string(buffer, offset + 16, target.name())
 +}
 +
 +fn list_versions(buffer: &mut [u8]) -> Result<()> {
@@ -886,7 +777,7 @@ index 000000000..da9d50a79
 +    let mut cursor = start;
 +    let mut previous = None;
 +
-+    for target in TARGET_VERSIONS {
++    for target in SUPPORTED_TARGETS {
 +        let record_len = target_version_record_len(target)?;
 +        if available_from(buffer, cursor) < record_len {
 +            set_buffer_full(buffer)?;
@@ -904,9 +795,9 @@ index 000000000..da9d50a79
 +
 +fn get_target_version(buffer: &mut [u8]) -> Result<()> {
 +    let name = required_c_string(buffer, OFF_NAME, DM_NAME_LEN, "target 名称")?;
-+    let target = TARGET_VERSIONS
++    let target = SUPPORTED_TARGETS
 +        .iter()
-+        .find(|target| target.name == name)
++        .find(|target| target.name() == name)
 +        .ok_or_else(|| Error::with_message(Errno::EINVAL, "未知的 Device Mapper target"))?;
 +    let start = data_start(buffer)?;
 +    let record_len = target_version_record_len(target)?;
@@ -1036,24 +927,16 @@ index 000000000..da9d50a79
 +    write_u64(buffer, OFF_DEV, 0)
 +}
 +
-+fn parse_linear_params(params: &str) -> Result<(DeviceId, u64)> {
-+    let mut fields = params.split_ascii_whitespace();
-+    let dev = fields
-+        .next()
-+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "linear 参数缺少 backing 设备"))?;
-+    let offset_str = fields
-+        .next()
-+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "linear 参数缺少起始扇区"))?;
-+
-+    if fields.next().is_some() {
-+        return_errno_with_message!(Errno::EINVAL, "linear 参数字段数量无效");
-+    }
-+
-+    let backing_id = parse_backing_device_id(dev)?;
-+    let backing_start = offset_str
-+        .parse::<u64>()
-+        .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing 起始扇区无效"))?;
-+    Ok((backing_id, backing_start))
++fn lookup_backing_device(backing_id: DeviceId) -> Result<BlockDeviceLease> {
++    lookup_lease(backing_id).ok_or_else(|| {
++        ostd::warn!(
++            "[dm] lookup_lease failed for {}:{}, registered devices: {:?}",
++            backing_id.major().get(),
++            backing_id.minor().get(),
++            aster_block::list()
++        );
++        Error::with_message(Errno::ENODEV, "Device Mapper backing 设备不存在或正在移除")
++    })
 +}
 +
 +fn parse_backing_device_id(dev: &str) -> Result<DeviceId> {
@@ -1064,68 +947,33 @@ index 000000000..da9d50a79
 +        let path_resolver = fs_ref.resolver().read();
 +        let path = path_resolver.lookup(&FsPath::try_from(dev)?)?;
 +        if path.type_() != InodeType::BlockDevice {
-+            return_errno_with_message!(Errno::EINVAL, "linear backing 路径不是块设备");
++            return_errno_with_message!(Errno::EINVAL, "Device Mapper backing 路径不是块设备");
 +        }
-+        return path
-+            .metadata()?
-+            .self_dev_id
-+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "linear backing 路径缺少设备号"));
++        return path.metadata()?.self_dev_id.ok_or_else(|| {
++            Error::with_message(Errno::EINVAL, "Device Mapper backing 路径缺少设备号")
++        });
 +    }
 +
 +    if let Some((major, minor)) = dev.split_once(':') {
 +        let major = major
 +            .parse::<u16>()
-+            .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing major 无效"))?;
++            .map_err(|_| Error::with_message(Errno::EINVAL, "Device Mapper backing major 无效"))?;
 +        let minor = minor
 +            .parse::<u32>()
-+            .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing minor 无效"))?;
-+        let major = MajorId::try_from(major)
-+            .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing major 超出范围"))?;
-+        let minor = MinorId::try_from(minor)
-+            .map_err(|_| Error::with_message(Errno::EINVAL, "linear backing minor 超出范围"))?;
++            .map_err(|_| Error::with_message(Errno::EINVAL, "Device Mapper backing minor 无效"))?;
++        let major = MajorId::try_from(major).map_err(|_| {
++            Error::with_message(Errno::EINVAL, "Device Mapper backing major 超出范围")
++        })?;
++        let minor = MinorId::try_from(minor).map_err(|_| {
++            Error::with_message(Errno::EINVAL, "Device Mapper backing minor 超出范围")
++        })?;
 +        return Ok(DeviceId::new(major, minor));
 +    }
 +
 +    return_errno_with_message!(
 +        Errno::EINVAL,
-+        "linear backing 必须采用 major:minor 或绝对设备路径"
++        "Device Mapper backing 必须采用 major:minor 或绝对设备路径"
 +    );
-+}
-+
-+fn normalize_striped_params(params: &str) -> Result<String> {
-+    let mut fields = params.split_ascii_whitespace();
-+    let stripe_count = fields
-+        .next()
-+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "striped 参数缺少 stripe count"))?;
-+    let chunk_size = fields
-+        .next()
-+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "striped 参数缺少 chunk size"))?;
-+    let stripe_count_value = stripe_count
-+        .parse::<usize>()
-+        .map_err(|_| Error::with_message(Errno::EINVAL, "striped stripe count 无效"))?;
-+    let mut normalized = format!("{} {}", stripe_count, chunk_size);
-+
-+    for _ in 0..stripe_count_value {
-+        let dev = fields
-+            .next()
-+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "striped 参数缺少 backing 设备"))?;
-+        let offset = fields.next().ok_or_else(|| {
-+            Error::with_message(Errno::EINVAL, "striped 参数缺少 backing 起始扇区")
-+        })?;
-+        let id = parse_backing_device_id(dev)?;
-+        normalized.push_str(&format!(
-+            " {}:{} {}",
-+            id.major().get(),
-+            id.minor().get(),
-+            offset
-+        ));
-+    }
-+
-+    if fields.next().is_some() {
-+        return_errno_with_message!(Errno::EINVAL, "striped 参数字段数量无效");
-+    }
-+
-+    Ok(normalized)
 +}
 +
 +fn validate_target_spec_next(data_start: usize, next: usize, buffer_len: usize) -> Result<usize> {
@@ -1311,6 +1159,16 @@ index 000000000..da9d50a79
 +    }
 +}
 +
++fn map_target_parse_error(error: DmTargetParseError<Error>) -> Error {
++    match error {
++        DmTargetParseError::UnsupportedTarget => {
++            Error::with_message(Errno::EINVAL, "不支持的 target 类型")
++        }
++        DmTargetParseError::Table(error) => map_table_error(error),
++        DmTargetParseError::ResolveBacking(error) => error,
++    }
++}
++
 +fn map_table_error(error: TableError) -> Error {
 +    match error {
 +        TableError::BackingRangeOutOfBounds => {
@@ -1338,9 +1196,15 @@ index 000000000..da9d50a79
 +    use core::ops::Range;
 +
 +    use aster_block::{
-+        BlockDeviceLease, BlockDeviceMeta,
++        BlockDeviceMeta,
 +        bio::{Bio, BioDirection, BioSegment, BioStatus},
 +        register, unregister,
++    };
++    use aster_device_mapper::target::{
++        error::ErrorTarget,
++        linear::LinearTarget,
++        striped::{StripedTarget, StripedTargetParams},
++        zero::ZeroTarget,
 +    };
 +    use ostd::prelude::ktest;
 +
@@ -3656,50 +3520,32 @@ index 000000000..da9d50a79
 +    }
 +
 +    #[ktest]
-+    fn parses_exact_linear_parameter_set() {
-+        let (id, start) = parse_linear_params("8:1 2048").unwrap();
++    fn parses_numeric_backing_device_ids() {
++        let id = parse_backing_device_id("8:1").unwrap();
 +        assert_eq!(id.major().get(), 8);
 +        assert_eq!(id.minor().get(), 1);
-+        assert_eq!(start, 2048);
-+        let (id, start) = parse_linear_params("  510:1048575\t0\n").unwrap();
-+        assert_eq!(id.major().get(), 510);
-+        assert_eq!(id.minor().get(), 0x000f_ffff);
-+        assert_eq!(start, 0);
 +
-+        for params in [
-+            "8:1",
-+            "8:1 x",
-+            "8:1 0 extra",
-+            "8:1 0 sectors",
-+            "8:1 0 sectors trailing",
-+            "bad 0",
-+            ":1 0",
-+            "8: 0",
-+            "8:1:2 0",
-+            "65536:1 0",
-+            "8:1048576 0",
-+            "8:4294967296 0",
-+            "8:1 18446744073709551616",
-+            "8:1 -1",
++        let id = parse_backing_device_id("4095:1048575").unwrap();
++        assert_eq!(id.major().get(), 0x0fff);
++        assert_eq!(id.minor().get(), 0x000f_ffff);
++
++        for dev in [
++            "",
++            "bad",
++            ":1",
++            "8:",
++            "8:1:2",
++            "4096:1",
++            "65536:1",
++            "8:1048576",
++            "8:4294967296",
++            "-1:0",
++            "8:-1",
 +        ] {
 +            assert_eq!(
-+                parse_linear_params(params).unwrap_err().error(),
++                parse_backing_device_id(dev).unwrap_err().error(),
 +                Errno::EINVAL,
-+                "params={params:?}"
-+            );
-+        }
-+    }
-+
-+    #[ktest]
-+    fn normalizes_exact_striped_parameter_set() {
-+        let params = normalize_striped_params("2 4 8:1 0 8:2 16").unwrap();
-+        assert_eq!(params, "2 4 8:1 0 8:2 16");
-+
-+        for params in ["", "2", "bad 4 8:1 0", "2 4 8:1 0", "1 4 8:1 0 extra"] {
-+            assert_eq!(
-+                normalize_striped_params(params).unwrap_err().error(),
-+                Errno::EINVAL,
-+                "params={params:?}"
++                "dev={dev:?}"
 +            );
 +        }
 +    }

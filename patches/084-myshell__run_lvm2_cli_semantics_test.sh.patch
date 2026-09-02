@@ -1,9 +1,9 @@
 diff --git a/myshell/run_lvm2_cli_semantics_test.sh b/myshell/run_lvm2_cli_semantics_test.sh
 new file mode 100755
-index 000000000..9263f1ea1
+index 000000000..0713fec0e
 --- /dev/null
 +++ b/myshell/run_lvm2_cli_semantics_test.sh
-@@ -0,0 +1,366 @@
+@@ -0,0 +1,371 @@
 +#!/bin/bash
 +
 +# SPDX-License-Identifier: MPL-2.0
@@ -24,6 +24,11 @@ index 000000000..9263f1ea1
 +  GUEST_QEMU_TIMEOUT        Full QEMU lifecycle timeout in seconds, default 180
 +  GUEST_READY_TIMEOUT       Compatibility alias if GUEST_QEMU_TIMEOUT is unset
 +  RESET_DM_TEST_IMAGES      1 to delete test images before running, default 1
++
++Expected success markers:
++  SUMMARY_GAP_LVM2_CLI_SEMANTICS: 0
++  TEST_PASS_LVM2_CLI_SEMANTICS
++  HOST_PASS_LVM2_CLI_SEMANTICS
 +EOF
 +    exit 0
 +fi

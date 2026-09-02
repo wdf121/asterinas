@@ -1,9 +1,9 @@
 diff --git a/myshell/run_dm_system_tests.sh b/myshell/run_dm_system_tests.sh
 new file mode 100755
-index 000000000..30a077b73
+index 000000000..7756dd0cc
 --- /dev/null
 +++ b/myshell/run_dm_system_tests.sh
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,84 @@
 +#!/bin/bash
 +
 +# SPDX-License-Identifier: MPL-2.0
@@ -26,6 +26,9 @@ index 000000000..30a077b73
 +  --linear-lvm2-cross-segment     Run independent linear cross-segment table, reboot recovery, and shrink regression.
 +  --striped-lvm2-cross-segment    Run independent striped N-to-2N cross-segment, reboot recovery, and shrink regression.
 +  --mixed-lvm2                    Run LVM2 linear + striped mixed table file I/O and reboot recovery regression.
++
++Expected success markers:
++  HOST_PASS_DM_SYSTEM_TESTS <suite>
 +EOF
 +    exit 0
 +fi

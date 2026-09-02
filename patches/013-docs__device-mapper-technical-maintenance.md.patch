@@ -1,6 +1,6 @@
 diff --git a/docs/device-mapper-technical-maintenance.md b/docs/device-mapper-technical-maintenance.md
 new file mode 100644
-index 000000000..996d879d7
+index 000000000..896a4c68a
 --- /dev/null
 +++ b/docs/device-mapper-technical-maintenance.md
 @@ -0,0 +1,963 @@
@@ -696,7 +696,7 @@ index 000000000..996d879d7
 +### 13.2 待确认事项
 +
 +- 是否需要在后续阶段补充更多 mixed table 组合，例如三段以上 target 或更复杂 grow/shrink 形态。
-+- 是否需要为 `patches/` 重新生成适配当前 `main` 基线的 patch 集。
++- 最新生成的 `patches/` 是否已基于当前 `main` 执行树一致性验证；若 patch 内容包含代码或脚本语义改动，还需同步完成对应 ktest 和系统测试。
 +- 是否有真实用户态路径要求 udev / systemd 自动联动、LVM 自动扫描与自动激活或完整 sysfs DM 层级；若有，应作为独立阶段评估。
 +- 是否需要进一步抽象 target registry，以支撑更多 target 类型。
 +

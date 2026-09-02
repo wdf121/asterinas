@@ -1,9 +1,9 @@
 diff --git a/kernel/core/comps/device-mapper/src/target/linear.rs b/kernel/core/comps/device-mapper/src/target/linear.rs
 new file mode 100644
-index 000000000..7c562554d
+index 000000000..2749d5484
 --- /dev/null
 +++ b/kernel/core/comps/device-mapper/src/target/linear.rs
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,216 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +use core::{fmt::Debug, ops::Range};
@@ -30,18 +30,8 @@ index 000000000..7c562554d
 +        backing_start: Sid,
 +        backing: BlockDeviceLease,
 +    ) -> Result<Self, TableError> {
-+        if length == 0 {
-+            return Err(TableError::ZeroLength);
-+        }
-+
-+        let logical_end = logical_start
-+            .to_raw()
-+            .checked_add(length)
-+            .ok_or(TableError::LogicalRangeOverflow)?;
-+        let backing_end = backing_start
-+            .to_raw()
-+            .checked_add(length)
-+            .ok_or(TableError::BackingRangeOverflow)?;
++        let (logical_end, backing_end) =
++            Self::validate_geometry(logical_start, length, backing_start)?;
 +        let backing_capacity = u64::try_from(backing.metadata().nr_sectors)
 +            .map_err(|_| TableError::BackingRangeOverflow)?;
 +        if backing_end > backing_capacity {
@@ -54,6 +44,26 @@ index 000000000..7c562554d
 +            backing_id: backing.id(),
 +            backing,
 +        })
++    }
++
++    pub(super) fn validate_geometry(
++        logical_start: Sid,
++        length: u64,
++        backing_start: Sid,
++    ) -> Result<(u64, u64), TableError> {
++        if length == 0 {
++            return Err(TableError::ZeroLength);
++        }
++
++        let logical_end = logical_start
++            .to_raw()
++            .checked_add(length)
++            .ok_or(TableError::LogicalRangeOverflow)?;
++        let backing_end = backing_start
++            .to_raw()
++            .checked_add(length)
++            .ok_or(TableError::BackingRangeOverflow)?;
++        Ok((logical_end, backing_end))
 +    }
 +
 +    /// Returns the logical sector range covered by this target.
