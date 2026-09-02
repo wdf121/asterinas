@@ -1,0 +1,27 @@
+diff --git a/kernel/core/comps/nvme/src/device/block_device.rs b/kernel/core/comps/nvme/src/device/block_device.rs
+index cf652f580..7740e72f0 100644
+--- a/kernel/core/comps/nvme/src/device/block_device.rs
++++ b/kernel/core/comps/nvme/src/device/block_device.rs
+@@ -84,8 +84,8 @@ impl aster_block::BlockDevice for NvmeBlockDevice {
+         }
+     }
+ 
+-    fn name(&self) -> &str {
+-        &self.name
++    fn name(&self) -> String {
++        self.name.clone()
+     }
+ 
+     fn id(&self) -> DeviceId {
+@@ -134,6 +134,11 @@ impl NvmeBlockDevice {
+             BioType::Read => self.device.read(request),
+             BioType::Write => self.device.write(request),
+             BioType::Flush => self.device.flush(request),
++            BioType::Discard | BioType::WriteZeroes => {
++                for bio in request.into_bios() {
++                    bio.complete(BioStatus::NotSupported);
++                }
++            }
+         }
+     }
+ }

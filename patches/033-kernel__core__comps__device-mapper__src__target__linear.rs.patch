@@ -1,6 +1,6 @@
 diff --git a/kernel/core/comps/device-mapper/src/target/linear.rs b/kernel/core/comps/device-mapper/src/target/linear.rs
 new file mode 100644
-index 000000000..56e7c8e57
+index 000000000..7c562554d
 --- /dev/null
 +++ b/kernel/core/comps/device-mapper/src/target/linear.rs
 @@ -0,0 +1,206 @@
@@ -13,7 +13,7 @@ index 000000000..56e7c8e57
 +
 +use crate::TableError;
 +
-+/// 一条已经解析并解析了底层设备引用的 linear target。
++/// A parsed `linear` target with a resolved backing device reference.
 +#[derive(Debug)]
 +pub struct LinearTarget {
 +    logical_range: Range<Sid>,
@@ -23,7 +23,7 @@ index 000000000..56e7c8e57
 +}
 +
 +impl LinearTarget {
-+    /// 创建一条 linear target，并验证逻辑范围和底层范围。
++    /// Creates a `linear` target and validates its logical and backing ranges.
 +    pub fn new(
 +        logical_start: Sid,
 +        length: u64,
@@ -56,32 +56,32 @@ index 000000000..56e7c8e57
 +        })
 +    }
 +
-+    /// 返回目标覆盖的逻辑扇区范围。
++    /// Returns the logical sector range covered by this target.
 +    pub fn logical_range(&self) -> &Range<Sid> {
 +        &self.logical_range
 +    }
 +
-+    /// 返回目标长度，单位为 512 字节扇区。
++    /// Returns the target length in 512-byte sectors.
 +    pub fn length(&self) -> u64 {
 +        self.logical_range.end.to_raw() - self.logical_range.start.to_raw()
 +    }
 +
-+    /// 返回底层映射的起始扇区。
++    /// Returns the backing mapping start sector.
 +    pub fn backing_start(&self) -> Sid {
 +        self.backing_start
 +    }
 +
-+    /// 返回底层块设备 ID。
++    /// Returns the backing block device ID.
 +    pub fn backing_id(&self) -> DeviceId {
 +        self.backing_id
 +    }
 +
-+    /// 返回底层块设备。
++    /// Returns the backing block device.
 +    pub fn backing(&self) -> &dyn BlockDevice {
 +        self.backing.device().as_ref()
 +    }
 +
-+    /// 把本目标范围内的逻辑扇区转换为底层扇区。
++    /// Maps a logical sector inside this target to a backing sector.
 +    pub fn map_sector(&self, logical: Sid) -> Option<Sid> {
 +        if !self.logical_range.contains(&logical) {
 +            return None;

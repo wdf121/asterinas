@@ -1,9 +1,9 @@
 diff --git a/log/2026-9-1.md b/log/2026-9-1.md
 new file mode 100644
-index 000000000..8015773e5
+index 000000000..ca8e5e9b5
 --- /dev/null
 +++ b/log/2026-9-1.md
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,494 @@
 +# 2026-9-1 工程改动日志
 +
 +本文按小阶段记录今天实际发生的工程改动。单纯解释、规划和未落地尝试不写入本日志；测试和验证结果跟随对应小阶段记录。
@@ -295,6 +295,8 @@ index 000000000..8015773e5
 +
 +### 背景
 +
++本节记录当时的临时边界收敛；discard / write zeroes 后续已在第 6 节作为通用 range BIO 增量重新接入，最新状态以第 6 节和当前代码为准。
++
 +用户确认暂不继续推进通用 discard / write zeroes 支持；当前未纳入通用 discard / write zeroes 能力，只保留 zero target 能力边界。
 +
 +### 改动
@@ -394,3 +396,105 @@ index 000000000..8015773e5
 +patch_count=93
 +patched tree matches current branch outside patches/
 +```
++
++## 6. 接入 discard / write zeroes 通用 range BIO 与 DM 映射
++
++### 背景
++
++在确认本阶段可以接受“基于已有 Asterinas block/BIO/driver/ioctl 抽象新增能力，但不引入 udev 类新框架或大规模重构”后，重新推进 discard / write zeroes。目标是让该能力成为通用 block range BIO，并让 DM 复用现有 split/remap/direct-complete 路径。
++
++### 改动
++
++```text
++kernel/core/comps/block/src/bio.rs
++kernel/core/comps/block/src/impl_block_device.rs
++kernel/core/comps/device-mapper/src/device.rs
++kernel/core/comps/device-mapper/src/table.rs
++kernel/core/comps/nvme/src/device/block_device.rs
++kernel/core/comps/virtio/src/device/block/device.rs
++kernel/core/comps/virtio/src/device/block/mod.rs
++kernel/core/src/device/registry/block.rs
++myshell/run_dm_dataplane_edge_test.sh
++myshell/run_dm_system_tests.sh
++myshell/run_dmsetup_cli_semantics_test.sh
++myshell/run_dmsetup_linux_cli_baseline.sh
++docs/device-mapper-technical-maintenance.md
++docs/test.md
++log/device-mapper-progress.md
++```
++
++主要行为：
++
++```text
++block 层新增 BioType::Discard / BioType::WriteZeroes、Bio::new_range 和 range-only split。
++BlockDevice 增加 discard_sectors / write_zeroes_sectors 及异步便捷 API。
++readonly mapper 将 Write / Discard / WriteZeroes 都视为 write-like 并拒绝。
++DM table 对 linear/striped 复用现有 split/remap；error target 返回 I/O error；zero target direct-complete。
++block ioctl 接入 BLKDISCARD / BLKZEROOUT，并补 legacy BLKSSZGET 以适配 util-linux blkdiscard。
++virtio block 协商 DISCARD / WRITE_ZEROES feature 后下发 VIRTIO_BLK_T_DISCARD / VIRTIO_BLK_T_WRITE_ZEROES。
++NVMe 暂未接真实 Dataset Management / Write Zeroes 命令，对 range BIO 明确返回 NotSupported。
++系统脚本增加 zero target 上 blkdiscard / blkdiscard -z 验收。
++技术文档、测试说明和滚动进度文档同步为当前边界。
++```
++
++### 验证
++
++格式、脚本语法、diff 检查通过：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --all --check'
++bash -n myshell/run_dm_dataplane_edge_test.sh myshell/run_dm_system_tests.sh myshell/run_dmsetup_cli_semantics_test.sh myshell/run_dmsetup_linux_cli_baseline.sh
++git diff --check
++git diff -- Cargo.toml
++```
++
++新增和相关定向 ktest 通过：
++
++```text
++new_range_constructs_range_only_bio: 1 passed; 0 failed
++splits_range_only_bio_without_segments: 1 passed; 0 failed
++write_like_includes_discard_and_write_zeroes: 1 passed; 0 failed
++splits_discard_across_linear_target_boundary: 1 passed; 0 failed
++zero_target_completes_discard_and_write_zeroes_successfully: 1 passed; 0 failed
++write_zeroes_across_linear_and_error_targets_reports_io_error: 1 passed; 0 failed
++splits_write_zeroes_across_striped_chunk_boundaries: 1 passed; 0 failed
++readonly_device_refuses_write_like_bios_but_allows_read_and_flush: 1 passed; 0 failed
++aster_core::device::registry::block::tests::validates_mapper_names: 1 passed; 0 failed; 186 filtered out
++virtio ktest 目标编译探针：All crates tested
++```
++
++NixOS 镜像重建通过：
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && CARGO_NET_OFFLINE=true timeout -k 10s 600s make nixos'
++```
++
++系统验收通过：
++
++```text
++GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dataplane-edge
++
++CHECK_PASS_ZERO_EDGE_READ_ZERO
++CHECK_PASS_ZERO_EDGE_WRITE_DISCARDED
++CHECK_PASS_ZERO_EDGE_READ_AFTER_WRITE_ZERO
++CHECK_PASS_ZERO_EDGE_BLKDISCARD
++CHECK_PASS_ZERO_EDGE_BLKZEROOUT
++TEST_PASS_DM_DATAPLANE_EDGE
++HOST_PASS_DM_SYSTEM_TESTS --dataplane-edge
++```
++
++```text
++GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dmsetup-cli
++
++SCENARIO_BEGIN_ZERO_BLKDISCARD
++STATUS_ZERO_BLKDISCARD: 0
++SCENARIO_BEGIN_ZERO_BLKZEROOUT
++STATUS_ZERO_BLKZEROOUT: 0
++SUMMARY_GAP_DMSETUP_CLI_SEMANTICS: 0
++TEST_PASS_DMSETUP_CLI_SEMANTICS
++HOST_PASS_DM_SYSTEM_TESTS --dmsetup-cli
++```
++
++### 结论
++
++discard / write zeroes 已作为通用 block range BIO 和 DM 数据面能力接入，并通过定向 ktest、core/virtio 编译覆盖和相关系统脚本验收。当前仍不声明完整 Linux DM queue stacking 或 NVMe discard/write-zeroes 后端命令支持；这些应作为后续独立阶段处理。
