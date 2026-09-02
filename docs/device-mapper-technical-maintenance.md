@@ -75,7 +75,7 @@ DM 分支的端到端路线是：用户态 `dmsetup` / LVM2 通过 `/dev/mapper/
 
 ### 2.2 能力边界与非目标关系
 
-当前设计目标是让 `dmsetup`、LVM2、ext2、真实 backing block device 和 reboot recovery 测试路径闭环；不承诺完整 Linux DM 生态。完整 udev/uevent/systemd 自动联动、完整 DM sysfs 层级、复杂 target、discard/write zeroes、完整 queue stacking 和 DM-on-DM backing 都属于非目标或后续独立阶段。
+当前设计目标是让 `dmsetup`、LVM2、ext2、真实 backing block device 和 reboot recovery 测试路径闭环；不承诺完整 Linux DM 生态。完整 udev/uevent/systemd 自动联动、完整 DM sysfs 层级、复杂 target、完整 queue stacking 和 DM-on-DM backing 都属于非目标或后续独立阶段。discard/write zeroes 作为已有 block/BIO 框架的增量能力接入，不代表引入新的设备管理框架。
 
 ### 2.3 当前能力闭环图
 
@@ -120,9 +120,9 @@ flowchart LR
 - target registry 泛化框架；
 - `crypt`、`snapshot`、`thin`、`mirror`、`multipath` 等复杂 target；
 - `DM_TARGET_MSG`、`DM_DEV_SET_GEOMETRY`、`DM_DEV_ARM_POLL`；
-- discard / write zeroes BIO 语义；
 - Linux DM 完整 queue stacking 规则；
-- DM-on-DM backing。
+- DM-on-DM backing；
+- NVMe discard / write zeroes 后端命令接入。
 
 ### 3.3 假设与边界
 
@@ -167,6 +167,7 @@ flowchart LR
 | FR-11 | 支持 Read/Write remap 或 direct completion，以及 Flush fan-out 或 direct completion | 已支持 |
 | FR-12 | 支持 BIO 跨 target 和跨 striped chunk 拆分 | 已支持 |
 | FR-13 | 支持 dmsetup/LVM2 create/grow/shrink/reboot recovery 验收路径 | 已覆盖主要路径 |
+| FR-14 | 支持通用 discard / write zeroes BIO、DM remap/direct completion 和 block ioctl 入口 | 已支持；NVMe 后端暂返回不支持 |
 
 ### 5.2 非功能需求
 
@@ -357,7 +358,7 @@ Flush 不读取或写入用户数据，也不携带需要 remap 的 logical sect
 - backing flush enqueue 或 completion 失败时，原 Flush 返回 I/O error。
 - readonly mapper 允许 Flush，因为它不修改 mapper 数据。
 
-discard / write zeroes 当前是明确非目标：不在通用 block `BioType`、backing driver 和 DM table fan-out/remap 中声明支持。`zero` target 的 Write 丢弃是 target 自身语义，不等于通用 discard；`zero` target 的 Read 填零也不等于通用 write zeroes。
+discard / write zeroes 是通用 block range BIO：不携带数据 segment，但携带 logical sector range。`linear` / `striped` 按现有 table-level 和 target-level split/remap 下发到 backing；`error` 直接返回 I/O error；`zero` 直接 Complete。只读 mapper 将 Write / Discard / WriteZeroes 都视为 write-like 并拒绝。当前 virtio block 已按协商能力下发 `VIRTIO_BLK_T_DISCARD` / `VIRTIO_BLK_T_WRITE_ZEROES`，NVMe 后端仍明确返回 NotSupported。
 
 ## 9. Target 能力路线
 
@@ -410,7 +411,7 @@ Target 能力按风险和映射复杂度递进：先用 `error` / `zero` 这类�
 
 选择理由：zero target 能验证无 backing target 的成功完成路径，也补齐 `dmsetup targets`、`target-version`、table/status/deps 和 raw 数据面边界覆盖。
 
-边界：zero target 的写丢弃是 target 自身语义，不代表通用 block `write zeroes` 或 discard BIO 支持。
+边界：zero target 的普通 Write 丢弃是 target 自身语义；通用 Discard / WriteZeroes BIO 在 zero target 上也可 direct-complete，因为该 target 的用户可见内容恒为零且没有 backing device。
 
 ### 9.4 Linear target 映射路线
 
@@ -730,9 +731,9 @@ ktest 不放进本矩阵。它是公共内核语义测试层，内部通过 case
 | Target | 控制面 | 数据面 | 系统验收 | 当前边界 |
 |---|---|---|---|---|
 | `error` | table load/status/deps 已支持；version 为 `1.6.0` | Read/Write 返回 I/O error；Flush 对无 backing table 成功完成 | 定向 ktest、`--dmsetup-cli` 已覆盖 | 只模拟稳定错误 target，不等于真实 backing fault injection。 |
-| `zero` | table load/status/deps 已支持；version 为 `1.1.0` | Read 返回全 0；Write 丢弃并成功；Flush 对无 backing table 成功完成 | 定向 ktest、`--dmsetup-cli`、`--dataplane-edge` 已覆盖 | 不实现 discard/write zeroes BIO；zero target 的写丢弃是 target 自身语义。 |
-| `linear` | table load/status/deps 已支持；version 为 `1.4.0` | Read/Write remap 到 backing；Flush 参与 backing 去重 fan-out；跨 target BIO split 已支持 | ktest、`--linear-data`、`--linear-lvm2`、`--linear-lvm2-cross-segment` 已覆盖 | 不支持 discard/write zeroes；不声明 Linux DM queue stacking 支持。 |
-| `striped` | table load/status/deps 已支持；version 为 `1.6.0` | Read/Write 按 stripe chunk remap 到 backing；Flush 参与 backing 去重 fan-out | ktest、`--striped-data`、`--striped-lvm2`、`--striped-lvm2-cross-segment` 已覆盖 | 不支持 discard/write zeroes；不承诺 Linux striped 周边扩展语义。 |
+| `zero` | table load/status/deps 已支持；version 为 `1.1.0` | Read 返回全 0；Write 丢弃并成功；Flush/Discard/WriteZeroes 对无 backing table 成功完成 | 定向 ktest、`--dmsetup-cli`、`--dataplane-edge` 已覆盖 | 普通 Write 丢弃仍是 zero target 自身语义；Discard/WriteZeroes 是通用 range BIO 在 zero 上的 direct-complete 特例。 |
+| `linear` | table load/status/deps 已支持；version 为 `1.4.0` | Read/Write/Discard/WriteZeroes remap 到 backing；Flush 参与 backing 去重 fan-out；跨 target BIO split 已支持 | ktest、`--linear-data`、`--linear-lvm2`、`--linear-lvm2-cross-segment` 已覆盖 | backing 不支持 range BIO 时返回不支持；不声明 Linux DM queue stacking 支持。 |
+| `striped` | table load/status/deps 已支持；version 为 `1.6.0` | Read/Write/Discard/WriteZeroes 按 stripe chunk remap 到 backing；Flush 参与 backing 去重 fan-out | ktest、`--striped-data`、`--striped-lvm2`、`--striped-lvm2-cross-segment` 已覆盖 | backing 不支持 range BIO 时返回不支持；不承诺 Linux striped 周边扩展语义。 |
 | `linear + striped mixed` | table load/status/deps 已支持 | 跨 target split + striped chunk split 已支持 | ktest、`--mixed-lvm2` 已覆盖 | 只表示同一 mapper table 内跨 target，不表示跨 LV。 |
 
 ### 15.2 系统验收脚本地图
@@ -741,7 +742,7 @@ ktest 不放进本矩阵。它是公共内核语义测试层，内部通过 case
 |---|---|---|
 | [myshell/run_dmsetup_cli_semantics_test.sh](../myshell/run_dmsetup_cli_semantics_test.sh) | `--dmsetup-cli` | dmsetup 控制面和 error/zero 基础 I/O 语义审计。 |
 | [myshell/run_lvm2_cli_semantics_test.sh](../myshell/run_lvm2_cli_semantics_test.sh) | `--lvm2-cli` | LVM2 控制面命令模板在测试盘隔离参数下的 guest 对齐审计。 |
-| [myshell/run_dm_dataplane_edge_test.sh](../myshell/run_dm_dataplane_edge_test.sh) | `--dataplane-edge` | raw DM linear/striped/zero 数据面边界审计。 |
+| [myshell/run_dm_dataplane_edge_test.sh](../myshell/run_dm_dataplane_edge_test.sh) | `--dataplane-edge` | raw DM linear/striped/zero 数据面边界审计，包含 zero target 的 BLKDISCARD/BLKZEROOUT。 |
 | [myshell/dm_linear/run_control_abi_test.sh](../myshell/dm_linear/run_control_abi_test.sh) | `--quick` | linear control ABI smoke。 |
 | [myshell/dm_linear/run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh) | `--linear-data`、`--quick` | raw linear cross-target BIO regression。 |
 | [myshell/dm_linear/run_lvm2_linear_reboot_test.sh](../myshell/dm_linear/run_lvm2_linear_reboot_test.sh) | `--linear-lvm2` | 单 PV、单 segment linear，同盘 grow/shrink、ext2 I/O、reboot recovery。 |

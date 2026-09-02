@@ -9,7 +9,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
 Usage: myshell/run_dm_dataplane_edge_test.sh
 
 Runs one NixOS guest pass for Device Mapper data-plane edge cases:
-three-segment linear remap, non-chunk-aligned striped writes, and zero target reads.
+three-segment linear remap, non-chunk-aligned striped writes, and zero target reads/range operations.
 
 Optional environment variables:
   DM_TEST_IMAGES            Space-separated backing image paths, default four test images
@@ -212,6 +212,12 @@ echo CHECK_PASS_ZERO_EDGE_WRITE_DISCARDED
 dd if=/dev/mapper/dm_zero_edge of=/tmp/zero-edge-read-after-write.bin bs=512 count=1 status=none
 cmp -n 512 /tmp/zero-edge-read-after-write.bin /dev/zero
 echo CHECK_PASS_ZERO_EDGE_READ_AFTER_WRITE_ZERO
+
+blkdiscard /dev/mapper/dm_zero_edge
+echo CHECK_PASS_ZERO_EDGE_BLKDISCARD
+
+blkdiscard -z /dev/mapper/dm_zero_edge
+echo CHECK_PASS_ZERO_EDGE_BLKZEROOUT
 
 dmsetup remove dm_zero_edge
 

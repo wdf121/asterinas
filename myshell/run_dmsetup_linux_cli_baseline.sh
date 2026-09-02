@@ -325,6 +325,8 @@ run_capture ZERO_DEPS dmsetup deps "${zero_name}" || true
 run_shell_capture ZERO_READ_ALL_ZERO "timeout 5 sh -c 'dd if=/dev/mapper/${zero_name} of=${TMPDIR_PATH}/zero-read.bin bs=512 count=1 status=none && cmp -n 512 ${TMPDIR_PATH}/zero-read.bin /dev/zero'" || true
 run_shell_capture ZERO_WRITE "timeout 5 dd if=/dev/urandom of=/dev/mapper/${zero_name} bs=512 count=1 status=none" || true
 run_shell_capture ZERO_READ_AFTER_WRITE_ALL_ZERO "timeout 5 sh -c 'dd if=/dev/mapper/${zero_name} of=${TMPDIR_PATH}/zero-read-after-write.bin bs=512 count=1 status=none && cmp -n 512 ${TMPDIR_PATH}/zero-read-after-write.bin /dev/zero'" || true
+run_shell_capture ZERO_BLKDISCARD "timeout 5 blkdiscard /dev/mapper/${zero_name}" || true
+run_shell_capture ZERO_BLKZEROOUT "timeout 5 blkdiscard -z /dev/mapper/${zero_name}" || true
 run_capture ZERO_REMOVE dmsetup remove "${zero_name}" || true
 
 table_name=$(name table_lifecycle)

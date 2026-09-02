@@ -122,10 +122,14 @@ After any temporary `Cargo.toml` default-member change, restore `Cargo.toml` and
 confirm `git diff -- Cargo.toml` has no output.
 
 Run QEMU, ktest, and NixOS system tests serially to avoid image lock conflicts,
-especially around `test/initramfs/build/ext2.img`. For NixOS system tests, set `GUEST_READY_TIMEOUT=180` so each single QEMU guest run has a three-minute full-lifecycle timeout. If a ktest/QEMU/NixOS run makes no relevant progress for about three
-minutes, suspect command filtering, default-members, leftover processes, or
-image-lock issues; inspect output and processes, stop only processes started for
-the current run if needed, and retry with a narrower command.
+especially around `test/initramfs/build/ext2.img`. For new NixOS system suite
+runs, set `GUEST_QEMU_TIMEOUT=180` so each single QEMU guest run has a
+three-minute full-lifecycle timeout; `GUEST_READY_TIMEOUT` remains a
+compatibility alias for older scripts. If a ktest/QEMU/NixOS run makes no
+relevant progress for about three minutes, suspect command filtering,
+default-members, leftover processes, or image-lock issues; inspect output and
+processes, stop only processes started for the current run if needed, and retry
+with a narrower command.
 
 Do not modify KVM, RELEASE, QEMU, NixOS boot protocol, or `myshell/br.sh` unless
 explicitly requested. Run DM system tests through explicit suite entries; do not
@@ -136,11 +140,11 @@ Run slower system tests only when the corresponding path changes or during stage
 acceptance, for example:
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
+docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2'
 ```
 
 Project logging rules:
