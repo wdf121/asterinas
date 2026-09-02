@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-截至 2026-09-01，`dm` 分支当前重点已从 LVM2 慢系统脚本整理，推进到 `dmsetup` / LVM2 控制面语义对齐、raw DM 数据面边界实测和基础 target 功能拓展。当前不声明完整 Device Mapper 或完整 LVM2 兼容；已确认的是当前实现范围内的 `error`、`linear`、`striped`、`zero` 以及 LVM2 生成的 linear/striped/mixed table 在测试场景下通过。
+截至 2026-09-02，`dm` 分支当前重点已从 DM 核心功能开发推进到文档、系统测试脚本、成功 marker、超时变量和 patches 的收敛验证。当前不声明完整 Device Mapper 或完整 LVM2 兼容；已确认的是当前实现范围内的 `error`、`linear`、`striped`、`zero` 以及 LVM2 生成的 linear/striped/mixed table 在测试场景下通过。
 
 当前可用的系统测试入口集中在：
 
@@ -32,7 +32,9 @@ myshell/run_dm_system_tests.sh --mixed-lvm2
 CLAUDE.md
 AGENTS.md
 log/device-mapper-progress.md
-log/2026-8-31.md
+log/device-mapper-optimization-v1.md
+log/2026-9-1.md
+log/2026-9-2.md
 docs/test.md
 docs/study.md
 docs/device-mapper-technical-maintenance.md
@@ -43,7 +45,9 @@ docs/device-mapper-technical-maintenance.md
 - `CLAUDE.md`：协作规则，包括简体中文、精简汇报、新阶段先说明差异、默认不 push。
 - `AGENTS.md`：项目路径、容器路径、测试入口、系统测试串行和临时 ktest 约束。
 - `log/device-mapper-progress.md`：当前项目滚动状态和下一步优先级，是接手时的主入口。
-- `log/2026-8-31.md`：最近已完成并验证的小阶段，避免重复做控制面对齐和 `--dataplane-edge`。
+- `log/device-mapper-optimization-v1.md`：第一版优化专题文档，集中维护 P0-P5 优先级、改动对比、验证矩阵和剩余风险。
+- `log/2026-9-1.md`：guest 启动慢排查修复、`zero` target 核心/控制面/数据面覆盖、discard / write zeroes 通用 range BIO 与 DM 映射接入。
+- `log/2026-9-2.md`：当前文档、系统测试脚本、成功 marker、超时变量和 patches 收敛状态；接手时用于判断最新未提交工作和验证缺口。
 - `docs/test.md`：实际运行命令、suite 列表和 QEMU 生命周期约束。
 - `docs/study.md`：`/dev/mapper/control` 注册主线和适合复盘的学习材料。
 - `docs/device-mapper-technical-maintenance.md`：DM 技术维护主文档；附录集中维护 `dmsetup` / LVM2 控制面对齐矩阵。
@@ -236,4 +240,4 @@ test result: ok. 52 passed; 0 failed; 0 filtered out.
 - `log/2026-8-24.md`：mixed active/inactive ktest、striped 几何边界 ktest、mixed LVM2 系统验收、合入当前 main 并适配 `kernel/core` 目录迁移。
 - `log/2026-8-31.md`：dmsetup 控制面语义对齐、LVM2 控制面 baseline/guest 同构、raw DM 数据面边界 guest 审计。
 - `log/2026-9-1.md`：guest 启动慢排查修复、`zero` target 核心/控制面/数据面覆盖、discard / write zeroes 通用 range BIO 与 DM 映射接入。
-- `log/2026-9-2.md`：面向 upstream/review 收敛 DM 相关源码注释为英文，项目日志和中文技术文档仍保持中文。
+- `log/2026-9-2.md`：源码注释、DM 文档事实、系统测试脚本口径、成功 marker、超时变量和 patches 同步记录。
