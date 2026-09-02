@@ -1,9 +1,9 @@
 diff --git a/myshell/run_dm_dataplane_edge_test.sh b/myshell/run_dm_dataplane_edge_test.sh
 new file mode 100755
-index 000000000..48f7e0232
+index 000000000..17c83012a
 --- /dev/null
 +++ b/myshell/run_dm_dataplane_edge_test.sh
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,233 @@
 +#!/bin/bash
 +
 +# SPDX-License-Identifier: MPL-2.0
@@ -15,7 +15,7 @@ index 000000000..48f7e0232
 +Usage: myshell/run_dm_dataplane_edge_test.sh
 +
 +Runs one NixOS guest pass for Device Mapper data-plane edge cases:
-+three-segment linear remap, non-chunk-aligned striped writes, and zero target reads.
++three-segment linear remap, non-chunk-aligned striped writes, and zero target reads/range operations.
 +
 +Optional environment variables:
 +  DM_TEST_IMAGES            Space-separated backing image paths, default four test images
@@ -218,6 +218,12 @@ index 000000000..48f7e0232
 +dd if=/dev/mapper/dm_zero_edge of=/tmp/zero-edge-read-after-write.bin bs=512 count=1 status=none
 +cmp -n 512 /tmp/zero-edge-read-after-write.bin /dev/zero
 +echo CHECK_PASS_ZERO_EDGE_READ_AFTER_WRITE_ZERO
++
++blkdiscard /dev/mapper/dm_zero_edge
++echo CHECK_PASS_ZERO_EDGE_BLKDISCARD
++
++blkdiscard -z /dev/mapper/dm_zero_edge
++echo CHECK_PASS_ZERO_EDGE_BLKZEROOUT
 +
 +dmsetup remove dm_zero_edge
 +

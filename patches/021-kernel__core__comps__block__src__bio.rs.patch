@@ -1,8 +1,8 @@
 diff --git a/kernel/core/comps/block/src/bio.rs b/kernel/core/comps/block/src/bio.rs
-index 7e0237d00..725dd27ea 100644
+index 7e0237d00..958791c21 100644
 --- a/kernel/core/comps/block/src/bio.rs
 +++ b/kernel/core/comps/block/src/bio.rs
-@@ -62,11 +62,35 @@ impl Bio {
+@@ -62,11 +62,50 @@ impl Bio {
          let nsectors = segments
              .iter()
              .map(|segment| segment.nsectors().to_raw())
@@ -11,6 +11,21 @@ index 7e0237d00..725dd27ea 100644
 +            .expect("BIO sector count overflow");
  
 +        Self::new_with_nsectors_unchecked(type_, start_sid, nsectors, segments, complete_fn)
++    }
++
++    /// Constructs a range-only `Bio`.
++    ///
++    /// Range-only operations carry only a sector interval. They intentionally
++    /// own no memory segments because the device either discards the range or
++    /// synthesizes zeroes without copying data from the caller.
++    pub fn new_range(
++        type_: BioType,
++        start_sid: Sid,
++        nsectors: u64,
++        complete_fn: Option<BioCompleteFn>,
++    ) -> Self {
++        assert!(type_.is_range_only());
++        Self::new_with_nsectors_unchecked(type_, start_sid, nsectors, Vec::new(), complete_fn)
 +    }
 +
 +    fn new_with_nsectors_unchecked(
@@ -40,7 +55,7 @@ index 7e0237d00..725dd27ea 100644
              status: AtomicU32::new(BioStatus::Init as u32),
              wait_queue: WaitQueue::new(),
          });
-@@ -97,6 +121,29 @@ impl Bio {
+@@ -97,6 +136,29 @@ impl Bio {
          self.metadata.status()
      }
  
@@ -70,7 +85,7 @@ index 7e0237d00..725dd27ea 100644
      /// Submits self to the `block_device` asynchronously.
      ///
      /// This method consumes `self` and transfers its segments and completion
-@@ -128,9 +175,10 @@ impl Bio {
+@@ -128,9 +190,10 @@ impl Bio {
          assert!(result.is_ok());
  
          let waiter_metadata = metadata.clone();
@@ -82,7 +97,7 @@ index 7e0237d00..725dd27ea 100644
              complete_fn,
              segments,
          };
-@@ -200,7 +248,7 @@ impl From<BioEnqueueError> for Error {
+@@ -200,7 +263,7 @@ impl From<BioEnqueueError> for Error {
  /// The request queue of block device only accepts a `SubmittedBio` into the queue.
  pub struct SubmittedBio {
      metadata: Arc<BioMetadata>,
@@ -91,18 +106,18 @@ index 7e0237d00..725dd27ea 100644
      complete_fn: Option<BioCompleteFn>,
      segments: Vec<BioSegment>,
  }
-@@ -211,19 +259,138 @@ impl SubmittedBio {
+@@ -211,19 +274,145 @@ impl SubmittedBio {
          self.metadata.type_()
      }
  
 -    /// Returns the range of target sectors on the device.
-+    /// 返回当前块设备层看到的目标扇区范围。
++    /// Returns the sector range seen by the current block device layer.
      pub fn sid_range(&self) -> &Range<Sid> {
 -        self.metadata.sid_range()
 +        &self.current_sid_range
 +    }
 +
-+    /// 保持 BIO 长度不变，将当前扇区范围重映射到新的起始扇区。
++    /// Remaps the current sector range to a new start while preserving the `Bio` length.
 +    pub fn remap_sid_start(&mut self, new_start: Sid) -> Result<(), BioEnqueueError> {
 +        let length = self
 +            .current_sid_range
@@ -118,7 +133,7 @@ index 7e0237d00..725dd27ea 100644
 +        Ok(())
 +    }
 +
-+    /// 在当前映射结果上增加扇区偏移。
++    /// Adds a sector offset to the current mapping result.
 +    pub fn add_sid_offset(&mut self, offset: u64) -> Result<(), BioEnqueueError> {
 +        let new_start = self
 +            .current_sid_range
@@ -130,7 +145,7 @@ index 7e0237d00..725dd27ea 100644
 +        self.remap_sid_start(new_start)
 +    }
 +
-+    /// 将当前 BIO 拆成覆盖同一范围的多个子 BIO。
++    /// Splits the current `Bio` into children that cover the same range.
 +    pub fn split(
 +        self,
 +        ranges: Vec<Range<Sid>>,
@@ -197,6 +212,13 @@ index 7e0237d00..725dd27ea 100644
 +        &self,
 +        range: &Range<Sid>,
 +    ) -> Result<Vec<BioSegment>, BioEnqueueError> {
++        if self.type_().is_range_only() {
++            // A range-only child keeps the logical sector subrange but has no
++            // data payload to slice; the lower driver receives the range from
++            // the `Bio` metadata.
++            return Ok(Vec::new());
++        }
++
 +        let start_sectors = range
 +            .start
 +            .to_raw()
@@ -238,14 +260,15 @@ index 7e0237d00..725dd27ea 100644
      }
  
      /// Returns the slice to the memory segments.
-@@ -236,6 +403,23 @@ impl SubmittedBio {
+@@ -236,6 +425,24 @@ impl SubmittedBio {
          self.metadata.status()
      }
  
-+    /// 在完成原回调后追加一个完成回调。
++    /// Chains an additional completion callback after the original one.
 +    ///
-+    /// 该方法用于 stacked block device 在 BIO 的真正下层完成时释放自身的
-+    /// in-flight 引用，而不影响上层提交者原有的完成通知。
++    /// Stacked block devices use this to release their own in-flight references
++    /// when the lower-level `Bio` really completes, without changing the
++    /// original submitter's completion notification.
 +    pub fn chain_complete_fn<F>(&mut self, complete_fn: F)
 +    where
 +        F: FnOnce(BioStatus) + Send + 'static,
@@ -262,7 +285,7 @@ index 7e0237d00..725dd27ea 100644
      /// Completes the `Bio` by consuming `self`, releasing the segments, invoking
      /// the callback function, and publishing the final status.
      ///
-@@ -257,7 +441,6 @@ impl SubmittedBio {
+@@ -257,7 +464,6 @@ impl SubmittedBio {
          // Complete the `complete_fn` before publishing the status change,
          // so that the effects of the callback function are visible to users.
          general_complete_fn(metadata.type_(), status, complete_fn);
@@ -270,7 +293,7 @@ index 7e0237d00..725dd27ea 100644
          let result = metadata.status.compare_exchange(
              BioStatus::Submit as u32,
              status as u32,
-@@ -274,12 +457,60 @@ impl Debug for SubmittedBio {
+@@ -274,12 +480,60 @@ impl Debug for SubmittedBio {
      fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
          f.debug_struct("SubmittedBio")
              .field("metadata", &self.metadata)
@@ -332,21 +355,31 @@ index 7e0237d00..725dd27ea 100644
  /// The metadata and waitable state shared by submitted `Bio`s and their waiter handles.
  struct BioMetadata {
      /// The type of the I/O
-@@ -343,7 +574,12 @@ pub enum BioType {
+@@ -343,7 +597,22 @@ pub enum BioType {
      Write = 1,
      /// Flush the volatile write cache.
      Flush = 2,
 -    // TODO: Add support for other BIO types, such as discarding sectors.
++    /// Discard sectors on the device.
++    Discard = 3,
++    /// Write zeroes to sectors on the device.
++    WriteZeroes = 4,
 +}
 +
 +impl BioType {
++    /// Returns whether this operation may change the device contents.
 +    pub fn is_write_like(self) -> bool {
-+        matches!(self, Self::Write)
++        matches!(self, Self::Write | Self::Discard | Self::WriteZeroes)
++    }
++
++    /// Returns whether this operation is described entirely by a sector range.
++    pub fn is_range_only(self) -> bool {
++        matches!(self, Self::Discard | Self::WriteZeroes)
 +    }
  }
  
  /// The status of `Bio`.
-@@ -443,8 +679,13 @@ impl BioSegment {
+@@ -443,8 +712,13 @@ impl BioSegment {
      }
  
      /// Constructs a new `BioSegment` with a given `USegment` and the bio direction.
@@ -360,7 +393,7 @@ index 7e0237d00..725dd27ea 100644
          let dma_stream = DmaStream::map(segment, false).unwrap();
          Self {
              inner: Arc::new(BioSegmentInner {
-@@ -480,6 +721,20 @@ impl BioSegment {
+@@ -480,6 +754,20 @@ impl BioSegment {
          &self.inner.dma_slice
      }
  
@@ -381,7 +414,7 @@ index 7e0237d00..725dd27ea 100644
      /// Returns the inner DMA object.
      ///
      /// Note that the slicing will be ignored. This is only for testing.
-@@ -693,6 +948,71 @@ pub fn is_sector_aligned(offset: usize) -> bool {
+@@ -693,6 +981,103 @@ pub fn is_sector_aligned(offset: usize) -> bool {
      offset.is_multiple_of(SECTOR_SIZE)
  }
  
@@ -438,6 +471,38 @@ index 7e0237d00..725dd27ea 100644
 +            Err(BioEnqueueError::Refused)
 +        );
 +        assert_eq!(bio.sid_range(), &original);
++    }
++
++    #[ktest]
++    fn new_range_constructs_range_only_bio() {
++        let bio = Bio::new_range(BioType::Discard, Sid::new(10), 8, None);
++
++        assert_eq!(bio.type_(), BioType::Discard);
++        assert_eq!(bio.sid_range(), &(Sid::new(10)..Sid::new(18)));
++        assert!(bio.segments().is_empty());
++    }
++
++    #[ktest]
++    fn splits_range_only_bio_without_segments() {
++        let bio = Bio::new_range(BioType::WriteZeroes, Sid::new(10), 8, None).submit_for_test();
++        let (children, _completion) = bio
++            .split(vec![Sid::new(10)..Sid::new(14), Sid::new(14)..Sid::new(18)])
++            .unwrap();
++
++        assert_eq!(children[0].type_(), BioType::WriteZeroes);
++        assert_eq!(children[0].sid_range(), &(Sid::new(10)..Sid::new(14)));
++        assert!(children[0].segments().is_empty());
++        assert_eq!(children[1].sid_range(), &(Sid::new(14)..Sid::new(18)));
++        assert!(children[1].segments().is_empty());
++    }
++
++    #[ktest]
++    fn write_like_includes_discard_and_write_zeroes() {
++        assert!(BioType::Write.is_write_like());
++        assert!(BioType::Discard.is_write_like());
++        assert!(BioType::WriteZeroes.is_write_like());
++        assert!(!BioType::Read.is_write_like());
++        assert!(!BioType::Flush.is_write_like());
 +    }
 +
 +    #[ktest]

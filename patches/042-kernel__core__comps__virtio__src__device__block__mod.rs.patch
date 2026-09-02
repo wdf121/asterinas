@@ -1,0 +1,58 @@
+diff --git a/kernel/core/comps/virtio/src/device/block/mod.rs b/kernel/core/comps/virtio/src/device/block/mod.rs
+index 74ca63b33..4746e1968 100644
+--- a/kernel/core/comps/virtio/src/device/block/mod.rs
++++ b/kernel/core/comps/virtio/src/device/block/mod.rs
+@@ -14,6 +14,21 @@ use crate::transport::{ConfigManager, VirtioTransport};
+ 
+ pub const DEVICE_NAME: &str = "Virtio-Block";
+ 
++/// The fixed length of a VirtIO block device identifier.
++pub const VIRTIO_BLOCK_ID_BYTES: usize = 20;
++
++/// A raw block device identifier returned by the host through `VIRTIO_BLK_T_GET_ID`.
++#[repr(transparent)]
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Pod)]
++pub struct VirtioBlockId([u8; VIRTIO_BLOCK_ID_BYTES]);
++
++impl VirtioBlockId {
++    /// Returns the raw fixed-length identifier including NUL padding.
++    pub fn as_bytes(&self) -> &[u8; VIRTIO_BLOCK_ID_BYTES] {
++        &self.0
++    }
++}
++
+ bitflags! {
+     /// features for virtio block device
+     struct BlockFeatures : u64 {
+@@ -31,7 +46,10 @@ bitflags! {
+         const DISCARD       = 1 << 13;
+         const WRITE_ZEROES  = 1 << 14;
+ 
+-        const ALL_SUPPORTED = Self::BLK_SIZE.bits() | Self::FLUSH.bits();
++        const ALL_SUPPORTED = Self::BLK_SIZE.bits()
++            | Self::FLUSH.bits()
++            | Self::DISCARD.bits()
++            | Self::WRITE_ZEROES.bits();
+     }
+ }
+ 
+@@ -198,4 +216,19 @@ impl ConfigManager<VirtioBlockConfig> {
+ 
+         (cap_high << 32) | cap_low
+     }
++
++    pub(self) fn max_discard_sectors(&self) -> u32 {
++        self.read_once::<u32>(offset_of!(VirtioBlockConfig, max_discard_sectors))
++            .unwrap()
++    }
++
++    pub(self) fn discard_sector_alignment(&self) -> u32 {
++        self.read_once::<u32>(offset_of!(VirtioBlockConfig, discard_sector_alignment))
++            .unwrap()
++    }
++
++    pub(self) fn max_write_zeroes_sectors(&self) -> u32 {
++        self.read_once::<u32>(offset_of!(VirtioBlockConfig, max_write_zeroes_sectors))
++            .unwrap()
++    }
+ }

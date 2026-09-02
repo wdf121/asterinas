@@ -1,9 +1,9 @@
 diff --git a/myshell/run_dmsetup_linux_cli_baseline.sh b/myshell/run_dmsetup_linux_cli_baseline.sh
 new file mode 100755
-index 000000000..ade406542
+index 000000000..6e136405f
 --- /dev/null
 +++ b/myshell/run_dmsetup_linux_cli_baseline.sh
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,401 @@
 +#!/bin/bash
 +
 +# SPDX-License-Identifier: MPL-2.0
@@ -331,6 +331,8 @@ index 000000000..ade406542
 +run_shell_capture ZERO_READ_ALL_ZERO "timeout 5 sh -c 'dd if=/dev/mapper/${zero_name} of=${TMPDIR_PATH}/zero-read.bin bs=512 count=1 status=none && cmp -n 512 ${TMPDIR_PATH}/zero-read.bin /dev/zero'" || true
 +run_shell_capture ZERO_WRITE "timeout 5 dd if=/dev/urandom of=/dev/mapper/${zero_name} bs=512 count=1 status=none" || true
 +run_shell_capture ZERO_READ_AFTER_WRITE_ALL_ZERO "timeout 5 sh -c 'dd if=/dev/mapper/${zero_name} of=${TMPDIR_PATH}/zero-read-after-write.bin bs=512 count=1 status=none && cmp -n 512 ${TMPDIR_PATH}/zero-read-after-write.bin /dev/zero'" || true
++run_shell_capture ZERO_BLKDISCARD "timeout 5 blkdiscard /dev/mapper/${zero_name}" || true
++run_shell_capture ZERO_BLKZEROOUT "timeout 5 blkdiscard -z /dev/mapper/${zero_name}" || true
 +run_capture ZERO_REMOVE dmsetup remove "${zero_name}" || true
 +
 +table_name=$(name table_lifecycle)

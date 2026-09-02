@@ -1,20 +1,21 @@
 diff --git a/kernel/core/src/device/registry/block.rs b/kernel/core/src/device/registry/block.rs
-index 7584ee4d9..23495de86 100644
+index 7584ee4d9..ebc623a58 100644
 --- a/kernel/core/src/device/registry/block.rs
 +++ b/kernel/core/src/device/registry/block.rs
-@@ -1,5 +1,7 @@
+@@ -1,6 +1,8 @@
  // SPDX-License-Identifier: MPL-2.0
  
+-use aster_block::{BLOCK_SIZE, BlockDevice, SECTOR_SIZE};
 +use alloc::format;
 +
- use aster_block::{BLOCK_SIZE, BlockDevice, SECTOR_SIZE};
++use aster_block::{BLOCK_SIZE, BlockDevice, SECTOR_SIZE, bio::BioStatus, id::Sid};
  use aster_nvme::NvmeBlockDevice;
  use aster_virtio::device::block::device::BlockDevice as VirtIoBlockDevice;
-@@ -7,8 +9,10 @@ use device_id::DeviceId;
- use ostd::mm::VmIo;
+ use device_id::DeviceId;
+@@ -8,7 +10,10 @@ use ostd::mm::VmIo;
  
  use crate::{
--    context::current_userspace,
+     context::current_userspace,
 -    device::{Device, DeviceType, DevtmpfsInodeMeta, add_node},
 +    device::{
 +        Device, DeviceType, DevtmpfsInodeMeta, add_node, add_runtime_node,
@@ -23,7 +24,7 @@ index 7584ee4d9..23495de86 100644
      events::IoEvents,
      fs::{
          file::{PerOpenFileOps, SettableStatusFlags, StatusFlags},
-@@ -62,10 +66,16 @@ pub(super) fn init_in_first_kthread() {
+@@ -62,10 +67,16 @@ pub(super) fn init_in_first_kthread() {
  
  pub(super) fn init_in_first_process(path_resolver: &PathResolver) -> Result<()> {
      for device in aster_block::collect_all() {
@@ -44,14 +45,13 @@ index 7584ee4d9..23495de86 100644
          }
      }
  
-@@ -73,13 +83,23 @@ pub(super) fn init_in_first_process(path_resolver: &PathResolver) -> Result<()>
+@@ -73,13 +84,23 @@ pub(super) fn init_in_first_process(path_resolver: &PathResolver) -> Result<()>
  }
  
  mod ioctl_defs {
--    use crate::util::ioctl::{NoData, OutData, ioc};
 +    use aster_virtio::device::block::VIRTIO_BLOCK_ID_BYTES;
 +
-+    use crate::util::ioctl::{OutData, ioc};
+     use crate::util::ioctl::{NoData, OutData, ioc};
  
      // Reference: <https://elixir.bootlin.com/linux/v6.18/source/include/uapi/linux/fs.h>
  
@@ -70,22 +70,38 @@ index 7584ee4d9..23495de86 100644
      /// Returns the logical sector size of the block device.
      ///
      /// This is the smallest unit of I/O the device can address and,
-@@ -93,7 +113,13 @@ mod ioctl_defs {
+@@ -93,7 +114,29 @@ mod ioctl_defs {
      /// is larger than the hardware sector, such as `ext2`'s 4 KiB block, this
      /// ioctl must return that larger value. Otherwise user programs will align
      /// correctly for the device but still hit `EINVAL` at the filesystem.
 -    pub(super) type BlkGetSectorSize = ioc!(BLKSSZGET, 0x12, 104, NoData);
 +    pub(super) type BlkGetSectorSize = ioc!(BLKSSZGET, 0x12, 104, OutData<i32>);
 +
-+    /// 返回 VirtIO Host 提供的原始 20 字节设备标识符。
++    /// Returns the logical sector size of the block device.
 +    ///
-+    /// 这是 Asterinas 内部测试使用的窄接口，不属于 Linux block ioctl ABI。
++    /// Linux: _IO(0x12, 104). Some user programs, including util-linux
++    /// `blkdiscard`, use this legacy command encoding instead of the typed
++    /// `_IOR(0x12, 104, int)` form above.
++    pub(super) type BlkGetSectorSizeLegacy = ioc!(BLKSSZGET_LEGACY, 0x1268, NoData);
++
++    /// Discards a byte range described by two u64 values: start and length.
++    /// Linux: _IO(0x12, 119).
++    pub(super) type BlkDiscard = ioc!(BLKDISCARD, 0x1277, NoData);
++
++    /// Writes zeroes to a byte range described by two u64 values: start and length.
++    /// Linux: _IO(0x12, 127).
++    pub(super) type BlkZeroout = ioc!(BLKZEROOUT, 0x127F, NoData);
++
++    /// Returns the raw 20-byte device identifier provided by the VirtIO host.
++    ///
++    /// This is a narrow Asterinas-internal test interface, not part of the Linux
++    /// block ioctl ABI.
 +    pub(super) type AsterVirtioBlkGetId =
 +        ioc!(ASTER_VIRTIO_BLK_GET_ID, b'A', 0x01, OutData<[u8; VIRTIO_BLOCK_ID_BYTES]>);
  }
  
  /// Represents a block device inode in the filesystem.
-@@ -102,11 +128,101 @@ mod ioctl_defs {
+@@ -102,11 +145,101 @@ mod ioctl_defs {
  // trait. It leads to redundant vtable dispatch, reference counting, and heap allocation. We should
  // devise a better strategy to eliminate the unnecessary intermediate `Arc`.
  #[derive(Debug)]
@@ -190,7 +206,7 @@ index 7584ee4d9..23495de86 100644
      }
  }
  
-@@ -116,15 +232,26 @@ impl Device for BlockFile {
+@@ -116,15 +249,26 @@ impl Device for BlockFile {
      }
  
      fn id(&self) -> DeviceId {
@@ -220,7 +236,7 @@ index 7584ee4d9..23495de86 100644
      }
  }
  
-@@ -133,7 +260,18 @@ impl Device for BlockFile {
+@@ -133,7 +277,18 @@ impl Device for BlockFile {
  // TODO: This type wraps an `Arc<dyn BlockDevice>` in another `Box` just to implement the
  // `PerOpenFileOps` trait. It leads to redundant vtable dispatch and heap allocation. We should
  // devise a better strategy to eliminate the unnecessary intermediate `Box`.
@@ -240,7 +256,7 @@ index 7584ee4d9..23495de86 100644
  
  impl FileOps for OpenBlockFile {
      fn read_at(
-@@ -147,7 +285,7 @@ impl FileOps for OpenBlockFile {
+@@ -147,7 +302,7 @@ impl FileOps for OpenBlockFile {
              return Ok(0);
          }
  
@@ -249,7 +265,7 @@ index 7584ee4d9..23495de86 100644
          if offset >= device_size {
              return Ok(0);
          }
-@@ -158,7 +296,7 @@ impl FileOps for OpenBlockFile {
+@@ -158,7 +313,7 @@ impl FileOps for OpenBlockFile {
              // so the writer must be precisely limited here.
              let mut limited_writer = writer.clone_exclusive();
              limited_writer.limit(read_len);
@@ -258,7 +274,7 @@ index 7584ee4d9..23495de86 100644
          }
          writer.skip(read_len);
          Ok(read_len)
-@@ -175,7 +313,7 @@ impl FileOps for OpenBlockFile {
+@@ -175,7 +330,7 @@ impl FileOps for OpenBlockFile {
              return Ok(0);
          }
  
@@ -267,7 +283,7 @@ index 7584ee4d9..23495de86 100644
          if offset >= device_size {
              return_errno_with_message!(
                  Errno::ENOSPC,
-@@ -189,7 +327,7 @@ impl FileOps for OpenBlockFile {
+@@ -189,13 +344,47 @@ impl FileOps for OpenBlockFile {
              // so the reader must be precisely limited here.
              let mut limited_reader = reader.clone();
              limited_reader.limit(write_len);
@@ -276,7 +292,47 @@ index 7584ee4d9..23495de86 100644
          }
          reader.skip(write_len);
          Ok(write_len)
-@@ -213,27 +351,53 @@ impl PerOpenFileOps for OpenBlockFile {
+     }
+ }
+ 
++fn write_sector_size_ioctl(device_range_addr: usize) -> Result<()> {
++    let sector_size = SECTOR_SIZE.max(BLOCK_SIZE) as i32;
++    current_userspace!().write_val(device_range_addr, &sector_size)?;
++    Ok(())
++}
++
++fn read_range_ioctl_arg(device_range_addr: usize, device: &dyn BlockDevice) -> Result<(Sid, u64)> {
++    let [start, len] = current_userspace!().read_val::<[u64; 2]>(device_range_addr)?;
++    let sector_size = SECTOR_SIZE as u64;
++    if start % sector_size != 0 || len % sector_size != 0 {
++        return_errno_with_message!(Errno::EINVAL, "the block range is not sector-aligned");
++    }
++
++    let end = start
++        .checked_add(len)
++        .ok_or_else(|| Error::with_message(Errno::EINVAL, "the block range overflows"))?;
++    let device_size = (device.metadata().nr_sectors as u64)
++        .checked_mul(sector_size)
++        .ok_or_else(|| Error::with_message(Errno::EINVAL, "the block device size overflows"))?;
++    if end > device_size {
++        return_errno_with_message!(Errno::EINVAL, "the block range is beyond the device");
++    }
++
++    Ok((Sid::new(start / sector_size), len / sector_size))
++}
++
++fn complete_range_ioctl(status: BioStatus) -> Result<()> {
++    match status {
++        BioStatus::Complete => Ok(()),
++        BioStatus::NotSupported | BioStatus::NoSpace | BioStatus::IoError => Err(status.into()),
++        _ => return_errno_with_message!(Errno::EIO, "the range I/O did not complete"),
++    }
++}
++
+ impl Pollable for OpenBlockFile {
+     fn poll(&self, mask: IoEvents, _: Option<&mut PollHandle>) -> IoEvents {
+         let events = IoEvents::IN | IoEvents::OUT;
+@@ -213,27 +402,78 @@ impl PerOpenFileOps for OpenBlockFile {
      }
  
      fn seek_end(&self) -> Result<Option<usize>> {
@@ -297,6 +353,10 @@ index 7584ee4d9..23495de86 100644
                  let sector_size = SECTOR_SIZE.max(BLOCK_SIZE) as i32;
 -                current_userspace!().write_val(raw_ioctl.arg(), &sector_size)?;
 +                cmd.write(&sector_size)?;
++                Ok(0)
++            }
++            BlkGetSectorSizeLegacy => {
++                write_sector_size_ioctl(raw_ioctl.arg())?;
                  Ok(0)
              }
              cmd @ BlkGetSize64 => {
@@ -313,6 +373,27 @@ index 7584ee4d9..23495de86 100644
 +            cmd @ BlkRaGet => {
 +                let readahead = 0_u64;
 +                cmd.write(&readahead)?;
++                Ok(0)
++            }
++            BlkDiscard => {
++                // Linux passes discard ranges as byte offsets, while the block
++                // layer uses 512-byte sectors. Validate the user ABI boundary
++                // here so drivers only receive sector-aligned `Bio`s.
++                let (start_sid, nsectors) =
++                    read_range_ioctl_arg(raw_ioctl.arg(), self.device.as_ref())?;
++                if nsectors != 0 {
++                    complete_range_ioctl(self.device.discard_sectors(start_sid, nsectors)?)?;
++                }
++                Ok(0)
++            }
++            BlkZeroout => {
++                // `BLKZEROOUT` shares the same `[start, len]` byte-range ABI as
++                // `BLKDISCARD`, but maps to write-zeroes rather than discard.
++                let (start_sid, nsectors) =
++                    read_range_ioctl_arg(raw_ioctl.arg(), self.device.as_ref())?;
++                if nsectors != 0 {
++                    complete_range_ioctl(self.device.write_zeroes_sectors(start_sid, nsectors)?)?;
++                }
 +                Ok(0)
 +            }
 +            cmd @ AsterVirtioBlkGetId => {
@@ -334,7 +415,7 @@ index 7584ee4d9..23495de86 100644
              _ => return_errno_with_message!(
                  Errno::ENOTTY,
                  "the ioctl command is not supported by block devices"
-@@ -247,16 +411,374 @@ impl PerOpenFileOps for OpenBlockFile {
+@@ -247,16 +487,375 @@ impl PerOpenFileOps for OpenBlockFile {
  }
  
  pub(super) fn lookup(id: DeviceId) -> Option<Arc<dyn Device>> {
@@ -404,7 +485,7 @@ index 7584ee4d9..23495de86 100644
 +        abort_runtime_unregistration(unregistration, &block_file);
 +        return Err(error);
 +    }
- 
++
 +    match aster_block::commit_unregister(unregistration) {
 +        Ok(device) => {
 +            remove_wrapper_if_matches(&block_file);
@@ -418,7 +499,7 @@ index 7584ee4d9..23495de86 100644
 +        }
 +    }
 +}
-+
+ 
 +fn register_runtime_with_alias(
 +    device: Arc<dyn BlockDevice>,
 +    path: String,
@@ -477,7 +558,8 @@ index 7584ee4d9..23495de86 100644
 +    Ok(())
 +}
 +
-+/// 删除仍属于本次注册的节点；节点已消失或已被替换也视为清理完成。
++/// Removes nodes that still belong to this registration; missing or replaced
++/// nodes are already clean.
 +fn remove_owned_node_or_accept_stale(path: &str, expected: &Path) -> Result<()> {
 +    match remove_owned_runtime_node(path, expected) {
 +        Ok(()) => Ok(()),
@@ -548,7 +630,12 @@ index 7584ee4d9..23495de86 100644
 +}
 +
 +fn remove_wrapper_if_matches(block_file: &Arc<BlockFile>) {
-+    let mut registry = DEVICE_REGISTRY.lock();
+     let mut registry = DEVICE_REGISTRY.lock();
+-    let block_device_file = registry
+-        .entry(id.to_raw())
+-        .or_insert_with(move || Arc::new(BlockFile::new(block_device)))
+-        .clone();
+-    Some(block_device_file)
 +    if registry
 +        .get(&block_file.id().to_raw())
 +        .is_some_and(|current| Arc::ptr_eq(current, block_file))
@@ -579,12 +666,7 @@ index 7584ee4d9..23495de86 100644
 +) -> Result<Arc<BlockFile>> {
 +    let id = device.id().to_raw();
 +    let block_file = Arc::new(BlockFile::new(device, path));
-     let mut registry = DEVICE_REGISTRY.lock();
--    let block_device_file = registry
--        .entry(id.to_raw())
--        .or_insert_with(move || Arc::new(BlockFile::new(block_device)))
--        .clone();
--    Some(block_device_file)
++    let mut registry = DEVICE_REGISTRY.lock();
 +    if registry.contains_key(&id) {
 +        return_errno_with_message!(Errno::EEXIST, "the block device wrapper already exists");
 +    }

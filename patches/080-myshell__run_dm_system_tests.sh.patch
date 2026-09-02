@@ -1,6 +1,6 @@
 diff --git a/myshell/run_dm_system_tests.sh b/myshell/run_dm_system_tests.sh
 new file mode 100755
-index 000000000..ad606a7f5
+index 000000000..30a077b73
 --- /dev/null
 +++ b/myshell/run_dm_system_tests.sh
 @@ -0,0 +1,81 @@
@@ -18,7 +18,7 @@ index 000000000..ad606a7f5
 +  --quick                         Run control ABI smoke plus raw linear and striped data regressions.
 +  --dmsetup-cli                   Run dmsetup CLI control-plane semantics audit with backing disks.
 +  --lvm2-cli                      Run LVM2 CLI control-plane semantics audit with test disks.
-+  --dataplane-edge                Run raw DM data-plane edge remap, stripe-boundary, and zero target audit.
++  --dataplane-edge                Run raw DM data-plane edge remap, stripe-boundary, and zero target range audit.
 +  --linear-data                   Run raw linear cross-target BIO split/remap regression.
 +  --striped-data                  Run raw striped BIO split/remap and backing distribution regression.
 +  --linear-lvm2                   Run single-PV LVM2 linear create, same-PV grow/shrink, file I/O, and reboot recovery.

@@ -1,0 +1,81 @@
+diff --git a/log/2026-9-2.md b/log/2026-9-2.md
+new file mode 100644
+index 000000000..114176e6e
+--- /dev/null
++++ b/log/2026-9-2.md
+@@ -0,0 +1,75 @@
++# 2026-9-2 工程改动日志
++
++本文按小阶段记录今天实际发生的工程改动。单纯解释、规划和未落地尝试不写入本日志；测试和验证结果跟随对应小阶段记录。
++
++## 1. 收敛 Device Mapper 源码注释为 upstream/review 风格
++
++### 背景
++
++用户确认代码注释主要服务后续 upstream/review；项目日志和中文技术文档仍继续使用简体中文。因此本阶段先更新协作规则，并把 DM 相关源码注释收敛为英文，不改功能逻辑，也不添加文件级版本横幅。
++
++### 改动
++
++```text
++AGENTS.md
++CLAUDE.md
++kernel/core/comps/block/src/bio.rs
++kernel/core/comps/block/src/device_id.rs
++kernel/core/comps/block/src/lib.rs
++kernel/core/comps/device-mapper/src/lib.rs
++kernel/core/comps/device-mapper/src/manager.rs
++kernel/core/comps/device-mapper/src/device.rs
++kernel/core/comps/device-mapper/src/table.rs
++kernel/core/comps/device-mapper/src/target/error.rs
++kernel/core/comps/device-mapper/src/target/linear.rs
++kernel/core/comps/device-mapper/src/target/zero.rs
++kernel/core/comps/virtio/src/device/block/device.rs
++kernel/core/comps/virtio/src/device/block/mod.rs
++kernel/core/src/device/misc/mod.rs
++kernel/core/src/device/misc/device_mapper.rs
++kernel/core/src/device/registry/char.rs
++kernel/core/src/device/registry/block.rs
++kernel/core/src/fs/fs_impls/procfs/devices.rs
++patches/apply_patches.sh
++```
++
++主要行为：
++
++```text
++CLAUDE.md 明确：交流、项目日志和中文技术文档继续用中文；面向 upstream/review 的源码注释和 Rust doc comment 默认使用英文。
++AGENTS.md 与 docs/test.md 统一新系统 suite 的 guest 生命周期超时变量为 `GUEST_QEMU_TIMEOUT`，并保留 `GUEST_READY_TIMEOUT` 作为旧脚本兼容 alias。
++Device Mapper crate 的模块说明、错误枚举、manager/device/table/target 公开 API doc comment 改为英文。
++清理 `/dev/mapper/control` 打通路径中人为带路式中文注释，包括 misc 初始化、char registry、block registry、`/proc/devices` 和 block lifecycle 注释。
++补充 range-only BIO、DM split completion 聚合、error/zero target direct-complete、readonly write-like、BLKDISCARD/BLKZEROOUT、VirtIO feature/limit/range descriptor 的 why/spec 注释。
++block BIO stacking/remap/split 相关 doc comment 改为英文。
++virtio block GET_ID、block registry 内部测试 ioctl、Device Mapper 控制面 ABI 关键注释改为英文。
++用户态 errno 文案保持不变，本阶段只整理源码注释。
++未新增逐文件版本信息；版本仍集中在 Cargo.toml、DM_VERSION、TARGET_VERSIONS 和 SPDX。
++patches verify-tree 改用临时 index 对比当前树，确保未跟踪新增文件也参与补丁一致性验证，且不污染真实 index。
++```
++
++### 验证
++
++```text
++docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --all --check'
++git diff --check -- . ':!patches/[0-9][0-9][0-9]-*.patch'
++grep -RInP "//[/!]?\s*[^\n]*[\x{4e00}-\x{9fff}]|#\s*[^\n]*[\x{4e00}-\x{9fff}]" kernel/core/src/device/misc kernel/core/src/device/registry kernel/core/src/fs/fs_impls/procfs kernel/core/comps/device-mapper/src kernel/core/comps/block/src kernel/core/comps/virtio/src/device/block kernel/core/comps/nvme/src/device/block_device.rs myshell/run_dm_dataplane_edge_test.sh myshell/run_dm_system_tests.sh myshell/run_dmsetup_cli_semantics_test.sh myshell/run_dmsetup_linux_cli_baseline.sh
++grep -RInP "^\s*///.{101,}|^\s*//! .{101,}|^\s*// .{101,}|^\s*# .{101,}" kernel/core/src/device/misc/mod.rs kernel/core/src/device/registry/char.rs kernel/core/src/fs/fs_impls/procfs/devices.rs kernel/core/comps/device-mapper/src kernel/core/comps/block/src kernel/core/comps/virtio/src/device/block kernel/core/src/device/registry/block.rs
++patches/generate_patches.sh
++patches/apply_patches.sh --verify-tree --base main --allow-dirty
++grep -RIn "GUEST_READY_TIMEOUT=180 myshell/run_dm_system_tests.sh" AGENTS.md docs/test.md
++```
++
++结果：
++
++```text
++cargo fmt --all --check: 通过
++git diff --check（排除 numbered patch 文件）: 通过
++中文源码注释残留检查: 无输出
++长源码注释行检查: 无输出
++patches/generate_patches.sh: patch_count=95, empty_count=0
++patches/apply_patches.sh --verify-tree --base main --allow-dirty: patched tree matches current branch outside patches/
++GUEST_READY_TIMEOUT 旧命令口径检查（AGENTS.md、docs/test.md）: 无输出
++```
++
++本阶段只改注释和协作规则，没有修改 Rust 逻辑或系统脚本，因此未重跑 ktest 和 NixOS 系统 suite。

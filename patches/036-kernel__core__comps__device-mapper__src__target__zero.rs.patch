@@ -1,8 +1,8 @@
-diff --git a/kernel/core/comps/device-mapper/src/target/error.rs b/kernel/core/comps/device-mapper/src/target/error.rs
+diff --git a/kernel/core/comps/device-mapper/src/target/zero.rs b/kernel/core/comps/device-mapper/src/target/zero.rs
 new file mode 100644
-index 000000000..317d6033b
+index 000000000..e39aa4811
 --- /dev/null
-+++ b/kernel/core/comps/device-mapper/src/target/error.rs
++++ b/kernel/core/comps/device-mapper/src/target/zero.rs
 @@ -0,0 +1,61 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
@@ -12,13 +12,13 @@ index 000000000..317d6033b
 +
 +use crate::TableError;
 +
-+/// 总是以 I/O error 完成普通读写的 error target。
++/// A `zero` target that returns zeroes for reads and discards writes successfully.
 +#[derive(Debug)]
-+pub struct ErrorTarget {
++pub struct ZeroTarget {
 +    logical_range: Range<Sid>,
 +}
 +
-+impl ErrorTarget {
++impl ZeroTarget {
 +    pub fn new(logical_start: Sid, length: u64) -> Result<Self, TableError> {
 +        if length == 0 {
 +            return Err(TableError::ZeroLength);
@@ -52,15 +52,15 @@ index 000000000..317d6033b
 +    #[ktest]
 +    fn validates_target_range() {
 +        assert_eq!(
-+            ErrorTarget::new(Sid::new(0), 0).unwrap_err(),
++            ZeroTarget::new(Sid::new(0), 0).unwrap_err(),
 +            TableError::ZeroLength
 +        );
 +        assert_eq!(
-+            ErrorTarget::new(Sid::new(u64::MAX), 1).unwrap_err(),
++            ZeroTarget::new(Sid::new(u64::MAX), 1).unwrap_err(),
 +            TableError::LogicalRangeOverflow
 +        );
 +
-+        let target = ErrorTarget::new(Sid::new(4), 8).unwrap();
++        let target = ZeroTarget::new(Sid::new(4), 8).unwrap();
 +        assert_eq!(target.logical_range(), &(Sid::new(4)..Sid::new(12)));
 +        assert_eq!(target.length(), 8);
 +    }

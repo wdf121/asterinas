@@ -145,7 +145,11 @@ verify_tree_matches_current_branch() {
         exit 1
     fi
 
-    git diff --binary "$base_ref" -- . ':!patches' > "$current_diff"
+    local current_index
+    current_index="$tmp_parent/current.index"
+    GIT_INDEX_FILE="$current_index" git read-tree "$base_ref"
+    GIT_INDEX_FILE="$current_index" git add -A -- . ':!patches'
+    GIT_INDEX_FILE="$current_index" git diff --cached --binary "$base_ref" -- . ':!patches' > "$current_diff"
 
     if cmp -s "$applied_diff" "$current_diff"; then
         git worktree remove --force "$verify_worktree" >/dev/null

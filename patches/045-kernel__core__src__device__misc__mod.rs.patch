@@ -1,8 +1,8 @@
 diff --git a/kernel/core/src/device/misc/mod.rs b/kernel/core/src/device/misc/mod.rs
-index aa0e0e629..ed71e79ca 100644
+index aa0e0e629..93be38cac 100644
 --- a/kernel/core/src/device/misc/mod.rs
 +++ b/kernel/core/src/device/misc/mod.rs
-@@ -9,15 +9,19 @@ use spin::Once;
+@@ -9,15 +9,18 @@ use spin::Once;
  
  use super::registry::char::{MajorIdOwner, acquire_major};
  
@@ -13,11 +13,10 @@ index aa0e0e629..ed71e79ca 100644
  
  static MISC_MAJOR: Once<MajorIdOwner> = Once::new();
  
-+// 内核启动后  初始化misc设备子系统 默认占用major 10
++// Linux misc devices use character major 10.
  pub(super) fn init_in_first_kthread() {
      MISC_MAJOR.call_once(|| acquire_major(MajorId::new(10)).unwrap());
  
-+    //把device mapper control 作为 misc子设备接入 启动期初始化
 +    device_mapper::init_in_first_kthread();
      hwrng::init_in_first_kthread();
  
