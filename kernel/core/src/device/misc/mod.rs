@@ -16,11 +16,10 @@ pub(crate) mod tdxguest;
 
 static MISC_MAJOR: Once<MajorIdOwner> = Once::new();
 
-// 内核启动后  初始化misc设备子系统 默认占用major 10
+// Linux misc devices use character major 10.
 pub(super) fn init_in_first_kthread() {
     MISC_MAJOR.call_once(|| acquire_major(MajorId::new(10)).unwrap());
 
-    //把device mapper control 作为 misc子设备接入 启动期初始化
     device_mapper::init_in_first_kthread();
     hwrng::init_in_first_kthread();
 

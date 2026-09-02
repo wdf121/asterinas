@@ -14,16 +14,16 @@ use crate::transport::{ConfigManager, VirtioTransport};
 
 pub const DEVICE_NAME: &str = "Virtio-Block";
 
-/// VirtIO block 设备标识符的固定长度。
+/// The fixed length of a VirtIO block device identifier.
 pub const VIRTIO_BLOCK_ID_BYTES: usize = 20;
 
-/// Host 通过 `VIRTIO_BLK_T_GET_ID` 返回的原始块设备标识符。
+/// A raw block device identifier returned by the host through `VIRTIO_BLK_T_GET_ID`.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Pod)]
 pub struct VirtioBlockId([u8; VIRTIO_BLOCK_ID_BYTES]);
 
 impl VirtioBlockId {
-    /// 返回包含 NUL 填充的原始固定长度标识符。
+    /// Returns the raw fixed-length identifier including NUL padding.
     pub fn as_bytes(&self) -> &[u8; VIRTIO_BLOCK_ID_BYTES] {
         &self.0
     }
@@ -46,7 +46,10 @@ bitflags! {
         const DISCARD       = 1 << 13;
         const WRITE_ZEROES  = 1 << 14;
 
-        const ALL_SUPPORTED = Self::BLK_SIZE.bits() | Self::FLUSH.bits();
+        const ALL_SUPPORTED = Self::BLK_SIZE.bits()
+            | Self::FLUSH.bits()
+            | Self::DISCARD.bits()
+            | Self::WRITE_ZEROES.bits();
     }
 }
 
@@ -63,6 +66,8 @@ enum ReqType {
     Out = 1,
     Flush = 4,
     GetId = 8,
+    Discard = 11,
+    WriteZeroes = 13,
 }
 
 #[repr(u8)]
@@ -210,5 +215,20 @@ impl ConfigManager<VirtioBlockConfig> {
             .unwrap() as usize;
 
         (cap_high << 32) | cap_low
+    }
+
+    pub(self) fn max_discard_sectors(&self) -> u32 {
+        self.read_once::<u32>(offset_of!(VirtioBlockConfig, max_discard_sectors))
+            .unwrap()
+    }
+
+    pub(self) fn discard_sector_alignment(&self) -> u32 {
+        self.read_once::<u32>(offset_of!(VirtioBlockConfig, discard_sector_alignment))
+            .unwrap()
+    }
+
+    pub(self) fn max_write_zeroes_sectors(&self) -> u32 {
+        self.read_once::<u32>(offset_of!(VirtioBlockConfig, max_write_zeroes_sectors))
+            .unwrap()
     }
 }

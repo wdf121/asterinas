@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Asterinas 的 Device Mapper 核心组件。
+//! Asterinas Device Mapper core component.
 //!
-//! 支持由 error、linear、striped、zero target 组成的映射表。Linux ioctl ABI 和
-//! `/dev/mapper/control` 位于内核设备层，本组件只负责映射表、设备状态与 I/O 转发。
+//! This crate supports mapping tables composed of `error`, `linear`, `striped`,
+//! and `zero` targets. The Linux ioctl ABI and `/dev/mapper/control` live in the
+//! kernel device layer; this component only owns mapping tables, device state,
+//! and I/O forwarding.
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -19,24 +21,24 @@ pub use device::{DmDevice, DmDeviceStatus};
 pub use manager::DmManager;
 pub use table::DmTable;
 
-/// Device Mapper 核心操作失败的原因。
+/// Reasons why a core Device Mapper operation failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DmError {
-    /// 名称已经存在。
+    /// The name already exists.
     NameExists,
-    /// UUID 已经存在。
+    /// The UUID already exists.
     UuidExists,
-    /// 找不到指定设备。
+    /// The specified device was not found.
     DeviceNotFound,
-    /// 指定 minor 已被占用。
+    /// The specified minor number is busy.
     MinorBusy,
-    /// minor 编号耗尽或超出范围。
+    /// Minor numbers are exhausted or out of range.
     MinorExhausted,
-    /// 块设备 major 编号耗尽。
+    /// Block device major numbers are exhausted.
     MajorExhausted,
-    /// 设备当前状态不允许该操作。
+    /// The current device state does not allow the operation.
     InvalidState,
-    /// 映射表无效。
+    /// The mapping table is invalid.
     InvalidTable(TableError),
 }
 
@@ -46,25 +48,25 @@ impl From<TableError> for DmError {
     }
 }
 
-/// 映射表验证失败的原因。
+/// Reasons why mapping table validation failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TableError {
-    /// 映射表至少需要一条 target。
+    /// A mapping table needs at least one target.
     UnsupportedTargetCount,
-    /// 逻辑 target 必须从扇区 0 开始并连续排列。
+    /// Logical targets must start at sector 0 and be contiguous.
     UnsupportedLogicalStart,
-    /// target 长度不能为零。
+    /// Target length cannot be zero.
     ZeroLength,
-    /// 逻辑范围发生整数溢出。
+    /// The logical range overflowed.
     LogicalRangeOverflow,
-    /// 底层范围发生整数溢出。
+    /// The backing range overflowed.
     BackingRangeOverflow,
-    /// 底层范围超过块设备容量。
+    /// The backing range exceeds the block device capacity.
     BackingRangeOutOfBounds,
-    /// 底层设备类型当前不受支持。
+    /// The backing device type is not currently supported.
     UnsupportedBackingDevice,
-    /// target 参数格式或几何信息无效。
+    /// Target parameters or geometry are invalid.
     InvalidTargetParams,
-    /// BIO 不完整地位于单个 target 中。
+    /// The `Bio` is not fully contained in a single target.
     BioOutOfRange,
 }
