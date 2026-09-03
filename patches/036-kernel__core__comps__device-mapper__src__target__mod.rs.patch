@@ -1,12 +1,22 @@
 diff --git a/kernel/core/comps/device-mapper/src/target/mod.rs b/kernel/core/comps/device-mapper/src/target/mod.rs
 new file mode 100644
-index 000000000..fc3b4d62f
+index 000000000..17a476eed
 --- /dev/null
 +++ b/kernel/core/comps/device-mapper/src/target/mod.rs
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,531 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
-+use core::ops::Range;
++//! Target metadata, parsing, and dispatch for supported Device Mapper targets.
++//!
++//! This module is the boundary between Linux table-load target strings and typed
++//! target implementations. It keeps target names, target-version metadata, common
++//! accessors, and parse-time error classification together so the ioctl layer does
++//! not duplicate target-specific knowledge.
++
++use alloc::{boxed::Box, string::String, vec::Vec};
++#[cfg(ktest)]
++use core::any::Any;
++use core::{fmt::Debug, ops::Range};
 +
 +use aster_block::{BlockDevice, BlockDeviceLease, id::Sid};
 +use device_id::DeviceId;
@@ -19,21 +29,168 @@ index 000000000..fc3b4d62f
 +pub mod striped;
 +pub mod zero;
 +
++/// Common logical sector range owned by every resolved target variant.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct TargetRange {
++    /// Half-open logical sector range exposed by the target inside its table.
++    logical_range: Range<Sid>,
++}
++
++impl TargetRange {
++    /// Builds a non-empty target range and rejects logical end overflow.
++    pub fn new(logical_start: Sid, length: u64) -> Result<Self, TableError> {
++        if length == 0 {
++            return Err(TableError::ZeroLength);
++        }
++
++        let logical_end = logical_start
++            .to_raw()
++            .checked_add(length)
++            .ok_or(TableError::LogicalRangeOverflow)?;
++        Ok(Self {
++            logical_range: logical_start..Sid::new(logical_end),
++        })
++    }
++
++    /// Returns the half-open logical sector range covered by the target.
++    pub fn logical_range(&self) -> &Range<Sid> {
++        &self.logical_range
++    }
++
++    /// Returns the range length in 512-byte sectors.
++    pub fn length(&self) -> u64 {
++        self.logical_range.end.to_raw() - self.logical_range.start.to_raw()
++    }
++
++    /// Returns the offset of an in-range sector from the target's logical start.
++    pub fn offset_of(&self, logical: Sid) -> Option<u64> {
++        if !self.logical_range.contains(&logical) {
++            return None;
++        }
++        logical
++            .to_raw()
++            .checked_sub(self.logical_range.start.to_raw())
++    }
++
++    /// Checks whether a non-empty logical subrange is fully owned by this target.
++    pub fn contains_range(&self, logical: &Range<Sid>) -> bool {
++        logical.start < logical.end
++            && logical.start.to_raw() >= self.logical_range.start.to_raw()
++            && logical.end.to_raw() <= self.logical_range.end.to_raw()
++    }
++}
++
++/// Target-local result that tells `DmTable` how to complete or submit one BIO part.
++pub enum TargetIoAction<'a> {
++    /// Remap the logical part to a backing device and submit it there.
++    Remap {
++        /// Logical range covered by this child BIO on the mapped device.
++        logical_range: Range<Sid>,
++        /// Backing sector corresponding to `logical_range.start`.
++        backing_start: Sid,
++        /// Resolved backing block device that receives the remapped BIO.
++        backing: &'a dyn BlockDevice,
++    },
++    /// Complete the logical part with a stable I/O error.
++    Error {
++        /// Logical range covered by this child BIO on the mapped device.
++        logical_range: Range<Sid>,
++    },
++    /// Complete the logical part without submitting backing I/O.
++    Zero {
++        /// Logical range covered by this child BIO on the mapped device.
++        logical_range: Range<Sid>,
++    },
++}
++
++impl TargetIoAction<'_> {
++    /// Returns the logical range used when splitting the original BIO into children.
++    pub(crate) fn logical_range(&self) -> &Range<Sid> {
++        match self {
++            Self::Remap { logical_range, .. }
++            | Self::Error { logical_range }
++            | Self::Zero { logical_range } => logical_range,
++        }
++    }
++}
++
++/// Selects the Linux table/status parameter flavor requested by `DM_TABLE_STATUS`.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum TargetStatusMode {
++    /// Report reloadable target parameters for `dmsetup table`-style queries.
++    Table,
++    /// Report runtime target status parameters for `dmsetup status`-style queries.
++    Status,
++}
++
++/// Common behavior implemented by every resolved Device Mapper target instance.
++pub trait DmTarget: Debug + Send + Sync {
++    /// Returns this target as `Any` for ktest-only downcasting of boxed targets.
++    #[cfg(ktest)]
++    fn as_any(&self) -> &dyn Any;
++
++    /// Returns static Linux-visible metadata for this target implementation.
++    fn metadata(&self) -> DmTargetMetadata;
++
++    /// Returns the Linux-visible target type name for table/status output.
++    fn name(&self) -> &'static str {
++        self.metadata().name()
++    }
++
++    /// Returns the logical sector range owned by this target in its table.
++    fn logical_range(&self) -> &Range<Sid>;
++
++    /// Returns the target length in 512-byte sectors.
++    fn length(&self) -> u64 {
++        let range = self.logical_range();
++        range.end.to_raw() - range.start.to_raw()
++    }
++
++    /// Visits backing IDs referenced by this target in Linux table order.
++    fn for_each_backing_id(&self, f: &mut dyn FnMut(DeviceId));
++
++    /// Visits resolved backing devices referenced by this target in Linux table order.
++    fn for_each_backing<'a>(&'a self, f: &mut dyn FnMut(&'a dyn BlockDevice));
++
++    /// Formats target-specific Linux table/status parameters.
++    fn status_params(&self, mode: TargetStatusMode) -> Result<String, TableError>;
++
++    /// Maps a target-local logical range into table-level I/O actions.
++    fn map_io_range(&self, logical: Range<Sid>) -> Option<Vec<TargetIoAction<'_>>>;
++}
++
++/// Owned target instance installed in a `DmTable`.
++pub type DmTargetBox = Box<dyn DmTarget>;
++
++#[cfg(ktest)]
++impl dyn DmTarget + '_ {
++    /// Returns the concrete target type when the boxed target has that implementation.
++    pub fn downcast_ref<T: DmTarget + 'static>(&self) -> Option<&T> {
++        self.as_any().downcast_ref::<T>()
++    }
++}
++
++/// Static identity exported through `dmsetup targets` and target-version ioctls.
 +#[derive(Clone, Copy, Debug)]
 +pub struct DmTargetMetadata {
++    /// Linux target type name used in table-load, table/status, and target-version records.
 +    name: &'static str,
++    /// Linux-compatible target-version triplet reported to libdevmapper.
 +    version: [u32; 3],
 +}
 +
 +impl DmTargetMetadata {
++    /// Creates a compile-time target metadata entry shared by parser and ioctl code.
 +    pub const fn new(name: &'static str, version: [u32; 3]) -> Self {
 +        Self { name, version }
 +    }
 +
++    /// Returns the Linux-visible target type name stored in `dm_target_spec` records.
 +    pub fn name(&self) -> &'static str {
 +        self.name
 +    }
 +
++    /// Returns the target-version triplet reported by `DM_LIST_VERSIONS`.
 +    pub fn version(&self) -> [u32; 3] {
 +        self.version
 +    }
@@ -44,6 +201,7 @@ index 000000000..fc3b4d62f
 +const STRIPED_METADATA: DmTargetMetadata = DmTargetMetadata::new("striped", [1, 6, 0]);
 +const ZERO_METADATA: DmTargetMetadata = DmTargetMetadata::new("zero", [1, 1, 0]);
 +
++/// Ordered list of target types currently accepted by table-load and version ioctls.
 +pub const SUPPORTED_TARGETS: &[DmTargetMetadata] = &[
 +    ERROR_METADATA,
 +    LINEAR_METADATA,
@@ -51,12 +209,14 @@ index 000000000..fc3b4d62f
 +    ZERO_METADATA,
 +];
 +
-+/// Keeps target validation separate from environment-specific backing lookup
-+/// failures so callers can preserve their native error semantics.
++/// Error boundary between target semantics and environment-specific backing lookup.
 +#[derive(Debug, Eq, PartialEq)]
 +pub enum DmTargetParseError<E> {
++    /// The requested target type is not implemented by this Device Mapper subset.
 +    UnsupportedTarget,
++    /// Target parameters were syntactically valid enough to parse but semantically invalid.
 +    Table(TableError),
++    /// Backing device token parsing or lease lookup failed outside the target component.
 +    ResolveBacking(E),
 +}
 +
@@ -66,165 +226,39 @@ index 000000000..fc3b4d62f
 +    }
 +}
 +
-+#[derive(Debug)]
-+pub enum DmTarget {
-+    Error(ErrorTarget),
-+    Linear(LinearTarget),
-+    Striped(StripedTarget),
-+    Zero(ZeroTarget),
-+}
-+
-+impl DmTarget {
-+    /// The resolver keeps environment-specific device lookup outside this
-+    /// component while target parsing remains responsible for target semantics.
-+    pub fn parse_with<E>(
-+        target_type: &str,
-+        logical_start: Sid,
-+        length: u64,
-+        params: &str,
-+        parse_backing: &mut impl FnMut(&str) -> Result<DeviceId, E>,
-+        resolve_backing: &mut impl FnMut(DeviceId) -> Result<BlockDeviceLease, E>,
-+    ) -> Result<Self, DmTargetParseError<E>> {
-+        match target_type {
-+            "error" => {
-+                require_empty_params(params)?;
-+                Ok(Self::Error(ErrorTarget::new(logical_start, length)?))
-+            }
-+            "linear" => {
-+                let (backing, backing_start) = parse_linear_params(params)?;
-+                let backing_start = Sid::new(backing_start);
-+                LinearTarget::validate_geometry(logical_start, length, backing_start)?;
-+                let backing = parse_backing(backing).map_err(DmTargetParseError::ResolveBacking)?;
-+                let backing =
-+                    resolve_backing(backing).map_err(DmTargetParseError::ResolveBacking)?;
-+                Ok(Self::Linear(LinearTarget::new(
-+                    logical_start,
-+                    length,
-+                    backing_start,
-+                    backing,
-+                )?))
-+            }
-+            "striped" => Ok(Self::Striped(StripedTarget::parse_with(
-+                logical_start,
-+                length,
-+                params,
-+                parse_backing,
-+                resolve_backing,
-+            )?)),
-+            "zero" => {
-+                require_empty_params(params)?;
-+                Ok(Self::Zero(ZeroTarget::new(logical_start, length)?))
-+            }
-+            _ => Err(DmTargetParseError::UnsupportedTarget),
-+        }
++/// Parses one Linux table target while keeping VFS/registry lookup in caller hooks.
++pub fn parse_target_with<E>(
++    target_type: &str,
++    logical_start: Sid,
++    length: u64,
++    params: &str,
++    parse_backing: &mut impl FnMut(&str) -> Result<DeviceId, E>,
++    resolve_backing: &mut impl FnMut(DeviceId) -> Result<BlockDeviceLease, E>,
++) -> Result<DmTargetBox, DmTargetParseError<E>> {
++    match target_type {
++        "error" => Ok(Box::new(ErrorTarget::parse(logical_start, length, params)?)),
++        "linear" => Ok(Box::new(LinearTarget::parse_with(
++            logical_start,
++            length,
++            params,
++            parse_backing,
++            resolve_backing,
++        )?)),
++        "striped" => Ok(Box::new(StripedTarget::parse_with(
++            logical_start,
++            length,
++            params,
++            parse_backing,
++            resolve_backing,
++        )?)),
++        "zero" => Ok(Box::new(ZeroTarget::parse(logical_start, length, params)?)),
++        _ => Err(DmTargetParseError::UnsupportedTarget),
 +    }
-+
-+    pub fn metadata(&self) -> DmTargetMetadata {
-+        match self {
-+            Self::Error(_) => ERROR_METADATA,
-+            Self::Linear(_) => LINEAR_METADATA,
-+            Self::Striped(_) => STRIPED_METADATA,
-+            Self::Zero(_) => ZERO_METADATA,
-+        }
-+    }
-+
-+    pub fn name(&self) -> &'static str {
-+        self.metadata().name()
-+    }
-+
-+    pub fn logical_range(&self) -> &Range<Sid> {
-+        match self {
-+            Self::Error(target) => target.logical_range(),
-+            Self::Linear(target) => target.logical_range(),
-+            Self::Striped(target) => target.logical_range(),
-+            Self::Zero(target) => target.logical_range(),
-+        }
-+    }
-+
-+    pub fn length(&self) -> u64 {
-+        match self {
-+            Self::Error(target) => target.length(),
-+            Self::Linear(target) => target.length(),
-+            Self::Striped(target) => target.length(),
-+            Self::Zero(target) => target.length(),
-+        }
-+    }
-+
-+    pub fn backing_start(&self) -> Option<Sid> {
-+        match self {
-+            Self::Linear(target) => Some(target.backing_start()),
-+            Self::Error(_) | Self::Striped(_) | Self::Zero(_) => None,
-+        }
-+    }
-+
-+    pub fn backing_id(&self) -> Option<DeviceId> {
-+        match self {
-+            Self::Linear(target) => Some(target.backing_id()),
-+            Self::Error(_) | Self::Striped(_) | Self::Zero(_) => None,
-+        }
-+    }
-+
-+    pub fn for_each_backing_id(&self, mut f: impl FnMut(DeviceId)) {
-+        match self {
-+            Self::Error(_) | Self::Zero(_) => {}
-+            Self::Linear(target) => f(target.backing_id()),
-+            Self::Striped(target) => target.for_each_backing_id(f),
-+        }
-+    }
-+
-+    pub fn backing(&self) -> Option<&dyn BlockDevice> {
-+        match self {
-+            Self::Linear(target) => Some(target.backing()),
-+            Self::Error(_) | Self::Striped(_) | Self::Zero(_) => None,
-+        }
-+    }
-+
-+    pub fn for_each_backing<'a>(&'a self, mut f: impl FnMut(&'a dyn BlockDevice)) {
-+        match self {
-+            Self::Error(_) | Self::Zero(_) => {}
-+            Self::Linear(target) => f(target.backing()),
-+            Self::Striped(target) => target.for_each_backing(f),
-+        }
-+    }
-+
-+    pub fn map_sector(&self, logical: Sid) -> Option<Sid> {
-+        match self {
-+            Self::Linear(target) => target.map_sector(logical),
-+            Self::Error(_) | Self::Striped(_) | Self::Zero(_) => None,
-+        }
-+    }
-+
-+    pub fn is_linear(&self) -> bool {
-+        matches!(self, Self::Linear(_))
-+    }
-+}
-+
-+fn require_empty_params<E>(params: &str) -> Result<(), DmTargetParseError<E>> {
-+    if params.trim().is_empty() {
-+        Ok(())
-+    } else {
-+        Err(TableError::InvalidTargetParams.into())
-+    }
-+}
-+
-+fn parse_linear_params(params: &str) -> Result<(&str, u64), TableError> {
-+    let mut fields = params.split_ascii_whitespace();
-+    let backing = fields.next().ok_or(TableError::InvalidTargetParams)?;
-+    let backing_start = fields
-+        .next()
-+        .ok_or(TableError::InvalidTargetParams)?
-+        .parse::<u64>()
-+        .map_err(|_| TableError::InvalidTargetParams)?;
-+    if fields.next().is_some() {
-+        return Err(TableError::InvalidTargetParams);
-+    }
-+
-+    Ok((backing, backing_start))
 +}
 +
 +#[cfg(ktest)]
 +mod tests {
-+    use alloc::{string::String, sync::Arc, vec, vec::Vec};
++    use alloc::{sync::Arc, vec};
 +
 +    use aster_block::{
 +        BlockDeviceMeta,
@@ -293,7 +327,7 @@ index 000000000..fc3b4d62f
 +            Ok(backing(id.minor().get()))
 +        };
 +
-+        let linear = DmTarget::parse_with(
++        let linear = parse_target_with(
 +            "linear",
 +            Sid::new(0),
 +            8,
@@ -302,10 +336,13 @@ index 000000000..fc3b4d62f
 +            &mut resolve_backing,
 +        )
 +        .unwrap();
-+        assert_eq!(linear.backing_id().unwrap().minor().get(), 1);
-+        assert_eq!(linear.backing_start(), Some(Sid::new(16)));
++        let linear = linear
++            .downcast_ref::<LinearTarget>()
++            .expect("expected linear target");
++        assert_eq!(linear.backing_id().minor().get(), 1);
++        assert_eq!(linear.backing_start(), Sid::new(16));
 +
-+        let striped = DmTarget::parse_with(
++        let striped = parse_target_with(
 +            "striped",
 +            Sid::new(8),
 +            16,
@@ -314,9 +351,9 @@ index 000000000..fc3b4d62f
 +            &mut resolve_backing,
 +        )
 +        .unwrap();
-+        let DmTarget::Striped(striped) = striped else {
-+            panic!("expected striped target");
-+        };
++        let striped = striped
++            .downcast_ref::<StripedTarget>()
++            .expect("expected striped target");
 +        assert_eq!(striped.stripe_count(), 2);
 +        assert_eq!(striped.chunk_size(), 4);
 +        assert_eq!(striped.backing_id(0).unwrap().minor().get(), 1);
@@ -344,8 +381,8 @@ index 000000000..fc3b4d62f
 +            Ok(backing(1))
 +        };
 +
-+        assert!(matches!(
-+            DmTarget::parse_with(
++        assert_eq!(
++            parse_target_with(
 +                "error",
 +                Sid::new(0),
 +                1,
@@ -353,11 +390,12 @@ index 000000000..fc3b4d62f
 +                &mut parse_backing,
 +                &mut resolve_backing,
 +            )
-+            .unwrap(),
-+            DmTarget::Error(_)
-+        ));
-+        assert!(matches!(
-+            DmTarget::parse_with(
++            .unwrap()
++            .name(),
++            "error"
++        );
++        assert_eq!(
++            parse_target_with(
 +                "zero",
 +                Sid::new(0),
 +                1,
@@ -365,9 +403,10 @@ index 000000000..fc3b4d62f
 +                &mut parse_backing,
 +                &mut resolve_backing,
 +            )
-+            .unwrap(),
-+            DmTarget::Zero(_)
-+        ));
++            .unwrap()
++            .name(),
++            "zero"
++        );
 +        for (target_type, params) in [
 +            ("error", "unexpected"),
 +            ("zero", "unexpected"),
@@ -377,7 +416,7 @@ index 000000000..fc3b4d62f
 +            ("striped", "2 4 510:1 0"),
 +        ] {
 +            assert_eq!(
-+                DmTarget::parse_with(
++                parse_target_with(
 +                    target_type,
 +                    Sid::new(0),
 +                    1,
@@ -391,7 +430,7 @@ index 000000000..fc3b4d62f
 +            );
 +        }
 +        assert_eq!(
-+            DmTarget::parse_with(
++            parse_target_with(
 +                "snapshot",
 +                Sid::new(0),
 +                1,
@@ -420,7 +459,7 @@ index 000000000..fc3b4d62f
 +        };
 +
 +        assert_eq!(
-+            DmTarget::parse_with(
++            parse_target_with(
 +                "linear",
 +                Sid::new(u64::MAX),
 +                1,
@@ -432,7 +471,7 @@ index 000000000..fc3b4d62f
 +            DmTargetParseError::Table(TableError::LogicalRangeOverflow)
 +        );
 +        assert_eq!(
-+            DmTarget::parse_with(
++            parse_target_with(
 +                "striped",
 +                Sid::new(0),
 +                0,
@@ -444,7 +483,7 @@ index 000000000..fc3b4d62f
 +            DmTargetParseError::Table(TableError::ZeroLength)
 +        );
 +        assert_eq!(
-+            DmTarget::parse_with(
++            parse_target_with(
 +                "striped",
 +                Sid::new(0),
 +                1,
@@ -465,7 +504,7 @@ index 000000000..fc3b4d62f
 +        let mut resolve_backing =
 +            |_id: DeviceId| -> Result<BlockDeviceLease, &'static str> { Ok(backing(1)) };
 +        assert_eq!(
-+            DmTarget::parse_with(
++            parse_target_with(
 +                "linear",
 +                Sid::new(0),
 +                1,
@@ -483,7 +522,7 @@ index 000000000..fc3b4d62f
 +        let mut resolve_backing =
 +            |_id: DeviceId| -> Result<BlockDeviceLease, &'static str> { Err("lookup") };
 +        assert_eq!(
-+            DmTarget::parse_with(
++            parse_target_with(
 +                "striped",
 +                Sid::new(0),
 +                8,

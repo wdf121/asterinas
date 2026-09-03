@@ -1,0 +1,167 @@
+diff --git a/log/2026-9-3.md b/log/2026-9-3.md
+new file mode 100644
+index 000000000..d3f9cda69
+--- /dev/null
++++ b/log/2026-9-3.md
+@@ -0,0 +1,161 @@
++# 2026-9-3 工程改动日志
++
++本文按小阶段记录今天实际发生的工程改动。单纯解释、规划和未落地尝试不写入本日志；测试和验证结果跟随对应小阶段记录。
++
++## 1. Device Mapper target trait object 重构
++
++### 背景
++
++Device Mapper 后续目标不是固定维护 `linear`、`striped`、`error`、`zero` 四种 target，而是继续向 Linux DM 风格 target framework 演进，后续可能扩展 snapshot、mirror 等 target。原先 `DmTarget` enum 属于 closed target set；新增 target 时需要新增 enum variant，并在 table、status、deps、I/O 分派和测试中同步补 match，扩展边界不够清晰。
++
++### 改动
++
++```text
++kernel/core/comps/device-mapper/src/table.rs
++kernel/core/comps/device-mapper/src/target/error.rs
++kernel/core/comps/device-mapper/src/target/linear.rs
++kernel/core/comps/device-mapper/src/target/mod.rs
++kernel/core/comps/device-mapper/src/target/striped.rs
++kernel/core/comps/device-mapper/src/target/zero.rs
++kernel/core/src/device/misc/device_mapper.rs
++```
++
++主要行为：
++
++```text
++删除 closed `DmTarget` enum，改为 `pub trait DmTarget: Debug + Send + Sync` 和 `pub type DmTargetBox = Box<dyn DmTarget>`。
++`DmTable` 改为持有 `Vec<DmTargetBox>`，table/control-plane 只通过 trait 方法访问 target 名称、range、status、deps 和 I/O 映射。
++保留 target 模块静态 factory `parse_target_with(...) -> Result<DmTargetBox, ...>`，本阶段不引入 registry，也不新增 snapshot/mirror target。
++`error`、`zero`、`linear`、`striped` 分别在 concrete target 文件中实现 `DmTarget`，target-local parse/status/map 语义继续下沉在各文件内。
++table-level BIO split 返回 `&dyn DmTarget`，再由 target 的 `map_io_range()` 产生 `TargetIoAction::{Remap, Error, Zero}`；`DmTable::enqueue()` 仍只负责 split、提交和 completion 聚合。
++flush 路径通过 `for_each_backing_id` 先收集唯一 backing id，再用 `for_each_backing` 提交 flush，避免把 borrowed `&dyn BlockDevice` 保存到 visitor 外。
++测试中需要 concrete-only 断言的位置使用 ktest-only `downcast_ref`，普通 table/control-plane 路径不再依赖 enum variant match。
++补强 DM target framework 相关英文源码注释，覆盖文件职责、trait 语义、factory 边界、target 参数约束和核心映射行为。
++```
++
++### 验证
++
++```text
++bash -n myshell/ktest_crate.sh
++cargo fmt --check --manifest-path kernel/core/comps/device-mapper/Cargo.toml
++cargo fmt --check --manifest-path kernel/core/Cargo.toml
++cargo fmt --manifest-path osdk/deps/test-kernel/Cargo.toml --check
++git diff --check -- AGENTS.md CLAUDE.md docs log kernel/core/comps/device-mapper/src kernel/core/src/device/misc/device_mapper.rs osdk/deps/test-kernel/src/lib.rs myshell/ktest_crate.sh
++myshell/ktest_crate.sh kernel/core/comps/device-mapper/
++myshell/ktest_crate.sh kernel/core
++GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --quick
++```
++
++结果：
++
++```text
++bash -n: 通过
++Rust fmt checks: 通过
++git diff --check: 通过
++aster-device-mapper crate ktest: 69 passed; 0 failed; 0 filtered out
++aster-core crate ktest: 186 passed; 0 failed; 0 filtered out
++--quick 系统验收: 通过
++HOST_PASS_DM_CONTROL_ABI
++HOST_PASS_CROSS_TARGET_BIO
++HOST_PASS_DM_STRIPED_RAW_BIO
++HOST_PASS_DM_SYSTEM_TESTS --quick
++```
++
++说明：`myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests` 曾得到 `0 passed; 186 filtered out`，不算 ioctl 层有效覆盖；最终以 `kernel/core` crate 全量 ktest 通过为准。
++
++## 2. ktest crate-local 结果日志与 runner 输出改造
++
++### 背景
++
++原先定向 ktest 依赖根目录 `make ktest` 或手写 `cargo osdk test` 参数，容易因为覆盖 Makefile 参数而漏掉 KVM/initramfs/release，导致 QEMU 退化到 TCG 或测试范围偏大。日志方面，根目录 `qemu.log` / `qemu-serial.log` 混入 QEMU/OVMF/GRUB/kernel 普通输出，不适合作为每个 crate 的最终测试结果。负测中被测代码打印预期 `ERROR:` 时，还会和 `test ... ok` 混在同一行，影响阅读。
++
++### 改动
++
++```text
++myshell/ktest_crate.sh
++osdk/deps/test-kernel/src/lib.rs
++docs/test.md
++AGENTS.md
++```
++
++主要行为：
++
++```text
++新增统一入口 `myshell/ktest_crate.sh <crate-dir> [cargo-osdk-test-filter-or-args...]`。
++脚本从仓库根目录接收 crate 路径，规范化尾部 `/`，进入目标 crate 后运行 `cargo osdk test`。
++脚本统一补齐 release、boot method、boot protocol、KVM、initramfs、console 和 timeout 参数。
++每个 crate 只生成一个最终结果日志：`<crate-dir>/ktest.log`。
++最终 `ktest.log` 只保留当前 crate 的 `running ... tests`、每个 `test ... ok/FAILED`、summary 和必要 failure 摘要，不保留 QEMU 启动日志、OVMF/GRUB 输出或 kernel 普通日志。
++根目录 `qemu.log` / `qemu-serial.log` 仅作为提取来源，生成结果日志后删除。
++脚本使用 `timeout --foreground`，避免交互终端中 QEMU 因不在前台进程组而被 job-control stop。
++ktest runner 将测试开始行和最终结果行拆开打印，负测中的预期 `ERROR:` 不再和 `ok/FAILED` 结果混在同一行。
++```
++
++### 验证
++
++```text
++bash -n myshell/ktest_crate.sh
++myshell/ktest_crate.sh kernel/core/comps/device-mapper/
++myshell/ktest_crate.sh kernel/core
++```
++
++结果：
++
++```text
++kernel/core/comps/device-mapper/ktest.log: 69 passed; 0 failed; 0 filtered out
++kernel/core/ktest.log: 186 passed; 0 failed; 0 filtered out
++根目录 qemu.log / qemu-serial.log: wrapper 结束后已清理
++用户交互终端手动运行 `myshell/ktest_crate.sh kernel/core/comps/device-mapper/` 已确认快速完成
++```
++
++## 3. 文档、日志、优化记录和 patches 同步
++
++### 背景
++
++代码重构、ktest 入口改造和验证完成后，同步更新项目文档、阶段日志、优化专题文档和 numbered patches，避免文档继续停留在 enum target、临时 `default-members` 或根目录 QEMU 日志的旧口径。
++
++### 改动
++
++```text
++AGENTS.md
++docs/device-mapper-technical-maintenance.md
++docs/img.md
++docs/production-code-validation-chain.md
++docs/test.md
++log/2026-9-3.md
++log/device-mapper-optimization-v1.md
++log/device-mapper-progress.md
++patches/
++```
++
++主要行为：
++
++```text
++新增今天阶段日志，记录 `dyn DmTarget` 重构、crate-local ktest wrapper、runner 结果行拆分和已完成验证。
++更新优化专题文档，把 target trait object 化、ktest wrapper、runner 结果行拆分纳入第一版优化成果。
++更新滚动进度文档，把当前状态推进到 2026-09-03，并把接手清单加入 `log/2026-9-3.md`。
++修正技术维护文档中的 target 表达设计决策：当前选择为 `dyn DmTarget` trait object + 静态 factory，而不是 closed enum。
++修正验证链路文档，去掉固定单文件 Cargo.toml diff 步骤，把 ktest 结果查看统一到 `<crate-dir>/ktest.log`。
++补充 AGENTS.md 中 `timeout --foreground` 的交互终端约束。
++重新生成 numbered patches，纳入当前文档、脚本、代码、ktest 结果日志和今天新增日志。
++```
++
++### 验证
++
++```text
++patches/generate_patches.sh
++bash -n myshell/ktest_crate.sh patches/generate_patches.sh patches/apply_patches.sh
++git diff --check -- AGENTS.md CLAUDE.md docs log kernel/core/comps/device-mapper/src kernel/core/src/device/misc/device_mapper.rs osdk/deps/test-kernel/src/lib.rs myshell/ktest_crate.sh patches
++grep -RIn <旧 target/ktest 口径关键词> docs AGENTS.md log/device-mapper-optimization-v1.md log/device-mapper-progress.md log/2026-9-3.md
++patches/apply_patches.sh --verify-tree --base main --allow-dirty
++```
++
++结果：
++
++```text
++patches/generate_patches.sh: patch_count=102, empty_count=0
++bash -n: 通过
++git diff --check: 通过
++当前文档旧口径检查: 无输出
++patches verify-tree: patched tree matches current branch outside patches/
++```
