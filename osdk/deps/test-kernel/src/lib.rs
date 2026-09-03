@@ -142,7 +142,7 @@ fn run_crate_ktests(crate_: &KtestCrate, whitelist: &Option<SuffixTrie>) -> Ktes
                 }
             }
             early_print!(
-                "test {}::{} ...",
+                "test {}::{} ...\n",
                 test.info().module_path,
                 test.info().fn_name
             );
@@ -152,11 +152,21 @@ fn run_crate_ktests(crate_: &KtestCrate, whitelist: &Option<SuffixTrie>) -> Ktes
                     as fn(fn()) -> Result<(), Box<dyn Any + Send + 'static>>),
             ) {
                 Ok(()) => {
-                    early_print!(" {}\n", "ok".green());
+                    early_print!(
+                        "test {}::{} ... {}\n",
+                        test.info().module_path,
+                        test.info().fn_name,
+                        "ok".green()
+                    );
                     passed += 1;
                 }
                 Err(e) => {
-                    early_print!(" {}\n", "FAILED".red());
+                    early_print!(
+                        "test {}::{} ... {}\n",
+                        test.info().module_path,
+                        test.info().fn_name,
+                        "FAILED".red()
+                    );
                     failed_tests.push((test.clone(), e.clone()));
                 }
             }
