@@ -2,18 +2,20 @@
 
 //! Linux Device Mapper control device.
 //!
-//! This module implements the first ioctl control plane for
-//! `/dev/mapper/control`. Variable-length ABI data is first copied into a
-//! bounded kernel buffer and then parsed through explicit little-endian field
-//! accesses, avoiding direct interpretation of unaligned or malformed user-space
-//! structures.
+//! This module implements the ioctl control plane for `/dev/mapper/control`. It
+//! copies the Linux `dm_ioctl` envelope into a bounded kernel buffer, validates
+//! command/flag combinations, resolves user-visible backing tokens through VFS or
+//! block-device IDs, and delegates target semantics to `aster-device-mapper`.
 
-use alloc::{format, vec};
+use alloc::vec;
 
 use aster_block::{BlockDevice, BlockDeviceLease, id::Sid, lookup_lease};
 use aster_device_mapper::{
     DmDevice, DmError, DmManager, DmTable, TableError,
-    target::{DmTarget, DmTargetMetadata, DmTargetParseError, SUPPORTED_TARGETS},
+    target::{
+        DmTarget, DmTargetBox, DmTargetMetadata, DmTargetParseError, SUPPORTED_TARGETS,
+        TargetStatusMode, parse_target_with,
+    },
 };
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::mm::VmIo;
@@ -129,13 +131,15 @@ const DM_TARGET_TYPE_LEN: usize = 16;
 static DM_MANAGER: Once<DmManager> = Once::new();
 static DM_CONTROL_LOCK: Mutex<()> = Mutex::new(());
 
+/// Character device object backing `/dev/mapper/control`.
 #[derive(Debug)]
 struct DmControlDevice {
+    /// Misc-device identity exposed through devtmpfs as `mapper/control`.
     id: DeviceId,
 }
 
-// Initializes the control device object and binds it to its major/minor `DeviceId`.
 impl DmControlDevice {
+    /// Creates the control device with the Linux-compatible misc minor number.
     fn new() -> Arc<Self> {
         let major = super::MISC_MAJOR.get().unwrap().get();
         Arc::new(Self {
@@ -162,6 +166,7 @@ impl Device for DmControlDevice {
     }
 }
 
+/// Per-open file state for the stateless Device Mapper control node.
 struct DmControlFile;
 
 impl Pollable for DmControlFile {
@@ -199,6 +204,7 @@ impl PerOpenFileOps for DmControlFile {
         false
     }
 
+    /// Handles one Linux DM ioctl by copying user ABI bytes, dispatching, then copying results back.
     fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
         let raw_cmd = raw_ioctl.cmd();
         let command = decode_command(raw_cmd)?;
@@ -276,6 +282,7 @@ impl PerOpenFileOps for DmControlFile {
     }
 }
 
+/// Validates the `dm_ioctl` envelope before variable data is trusted or copied.
 fn validate_ioctl_buffer_layout(data_size: usize, data_start: usize) -> Result<()> {
     if !(DM_IOCTL_HEADER_SIZE..=DM_IOCTL_MAX_SIZE).contains(&data_size) {
         return_errno_with_message!(Errno::EINVAL, "dm_ioctl.data_size 超出允许范围");
@@ -286,6 +293,7 @@ fn validate_ioctl_buffer_layout(data_size: usize, data_start: usize) -> Result<(
     Ok(())
 }
 
+/// Decodes the Linux ioctl number and rejects command IDs outside this DM subset.
 fn decode_command(raw: u32) -> Result<u8> {
     if raw & !0xff != DM_IOCTL_COMMAND_PREFIX || (raw >> 8) & 0xff != DM_IOCTL_MAGIC {
         return_errno_with_message!(Errno::ENOTTY, "未知的 Device Mapper ioctl 命令");
@@ -311,6 +319,7 @@ fn decode_command(raw: u32) -> Result<u8> {
     }
 }
 
+/// Ensures the userspace libdevmapper major version matches this implementation.
 fn validate_client_version(buffer: &[u8]) -> Result<()> {
     if read_u32(buffer, OFF_VERSION)? != DM_VERSION[0] {
         return_errno_with_message!(Errno::EINVAL, "Device Mapper ioctl 主版本不兼容");
@@ -318,6 +327,7 @@ fn validate_client_version(buffer: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Rejects flag bits or flag-command combinations that would change Linux DM semantics.
 fn validate_input_flags(command: u8, buffer: &[u8]) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
     if flags & !DM_KNOWN_FLAGS != 0 {
@@ -349,6 +359,7 @@ fn validate_input_flags(command: u8, buffer: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Dispatches commands that may mutate DM state while holding the global control lock.
 fn handle_command(command: u8, buffer: &mut [u8]) -> Result<()> {
     match command {
         DM_VERSION_CMD => Ok(()),
@@ -370,6 +381,7 @@ fn handle_command(command: u8, buffer: &mut [u8]) -> Result<()> {
     }
 }
 
+/// Creates a mapped device and writes its assigned identity back into the ioctl header.
 fn create_device(buffer: &mut [u8]) -> Result<()> {
     let name = required_c_string(buffer, OFF_NAME, DM_NAME_LEN, "设备名称")?;
     let uuid = optional_c_string(buffer, OFF_UUID, DM_UUID_LEN, "设备 UUID")?;
@@ -400,6 +412,7 @@ fn create_device(buffer: &mut [u8]) -> Result<()> {
     fill_device_header(buffer, &device)
 }
 
+/// Removes one mapped device after unregistering its runtime block-device alias.
 fn remove_device(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
     unregister_device_runtime_if_registered(&device)?;
@@ -408,6 +421,7 @@ fn remove_device(buffer: &mut [u8]) -> Result<()> {
     clear_device_header(buffer)
 }
 
+/// Implements Linux-style best-effort removal across all mapped devices.
 fn remove_all(buffer: &mut [u8]) -> Result<()> {
     // Linux `DM_REMOVE_ALL` is best effort: busy devices are kept while the rest
     // continue to be removed, and a single removal failure does not fail the
@@ -427,6 +441,7 @@ fn device_status(buffer: &mut [u8]) -> Result<()> {
     device_status_for_device(buffer, &device)
 }
 
+/// Fills status fields that depend on the selected active or inactive table.
 fn device_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
     let target_count = selected_table(device, flags)
@@ -459,6 +474,7 @@ fn device_wait_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     fill_device_header(buffer, device)
 }
 
+/// Waits until the selected device publishes an event number different from input.
 fn wait_for_device_event(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let event_nr = read_u32(buffer, OFF_EVENT_NR)?;
     device.event_queue().pause_until(|| {
@@ -468,6 +484,7 @@ fn wait_for_device_event(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     Ok(())
 }
 
+/// Renames a mapped device or updates its UUID according to `DM_UUID_FLAG`.
 fn device_rename(buffer: &mut [u8]) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
     let device = lookup_device(buffer)?;
@@ -492,6 +509,7 @@ fn device_rename(buffer: &mut [u8]) -> Result<()> {
     fill_device_header(buffer, &device)
 }
 
+/// Moves both the manager name index and runtime block alias as one operation.
 fn rename_device_runtime<F>(
     manager: &DmManager,
     device: &DmDevice,
@@ -532,6 +550,7 @@ fn is_device_registered_as_block(device: &DmDevice) -> bool {
     block_open_count(device.id()).is_some()
 }
 
+/// Registers `/dev/dm-N` and `/dev/mapper/<name>` once a table can be activated.
 fn register_device_runtime_if_needed(device: &Arc<DmDevice>) -> Result<()> {
     if is_device_registered_as_block(device) {
         return Ok(());
@@ -543,6 +562,7 @@ fn register_device_runtime_if_needed(device: &Arc<DmDevice>) -> Result<()> {
     register_block_mapper(device.clone(), &name)
 }
 
+/// Unregisters runtime aliases if this mapped device has been made visible.
 fn unregister_device_runtime_if_registered(device: &DmDevice) -> Result<()> {
     if is_device_registered_as_block(device) {
         unregister_block_mapper(device.id(), &&device.name())?;
@@ -555,6 +575,7 @@ fn table_load(buffer: &mut [u8]) -> Result<()> {
     table_load_for_device(buffer, &device)
 }
 
+/// Parses `DM_TABLE_LOAD` target specs and installs a fully validated inactive table.
 fn table_load_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let target_count = read_u32(buffer, OFF_TARGET_COUNT)?;
     let flags = read_u32(buffer, OFF_FLAGS)?;
@@ -585,7 +606,7 @@ fn table_load_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
         let target_type =
             required_c_string(buffer, cursor + 24, DM_TARGET_TYPE_LEN, "target 类型")?;
         let params = c_string_until(buffer, spec_end, next_spec, "target 参数")?;
-        let target = DmTarget::parse_with(
+        let target = parse_target_with(
             &target_type,
             Sid::new(logical_start),
             length,
@@ -674,6 +695,7 @@ fn table_status(buffer: &mut [u8]) -> Result<()> {
     table_status_for_device(buffer, &device)
 }
 
+/// Emits Linux `DM_TABLE_STATUS` records for active or inactive table selection flags.
 fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
     let start = data_start(buffer)?;
@@ -685,52 +707,14 @@ fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     };
     write_u32(buffer, OFF_TARGET_COUNT, table.target_count() as u32)?;
 
+    let mode = if flags & DM_STATUS_TABLE_FLAG != 0 {
+        TargetStatusMode::Table
+    } else {
+        TargetStatusMode::Status
+    };
     let mut cursor = start;
     for target in table.targets() {
-        let params = match target {
-            DmTarget::Error(_) | DmTarget::Zero(_) => String::new(),
-            DmTarget::Linear(target) => {
-                if flags & DM_STATUS_TABLE_FLAG != 0 {
-                    let backing = target.backing_id();
-                    format!(
-                        "{}:{} {}",
-                        backing.major().get(),
-                        backing.minor().get(),
-                        target.backing_start().to_raw()
-                    )
-                } else {
-                    String::new()
-                }
-            }
-            DmTarget::Striped(target) => {
-                if flags & DM_STATUS_TABLE_FLAG != 0 {
-                    let mut params = format!("{} {}", target.stripe_count(), target.chunk_size());
-                    target.for_each_stripe(|backing, backing_start| {
-                        params.push_str(&format!(
-                            " {}:{} {}",
-                            backing.major().get(),
-                            backing.minor().get(),
-                            backing_start.to_raw()
-                        ));
-                    });
-                    params
-                } else {
-                    let mut params = format!("{}", target.stripe_count());
-                    target.for_each_stripe(|backing, _| {
-                        params.push_str(&format!(
-                            " {}:{}",
-                            backing.major().get(),
-                            backing.minor().get()
-                        ));
-                    });
-                    params.push_str(" 1 ");
-                    for _ in 0..target.stripe_count() {
-                        params.push('A');
-                    }
-                    params
-                }
-            }
-        };
+        let params = target.status_params(mode).map_err(map_table_error)?;
         let record_len = table_status_record_len(params.len())?;
         if available_from(buffer, cursor) < record_len {
             set_buffer_full(buffer)?;
@@ -747,10 +731,12 @@ fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     Ok(())
 }
 
+/// Computes the aligned ABI record length for one target-version entry.
 fn target_version_record_len(target: &DmTargetMetadata) -> Result<usize> {
     align_up(16 + target.name().len() + 1, 8)
 }
 
+/// Writes one target-version record into the variable ioctl output area.
 fn write_target_version(
     buffer: &mut [u8],
     offset: usize,
@@ -766,6 +752,7 @@ fn write_target_version(
     write_c_string(buffer, offset + 16, target.name())
 }
 
+/// Lists all supported target versions from the target module metadata table.
 fn list_versions(buffer: &mut [u8]) -> Result<()> {
     let start = data_start(buffer)?;
     let mut cursor = start;
@@ -787,6 +774,7 @@ fn list_versions(buffer: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+/// Looks up one target-version entry by Linux target type name.
 fn get_target_version(buffer: &mut [u8]) -> Result<()> {
     let name = required_c_string(buffer, OFF_NAME, DM_NAME_LEN, "target 名称")?;
     let target = SUPPORTED_TARGETS
@@ -806,6 +794,7 @@ fn list_devices(buffer: &mut [u8]) -> Result<()> {
     list_devices_for_devices(buffer, manager().devices())
 }
 
+/// Lists mapped device names and UUID extensions in Linux `DM_LIST_DEVICES` format.
 fn list_devices_for_devices<I>(buffer: &mut [u8], devices: I) -> Result<()>
 where
     I: IntoIterator<Item = Arc<DmDevice>>,
@@ -921,6 +910,7 @@ fn clear_device_header(buffer: &mut [u8]) -> Result<()> {
     write_u64(buffer, OFF_DEV, 0)
 }
 
+/// Resolves a previously parsed backing device ID into a live block-device lease.
 fn lookup_backing_device(backing_id: DeviceId) -> Result<BlockDeviceLease> {
     lookup_lease(backing_id).ok_or_else(|| {
         ostd::warn!(
@@ -933,6 +923,7 @@ fn lookup_backing_device(backing_id: DeviceId) -> Result<BlockDeviceLease> {
     })
 }
 
+/// Parses a backing token from table parameters without taking the backing lease.
 fn parse_backing_device_id(dev: &str) -> Result<DeviceId> {
     if dev.starts_with('/') {
         let current_task = ostd::task::Task::current().unwrap();
@@ -970,6 +961,7 @@ fn parse_backing_device_id(dev: &str) -> Result<DeviceId> {
     );
 }
 
+/// Validates and advances a Linux `dm_target_spec.next` offset.
 fn validate_target_spec_next(data_start: usize, next: usize, buffer_len: usize) -> Result<usize> {
     // `next == 0` means this is the last target spec, so parameters extend to
     // the end of the buffer.
@@ -986,6 +978,7 @@ fn validate_target_spec_next(data_start: usize, next: usize, buffer_len: usize) 
     Ok(next_spec)
 }
 
+/// Computes the aligned ABI record length for one table/status target entry.
 fn table_status_record_len(params_len: usize) -> Result<usize> {
     let unaligned = DM_TARGET_SPEC_SIZE
         .checked_add(params_len)
@@ -994,6 +987,7 @@ fn table_status_record_len(params_len: usize) -> Result<usize> {
     align_up(unaligned, 8)
 }
 
+/// Computes aligned offsets for one `DM_LIST_DEVICES` name-list record.
 fn name_list_record_layout(name_len: usize, uuid_len: usize) -> Result<(usize, usize)> {
     let extension_offset = align_up(12usize.checked_add(name_len).ok_or_else(invalid_buffer)?, 8)?;
     let record_end = extension_offset
@@ -1003,10 +997,12 @@ fn name_list_record_layout(name_len: usize, uuid_len: usize) -> Result<(usize, u
     Ok((extension_offset, align_up(record_end, 8)?))
 }
 
+/// Returns the process-wide DM manager initialized during misc-device setup.
 fn manager() -> &'static DmManager {
     DM_MANAGER.get().unwrap()
 }
 
+/// Reads and validates the variable data offset from a `dm_ioctl` buffer.
 fn data_start(buffer: &[u8]) -> Result<usize> {
     let start = read_u32(buffer, OFF_DATA_START)? as usize;
     validate_ioctl_buffer_layout(buffer.len(), start)?;
@@ -1024,6 +1020,7 @@ fn align_up(value: usize, alignment: usize) -> Result<usize> {
         .ok_or_else(invalid_buffer)
 }
 
+/// Sets `DM_BUFFER_FULL_FLAG` when the caller-provided output area is too small.
 fn set_buffer_full(buffer: &mut [u8]) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)? | DM_BUFFER_FULL_FLAG;
     write_u32(buffer, OFF_FLAGS, flags)
@@ -1036,11 +1033,13 @@ fn write_version(buffer: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+/// Reads a required fixed-size NUL-terminated string from an ABI field.
 fn required_c_string(buffer: &[u8], offset: usize, len: usize, field: &str) -> Result<String> {
     optional_c_string(buffer, offset, len, field)?
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "Device Mapper 字符串字段不能为空"))
 }
 
+/// Reads an optional fixed-size NUL-terminated string from an ABI field.
 fn optional_c_string(
     buffer: &[u8],
     offset: usize,
@@ -1064,6 +1063,7 @@ fn optional_c_string(
     Ok(Some(value.to_string()))
 }
 
+/// Reads a variable-length NUL-terminated parameter string between two offsets.
 fn c_string_until(buffer: &[u8], start: usize, end: usize, _field: &str) -> Result<String> {
     if start >= end || end > buffer.len() {
         return Err(invalid_buffer());
@@ -1078,6 +1078,7 @@ fn c_string_until(buffer: &[u8], start: usize, end: usize, _field: &str) -> Resu
     Ok(value.to_string())
 }
 
+/// Writes and zero-pads a fixed-size NUL-terminated ABI string field.
 fn write_c_string_fixed(buffer: &mut [u8], offset: usize, len: usize, value: &str) -> Result<()> {
     if value.len() >= len {
         return_errno_with_message!(Errno::EINVAL, "输出字符串超过 ABI 字段长度");
@@ -1088,6 +1089,7 @@ fn write_c_string_fixed(buffer: &mut [u8], offset: usize, len: usize, value: &st
     Ok(())
 }
 
+/// Writes a variable-length NUL-terminated ABI string.
 fn write_c_string(buffer: &mut [u8], offset: usize, value: &str) -> Result<()> {
     let len = value.len().checked_add(1).ok_or_else(invalid_buffer)?;
     require_range(buffer, offset, len)?;
@@ -1096,6 +1098,7 @@ fn write_c_string(buffer: &mut [u8], offset: usize, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Verifies an ABI field range is fully contained in the copied buffer.
 fn require_range(buffer: &[u8], offset: usize, len: usize) -> Result<()> {
     let end = offset.checked_add(len).ok_or_else(invalid_buffer)?;
     if end > buffer.len() {
@@ -1104,6 +1107,7 @@ fn require_range(buffer: &[u8], offset: usize, len: usize) -> Result<()> {
     Ok(())
 }
 
+/// Reads one little-endian `u32` from an aligned or unaligned ABI offset.
 fn read_u32(buffer: &[u8], offset: usize) -> Result<u32> {
     require_range(buffer, offset, 4)?;
     Ok(u32::from_le_bytes(
@@ -1111,6 +1115,7 @@ fn read_u32(buffer: &[u8], offset: usize) -> Result<u32> {
     ))
 }
 
+/// Reads one little-endian `u64` from an aligned or unaligned ABI offset.
 fn read_u64(buffer: &[u8], offset: usize) -> Result<u64> {
     require_range(buffer, offset, 8)?;
     Ok(u64::from_le_bytes(
@@ -1118,6 +1123,7 @@ fn read_u64(buffer: &[u8], offset: usize) -> Result<u64> {
     ))
 }
 
+/// Writes one little-endian `u32` value after range and conversion checks.
 fn write_u32(buffer: &mut [u8], offset: usize, value: impl TryInto<u32>) -> Result<()> {
     let value = value
         .try_into()
@@ -1127,6 +1133,7 @@ fn write_u32(buffer: &mut [u8], offset: usize, value: impl TryInto<u32>) -> Resu
     Ok(())
 }
 
+/// Writes one little-endian `u64` value into the copied ABI buffer.
 fn write_u64(buffer: &mut [u8], offset: usize, value: u64) -> Result<()> {
     require_range(buffer, offset, 8)?;
     buffer[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
@@ -1203,6 +1210,10 @@ mod tests {
     use ostd::prelude::ktest;
 
     use super::*;
+
+    fn boxed<T: DmTarget + 'static>(target: T) -> DmTargetBox {
+        Box::new(target)
+    }
 
     fn test_buffer(size: usize) -> Vec<u8> {
         let mut buffer = vec![0u8; size];
@@ -1310,19 +1321,15 @@ mod tests {
 
     fn single_error_table(length: u64) -> Arc<DmTable> {
         Arc::new(
-            DmTable::new_targets(vec![DmTarget::Error(
-                ErrorTarget::new(Sid::new(0), length).unwrap(),
-            )])
-            .unwrap(),
+            DmTable::new_targets(vec![boxed(ErrorTarget::new(Sid::new(0), length).unwrap())])
+                .unwrap(),
         )
     }
 
     fn single_zero_table(length: u64) -> Arc<DmTable> {
         Arc::new(
-            DmTable::new_targets(vec![DmTarget::Zero(
-                ZeroTarget::new(Sid::new(0), length).unwrap(),
-            )])
-            .unwrap(),
+            DmTable::new_targets(vec![boxed(ZeroTarget::new(Sid::new(0), length).unwrap())])
+                .unwrap(),
         )
     }
 
@@ -1347,7 +1354,7 @@ mod tests {
             .map(|minor| status_backing_lease(*minor))
             .collect();
         Arc::new(
-            DmTable::new_targets(vec![DmTarget::Striped(
+            DmTable::new_targets(vec![boxed(
                 StripedTarget::new(
                     Sid::new(0),
                     length,
@@ -1361,31 +1368,27 @@ mod tests {
     }
 
     fn error_target(table: &DmTable, index: usize) -> &ErrorTarget {
-        let DmTarget::Error(target) = &table.targets()[index] else {
-            panic!("expected error target");
-        };
-        target
+        table.targets()[index]
+            .downcast_ref::<ErrorTarget>()
+            .expect("expected error target")
     }
 
     fn zero_target(table: &DmTable, index: usize) -> &ZeroTarget {
-        let DmTarget::Zero(target) = &table.targets()[index] else {
-            panic!("expected zero target");
-        };
-        target
+        table.targets()[index]
+            .downcast_ref::<ZeroTarget>()
+            .expect("expected zero target")
     }
 
     fn linear_target(table: &DmTable, index: usize) -> &LinearTarget {
-        let DmTarget::Linear(target) = &table.targets()[index] else {
-            panic!("expected linear target");
-        };
-        target
+        table.targets()[index]
+            .downcast_ref::<LinearTarget>()
+            .expect("expected linear target")
     }
 
     fn striped_target(table: &DmTable, index: usize) -> &StripedTarget {
-        let DmTarget::Striped(target) = &table.targets()[index] else {
-            panic!("expected striped target");
-        };
-        target
+        table.targets()[index]
+            .downcast_ref::<StripedTarget>()
+            .expect("expected striped target")
     }
 
     fn assert_failed_table_load_preserves_state(
@@ -1915,10 +1918,8 @@ mod tests {
         let first = status_backing_lease(1);
         let second = status_backing_lease(2);
         let table = DmTable::new_targets(vec![
-            DmTarget::Linear(
-                LinearTarget::new(Sid::new(0), 4, Sid::new(100), first.clone()).unwrap(),
-            ),
-            DmTarget::Striped(
+            boxed(LinearTarget::new(Sid::new(0), 4, Sid::new(100), first.clone()).unwrap()),
+            boxed(
                 StripedTarget::new(
                     Sid::new(4),
                     16,

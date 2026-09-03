@@ -1,38 +1,58 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::vec::Vec;
+//! Linux Device Mapper `striped` target support.
+//!
+//! A striped target distributes logical sectors across backing devices in chunk
+//! order. This file owns Linux parameter parsing, stripe geometry validation,
+//! per-sector mapping, and range splitting at chunk boundaries; `DmTable` only
+//! splits at target boundaries before calling into this target.
+
+use alloc::{format, string::String, vec::Vec};
 use core::ops::Range;
 
 use aster_block::{BlockDevice, BlockDeviceLease, id::Sid};
 use device_id::{DeviceId, MajorId, MinorId};
 
-use super::DmTargetParseError;
+use super::{
+    DmTarget, DmTargetMetadata, DmTargetParseError, STRIPED_METADATA, TargetIoAction, TargetRange,
+    TargetStatusMode,
+};
 use crate::TableError;
 
+/// One backing stripe entry parsed from a Linux `striped` target parameter list.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StripedBacking {
+    /// Backing block device ID for this stripe entry.
     id: DeviceId,
+    /// First backing sector used by the first chunk mapped to this stripe.
     backing_start: Sid,
 }
 
 impl StripedBacking {
+    /// Returns the backing block device ID encoded in the table parameters.
     pub fn id(&self) -> DeviceId {
         self.id
     }
 
+    /// Returns the first backing sector used by this stripe.
     pub fn backing_start(&self) -> Sid {
         self.backing_start
     }
 }
 
+/// Parsed `striped` parameters before backing leases are resolved.
 #[derive(Debug, Eq, PartialEq)]
 pub struct StripedTargetParams {
+    /// Number of stripes listed in the Linux parameter string.
     stripe_count: usize,
+    /// Number of 512-byte sectors per stripe chunk.
     chunk_size: u64,
+    /// Backing stripe descriptors in Linux table order.
     stripes: Vec<StripedBacking>,
 }
 
 impl StripedTargetParams {
+    /// Parses Linux `striped` parameters that already use `major:minor` backing tokens.
     pub fn parse(params: &str) -> Result<Self, TableError> {
         let fields = parse_striped_fields(params)?;
         let mut stripes = Vec::new();
@@ -50,35 +70,34 @@ impl StripedTargetParams {
         })
     }
 
+    /// Returns the number of backing stripes in one stripe row.
     pub fn stripe_count(&self) -> usize {
         self.stripe_count
     }
 
+    /// Returns the per-stripe chunk size in 512-byte sectors.
     pub fn chunk_size(&self) -> u64 {
         self.chunk_size
     }
 
+    /// Returns the parsed backing stripes in Linux parameter order.
     pub fn stripes(&self) -> &[StripedBacking] {
         &self.stripes
     }
 
+    /// Computes per-backing capacity demand, including a partial final stripe row.
     pub fn required_sectors(&self, stripe_index: usize, length: u64) -> Result<u64, TableError> {
         required_sectors(self.stripe_count, self.chunk_size, stripe_index, length)
     }
 
+    /// Checks logical overflow, stripe count, and backing capacities after leases resolve.
     pub fn validate_backing_ranges(
         &self,
         logical_start: Sid,
         length: u64,
         backing_capacities: &[u64],
     ) -> Result<(), TableError> {
-        if length == 0 {
-            return Err(TableError::ZeroLength);
-        }
-        logical_start
-            .to_raw()
-            .checked_add(length)
-            .ok_or(TableError::LogicalRangeOverflow)?;
+        TargetRange::new(logical_start, length)?;
         if backing_capacities.len() != self.stripe_count {
             return Err(TableError::InvalidTargetParams);
         }
@@ -98,69 +117,94 @@ impl StripedTargetParams {
     }
 }
 
+/// A resolved `striped` target that maps sectors across backing devices by chunk.
 #[derive(Debug)]
 pub struct StripedTarget {
-    logical_range: Range<Sid>,
+    /// Shared logical geometry used by table split and chunk mapping decisions.
+    range: TargetRange,
+    /// Number of sectors placed on one stripe before rotating to the next stripe.
     chunk_size: u64,
+    /// Number of sectors in one full row across all stripes.
     stripe_width: u64,
+    /// Resolved backing stripes in Linux parameter order.
     stripes: Vec<StripedTargetStripe>,
 }
 
 #[derive(Debug)]
 struct StripedTargetStripe {
+    /// First backing sector used by the first chunk mapped to this stripe.
     backing_start: Sid,
+    /// Backing identity retained for deps and table/status reporting.
     backing_id: DeviceId,
+    /// Lease that keeps the backing device alive while the table is installed.
     backing: BlockDeviceLease,
 }
 
+/// Mapping result for one logical sector in a striped target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StripedSectorMap {
+    /// Stripe selected by the logical sector's position inside the stripe row.
     stripe_index: usize,
+    /// Backing device receiving this logical sector.
     backing_id: DeviceId,
+    /// Backing sector after applying row, chunk, and backing-start offsets.
     backing_sector: Sid,
 }
 
 impl StripedSectorMap {
+    /// Returns the stripe index selected by the logical sector's chunk position.
     pub fn stripe_index(&self) -> usize {
         self.stripe_index
     }
 
+    /// Returns the backing device ID selected for this sector.
     pub fn backing_id(&self) -> DeviceId {
         self.backing_id
     }
 
+    /// Returns the backing sector corresponding to the logical sector.
     pub fn backing_sector(&self) -> Sid {
         self.backing_sector
     }
 }
 
+/// Mapping result for one contiguous subrange inside a single stripe chunk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StripedRangeMap {
+    /// Logical subrange covered by this mapping part.
     logical_range: Range<Sid>,
+    /// Stripe selected for the whole subrange.
     stripe_index: usize,
+    /// Backing device receiving the whole subrange.
     backing_id: DeviceId,
+    /// Backing subrange submitted after remapping.
     backing_range: Range<Sid>,
 }
 
 impl StripedRangeMap {
+    /// Returns the logical range covered by this chunk-local mapping part.
     pub fn logical_range(&self) -> &Range<Sid> {
         &self.logical_range
     }
 
+    /// Returns the backing stripe index for this mapping part.
     pub fn stripe_index(&self) -> usize {
         self.stripe_index
     }
 
+    /// Returns the backing device ID for this mapping part.
     pub fn backing_id(&self) -> DeviceId {
         self.backing_id
     }
 
+    /// Returns the backing range to submit for this mapping part.
     pub fn backing_range(&self) -> &Range<Sid> {
         &self.backing_range
     }
 }
 
 impl StripedTarget {
+    /// Parses one target, validates pure geometry, parses all tokens, then resolves leases.
     pub(super) fn parse_with<E>(
         logical_start: Sid,
         length: u64,
@@ -207,13 +251,14 @@ impl StripedTarget {
         Self::new(logical_start, length, params, backings).map_err(Into::into)
     }
 
+    /// Builds a resolved striped target after validating backing IDs and capacities.
     pub fn new(
         logical_start: Sid,
         length: u64,
         params: StripedTargetParams,
         backings: Vec<BlockDeviceLease>,
     ) -> Result<Self, TableError> {
-        let (logical_end, stripe_width) = validate_striped_geometry(
+        let (range, stripe_width) = validate_striped_geometry(
             logical_start,
             length,
             params.stripe_count(),
@@ -247,71 +292,107 @@ impl StripedTarget {
             .collect();
 
         Ok(Self {
-            logical_range: logical_start..Sid::new(logical_end),
+            range,
             chunk_size: params.chunk_size(),
             stripe_width,
             stripes,
         })
     }
 
+    /// Returns the logical sector range covered by this target.
     pub fn logical_range(&self) -> &Range<Sid> {
-        &self.logical_range
+        self.range.logical_range()
     }
 
+    /// Returns the target length in 512-byte sectors.
     pub fn length(&self) -> u64 {
-        self.logical_range.end.to_raw() - self.logical_range.start.to_raw()
+        self.range.length()
     }
 
+    /// Returns the per-stripe chunk size in 512-byte sectors.
     pub fn chunk_size(&self) -> u64 {
         self.chunk_size
     }
 
+    /// Returns the number of backing stripes in each stripe row.
     pub fn stripe_count(&self) -> usize {
         self.stripes.len()
     }
 
+    /// Returns the full stripe row width in 512-byte sectors.
     pub fn stripe_width(&self) -> u64 {
         self.stripe_width
     }
 
+    /// Returns the backing device ID for a stripe index, if present.
     pub fn backing_id(&self, stripe_index: usize) -> Option<DeviceId> {
         self.stripes
             .get(stripe_index)
             .map(|stripe| stripe.backing_id)
     }
 
+    /// Visits backing IDs in stripe order for deps and flush fan-out.
     pub fn for_each_backing_id(&self, mut f: impl FnMut(DeviceId)) {
         for stripe in &self.stripes {
             f(stripe.backing_id);
         }
     }
 
+    /// Visits stripe metadata in Linux table/status output order.
     pub fn for_each_stripe(&self, mut f: impl FnMut(DeviceId, Sid)) {
         for stripe in &self.stripes {
             f(stripe.backing_id, stripe.backing_start);
         }
     }
 
+    /// Returns the resolved backing device for a stripe index, if present.
     pub fn backing(&self, stripe_index: usize) -> Option<&dyn BlockDevice> {
         self.stripes
             .get(stripe_index)
             .map(|stripe| stripe.backing.device().as_ref())
     }
 
+    /// Visits all resolved backing devices in stripe order.
     pub fn for_each_backing<'a>(&'a self, mut f: impl FnMut(&'a dyn BlockDevice)) {
         for stripe in &self.stripes {
             f(stripe.backing.device().as_ref());
         }
     }
 
-    pub fn map_sector(&self, logical: Sid) -> Option<StripedSectorMap> {
-        if !self.logical_range.contains(&logical) {
-            return None;
-        }
+    /// Formats Linux table output parameters that can be loaded again.
+    fn table_params(&self) -> String {
+        let mut params = format!("{} {}", self.stripe_count(), self.chunk_size());
+        self.for_each_stripe(|backing, backing_start| {
+            params.push_str(&format!(
+                " {}:{} {}",
+                backing.major().get(),
+                backing.minor().get(),
+                backing_start.to_raw()
+            ));
+        });
+        params
+    }
 
-        let offset = logical
-            .to_raw()
-            .checked_sub(self.logical_range.start.to_raw())?;
+    /// Formats Linux runtime status parameters for striped targets.
+    fn runtime_status_params(&self) -> String {
+        let mut params = format!("{}", self.stripe_count());
+        self.for_each_stripe(|backing, _| {
+            params.push_str(&format!(
+                " {}:{}",
+                backing.major().get(),
+                backing.minor().get()
+            ));
+        });
+        params.push_str(" 1 ");
+        for _ in 0..self.stripe_count() {
+            params.push('A');
+        }
+        params
+    }
+
+    /// Maps one logical sector to the backing sector selected by striped chunk math.
+    pub fn map_sector(&self, logical: Sid) -> Option<StripedSectorMap> {
+        let offset = self.range.offset_of(logical)?;
         let row = offset / self.stripe_width;
         let within_row = offset % self.stripe_width;
         let stripe_index = usize::try_from(within_row / self.chunk_size).ok()?;
@@ -332,13 +413,11 @@ impl StripedTarget {
         })
     }
 
+    /// Splits a logical range into maximal contiguous pieces that stay within one chunk.
     pub fn map_range(&self, logical: Range<Sid>) -> Option<Vec<StripedRangeMap>> {
         let start = logical.start.to_raw();
         let end = logical.end.to_raw();
-        if start >= end {
-            return None;
-        }
-        if start < self.logical_range.start.to_raw() || end > self.logical_range.end.to_raw() {
+        if !self.range.contains_range(&logical) {
             return None;
         }
 
@@ -346,7 +425,7 @@ impl StripedTarget {
         let mut parts = Vec::new();
         while cursor < end {
             let sector = self.map_sector(Sid::new(cursor))?;
-            let offset = cursor.checked_sub(self.logical_range.start.to_raw())?;
+            let offset = cursor.checked_sub(self.range.logical_range().start.to_raw())?;
             let within_row = offset % self.stripe_width;
             let chunk_offset = within_row % self.chunk_size;
             let remaining_in_chunk = self.chunk_size.checked_sub(chunk_offset)?;
@@ -367,6 +446,54 @@ impl StripedTarget {
     }
 }
 
+impl DmTarget for StripedTarget {
+    #[cfg(ktest)]
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn metadata(&self) -> DmTargetMetadata {
+        STRIPED_METADATA
+    }
+
+    fn logical_range(&self) -> &Range<Sid> {
+        self.logical_range()
+    }
+
+    fn length(&self) -> u64 {
+        self.length()
+    }
+
+    fn for_each_backing_id(&self, f: &mut dyn FnMut(DeviceId)) {
+        self.for_each_backing_id(f);
+    }
+
+    fn for_each_backing<'a>(&'a self, f: &mut dyn FnMut(&'a dyn BlockDevice)) {
+        self.for_each_backing(f);
+    }
+
+    fn status_params(&self, mode: TargetStatusMode) -> Result<String, TableError> {
+        match mode {
+            TargetStatusMode::Table => Ok(self.table_params()),
+            TargetStatusMode::Status => Ok(self.runtime_status_params()),
+        }
+    }
+
+    fn map_io_range(&self, logical: Range<Sid>) -> Option<Vec<TargetIoAction<'_>>> {
+        let stripe_parts = self.map_range(logical)?;
+        let mut actions = Vec::new();
+        for stripe_part in stripe_parts {
+            actions.push(TargetIoAction::Remap {
+                logical_range: stripe_part.logical_range().clone(),
+                backing_start: stripe_part.backing_range().start,
+                backing: self.backing(stripe_part.stripe_index())?,
+            });
+        }
+        Some(actions)
+    }
+}
+
+/// Computes one stripe's backing-sector demand for possibly uneven final rows.
 fn required_sectors(
     stripe_count: usize,
     chunk_size: u64,
@@ -402,6 +529,7 @@ fn required_sectors(
         .ok_or(TableError::BackingRangeOverflow)
 }
 
+/// Rejects backing-start plus required-sector overflow before resolving leases.
 fn validate_backing_range_arithmetic(
     length: u64,
     stripe_count: usize,
@@ -417,24 +545,19 @@ fn validate_backing_range_arithmetic(
     Ok(())
 }
 
+/// Validates striped target arithmetic and returns logical range plus stripe width.
 fn validate_striped_geometry(
     logical_start: Sid,
     length: u64,
     stripe_count: usize,
     chunk_size: u64,
-) -> Result<(u64, u64), TableError> {
-    if length == 0 {
-        return Err(TableError::ZeroLength);
-    }
-    let logical_end = logical_start
-        .to_raw()
-        .checked_add(length)
-        .ok_or(TableError::LogicalRangeOverflow)?;
+) -> Result<(TargetRange, u64), TableError> {
+    let range = TargetRange::new(logical_start, length)?;
     let stripe_count = u64::try_from(stripe_count).map_err(|_| TableError::InvalidTargetParams)?;
     let stripe_width = stripe_count
         .checked_mul(chunk_size)
         .ok_or(TableError::BackingRangeOverflow)?;
-    Ok((logical_end, stripe_width))
+    Ok((range, stripe_width))
 }
 
 struct ParsedStripedFields<'a> {
@@ -442,6 +565,7 @@ struct ParsedStripedFields<'a> {
     stripes: Vec<(&'a str, u64)>,
 }
 
+/// Parses count, chunk size, backing token, and offset fields exactly once.
 fn parse_striped_fields(params: &str) -> Result<ParsedStripedFields<'_>, TableError> {
     let mut fields = params.split_ascii_whitespace();
     let stripe_count = fields
@@ -497,7 +621,7 @@ fn parse_device_id(dev: &str) -> Result<DeviceId, TableError> {
 
 #[cfg(ktest)]
 mod tests {
-    use alloc::{string::String, sync::Arc, vec};
+    use alloc::{sync::Arc, vec};
 
     use aster_block::{
         BlockDeviceMeta,
