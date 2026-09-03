@@ -1,0 +1,472 @@
+# 生产代码修改后的验证命令与执行链路
+
+## 执行摘要
+
+本文记录写完生产代码后常用的验证命令，以及这些命令背后实际执行的链路。命令默认在 Docker 容器内、仓库根目录 `/root/asterinas` 下执行，因此所有示例都直接从仓库根目录开始。
+
+验证不是为了“跑一个命令看绿不绿”，而是为了知道每一层在证明什么：
+
+- `cargo fmt --all --check` 证明 Rust 代码格式没有偏离 rustfmt 输出。
+- `git diff --check` 证明当前 diff 没有 Git 能识别的空白错误和冲突 marker。
+- `make ktest` 证明被选中的 kernel crate 能被 OSDK 构造成测试内核，并在 QEMU 中由 ktest runner 执行。
+- DM 系统测试证明真实 NixOS guest 内的 `dmsetup`、LVM2、文件系统和真实 block device I/O 链路可用。
+
+掌握链路后，遇到“慢”或“失败”时就能拆阶段定位：是 Makefile 参数问题、Cargo 构建问题、OSDK bundle 问题、QEMU/KVM 问题、kernel boot 问题，还是 ktest/system test 本身的问题。
+
+## 1. 基础验证命令
+
+### 1.1 Rust 格式检查
+
+```bash
+cargo fmt --all --check
+```
+
+目的：确认 Rust 源码与 Rust 官方格式化工具 `rustfmt` 的规则一致。
+
+`rustfmt` 是 Rust 官方提供的代码格式化工具，通常作为 Rust toolchain 的一个组件随 `rustup` 管理。它不负责判断业务逻辑是否正确，而是把 Rust 源码解析后按统一规则重新排版，例如缩进、换行、空格、链式调用换行、`use` 分组等。
+
+依赖关系：
+
+```text
+cargo fmt
+  → 使用当前项目选中的 Rust toolchain
+  → 调用该 toolchain 中的 rustfmt 组件
+  → rustfmt 解析 Rust 源码并生成规范格式
+  → --check 模式下只比较结果，不写回文件
+```
+
+这里的“当前项目选中的 Rust toolchain”通常由 `rust-toolchain.toml`、`rust-toolchain` 或当前 shell 的 `rustup default` 决定。因此不是随便安装一个 stable/nightly 就一定够，而是要安装项目实际使用的 toolchain，并且这个 toolchain 里要有 `rustfmt` 组件。
+
+检查当前工具链和 `rustfmt` 是否可用：
+
+```bash
+rustc --version
+cargo --version
+rustfmt --version
+cargo fmt --version
+```
+
+如果使用 `rustup`，还可以看当前目录会选择哪个 toolchain：
+
+```bash
+rustup show
+rustup component list --installed | grep rustfmt
+```
+
+如果缺少 `rustfmt`，常见安装方式是：
+
+```bash
+rustup component add rustfmt
+```
+
+如果项目使用指定 toolchain，例如 nightly，则安装到对应 toolchain：
+
+```bash
+rustup component add rustfmt --toolchain nightly
+```
+
+如果仓库使用 `rust-toolchain.toml` 固定了更具体的 nightly 版本，则应按 `rustup show` 中显示的 active toolchain 安装对应组件。
+
+内部检查链路：
+
+```text
+工作区 Rust 源码
+  → cargo 根据当前目录选择 Rust toolchain
+  → cargo fmt 调用该 toolchain 的 rustfmt
+  → rustfmt 解析 crate/module 中的 Rust 语法树
+  → rustfmt 在内存中生成规范格式结果
+  → --check 将规范格式结果与磁盘文件比较
+  → 不一致则输出 diff 并返回失败
+```
+
+它能发现：
+
+- Rust 文件缩进、换行、import 分组等格式问题。
+- 手工编辑后忘记运行 formatter。
+- 缺少 `rustfmt` 组件或当前 toolchain 不完整。
+- 某些语法未闭合导致 rustfmt 无法解析。
+
+它不能证明：
+
+- 代码能通过 `cargo check` 或 `cargo build`。
+- 类型、生命周期、trait bound、feature/cfg 组合一定正确。
+- 代码语义正确或测试覆盖充分。
+- QEMU、ktest 或系统测试能启动。
+
+失败时处理：
+
+```bash
+cargo fmt --all
+cargo fmt --all --check
+```
+
+### 1.2 Git diff 空白检查
+
+```bash
+git diff --check
+```
+
+目的：检查当前未提交 diff 里是否有不适合进入提交的空白问题，例如行尾空格、文件末尾空白错误，或残留 merge conflict marker。
+
+`git diff` 是 Git 用来查看“当前内容相对另一个版本改了什么”的命令。日常验证里不需要理解 Git 的底层存储，只要熟悉几个常用看法：
+
+```bash
+git diff
+```
+
+查看 working tree 中还没 staged 的改动。
+
+```bash
+git diff --staged
+```
+
+查看已经 staged、准备进入下一次 commit 的改动。
+
+```bash
+git diff -- <path>
+```
+
+只看某个文件或目录的改动，例如：
+
+```bash
+git diff -- "kernel/core/comps/device-mapper/src"
+```
+
+`--check` 是 `git diff` 的一个验证模式。它不关心业务逻辑，只扫描 diff 中 Git 能识别的空白错误：
+
+```bash
+git diff --check
+```
+
+也可以限制范围：
+
+```bash
+git diff --check -- "kernel/core/comps/device-mapper/src" "kernel/core/src/device/misc/device_mapper.rs"
+```
+
+使用时重点看两点：
+
+1. 命令没有输出且 exit code 为 0：说明当前检查范围没有 Git 空白错误。
+2. 命令输出 `path:line: message`：说明对应文件对应行附近有问题，需要打开文件修掉。
+
+常见输出含义：
+
+```text
+path/to/file.rs:42: trailing whitespace.
+```
+
+表示第 42 行行尾有多余空格。
+
+```text
+path/to/file.md:10: leftover conflict marker
+```
+
+表示文件里可能还残留 `<<<<<<<`、`=======`、`>>>>>>>` 这类 merge conflict marker。
+
+它和 `cargo fmt` 的关系：
+
+- `cargo fmt` 只处理 Rust 格式，并且会按 rustfmt 规则重排 Rust 代码。
+- `git diff --check` 不重排代码，只检查当前 diff 的空白错误。
+- `git diff --check` 能覆盖 Markdown、Shell、TOML、patch 等非 Rust 文件。
+- 所以两者都要跑：`cargo fmt` 解决 Rust 格式，`git diff --check` 兜住跨文件类型的 diff 空白问题。
+
+### 1.3 工作区状态检查
+
+```bash
+git status --short
+```
+
+目的：确认验证后工作区状态与本轮预期一致，特别是区分代码/文档改动、测试产物日志和新脚本文件。
+
+定向 ktest 优先从仓库根目录调用 [ktest_crate.sh](../myshell/ktest_crate.sh)，由脚本进入目标 crate 目录并补齐 release、boot、KVM、initramfs 等公共参数；不要为了筛选 crate 临时修改根 [Cargo.toml](../Cargo.toml) 的 `default-members`。例如：
+
+```bash
+myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::<test_path>
+```
+
+或：
+
+```bash
+myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>
+```
+
+`git status --short` 的作用是确认本轮留下的文件是否都在预期范围内。当前 ktest wrapper 会在目标 crate 下生成 `<crate-dir>/ktest.log` 作为测试产物；是否提交这类结果日志应由阶段要求决定，不能默认混入代码提交。
+
+## 2. `make ktest` 背后到底在做什么
+
+通用入口：
+
+```bash
+make ktest
+```
+
+定向入口推荐从仓库根目录调用 [ktest_crate.sh](../myshell/ktest_crate.sh)，避免临时修改根 `Cargo.toml`，也避免每次手写 KVM/initramfs 参数：
+
+```bash
+myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::<test_path>
+```
+
+ioctl 层测试：
+
+```bash
+myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>
+```
+
+先看总链路：
+
+| 阶段 | 谁在做 | 主要动作 | 关键产物/日志 | 慢或失败时优先看 |
+|---|---|---|---|---|
+| 1. Makefile 入口 | `make ktest` | 设置 `CONSOLE=ttyS0`，准备前置依赖，然后调用 `cargo osdk test` | 终端 stdout | Makefile 参数是否被命令行覆盖 |
+| 2. initramfs 前置依赖 | `make initramfs` | 构建测试用 initramfs | `test/initramfs/build/initramfs.cpio.gz` | initramfs 是否在重建、VDSO 环境是否缺失 |
+| 3. cargo-osdk 前置依赖 | `$(CARGO_OSDK)` | 确认 `~/.cargo/bin/cargo-osdk` 可用；必要时重新安装 OSDK | `~/.cargo/bin/cargo-osdk` | 是否触发 `cargo install cargo-osdk --path osdk` |
+| 4. 选择测试 crate | `cargo osdk test` | 根据当前目录识别 current crate；在根目录时才受 workspace/default-members 影响 | 当前 crate 或 root `Cargo.toml` | 是否站在正确 crate 目录、是否误从根目录扩大测试范围 |
+| 5. 生成 test base crate | OSDK test command | 为每个被测 crate 生成临时 test base crate，并写入测试白名单 | `target/osdk/<crate>/src/main.rs` | TESTNAME 是否正确进入 whitelist |
+| 6. 编译测试内核 | OSDK build | 用 `--cfg ktest` 编译 kernel ELF，让 `#[cfg(ktest)]` 测试代码进入内核 | `target/<arch>/<profile>/<crate>` | Rust 编译错误、profile 改变、增量缓存失效 |
+| 7. 生成启动 bundle | OSDK bundle | 复制 kernel/initramfs，按 boot method 生成 GRUB ISO 等启动产物 | `target/osdk/<crate>/bundle.toml`、ISO | bundle/cache 是否重建、GRUB ISO 是否耗时 |
+| 8. 启动 QEMU | OSDK bundle runner | 拼 QEMU 参数并启动 guest；`ktest_crate.sh` 保留终端输出并在结束后清理 QEMU 原始日志 | 终端 stdout；最终 `<crate-dir>/ktest.log` | 是否带 `-accel kvm`，是否退回 TCG，是否进入 ktest runner |
+| 9. guest 内运行 ktest runner | `osdk-test-kernel` | 枚举所有 `#[ktest]`，按 crate/test whitelist 过滤并执行 | `[ktest runner]`、`test result` | 测试是否卡住、panic、过滤条件是否过宽 |
+| 10. 返回结果 | OSDK/QEMU | guest 通过 `isa-debug-exit` 退出，OSDK 解码成功/失败 | shell exit code、`test result` | QEMU 自身失败、kernel panic、triple fault |
+
+几个最容易误解的点：
+
+| 现象 | 实际含义 |
+|---|---|
+| `make ktest` 不是普通 `cargo test` | 它会构建一个可启动测试内核，并在 QEMU guest 里跑 kernel-mode tests。 |
+| 只跑一个测试仍显示很多 tests/crates | guest 内 runner 会先枚举完整 ktest tree，再用 whitelist 过滤。 |
+| `... filtered out` | 不是失败，只是当前 crate 中未匹配测试被跳过；如果目标是覆盖某个路径而结果为 `0 passed`，应改跑正确 crate、修正过滤路径或扩大到 crate 全量 ktest。 |
+| `myshell/ktest_crate.sh` | 推荐用于定向 crate 测试；它会进入目标 crate 并补齐 release、KVM、initramfs 等关键参数。 |
+| ktest 很慢但 QEMU 已出现 | 多半要看 guest boot 到 `[ktest runner]` 之间，例如 KVM/TCG、boot protocol、kernel init。 |
+
+定向 ktest 的过滤链路可以记成一行：
+
+```text
+命令行 TESTNAME → OSDK 写入 KTEST_TEST_WHITELIST → guest 内 ktest runner 按后缀匹配测试路径 → 不匹配的计入 filtered out
+```
+
+`#[cfg(ktest)]` 的编译链路可以记成一行：
+
+```text
+cargo osdk test → RUSTFLAGS 加 `--cfg ktest` → `#[cfg(ktest)]` 测试模块/helper 编进 kernel ELF → 正常生产 build 不包含这些测试代码
+```
+
+慢启动定位也先看一张表：
+
+| 观察阶段 | 如果这里慢，优先怀疑 |
+|---|---|
+| 命令开始 → cargo build 完成 | 编译增量失效、profile 改变、当前目录选错导致测试 crate 过大、依赖更新 |
+| cargo build 完成 → QEMU 进程出现 | OSDK bundle、GRUB ISO、initramfs 打包 |
+| QEMU 进程出现 → 终端出现 boot / runner 输出 | QEMU 参数、固件启动、日志重定向 |
+| boot 输出 → `[ktest runner]` | KVM/TCG、boot protocol、kernel 初始化、panic |
+| `[ktest runner]` → `test result` | 测试本身慢、死锁、过滤条件过宽 |
+
+常用定位命令：
+
+```bash
+pgrep -af '[q]emu-system' || true
+cat <crate-dir>/ktest.log
+```
+
+本次发现的典型问题：根目录 `make ktest CARGO_OSDK_TEST_ARGS="..."` 覆盖 Make 变量后没有显式带 `--qemu-args="-accel kvm"`，实际 QEMU 走 TCG，启动时间明显变慢。后续定向测试优先从仓库根目录调用 [ktest_crate.sh](../myshell/ktest_crate.sh)，由脚本统一补齐 KVM/initramfs/release 参数，并通过 `timeout --foreground` 避免交互终端里 QEMU 被 job-control stop。
+
+## 3. DM system test 背后在做什么
+
+### 3.1 表层命令
+
+```bash
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh <suite>
+```
+
+常用 suite：
+
+```bash
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dmsetup-cli
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --lvm2-cli
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dataplane-edge
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2
+```
+
+### 3.2 system test 的执行链路
+
+系统测试不是 ktest。它不把 `#[ktest]` 函数编进测试 kernel，而是启动一个 NixOS guest，在 guest 里运行真实用户态命令。
+
+链路：
+
+```text
+myshell/run_dm_system_tests.sh <suite>
+  → 选择对应子脚本
+  → 子脚本 source myshell/lib/dm_nixos_test.sh
+  → dm_prepare_nixos_test
+      → 检查无残留 QEMU
+      → 检查 target/nixos/asterinas.img 存在
+      → 准备/重置 DM_TEST_IMAGES
+  → dm_run_guest_script 或 dm_run_two_guest_test
+      → setsid make run_nixos
+      → tools/nixos/run.sh 拼 QEMU 命令
+      → 挂载 NixOS root image 和测试 raw disk images
+      → 等待 guest log 出现 root@asterinas prompt
+      → 计算 *_guest_ready_after=<N>s
+      → 把 guest script 写入 QEMU stdin
+  → guest 内执行 dmsetup/LVM2/dd/mount/reboot 等命令
+  → guest 输出 CHECK_PASS_* 和 TEST_PASS_*
+  → host 扫描日志，输出 HOST_PASS_* 或 HOST_FAIL_*
+```
+
+### 3.3 system test 验证的层次
+
+| suite | 验证层次 | 实际证明什么 |
+|---|---|---|
+| `--dmsetup-cli` | 真实 libdevmapper 控制面 | `/dev/mapper/control`、ioctl ABI、table/status/deps/remove 等用户可见语义 |
+| `--lvm2-cli` | 真实 LVM2 控制面 | PV/VG/LV 生命周期、DM table 生成、scan/activation、文件系统 I/O |
+| `--dataplane-edge` | raw DM 数据面 | dmsetup table → mapper I/O → backing disk 布局是否完全一致 |
+| `--linear-lvm2-cross-segment` | LVM2 linear 多 segment | 扩容形成多 segment、reboot recovery、shrink 回单段 |
+| `--striped-lvm2-cross-segment` | LVM2 striped 多 segment | N-to-2N striped segment、reboot recovery、shrink 回单段 |
+| `--mixed-lvm2` | mixed table | 同一 LV 内 linear + striped 混合 table 的 I/O 和恢复 |
+
+### 3.4 guest ready marker 的含义
+
+system test 输出类似：
+
+```text
+HOST_INFO_<TEST_ID> guest_guest_ready_after=<N>s
+HOST_INFO_<TEST_ID> first_guest_ready_after=<N>s
+HOST_INFO_<TEST_ID> second_guest_ready_after=<N>s
+```
+
+这个时间来自 [myshell/lib/dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh)：
+
+```text
+start_ts=$(date +%s)
+  → setsid make run_nixos 启动 QEMU
+  → tail 日志等待 root@asterinas
+  → elapsed=$(date +%s - start_ts)
+  → echo HOST_INFO_<TEST_ID> ..._guest_ready_after=<elapsed>s
+```
+
+它表示 guest shell 可接收命令，不表示 suite 完整完成。
+
+### 3.5 为什么 system test 能证明真实数据面
+
+以 `--dataplane-edge` 的 linear 三段 remap 为例：
+
+```text
+创建三块测试 disk image
+  → guest 内定位 /dev/vd* 对应 serial
+  → dmsetup create 三段 linear table
+  → 向 /dev/mapper/dm_linear_edge 写入可区分 sector payload
+  → 从 mapper 读回验证用户视角连续
+  → 从每个 backing disk 指定 offset 直接读出实际内容
+  → 与 payload 切片逐段比较
+```
+
+这证明的不只是 mapper readback 正确，还证明 logical sector 到 backing sector 的 remap、跨 segment BIO split、deps 顺序和 backing offset 都正确。
+
+striped 跨边界测试类似：
+
+```text
+创建 striped 2 4 table
+  → 从 mapper sector 2 开始写 12 sectors
+  → 覆盖 partial first chunk、完整 stripe row、partial final row
+  → mapper readback 验证用户视角
+  → 分别构造两个 backing disk 的 expected layout
+  → 直接读 backing disk 并比较
+```
+
+这能发现单纯 ktest mock 不容易覆盖的真实块设备布局错误。
+
+## 4. 推荐验证组合
+
+### 4.1 任何生产 Rust 代码修改后
+
+```bash
+cargo fmt --all --check
+git diff --check
+git status --short
+```
+
+测试表现不像预期时，优先确认 `git status --short` 输出是否只包含本轮预期文件；如果出现意外的 workspace 配置改动，应按普通工作区异常处理，而不是把某个单文件 diff 作为固定验证步骤。
+
+### 4.2 改 DM core target/table 数据面
+
+```bash
+cargo fmt --all --check
+git diff --check -- "kernel/core/comps/device-mapper/src"
+```
+
+定向 ktest：
+
+```bash
+myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::<test_path>
+```
+
+如果改动影响真实数据面边界：
+
+```bash
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dataplane-edge
+```
+
+### 4.3 改 DM ioctl/control-plane
+
+```bash
+cargo fmt --all --check
+git diff --check -- "kernel/core/comps/device-mapper/src" "kernel/core/src/device/misc/device_mapper.rs"
+```
+
+定向 ioctl ktest：
+
+```bash
+myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>
+```
+
+如果改变用户可见 dmsetup 语义：
+
+```bash
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dmsetup-cli
+```
+
+如果改变 LVM2 可见行为或 segment 布局：
+
+```bash
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
+```
+
+### 4.4 测试前后检查 QEMU 残留
+
+```bash
+pgrep -af '[q]emu-system' || true
+```
+
+目的：避免多个 QEMU 同时争用同一批测试 image、host port 或日志文件。
+
+如果发现残留，不要直接杀未知 QEMU；先确认它是否是当前 run 启动的进程。只停止当前测试自己启动的进程。
+
+## 5. 通过标准
+
+一次生产代码修改通常至少需要满足：
+
+- `cargo fmt --all --check` 通过。
+- `git diff --check` 通过。
+- 相关定向 [ktest_crate.sh](../myshell/ktest_crate.sh) 或必要的 `make ktest` 通过。
+- 如果影响真实 `dmsetup`/LVM2/数据面语义，相关 system suite 输出 `HOST_PASS_*`。
+- 测试后无 QEMU 残留。
+- 定向 ktest 使用 `myshell/ktest_crate.sh <crate-dir> [filter]`，并在对应 `<crate-dir>/ktest.log` 中看到有效结果；`0 passed; ... filtered out` 不算目标覆盖。
+
+判断 system test 完整通过时，要看最终 marker：
+
+```text
+TEST_PASS_...
+HOST_PASS_...
+```
+
+只有中间的 `CHECK_PASS_*` 不代表完整 suite 通过。
+
+## 6. 核心方法论
+
+1. 先知道命令会进入哪条链路，再解释结果。
+2. 先看阶段 marker，再判断是构建慢、QEMU 慢、boot 慢还是测试慢。
+3. 定向 ktest 的过滤发生在 guest 内 ktest runner，不是宿主 shell 层过滤。
+4. `myshell/ktest_crate.sh` 的 `<crate-dir>` 决定 OSDK 要为哪个 crate 生成测试内核；过滤参数只决定 runner 最后跑哪些测试。
+5. QEMU 参数是性能和启动路径判断的关键证据，尤其要确认是否带 `-accel kvm`。
+6. ktest 证明 kernel 内部逻辑；system test 证明真实用户态工具和真实 block device 链路。
