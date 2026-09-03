@@ -1,39 +1,94 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Linux Device Mapper `error` target support.
+//!
+//! The error target owns a logical sector range but has no backing device. It is
+//! used for deterministic failure regions: non-flush I/O reports `IoError`, while
+//! table metadata such as range and length still behaves like a normal target.
+
+use alloc::{string::String, vec::Vec};
 use core::{fmt::Debug, ops::Range};
 
-use aster_block::id::Sid;
+use aster_block::{BlockDevice, id::Sid};
+use device_id::DeviceId;
 
+use super::{
+    DmTarget, DmTargetMetadata, ERROR_METADATA, TargetIoAction, TargetRange, TargetStatusMode,
+};
 use crate::TableError;
 
-/// An `error` target that always completes normal reads and writes with I/O error.
+/// An `error` target that owns a range and makes normal data I/O fail predictably.
 #[derive(Debug)]
 pub struct ErrorTarget {
-    logical_range: Range<Sid>,
+    /// Shared logical geometry used by table split and direct-complete decisions.
+    range: TargetRange,
 }
 
 impl ErrorTarget {
-    pub fn new(logical_start: Sid, length: u64) -> Result<Self, TableError> {
-        if length == 0 {
-            return Err(TableError::ZeroLength);
+    /// Parses Linux `error` target parameters and builds the resolved target.
+    pub(super) fn parse(logical_start: Sid, length: u64, params: &str) -> Result<Self, TableError> {
+        if !params.trim().is_empty() {
+            return Err(TableError::InvalidTargetParams);
         }
+        Self::new(logical_start, length)
+    }
 
-        let logical_end = logical_start
-            .to_raw()
-            .checked_add(length)
-            .ok_or(TableError::LogicalRangeOverflow)?;
-
+    /// Builds an error target after rejecting zero length and logical overflow.
+    pub fn new(logical_start: Sid, length: u64) -> Result<Self, TableError> {
         Ok(Self {
-            logical_range: logical_start..Sid::new(logical_end),
+            range: TargetRange::new(logical_start, length)?,
         })
     }
 
+    /// Returns the logical range that is visible to table-level split decisions.
     pub fn logical_range(&self) -> &Range<Sid> {
-        &self.logical_range
+        self.range.logical_range()
     }
 
+    /// Returns the target length in 512-byte sectors for table/status output.
     pub fn length(&self) -> u64 {
-        self.logical_range.end.to_raw() - self.logical_range.start.to_raw()
+        self.range.length()
+    }
+
+    /// Checks whether an I/O subrange should use this target's error action.
+    pub(super) fn contains_range(&self, logical: &Range<Sid>) -> bool {
+        self.range.contains_range(logical)
+    }
+}
+
+impl DmTarget for ErrorTarget {
+    #[cfg(ktest)]
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn metadata(&self) -> DmTargetMetadata {
+        ERROR_METADATA
+    }
+
+    fn logical_range(&self) -> &Range<Sid> {
+        self.logical_range()
+    }
+
+    fn length(&self) -> u64 {
+        self.length()
+    }
+
+    fn for_each_backing_id(&self, _f: &mut dyn FnMut(DeviceId)) {}
+
+    fn for_each_backing<'a>(&'a self, _f: &mut dyn FnMut(&'a dyn BlockDevice)) {}
+
+    fn status_params(&self, _mode: TargetStatusMode) -> Result<String, TableError> {
+        Ok(String::new())
+    }
+
+    fn map_io_range(&self, logical: Range<Sid>) -> Option<Vec<TargetIoAction<'_>>> {
+        if !self.contains_range(&logical) {
+            return None;
+        }
+        Some(alloc::vec![TargetIoAction::Error {
+            logical_range: logical,
+        }])
     }
 }
 
