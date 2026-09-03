@@ -1,6 +1,6 @@
 diff --git a/docs/img.md b/docs/img.md
 new file mode 100644
-index 000000000..64fb79aed
+index 000000000..dcf3f80af
 --- /dev/null
 +++ b/docs/img.md
 @@ -0,0 +1,916 @@
@@ -274,7 +274,7 @@ index 000000000..64fb79aed
 +    <tr><td><code>create_device</code><br><code>remove_device</code><br><code>remove_all</code></td><td><code>create_device_honors_readonly_flag</code><br><code>fills_device_header_from_runtime_state</code><br><code>fills_readonly_flag_for_readonly_device</code></td></tr>
 +    <tr><td><code>lookup_device</code><br><code>fill_device_header</code></td><td><code>selects_uuid_then_name_then_device_id</code></td></tr>
 +    <tr><td><code>device_rename</code><br><code>rename_device_runtime</code></td><td><code>rename_runtime_updates_manager_and_device_name</code><br><code>rename_runtime_treats_same_name_as_noop</code><br><code>device_rename_with_uuid_flag_updates_uuid_not_name</code><br><code>device_rename_rejects_duplicate_and_empty_uuid_without_state_change</code></td></tr>
-+    <tr><td><code>table_load</code><br><code>table_load_for_device</code><br><code>parse_linear_params</code><br><code>validate_target_spec_next</code></td><td><code>loads_multiple_targets_using_dm_target_spec_next_offsets</code><br><code>loads_single_striped_target_through_ioctl</code><br><code>loads_mixed_linear_and_striped_targets_through_ioctl</code><br><code>parses_exact_linear_parameter_set</code></td></tr>
++    <tr><td><code>table_load</code><br><code>table_load_for_device</code><br><code>parse_target_with</code><br><code>validate_target_spec_next</code></td><td><code>loads_multiple_targets_using_dm_target_spec_next_offsets</code><br><code>loads_single_striped_target_through_ioctl</code><br><code>loads_mixed_linear_and_striped_targets_through_ioctl</code><br><code>parses_exact_linear_parameter_set</code></td></tr>
 +    <tr><td><code>table_load_for_device</code><br><code>map_table_error</code></td><td><code>rejects_zero_target_table_load_before_state_changes</code><br><code>rejects_unsupported_table_targets_without_changing_device_state</code><br><code>rejects_missing_backing_without_setting_readonly_or_table</code><br><code>rejects_invalid_linear_params_without_changing_device_state</code></td></tr>
 +    <tr><td><code>device_suspend</code><br><code>selected_table</code></td><td><code>resume_ioctl_activates_inactive_table_for_active_queries</code><br><code>resume_ioctl_replaces_active_linear_table_with_ioctl_loaded_mixed_table</code><br><code>query_flags_select_active_or_inactive_tables_consistently</code></td></tr>
 +    <tr><td><code>table_status</code><br><code>table_status_for_device</code><br><code>table_status_record_len</code></td><td><code>reports_three_table_status_records_with_linux_next_offsets</code><br><code>reports_linear_info_status_with_empty_params</code><br><code>reports_striped_table_status_with_canonical_params</code><br><code>reports_status_target_count_for_selected_table</code></td></tr>
@@ -290,10 +290,10 @@ index 000000000..64fb79aed
 +
 +| 改动范围 | 优先命令策略 | 说明 |
 +|---|---|---|
-+| 单个函数 | `make ktest CARGO_OSDK_TEST_ARGS="完整测试函数名"` | 最快确认当前函数对应场景，例如只跑 `aster_device_mapper::target::linear::tests::maps_end_exclusive_sector_range`。 |
-+| 单个模块 | `make ktest CARGO_OSDK_TEST_ARGS="模块路径或测试名前缀"` | 适合改 `linear.rs`、`striped.rs`、`table.rs` 这类模块。 |
-+| 整个 DM crate | 临时只保留 `default-members = ["kernel/core/comps/device-mapper"]` 后跑 `make ktest` | 覆盖 DM crate 内部 ktest；跑完必须恢复 [Cargo.toml](../Cargo.toml)，确认 `git diff -- Cargo.toml` 无残留。 |
-+| ioctl ABI 或完整控制面 | 临时只保留 `default-members = ["kernel/core"]` 后过滤 `aster_core::device::misc::device_mapper::tests` | 覆盖 core ioctl 层 ktest，验证 `/dev/mapper/control` 的 Linux ABI 语义。 |
++| 单个函数 | `myshell/ktest_crate.sh <crate-dir> 完整测试函数名` | 最快确认当前函数对应场景，例如 `myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::target::linear::tests::maps_end_exclusive_sector_range`。 |
++| 单个模块 | `myshell/ktest_crate.sh <crate-dir> 模块路径或测试名前缀` | 适合改 `linear.rs`、`striped.rs`、`table.rs` 这类模块；脚本会补齐 release、boot、KVM 和 initramfs 参数。 |
++| 整个 DM crate | `myshell/ktest_crate.sh kernel/core/comps/device-mapper` | 覆盖 DM crate 内部 ktest；结果查看 `kernel/core/comps/device-mapper/ktest.log`。 |
++| ioctl ABI 或完整控制面 | `myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>` | 覆盖 core ioctl 层 ktest，验证 `/dev/mapper/control` 的 Linux ABI 语义。 |
 +| 阶段验收 | 跑对应 NixOS/LVM2 系统测试 | 验证 `dmsetup`/LVM2 用户态工具到 block I/O 的完整链路。 |
 +
 +## 整体取舍建议

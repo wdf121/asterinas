@@ -1,6 +1,6 @@
 diff --git a/docs/striped-cross-segment-manual.md b/docs/striped-cross-segment-manual.md
 new file mode 100644
-index 000000000..fb8589763
+index 000000000..ed41811d8
 --- /dev/null
 +++ b/docs/striped-cross-segment-manual.md
 @@ -0,0 +1,540 @@
@@ -542,5 +542,5 @@ index 000000000..fb8589763
 +容器内常用执行方式：
 +
 +```bash
-+docker exec myAsterinas bash -lc 'cd /root/asterinas && myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
++myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
 +```

@@ -1,16 +1,16 @@
 diff --git a/log/device-mapper-progress.md b/log/device-mapper-progress.md
 new file mode 100644
-index 000000000..4d88839ef
+index 000000000..bc95c8286
 --- /dev/null
 +++ b/log/device-mapper-progress.md
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,245 @@
 +# Device Mapper 项目进度
 +
 +本文记录 `dm` 分支中变化较快的 Device Mapper 项目状态。若本文与当前代码或实际命令结果不一致，以当前代码和命令结果为准，并及时修正本文。
 +
 +## 当前状态
 +
-+截至 2026-09-02，`dm` 分支当前重点已从 DM 核心功能开发推进到文档、系统测试脚本、成功 marker、超时变量和 patches 的收敛验证。当前不声明完整 Device Mapper 或完整 LVM2 兼容；已确认的是当前实现范围内的 `error`、`linear`、`striped`、`zero` 以及 LVM2 生成的 linear/striped/mixed table 在测试场景下通过。
++截至 2026-09-03，`dm` 分支当前重点已推进到 Device Mapper target framework 可扩展性重构和 ktest 验证链路收敛。当前不声明完整 Device Mapper 或完整 LVM2 兼容；已确认的是当前实现范围内的 `error`、`linear`、`striped`、`zero` 以及 LVM2 生成的 linear/striped/mixed table 在测试场景下通过。DM table/control-plane 已从 closed `DmTarget` enum 迁移为 `dyn DmTarget` trait object，具体 target 语义下沉到各 target 文件；定向 ktest 默认通过 crate-local wrapper 运行。
 +
 +当前可用的系统测试入口集中在：
 +
@@ -41,6 +41,7 @@ index 000000000..4d88839ef
 +log/device-mapper-optimization-v1.md
 +log/2026-9-1.md
 +log/2026-9-2.md
++log/2026-9-3.md
 +docs/test.md
 +docs/study.md
 +docs/device-mapper-technical-maintenance.md
@@ -53,12 +54,13 @@ index 000000000..4d88839ef
 +- `log/device-mapper-progress.md`：当前项目滚动状态和下一步优先级，是接手时的主入口。
 +- `log/device-mapper-optimization-v1.md`：第一版优化专题文档，集中维护 P0-P5 优先级、改动对比、验证矩阵和剩余风险。
 +- `log/2026-9-1.md`：guest 启动慢排查修复、`zero` target 核心/控制面/数据面覆盖、discard / write zeroes 通用 range BIO 与 DM 映射接入。
-+- `log/2026-9-2.md`：当前文档、系统测试脚本、成功 marker、超时变量和 patches 收敛状态；接手时用于判断最新未提交工作和验证缺口。
++- `log/2026-9-2.md`：文档、系统测试脚本、成功 marker、超时变量和 patches 收敛状态。
++- `log/2026-9-3.md`：`DmTarget` trait object 重构、crate-local ktest wrapper、runner 结果行拆分、`timeout --foreground` 修复和本轮验证结果。
 +- `docs/test.md`：实际运行命令、suite 列表和 QEMU 生命周期约束。
 +- `docs/study.md`：`/dev/mapper/control` 注册主线和适合复盘的学习材料。
 +- `docs/device-mapper-technical-maintenance.md`：DM 技术维护主文档；附录集中维护 `dmsetup` / LVM2 控制面对齐矩阵。
 +
-+当前接手结论：`dmsetup` 和 LVM2 控制面对齐已完成，`--dataplane-edge` 已通过，`error` / `zero` target 已完成核心 ktest、ioctl 层定向 ktest 和 guest 脚本覆盖。flush 数据面已通过现有 core ktest 收口确认；discard / write zeroes 已作为通用 block range BIO 增量接入，DM 可对 linear/striped remap，对 error 返回 I/O error，对 zero direct-complete，block ioctl 已支持 BLKDISCARD/BLKZEROOUT，virtio 后端按协商能力下发，NVMe 后端仍返回不支持。下一步优先串行跑现有数据面和慢系统回归，或审计 queue limit / alignment / topology。
++当前接手结论：`dmsetup` 和 LVM2 控制面对齐已完成，`--dataplane-edge` 已通过，`error` / `zero` target 已完成核心 ktest、ioctl 层定向 ktest 和 guest 脚本覆盖。flush 数据面已通过现有 core ktest 收口确认；discard / write zeroes 已作为通用 block range BIO 增量接入，DM 可对 linear/striped remap，对 error 返回 I/O error，对 zero direct-complete，block ioctl 已支持 BLKDISCARD/BLKZEROOUT，virtio 后端按协商能力下发，NVMe 后端仍返回不支持。当前 DM target 表达已从 closed enum 迁移为 `dyn DmTarget` trait object，`DmTable` 持有 `Vec<DmTargetBox>`，target-local 语义由各 concrete target 实现；静态 factory 暂时保留。定向 ktest 默认用 `myshell/ktest_crate.sh <crate-dir> [filter]`，结果日志为 `<crate-dir>/ktest.log`。下一步优先根据新增 target 或数据面语义选择小阶段设计，而不是继续扩散 enum/match 分派。
 +
 +本节是上下文交接入口；后续每完成一个小阶段，应同步更新阅读清单、当前接手结论和下一步优先级。
 +
@@ -192,22 +194,22 @@ index 000000000..4d88839ef
 +- readonly mapper 允许 Read / Flush，拒绝 Write。
 +- suspend 会等待已提交 flush 完成，并拒绝 suspend 期间的新 flush。
 +
-+已通过定向收窄后的 device-mapper crate ktest：
++已通过当前 device-mapper crate 全量 ktest：
 +
 +```text
-+docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2"'
++myshell/ktest_crate.sh kernel/core/comps/device-mapper
 +
-+test result: ok. 52 passed; 0 failed; 0 filtered out.
++test result: ok. 69 passed; 0 failed; 0 filtered out.
 +```
 +
-+首次尝试用 `flush` 和 `aster_device_mapper::table::tests::` 作为过滤条件时均未匹配到测试，结果是 `0 passed; 52 filtered out`；有效验证以上述全 crate ktest 为准。
++历史上曾尝试用 `flush` 和 `aster_device_mapper::table::tests::` 作为过滤条件，结果均未匹配到测试；有效验证以上述全 crate ktest 为准。
 +
 +## 当前文档状态
 +
-+- `docs/device-mapper-technical-maintenance.md` 已更新到 2026-09-01 状态，正文覆盖 error/zero/linear/striped/mixed 设计；第 8 章集中说明 Read/Write remap/direct completion、split 聚合、Flush fan-out/direct completion，以及 discard/write zeroes 通用 range BIO 的 DM 映射边界；附录集中维护 `dmsetup` 和 LVM2 控制面对齐矩阵。
-+- `docs/study.md` 已精简为 `/dev/mapper/control` 注册主线，不再保留命令矩阵迁移记录。
-+- `docs/test.md` 已记录 LVM2 host baseline、guest `--lvm2-cli` 和 raw 数据面 `--dataplane-edge` 入口。
-+- LVM2 表格当前按命令模板和前置条件判断结论；整体适用边界放在表格前说明中，不把所有行都写成“限定场景已对齐”，也不从单行“已对齐”外推到裸 LVM2 / 默认 udev 体验。
++- `docs/device-mapper-technical-maintenance.md` 已更新到 2026-09-03 状态，正文覆盖 error/zero/linear/striped/mixed 设计、`dyn DmTarget` target framework、table/control-plane 边界和分层验证路线；第 8 章集中说明 Read/Write remap/direct completion、split 聚合、Flush fan-out/direct completion，以及 discard/write zeroes 通用 range BIO 的 DM 映射边界；附录集中维护 `dmsetup` 和 LVM2 控制面对齐矩阵。
++- `docs/study.md` 已精简为 `/dev/mapper/control` 注册主线和后续学习材料，不再保留命令矩阵迁移记录。
++- `docs/test.md` 已按静态检查、crate-local ktest、系统验收 suite、底层命令说明的顺序记录当前验证链路；定向 ktest 默认入口为 `myshell/ktest_crate.sh`，结果日志为 `<crate-dir>/ktest.log`。
++- `log/device-mapper-optimization-v1.md` 已记录 target metadata/parser 收敛、`DmTarget` trait object 化、ktest wrapper 和 runner 结果行拆分。
 +
 +## 当前功能边界
 +
@@ -233,8 +235,8 @@ index 000000000..4d88839ef
 +
 +## 后续可做优先级
 +
-+1. 先串行跑现有数据面和慢系统回归：`--linear-data`、`--striped-data`、`--linear-lvm2`、`--striped-lvm2`、`--linear-lvm2-cross-segment`、`--striped-lvm2-cross-segment`、`--mixed-lvm2`。
-+2. 若继续拓展 DM target 功能，snapshot/thin/cache 等需要另起大阶段设计；更小的基础 target 也应先做 host baseline 与最小 guest 语义脚本。
++1. 若继续拓展 DM target 功能，snapshot/thin/cache/mirror 等需要另起大阶段设计；更小的基础 target 也应先做 host baseline 与最小 guest 语义脚本。
++2. 若继续做 target framework 泛化，可在当前 `dyn DmTarget` 基础上评估 registry/manifest；本阶段只保留静态 factory，不提前引入全局注册机制。
 +3. 若继续做数据面语义增强，可审计 queue limit / alignment / topology 的当前实现和测试覆盖；这属于“当前实现自洽性”审计，不声明完整 Linux DM queue stacking 对齐。
 +4. backing I/O error / partial completion 已有 core 模拟测试；新增 `error` target 可支持 guest 侧稳定 I/O error 场景，但不等于真实 backing fault injection。
 +5. NVMe discard / write zeroes 当前仅在 block/DM 语义层返回 NotSupported；真实 NVMe Dataset Management / Write Zeroes 命令接入需另起小阶段。

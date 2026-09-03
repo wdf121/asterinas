@@ -1,37 +1,70 @@
 diff --git a/kernel/core/comps/device-mapper/src/target/linear.rs b/kernel/core/comps/device-mapper/src/target/linear.rs
 new file mode 100644
-index 000000000..2749d5484
+index 000000000..034a561e9
 --- /dev/null
 +++ b/kernel/core/comps/device-mapper/src/target/linear.rs
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,311 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
++//! Linux Device Mapper `linear` target support.
++//!
++//! A linear target maps a contiguous logical sector range to one backing block
++//! device with a fixed sector offset. This file owns range arithmetic, capacity
++//! validation, and single-sector remapping for that target; table-wide ordering
++//! remains in `DmTable`.
++
++use alloc::{format, string::String, vec::Vec};
 +use core::{fmt::Debug, ops::Range};
 +
 +use aster_block::{BlockDevice, BlockDeviceLease, id::Sid};
 +use device_id::DeviceId;
 +
-+use crate::TableError;
++use crate::{
++    TableError,
++    target::{
++        DmTarget, DmTargetMetadata, DmTargetParseError, LINEAR_METADATA, TargetIoAction,
++        TargetRange, TargetStatusMode,
++    },
++};
 +
-+/// A parsed `linear` target with a resolved backing device reference.
++/// A `linear` target maps one contiguous logical range to one backing range.
 +#[derive(Debug)]
 +pub struct LinearTarget {
-+    logical_range: Range<Sid>,
++    /// Shared logical geometry used by table split and remap decisions.
++    range: TargetRange,
++    /// First backing sector that corresponds to `logical_range.start`.
 +    backing_start: Sid,
++    /// Stable backing device identity used by deps/status reporting.
 +    backing_id: DeviceId,
++    /// Lease that keeps the backing block device alive while the table is installed.
 +    backing: BlockDeviceLease,
 +}
 +
 +impl LinearTarget {
-+    /// Creates a `linear` target and validates its logical and backing ranges.
++    /// Parses one Linux `linear` target and resolves its single backing lease.
++    pub(super) fn parse_with<E>(
++        logical_start: Sid,
++        length: u64,
++        params: &str,
++        parse_backing: &mut impl FnMut(&str) -> Result<DeviceId, E>,
++        resolve_backing: &mut impl FnMut(DeviceId) -> Result<BlockDeviceLease, E>,
++    ) -> Result<Self, DmTargetParseError<E>> {
++        let (backing, backing_start) = parse_linear_params(params)?;
++        let backing_start = Sid::new(backing_start);
++        Self::validate_geometry(logical_start, length, backing_start)?;
++        let backing = parse_backing(backing).map_err(DmTargetParseError::ResolveBacking)?;
++        let backing = resolve_backing(backing).map_err(DmTargetParseError::ResolveBacking)?;
++        Self::new(logical_start, length, backing_start, backing).map_err(Into::into)
++    }
++
++    /// Builds a resolved target and rejects zero length, overflow, or over-capacity ranges.
 +    pub fn new(
 +        logical_start: Sid,
 +        length: u64,
 +        backing_start: Sid,
 +        backing: BlockDeviceLease,
 +    ) -> Result<Self, TableError> {
-+        let (logical_end, backing_end) =
-+            Self::validate_geometry(logical_start, length, backing_start)?;
++        let (range, backing_end) = Self::validate_geometry(logical_start, length, backing_start)?;
 +        let backing_capacity = u64::try_from(backing.metadata().nr_sectors)
 +            .map_err(|_| TableError::BackingRangeOverflow)?;
 +        if backing_end > backing_capacity {
@@ -39,41 +72,35 @@ index 000000000..2749d5484
 +        }
 +
 +        Ok(Self {
-+            logical_range: logical_start..Sid::new(logical_end),
++            range,
 +            backing_start,
 +            backing_id: backing.id(),
 +            backing,
 +        })
 +    }
 +
++    /// Checks pure range arithmetic so parser can fail before VFS or lease lookup.
 +    pub(super) fn validate_geometry(
 +        logical_start: Sid,
 +        length: u64,
 +        backing_start: Sid,
-+    ) -> Result<(u64, u64), TableError> {
-+        if length == 0 {
-+            return Err(TableError::ZeroLength);
-+        }
-+
-+        let logical_end = logical_start
-+            .to_raw()
-+            .checked_add(length)
-+            .ok_or(TableError::LogicalRangeOverflow)?;
++    ) -> Result<(TargetRange, u64), TableError> {
++        let range = TargetRange::new(logical_start, length)?;
 +        let backing_end = backing_start
 +            .to_raw()
-+            .checked_add(length)
++            .checked_add(range.length())
 +            .ok_or(TableError::BackingRangeOverflow)?;
-+        Ok((logical_end, backing_end))
++        Ok((range, backing_end))
 +    }
 +
 +    /// Returns the logical sector range covered by this target.
 +    pub fn logical_range(&self) -> &Range<Sid> {
-+        &self.logical_range
++        self.range.logical_range()
 +    }
 +
 +    /// Returns the target length in 512-byte sectors.
 +    pub fn length(&self) -> u64 {
-+        self.logical_range.end.to_raw() - self.logical_range.start.to_raw()
++        self.range.length()
 +    }
 +
 +    /// Returns the backing mapping start sector.
@@ -91,15 +118,14 @@ index 000000000..2749d5484
 +        self.backing.device().as_ref()
 +    }
 +
-+    /// Maps a logical sector inside this target to a backing sector.
-+    pub fn map_sector(&self, logical: Sid) -> Option<Sid> {
-+        if !self.logical_range.contains(&logical) {
-+            return None;
-+        }
++    /// Checks whether an I/O subrange can be remapped by this target.
++    pub(super) fn contains_range(&self, logical: &Range<Sid>) -> bool {
++        self.range.contains_range(logical)
++    }
 +
-+        let offset = logical
-+            .to_raw()
-+            .checked_sub(self.logical_range.start.to_raw())?;
++    /// Maps an in-range logical sector by adding the fixed backing offset.
++    pub fn map_sector(&self, logical: Sid) -> Option<Sid> {
++        let offset = self.range.offset_of(logical)?;
 +        self.backing_start
 +            .to_raw()
 +            .checked_add(offset)
@@ -107,9 +133,78 @@ index 000000000..2749d5484
 +    }
 +}
 +
++impl DmTarget for LinearTarget {
++    #[cfg(ktest)]
++    fn as_any(&self) -> &dyn core::any::Any {
++        self
++    }
++
++    fn metadata(&self) -> DmTargetMetadata {
++        LINEAR_METADATA
++    }
++
++    fn logical_range(&self) -> &Range<Sid> {
++        self.logical_range()
++    }
++
++    fn length(&self) -> u64 {
++        self.length()
++    }
++
++    fn for_each_backing_id(&self, f: &mut dyn FnMut(DeviceId)) {
++        f(self.backing_id());
++    }
++
++    fn for_each_backing<'a>(&'a self, f: &mut dyn FnMut(&'a dyn BlockDevice)) {
++        f(self.backing());
++    }
++
++    fn status_params(&self, mode: TargetStatusMode) -> Result<String, TableError> {
++        match mode {
++            TargetStatusMode::Table => {
++                let backing = self.backing_id();
++                Ok(format!(
++                    "{}:{} {}",
++                    backing.major().get(),
++                    backing.minor().get(),
++                    self.backing_start().to_raw()
++                ))
++            }
++            TargetStatusMode::Status => Ok(String::new()),
++        }
++    }
++
++    fn map_io_range(&self, logical: Range<Sid>) -> Option<Vec<TargetIoAction<'_>>> {
++        if !self.contains_range(&logical) {
++            return None;
++        }
++        Some(alloc::vec![TargetIoAction::Remap {
++            backing_start: self.map_sector(logical.start)?,
++            backing: self.backing(),
++            logical_range: logical,
++        }])
++    }
++}
++
++/// Parses the two-field Linux `linear` parameter string without resolving the backing.
++fn parse_linear_params(params: &str) -> Result<(&str, u64), TableError> {
++    let mut fields = params.split_ascii_whitespace();
++    let backing = fields.next().ok_or(TableError::InvalidTargetParams)?;
++    let backing_start = fields
++        .next()
++        .ok_or(TableError::InvalidTargetParams)?
++        .parse::<u64>()
++        .map_err(|_| TableError::InvalidTargetParams)?;
++    if fields.next().is_some() {
++        return Err(TableError::InvalidTargetParams);
++    }
++
++    Ok((backing, backing_start))
++}
++
 +#[cfg(ktest)]
 +mod tests {
-+    use alloc::{string::String, sync::Arc};
++    use alloc::sync::Arc;
 +
 +    use aster_block::{
 +        BlockDeviceMeta,

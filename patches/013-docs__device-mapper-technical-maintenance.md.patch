@@ -1,19 +1,19 @@
 diff --git a/docs/device-mapper-technical-maintenance.md b/docs/device-mapper-technical-maintenance.md
 new file mode 100644
-index 000000000..896a4c68a
+index 000000000..75af3e64b
 --- /dev/null
 +++ b/docs/device-mapper-technical-maintenance.md
-@@ -0,0 +1,963 @@
+@@ -0,0 +1,944 @@
 +# Asterinas Device Mapper 技术与设计文档
 +
 +## 文档信息
 +
 +| 项目 | 内容 |
 +|---|---|
-+| 版本 | v2.1 |
-+| 状态 | 维护中，基于当前 `dm` 分支实现与 2026-09-01 验证结果整理 |
++| 版本 | v2.2 |
++| 状态 | 维护中，基于当前 `dm` 分支实现与 2026-09-03 验证结果整理 |
 +| 目标读者 | 内核开发人员、架构评审人员、测试与集成维护人员 |
-+| 更新时间 | 2026-09-01 |
++| 更新时间 | 2026-09-03 |
 +| 相关进度 | [Device Mapper 项目进度](../log/device-mapper-progress.md) |
 +
 +## 执行摘要
@@ -251,7 +251,8 @@ index 000000000..896a4c68a
 +- [kernel/core/src/device/misc/device_mapper.rs](../kernel/core/src/device/misc/device_mapper.rs) 不承载 target 数据面算法；它只做 ABI、buffer、flags 和 ioctl 分发。
 +- [kernel/core/comps/device-mapper](../kernel/core/comps/device-mapper) 不直接依赖用户态测试脚本；它只表达 DM 内核语义。
 +- `DmTable` 负责 table 连续性、capacity、deps、metadata、BIO split 和 flush fan-out。
-+- `DmTarget` 负责 target 内部映射规则；多 backing target 不能被伪装成 single backing target。
++- `DmTarget` 是 `Debug + Send + Sync` trait object，负责 target 内部映射规则、status params、backing 枚举和 I/O action 生成；多 backing target 不能被伪装成 single backing target。
++- target 模块当前保留静态 factory `parse_target_with()`，用于把 Linux DM target type 字符串构造成 `DmTargetBox`；本阶段不引入 registry。
 +- block registry 负责 block device 生命周期和 open count，不应被 DM 绕过。
 +
 +## 7. 控制面功能路线
@@ -371,6 +372,8 @@ index 000000000..896a4c68a
 +### 9.1 Target 能力演进路线
 +
 +Target 能力按风险和映射复杂度递进：先用 `error` / `zero` 这类无 backing target 锁定控制面、deps 和直接完成语义；再用 single linear 验证基础 sector remap，用 multi-segment linear 验证 table-level split；随后用 striped 验证多 backing、chunk split 和 deps；最后用 mixed table 验证同一 table 内 linear segment 与 striped segment 的组合。
++
++当前代码结构已经从 closed `DmTarget` enum 迁移为 `dyn DmTarget` trait object：`DmTable` 保存 `Vec<DmTargetBox>`，table/control-plane 不再按 enum variant 分派 target 行为；`error`、`zero`、`linear`、`striped` 分别在 concrete target 文件中实现 `DmTarget`。这样新增 target 时仍需要在静态 factory `parse_target_with()` 中添加 target type 分支，但不需要继续把 table/status/deps/I/O 路径扩散成多处 enum match。
 +
 +系统验收也按这个顺序分层：`--dmsetup-cli` 覆盖控制面和 error/zero 基础 I/O，`--dataplane-edge` 覆盖 raw DM 边界和 zero 读写语义，raw linear / raw striped 覆盖窄数据面，linear / striped 基础 LVM2 覆盖单 segment grow/shrink，linear / striped cross-segment 覆盖追加 segment 和 shrink 回单段，mixed 覆盖 linear + striped table 组合。
 +
@@ -551,27 +554,19 @@ index 000000000..896a4c68a
 +| DM core / target ktest | `kernel/core/comps/device-mapper` | table、error target、zero target、linear target、striped target、BIO split/remap、flush、deps 去重 | 修改 table、target、数据面时跑 |
 +| ioctl 层 ktest | `kernel/core` | `/dev/mapper/control` ioctl ABI、flags、active/inactive、status/deps、remove/rename/wait | 修改 ioctl、控制面、状态机时跑 |
 +
-+当前 ktest 受根 [Cargo.toml](../Cargo.toml) 的 `default-members` 影响。为了只跑目标 crate 的内核测试，通常需要临时收窄 `default-members`；否则可能跑到无关 crate、耗时过长，或者测试过滤没有命中目标。
++定向 ktest 的 crate 选择由 [ktest_crate.sh](../myshell/ktest_crate.sh) 进入的目标目录决定。为了只跑目标 crate 的内核测试，应从仓库根目录调用该脚本；不要为了筛选 crate 临时修改根 [Cargo.toml](../Cargo.toml) 的 `default-members`，也不要在仓库根目录用 `make ktest CARGO_OSDK_TEST_ARGS="..."` 作为默认定向测试入口。
 +
 +标准流程：
 +
-+1. 临时修改 [Cargo.toml](../Cargo.toml) 的 `default-members`；
-+2. 运行对应 ktest；
-+3. 立刻还原 [Cargo.toml](../Cargo.toml)；
-+4. 执行 `git diff -- Cargo.toml`，预期无输出。
++1. 从仓库根目录调用 `myshell/ktest_crate.sh <crate-dir> <test-path>`；
++2. 由脚本补齐 release、boot、KVM、initramfs、console、timeout 等公共参数；
++3. 脚本进入对应 crate 执行 `cargo osdk test`；
++4. 测试结束后查看 `<crate-dir>/ktest.log`，确认结果行、summary 和 `All crates tested.`。
 +
-+修改 table / target / BIO 数据面时，先临时把根 [Cargo.toml](../Cargo.toml) 收窄为：
-+
-+```toml
-+default-members = [
-+    "kernel/core/comps/device-mapper",
-+]
-+```
-+
-+示例命令：
++修改 table / target / BIO 数据面时：
 +
 +```bash
-+docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_device_mapper::<test_path>"'
++myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::<test_path>
 +```
 +
 +适用改动：
@@ -584,18 +579,10 @@ index 000000000..896a4c68a
 +- mixed table split；
 +- flush fan-out 和错误传播。
 +
-+修改 ioctl / 控制面状态机时，先临时把根 [Cargo.toml](../Cargo.toml) 收窄为：
-+
-+```toml
-+default-members = [
-+    "kernel/core",
-+]
-+```
-+
-+示例命令：
++修改 ioctl / 控制面状态机时：
 +
 +```bash
-+docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_core::device::misc::device_mapper::tests::<test_name>"'
++myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>
 +```
 +
 +适用改动：
@@ -606,13 +593,7 @@ index 000000000..896a4c68a
 +- active / inactive table；
 +- readonly flag、wait event、flags 校验、buffer layout。
 +
-+每次临时修改 [Cargo.toml](../Cargo.toml) 后，收尾必须还原并确认：
-+
-+```bash
-+git diff -- Cargo.toml
-+```
-+
-+预期结果是无输出；如果有输出，说明临时收窄 `default-members` 没还原，不能提交。
++`ktest.log` 只保留 ktest runner 的最终结果，不保留 QEMU 启动日志、OVMF/GRUB 输出或 kernel 普通日志。负测中出现的预期 `ERROR:` 仍可能打印到终端，但不会混入 `test ... ok/FAILED` 结果行。
 +
 +### 11.2 按 target 特性分层的系统验收矩阵
 +
@@ -670,7 +651,7 @@ index 000000000..896a4c68a
 +| 决策 | 选择 | 替代方案 | 理由 | 权衡 |
 +|---|---|---|---|---|
 +| 兼容范围 | Linux DM 核心 ABI 子集 | 完整 Linux DM | 当前 Asterinas 不具备完整 udev/sysfs/queue stacking 生态 | 需要明确拒绝未实现语义 |
-+| target 表达 | `DmTarget` enum | target registry 泛化 | 当前支持的 target 数量仍少，enum 更直接 | 新增 target 时需要同步修改匹配逻辑 |
++| target 表达 | `dyn DmTarget` trait object + 静态 factory | closed enum；或完整 target registry | table/control-plane 面向统一 trait，减少新增 target 时的 match 扩散 | 当前仍需在 `parse_target_with()` 中登记 target type，registry 留作后续阶段 |
 +| table 激活 | load 写 inactive，resume 激活 | load 直接替换 active | 对齐 Linux DM table 生命周期 | 状态机更复杂，但语义正确 |
 +| backing 生命周期 | `BlockDeviceLease` | 裸 `Arc<dyn BlockDevice>` | 避免 backing 被注销时仍被 DM 使用 | rootfs 预解析设备需要 untracked lease |
 +| 数据面 split | table-level split + target-level split | 每个 target 自己处理完整 BIO | 能统一处理 mixed table 和 completion 聚合 | table 与 target 边界需要清晰 |
