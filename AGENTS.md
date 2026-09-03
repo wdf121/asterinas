@@ -48,15 +48,11 @@ Stage-by-stage engineering changes are recorded in `log/YYYY-M-D.md`.
 
 Local environment:
 
-- Repository path: `/root/atom/asterinas`.
+- Host repository path: `/root/atom/asterinas`.
 - Working branch: `dm`.
 - Docker container: `myAsterinas`.
 - Container project path: `/root/asterinas`.
-- Prefer running builds, ktests, and NixOS/LVM2 system tests inside the container:
-
-```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && <command>'
-```
+- Commands in project docs and examples assume they are run inside the container from `/root/asterinas`, unless explicitly marked as host commands.
 
 Resource checks before commands that may consume noticeable CPU or memory,
 especially builds, ktests, QEMU/NixOS runs, patch generation, and large document
@@ -66,7 +62,6 @@ rewrites:
 free -h
 uptime
 ps -eo pid,ppid,comm,%mem,%cpu,rss --sort=-rss | head -15
-docker exec myAsterinas bash -lc 'free -h && uptime'
 ```
 
 Interpretation rules:
@@ -82,44 +77,33 @@ Interpretation rules:
 Quick checks:
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && cargo fmt --check'
+cargo fmt --check
 git diff --check
-git diff -- Cargo.toml
 git status --short
 ```
 
-To narrowly run `aster-device-mapper` crate ktests, temporarily reduce the root
-`Cargo.toml` `default-members` to:
-
-```toml
-default-members = [
-    "kernel/core/comps/device-mapper",
-]
-```
-
-Then run, for example:
+To narrowly run `aster-device-mapper` crate ktests, call the repository wrapper
+from the repository root. The wrapper enters the target crate and supplies the
+release, boot, KVM, initramfs, console, and timeout arguments:
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_device_mapper::table::tests::<test_name>"'
+myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::table::tests::<test_name>
 ```
 
-To narrowly run `aster-core` ioctl-layer ktests, temporarily reduce the root
-`Cargo.toml` `default-members` to:
-
-```toml
-default-members = [
-    "kernel/core",
-]
-```
-
-Then run, for example:
+To narrowly run `aster-core` ioctl-layer ktests, use the same wrapper with the
+`kernel/core` crate directory:
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && timeout -k 10s 180s make ktest CARGO_OSDK_TEST_ARGS="--kcmd-args=loglevel=error --kcmd-args=earlycon --kcmd-args=console=ttyS0 --boot-method=grub-rescue-iso --grub-boot-protocol=multiboot2 aster_core::device::misc::device_mapper::tests::<test_name>"'
+myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>
 ```
 
-After any temporary `Cargo.toml` default-member change, restore `Cargo.toml` and
-confirm `git diff -- Cargo.toml` has no output.
+Do not use root `make ktest CARGO_OSDK_TEST_ARGS="..."` as the default targeted
+ktest entry because it can override Makefile-provided release, KVM, and
+initramfs arguments. Use `myshell/ktest_crate.sh <crate-dir> <test-path>` for
+targeted ktests. The wrapper writes one result log at `<crate-dir>/ktest.log`;
+it contains the current crate's ktest results and omits QEMU startup and kernel
+noise. It uses `timeout --foreground` so QEMU stays in the invoking terminal's
+foreground process group during interactive runs.
 
 Run QEMU, ktest, and NixOS system tests serially to avoid image lock conflicts,
 especially around `test/initramfs/build/ext2.img`. For new NixOS system suite
@@ -127,9 +111,10 @@ runs, set `GUEST_QEMU_TIMEOUT=180` so each single QEMU guest run has a
 three-minute full-lifecycle timeout; `GUEST_READY_TIMEOUT` remains a
 compatibility alias for older scripts. If a ktest/QEMU/NixOS run makes no
 relevant progress for about three minutes, suspect command filtering,
-default-members, leftover processes, or image-lock issues; inspect output and
-processes, stop only processes started for the current run if needed, and retry
-with a narrower command.
+wrong crate working directory, root `make ktest` argument override, missing KVM
+or initramfs arguments, leftover processes, or image-lock issues; inspect output
+and processes, stop only processes started for the current run if needed, and
+retry with `myshell/ktest_crate.sh` from the repository root.
 
 Do not modify KVM, RELEASE, QEMU, NixOS boot protocol, or `myshell/br.sh` unless
 explicitly requested. Run DM system tests through explicit suite entries; do not
@@ -140,11 +125,11 @@ Run slower system tests only when the corresponding path changes or during stage
 acceptance, for example:
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
-docker exec myAsterinas bash -lc 'cd /root/asterinas && GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2'
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
+GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2
 ```
 
 Project logging rules:

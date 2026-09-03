@@ -536,5 +536,5 @@ myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
 容器内常用执行方式：
 
 ```bash
-docker exec myAsterinas bash -lc 'cd /root/asterinas && myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment'
+myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
 ```
