@@ -107,29 +107,29 @@ foreground process group during interactive runs.
 
 Run QEMU, ktest, and NixOS system tests serially to avoid image lock conflicts,
 especially around `test/initramfs/build/ext2.img`. For new NixOS system suite
-runs, set `GUEST_QEMU_TIMEOUT=180` so each single QEMU guest run has a
-three-minute full-lifecycle timeout; `GUEST_READY_TIMEOUT` remains a
-compatibility alias for older scripts. If a ktest/QEMU/NixOS run makes no
-relevant progress for about three minutes, suspect command filtering,
-wrong crate working directory, root `make ktest` argument override, missing KVM
-or initramfs arguments, leftover processes, or image-lock issues; inspect output
-and processes, stop only processes started for the current run if needed, and
-retry with `myshell/ktest_crate.sh` from the repository root.
+runs, set `GUEST_READY_TIMEOUT=40` and `GUEST_QEMU_TIMEOUT=180`: the former
+limits boot to the guest shell, while the latter limits the complete lifecycle
+of each QEMU guest. If a ktest/QEMU/NixOS run makes no relevant progress for
+about three minutes, suspect command filtering, wrong crate working directory,
+root `make ktest` argument override, missing KVM or initramfs arguments,
+leftover processes, or image-lock issues; inspect output and processes, stop
+only processes started for the current run if needed, and retry with
+`myshell/ktest_crate.sh` from the repository root.
 
 Do not modify KVM, RELEASE, QEMU, NixOS boot protocol, or `myshell/br.sh` unless
-explicitly requested. Run DM system tests through explicit suite entries; do not
-reintroduce a default all-in-one suite, and keep linear/striped LVM2 execution
-aligned as base plus cross-segment entries.
+explicitly requested. Run DM system tests through explicit canonical suite
+entries; do not reintroduce a default all-in-one suite or compatibility aliases.
 
 Run slower system tests only when the corresponding path changes or during stage
-acceptance, for example:
+acceptance. The six canonical entries are:
 
 ```bash
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --control-plane
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dataplane
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --lvm2-topology
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-integration
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-integration
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-integration
 ```
 
 Project logging rules:

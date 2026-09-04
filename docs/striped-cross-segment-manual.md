@@ -1,6 +1,6 @@
-# striped cross-segment LVM2 手动操作文档
+# striped integration 的跨 segment LVM2 手动操作文档
 
-本文展开 [run_lvm2_striped_cross_segment_test.sh](../myshell/dm_striped/run_lvm2_striped_cross_segment_test.sh) 的默认执行流程，用于手动进入 NixOS guest 后逐步执行命令、观察 LVM2 生成的 striped 多 segment/table 形态，并验证 reboot recovery 与 shrink。
+本文记录 [run_lvm2_striped_integration_test.sh](../myshell/dm_striped/run_lvm2_striped_integration_test.sh) 所覆盖的跨 segment striped 场景：手动进入 NixOS guest 后创建初始 striped segment、用第二组 PV 增加第二个 striped segment、验证 table/status/deps、文件数据与 shrink。自动化 `--striped-integration` 使用三次 guest：第一轮创建和 grow，第二轮恢复和 shrink，第三轮重新 scan/activate 并以只读 ext2/MD5 验证 shrink 后持久化。本手册的命令主体展开前两轮，第三轮应按自动化脚本的 readonly recovery 语义补做。
 
 ## 1. 默认参数
 
@@ -530,11 +530,13 @@ poweroff
 自动化脚本入口是：
 
 ```bash
-myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --striped-integration
 ```
 
 容器内常用执行方式：
 
 ```bash
-myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --striped-integration
 ```

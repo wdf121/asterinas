@@ -150,7 +150,7 @@ flowchart TB
 | DM device 生命周期、readonly、suspend/load/resume、event、BIO 入口 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/device.rs](../kernel/core/comps/device-mapper/src/device.rs) |
 | DM manager、name/uuid/id/minor 索引、create/remove/rename | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/manager.rs](../kernel/core/comps/device-mapper/src/manager.rs) |
 | DM table 构造、target 顺序、容量、deps、BIO remap/split、flush | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/table.rs](../kernel/core/comps/device-mapper/src/table.rs) |
-| target enum 与 target 通用转发接口 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/target/mod.rs](../kernel/core/comps/device-mapper/src/target/mod.rs) |
+| target trait object、解析 factory 与 target 通用转发接口 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/target/mod.rs](../kernel/core/comps/device-mapper/src/target/mod.rs) |
 | linear target 构造、范围校验、sector 映射 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/target/linear.rs](../kernel/core/comps/device-mapper/src/target/linear.rs) |
 | striped target 参数解析、容量校验、sector/range 映射 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/target/striped.rs](../kernel/core/comps/device-mapper/src/target/striped.rs) |
 | **原有 block 框架：/root/atom/asterinas/kernel/core/comps/block/src** |  |
@@ -194,14 +194,12 @@ flowchart TB
 | 本地启动辅助脚本 | [/root/atom/asterinas/myshell/br.sh](../myshell/br.sh) |
 | DM 系统测试统一入口 | [/root/atom/asterinas/myshell/run_dm_system_tests.sh](../myshell/run_dm_system_tests.sh) |
 | DM NixOS 测试公共库 | [/root/atom/asterinas/myshell/lib/dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh) |
-| linear control ABI 系统测试 | [/root/atom/asterinas/myshell/dm_linear/run_control_abi_test.sh](../myshell/dm_linear/run_control_abi_test.sh) |
-| linear 跨 target BIO 回归测试 | [/root/atom/asterinas/myshell/dm_linear/run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh) |
-| linear LVM2 跨 segment 测试 | [/root/atom/asterinas/myshell/dm_linear/run_lvm2_linear_cross_segment_test.sh](../myshell/dm_linear/run_lvm2_linear_cross_segment_test.sh) |
-| linear LVM2 reboot 测试 | [/root/atom/asterinas/myshell/dm_linear/run_lvm2_linear_reboot_test.sh](../myshell/dm_linear/run_lvm2_linear_reboot_test.sh) |
-| striped raw BIO 测试 | [/root/atom/asterinas/myshell/dm_striped/run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh) |
-| striped LVM2 跨 segment 测试 | [/root/atom/asterinas/myshell/dm_striped/run_lvm2_striped_cross_segment_test.sh](../myshell/dm_striped/run_lvm2_striped_cross_segment_test.sh) |
-| striped LVM2 reboot 测试 | [/root/atom/asterinas/myshell/dm_striped/run_lvm2_striped_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_reboot_test.sh) |
-| mixed linear+striped LVM2 reboot 测试 | [/root/atom/asterinas/myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh](../myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh) |
+| control-plane 系统验收 | [/root/atom/asterinas/myshell/run_dm_control_plane_test.sh](../myshell/run_dm_control_plane_test.sh) |
+| raw DM dataplane 系统验收 | [/root/atom/asterinas/myshell/run_dm_dataplane_test.sh](../myshell/run_dm_dataplane_test.sh) |
+| LVM2 PV/VG/LV topology 系统验收 | [/root/atom/asterinas/myshell/run_lvm2_topology_test.sh](../myshell/run_lvm2_topology_test.sh) |
+| linear LVM2/ext2/reboot integration | [/root/atom/asterinas/myshell/dm_linear/run_lvm2_linear_integration_test.sh](../myshell/dm_linear/run_lvm2_linear_integration_test.sh) |
+| striped LVM2/ext2/reboot integration | [/root/atom/asterinas/myshell/dm_striped/run_lvm2_striped_integration_test.sh](../myshell/dm_striped/run_lvm2_striped_integration_test.sh) |
+| mixed linear+striped LVM2/ext2/reboot integration | [/root/atom/asterinas/myshell/dm_mixed/run_lvm2_mixed_integration_test.sh](../myshell/dm_mixed/run_lvm2_mixed_integration_test.sh) |
 | **NixOS/QEMU/工具脚本** |  |
 | NixOS 配置接入 DM/LVM2 测试环境 | [/root/atom/asterinas/distro/etc_nixos/configuration.nix](../distro/etc_nixos/configuration.nix) |
 | hello-asterinas overlay 支撑测试镜像包 | [/root/atom/asterinas/distro/etc_nixos/overlays/hello-asterinas/default.nix](../distro/etc_nixos/overlays/hello-asterinas/default.nix) |

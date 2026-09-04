@@ -1,5 +1,124 @@
 # Device Mapper 学习记录
 
+## DM 项目分层总图
+
+这张图先按层理解整个项目：每一层只放核心结构体或关键函数，红色节点是跨层入口。
+
+```mermaid
+flowchart TD
+    subgraph U["用户空间（Userspace）"]
+        U1["dmsetup"]
+        U2["LVM2"]
+        U3["libdevmapper"]
+        U4["Applications / mkfs"]
+    end
+
+    subgraph K["Asterinas 内核态（Kernel）"]
+        CDEV["/dev/mapper/control<br/>DmControlDevice / DmControlFile"]
+        MDEV["/dev/dm-N 与 mapper 别名<br/>DmDevice 块设备节点"]
+
+        subgraph DM["DM 核心引擎（comps/device-mapper）"]
+            subgraph CP["第一层：Device Mapper 控制面框架（低频）"]
+                CP1["DmControlFile::ioctl<br/>decode_command / handle_command"]
+                CP2["DmManager<br/>name / uuid / minor 索引"]
+                CP3["DmDeviceState<br/>active / inactive table"]
+                CP4["Table load / clear / status<br/>suspend / resume / wait"]
+            end
+
+            subgraph DP["第二层：Device Mapper 数据面核心（高频 I/O）"]
+                DP1["DmDevice::enqueue<br/>只接受 active table"]
+                DP2["DmTable::enqueue<br/>按 logical sector 查 target"]
+                DP3["Target dispatch<br/>map_io_range"]
+                DP4["BIO remapping / split<br/>remap_sid_start / split"]
+                DP5["Flush fan-out<br/>FlushCompletion 聚合"]
+            end
+
+            subgraph TG["第三层：Target 映射策略插件"]
+                TG1["linear<br/>单后端 + sector offset"]
+                TG2["striped<br/>多后端 stripe / chunk"]
+                TG3["zero<br/>读零 / 写成功"]
+                TG4["error<br/>返回 I/O error"]
+            end
+        end
+
+        subgraph BLK["Asterinas 块设备框架（comps/block + device registry）"]
+            B1["BlockDevice trait"]
+            B2["BlockDeviceLease"]
+            B3["Bio / SubmittedBio / BioSegment"]
+            B4["BioRequestSingleQueue / BioRequest"]
+            B5["Block registry<br/>lookup / register / unregister"]
+        end
+
+        subgraph BACK["真实后端块设备"]
+            D1["virtio-blk"]
+            D2["NVMe"]
+            D3["PartitionNode"]
+        end
+    end
+
+    U1 -->|"ioctl"| U3
+    U2 -->|"ioctl"| U3
+    U3 -->|"Linux DM ABI"| CDEV
+    U4 -->|"read / write / mount"| MDEV
+
+    CDEV -->|"ioctl 分发"| CP1
+    CP1 --> CP2
+    CP2 --> CP3
+    CP3 --> CP4
+    CP4 -->|"resume 后注册"| MDEV
+
+    MDEV -->|"BIO 提交"| DP1
+    DP1 --> DP2
+    DP2 --> DP3
+    DP3 --> DP4
+    DP3 --> DP5
+    DP3 --> TG1
+    DP3 --> TG2
+    DP3 --> TG3
+    DP3 --> TG4
+
+    TG1 -->|"Remap"| B2
+    TG2 -->|"Remap / split"| B2
+    TG3 -->|"Zero"| B3
+    TG4 -->|"Error"| B3
+    DP4 --> B3
+    DP5 --> B3
+
+    B2 --> B1
+    B3 --> B1
+    B1 --> B4
+    B1 --> B5
+    B4 --> D1
+    B4 --> D2
+    B5 --> D3
+
+    classDef userspace fill:#14351f,stroke:#4ade80,stroke-width:2px,color:#f8fafc;
+    classDef entry fill:#12385c,stroke:#60a5fa,stroke-width:2px,color:#f8fafc;
+    classDef control fill:#5b2a06,stroke:#fb923c,stroke-width:2px,color:#fff7ed;
+    classDef dataplane fill:#4a2504,stroke:#f97316,stroke-width:2px,color:#fff7ed;
+    classDef target fill:#713f12,stroke:#facc15,stroke-width:2px,color:#fffbeb;
+    classDef block fill:#3b173f,stroke:#e879f9,stroke-width:2px,color:#fdf4ff;
+    classDef backend fill:#1f2937,stroke:#94a3b8,stroke-width:2px,color:#f8fafc;
+    classDef critical fill:#7f1d1d,stroke:#f87171,stroke-width:3px,color:#fff1f2;
+
+    class U1,U2,U3,U4 userspace;
+    class CDEV,MDEV entry;
+    class CP1,CP2,CP3,CP4 control;
+    class DP1,DP2,DP3,DP4,DP5 dataplane;
+    class TG1,TG2,TG3,TG4 target;
+    class B1,B2,B3,B4,B5 block;
+    class D1,D2,D3 backend;
+    class CDEV,MDEV,CP1,DP1,DP2,DP3 critical;
+```
+
+读这张图时先抓三条线：
+
+```text
+控制面：dmsetup / LVM2 -> libdevmapper -> DmControlFile::ioctl -> DmManager -> DmDevice -> DmTable
+数据面：ext2 / page cache -> DmDevice -> DmTable -> DmTarget -> TargetIoAction -> Bio -> backing BlockDevice
+生命周期：DmTarget -> BlockDeviceLease -> BlockDevice -> block registry
+```
+
 ## `/dev/mapper/control` 注册主线
 
 这条主线解释 `/dev/mapper/control` 如何从内核启动期注册到用户态可见。重点不是 DM table、target 或 BIO 数据面，而是 DM control 字符设备如何挂到 Asterinas 的 misc/char/devtmpfs 链路下。
@@ -64,412 +183,32 @@ char::init_in_first_process(path_resolver)
 
 ## `dmsetup version` ioctl 主线
 
-这条主线解释标准 `dmsetup version` 如何从用户态 LVM2 工具进入 Asterinas 的 Device Mapper control ioctl，并拿到内核写回的 driver version。重点是 control fd、raw ioctl command、`struct dm_ioctl` buffer 和只读命令分发，不涉及 mapper 创建、table load 或 BIO 数据面。
-
-### 1. 标准 libdevmapper 为什么打开 control
-
-`dmsetup version` 不是 Asterinas 自定义命令，而是标准 LVM2/dmsetup 用户态工具的子命令。标准 libdevmapper 按 Linux Device Mapper ABI 默认使用 `/dev/mapper/control` 作为 control endpoint。
-
 ```text
 dmsetup version
-  -> 标准 LVM2/dmsetup 处理 version 子命令
-  -> libdevmapper 按 Linux DM ABI 默认打开 /dev/mapper/control
-  -> 后续通过这个 control fd 发 DM_VERSION ioctl
-```
+  -> libdevmapper
+       准备 raw ioctl number = DM_VERSION
+       准备 dm_ioctl buffer，其中 version 字段带用户态版本
 
-这也解释了上一节为什么必须暴露 `/dev/mapper/control`：
-
-```text
-Asterinas 要兼容标准 dmsetup/LVM2
-  -> 标准 libdevmapper 默认找 /dev/mapper/control
-  -> Asterinas 必须注册 DmControlDevice
-  -> first process 阶段必须创建 /dev/mapper/control 节点
-```
-
-### 2. control 设备和 open 对象
-
-启动期注册入口在 `kernel/core/src/device/misc/device_mapper.rs`：
-
-```text
-device_mapper::init_in_first_kthread()
-  -> DM_MANAGER.call_once(...)
-     先准备 Device Mapper 后端 manager。
-     这不是注册 control 的硬依赖，而是顺序保障：
-     control 暴露给用户态后，ioctl 后端已经可用。
-
-  -> char::register(DmControlDevice::new())
-     创建并注册 control 字符设备对象。
-```
-
-`DmControlDevice` 负责三件事：
-
-```text
-DmControlDevice::new()
-  -> 绑定 DeviceId = misc major 10 + DM_CONTROL_MINOR 236
-
-DmControlDevice::devtmpfs_meta()
-  -> 返回 "mapper/control"
-  -> first process 阶段据此在 /dev 下创建 mapper/control
-
-DmControlDevice::open()
-  -> 返回 DmControlFile
-  -> DmControlFile 是后续真正接收 DM ioctl 的 per-open file ops
-```
-
-需要区分：
-
-```text
-DmControlDevice = 设备对象，负责设备号、devtmpfs 路径、open 行为
-DmControlFile   = open 之后得到的文件操作对象，负责 ioctl
-```
-
-所以 open 主线是：
-
-```text
-open("/dev/mapper/control")
-  -> VFS/devtmpfs 找到 char device 节点
-  -> 节点设备号是 DeviceId(10, 236)
-  -> char registry lookup(DeviceId(10, 236))
-  -> 找到 DmControlDevice
+  -> open("/dev/mapper/control")
   -> DmControlDevice::open()
-  -> 返回 DmControlFile
-```
+  -> DmControlFile
 
-到这里还没有执行 `version`，只是拿到了 control fd。
-
-### 3. `DM_VERSION` raw ioctl command 从哪里来
-
-用户态 libdevmapper 接下来发：
-
-```text
-ioctl(control_fd, DM_VERSION, buffer)
-```
-
-这里的 `DM_VERSION` 是 Linux ioctl 宏根据 Device Mapper ABI 编码出的 32-bit command number。当前对应：
-
-```text
-DM_VERSION
-  -> _IOWR(DM_IOCTL, 0, struct dm_ioctl)
-     - _IOWR：方向是 read + write
-     - DM_IOCTL = 0xfd：Device Mapper ioctl magic
-     - 0：具体 command number，即 DM_VERSION_CMD
-     - struct dm_ioctl：用户态/内核共享 buffer 类型，大小参与编码
-  -> raw_cmd = 0xc138fd00
-```
-
-要区分：
-
-```text
-0xc138fd00  = 这次 ioctl 是什么命令
-[4, 48, 0] = 内核 DM driver version
-```
-
-### 4. syscall 层如何把 ioctl 分发给 control file
-
-Asterinas 通用 syscall 入口在 `kernel/core/src/syscall/ioctl.rs`：
-
-```text
-sys_ioctl(raw_fd, cmd, arg, ctx)
-  -> RawIoctl::new(cmd, arg)
-     - cmd = 0xc138fd00
-     - arg = 用户态 struct dm_ioctl buffer 地址
-
-  -> get_file_fast(raw_fd)
-     根据 fd 找到之前 open 出来的 file object。
-
-  -> file_owned.ioctl(raw_ioctl)
-     把 ioctl 分发给 fd 对应的文件对象。
-```
-
-通用文件层再进入 open file：
-
-```text
-InodeHandle::ioctl(raw_ioctl)
-  -> 如果 fd 是 O_PATH，拒绝
-  -> 如果有 open_file，则调用 open_file.ioctl(path, raw_ioctl)
-  -> 这里的 open_file 就是 DmControlFile
-```
-
-因此链路变成：
-
-```text
-ioctl(control_fd, 0xc138fd00, buffer)
-  -> sys_ioctl()
-  -> 根据 fd 找到 file
-  -> file.ioctl(raw_ioctl)
-  -> open_file.ioctl(path, raw_ioctl)
-  -> DmControlFile::ioctl(path, raw_ioctl)
-```
-
-### 5. `DmControlFile::ioctl()` 主流程
-
-进入 `kernel/core/src/device/misc/device_mapper.rs` 的 `DmControlFile::ioctl()` 后，主流程是：
-
-```text
-DmControlFile::ioctl(raw_ioctl)
-  -> raw_cmd = raw_ioctl.cmd()
-  -> decode_command(raw_cmd)
-  -> 先读用户态 dm_ioctl fixed header
-  -> 从 header 解析 data_size / data_start / flags / name / uuid / dev / target_count
-  -> validate_ioctl_buffer_layout(data_size, data_start)
-  -> 根据 data_size 读取完整 dm_ioctl buffer
-  -> validate_client_version(buffer)
-  -> write_version(buffer)
-  -> validate_input_flags(command, buffer)
-  -> handle_command(command, buffer)
-  -> copy_to_user(buffer)
-```
-
-### 6. `decode_command(raw_cmd)` 的语义
-
-对 `dmsetup version` 来说：
-
-```text
-raw_cmd = 0xc138fd00
-```
-
-`decode_command(raw_cmd)` 做的是：
-
-```text
-decode_command(0xc138fd00)
-  -> 检查 prefix
-     确认这是当前支持的 dm_ioctl ABI 形状。
-
-  -> 检查 magic
-     确认这是 Device Mapper ioctl。
-     magic = 0xfd。
-
-  -> 取低 8 bit
-     0xc138fd00 的低 8 bit 是 0。
-
-  -> 匹配支持列表
-     command number 0 对应 DM_VERSION_CMD。
-```
-
-所以这一段不是在解析字符串 `version`。`version` 字符串已经在用户态 dmsetup/libdevmapper 中被映射成了 `DM_VERSION`。内核看到的是 raw ioctl number：
-
-```text
-ioctl(fd, 0xc138fd00, buffer)
-  -> decode_command(0xc138fd00)
-  -> command = DM_VERSION_CMD
-```
-
-### 7. 为什么先读 fixed header
-
-`DmControlFile::ioctl()` 先从用户态读取固定大小 header：
-
-```text
-read fixed header
-  -> 读取 DM_IOCTL_HEADER_SIZE 字节
-  -> 从 header 中拿 data_size
-  -> 从 header 中拿 data_start
-```
-
-原因：
-
-```text
-不能一开始就读完整 buffer，
-因为完整 buffer 有多大，是用户态写在 dm_ioctl.data_size 里的。
-```
-
-拿到 `data_size` 和 `data_start` 后，才能校验布局并读取完整 buffer。
-
-### 8. `validate_ioctl_buffer_layout(data_size, data_start)`
-
-这一步检查用户态给的 `struct dm_ioctl` buffer 布局是否合法：
-
-```text
-validate_ioctl_buffer_layout(data_size, data_start)
-  -> data_size 不能小于 dm_ioctl header
-  -> data_size 不能超过当前允许的 1 MiB
-  -> data_start 不能小于 header
-  -> data_start 不能超过 data_size
-  -> data_start 必须 8 字节对齐
-```
-
-对 `dmsetup version` 来说，虽然没有复杂 payload，但仍然必须提供合法的 `dm_ioctl` buffer。
-
-### 9. 读取完整 buffer 并校验 client version
-
-布局合法后：
-
-```text
-根据 data_size 分配内核 Vec<u8>
-  -> 从 raw_ioctl.arg() 读取完整 dm_ioctl buffer
-  -> 后续命令都在这份内核 buffer 上读写
-```
-
-然后校验用户态 client version：
-
-```text
-validate_client_version(buffer)
-  -> 读取 buffer.version[0]
-  -> 要求用户态 major version 等于内核支持的 major version
-```
-
-当前内核常量是：
-
-```text
-DM_VERSION = [4, 48, 0]
-```
-
-所以这里要求：
-
-```text
-client major version == 4
-```
-
-意义是确认用户态 libdevmapper 和内核 DM ioctl ABI 主版本兼容。
-
-### 10. `write_version(buffer)` 写回 driver version
-
-版本写回发生在通用阶段：
-
-```text
-write_version(buffer)
-  -> 把内核 DM_VERSION 写回 buffer.version[0..3]
-  -> 当前写回 [4, 48, 0]
-```
-
-关键点：
-
-```text
-DM_VERSION_CMD 的 handler 本身几乎不做事。
-真正把 Driver version 写回用户态的是通用 write_version(buffer)。
-```
-
-### 11. flags 校验和 command handler
-
-然后进入 flags 校验：
-
-```text
-validate_input_flags(DM_VERSION_CMD, buffer)
-  -> flags 不能包含未知位
-  -> deferred remove 当前不支持
-  -> IMA measurement 当前不支持
-  -> status table flag 只能用于 table status
-  -> query inactive flag 只能用于特定查询命令
-  -> uuid flag 只能用于设备重命名
-```
-
-最后分发 command：
-
-```text
-handle_command(DM_VERSION_CMD, buffer)
-  -> match command
-  -> DM_VERSION_CMD => Ok(())
-```
-
-为什么 `DM_VERSION_CMD` 只是 `Ok(())`：
-
-```text
-version 信息已经由 write_version(buffer) 写回。
-这个命令不创建 device，
-不加载 table，
-不访问 backing disk，
-也不修改 DM_MANAGER 状态。
-```
-
-### 12. copy_to_user 并打印结果
-
-最后：
-
-```text
-copy_to_user(buffer)
-  -> 把修改后的 dm_ioctl buffer 写回用户态
-  -> buffer.version = [4, 48, 0]
-
-libdevmapper 读取返回 buffer
-  -> dmsetup 打印 Driver version: 4.48.0
-```
-
-完整链路到这里结束。
-
-### 13. 代码跳转顺序
-
-按代码阅读时可以这样跳：
-
-```text
-1. control 启动期注册
-   -> kernel/core/src/device/misc/device_mapper.rs
-   -> device_mapper::init_in_first_kthread()
-
-2. control 设备对象
-   -> kernel/core/src/device/misc/device_mapper.rs
-   -> DmControlDevice
-   -> DmControlDevice::devtmpfs_meta()
-   -> DmControlDevice::open()
-
-3. char registry 注册
-   -> kernel/core/src/device/registry/char.rs
-   -> char::register()
-
-4. first process 创建 /dev 节点
-   -> kernel/core/src/device/registry/char.rs
-   -> char::init_in_first_process()
-
-5. 创建 /dev/mapper/control
-   -> kernel/core/src/device/mod.rs
-   -> add_node()
-   -> add_node_at()
-
-6. 用户态 ioctl syscall
-   -> kernel/core/src/syscall/ioctl.rs
-   -> sys_ioctl()
-
-7. 通用文件 ioctl 分发
-   -> kernel/core/src/fs/file/inode_handle.rs
-   -> InodeHandle::ioctl()
-
-8. DM control ioctl
-   -> kernel/core/src/device/misc/device_mapper.rs
-   -> DmControlFile::ioctl()
-
-9. 解码 ioctl command
-   -> kernel/core/src/device/misc/device_mapper.rs
-   -> decode_command(raw_cmd)
-
-10. 校验 buffer 布局
-    -> kernel/core/src/device/misc/device_mapper.rs
-    -> validate_ioctl_buffer_layout(data_size, data_start)
-
-11. 校验 client version
-    -> kernel/core/src/device/misc/device_mapper.rs
-    -> validate_client_version(buffer)
-
-12. 写回 driver version
-    -> kernel/core/src/device/misc/device_mapper.rs
-    -> write_version(buffer)
-
-13. 校验 flags
-    -> kernel/core/src/device/misc/device_mapper.rs
-    -> validate_input_flags(command, buffer)
-
-14. 分发命令
-    -> kernel/core/src/device/misc/device_mapper.rs
-    -> handle_command(command, buffer)
-
-15. 写回用户态
-    -> kernel/core/src/device/misc/device_mapper.rs
-    -> current_userspace!().write_bytes(...)
-```
-
-### 14. 本节结论
-
-```text
-标准 libdevmapper 默认打开 /dev/mapper/control
-  -> Asterinas 必须注册 DmControlDevice 并创建 devtmpfs 节点
-
-open control
-  -> 通过 char registry 找到 DmControlDevice
-  -> DmControlDevice::open() 返回 DmControlFile
-
-ioctl DM_VERSION
+  -> ioctl(fd, DM_VERSION, dm_ioctl buffer pointer)
   -> sys_ioctl 根据 fd 找到 DmControlFile
-  -> DmControlFile::ioctl 解码 0xc138fd00
-  -> 得到 DM_VERSION_CMD
-  -> 通用 write_version 写回 [4, 48, 0]
-  -> handle_command(DM_VERSION_CMD) 只需要 Ok(())
-  -> copy_to_user
+  -> DmControlFile::ioctl()
+
+       raw ioctl number ---------> decode_command() = DM_VERSION_CMD
+                                      |
+                                      v
+       dm_ioctl buffer pointer ---> 读取并校验 dm_ioctl buffer
+                                      |
+                                      v
+                              validate_client_version(buffer)
+                              write_version(buffer)
+                              handle_command(DM_VERSION_CMD, buffer)
+                                      |
+                                      v
+                              写回 dm_ioctl buffer
+
   -> dmsetup 打印 Driver version
 ```

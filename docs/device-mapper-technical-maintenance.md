@@ -4,10 +4,10 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | v2.2 |
-| 状态 | 维护中，基于当前 `dm` 分支实现与 2026-09-03 验证结果整理 |
+| 版本 | v2.3 |
+| 状态 | 维护中，基于当前 `dm` 分支实现与 2026-09-04 验证结果整理 |
 | 目标读者 | 内核开发人员、架构评审人员、测试与集成维护人员 |
-| 更新时间 | 2026-09-03 |
+| 更新时间 | 2026-09-04 |
 | 相关进度 | [Device Mapper 项目进度](../log/device-mapper-progress.md) |
 
 ## 执行摘要
@@ -369,7 +369,7 @@ Target 能力按风险和映射复杂度递进：先用 `error` / `zero` 这类�
 
 当前代码结构已经从 closed `DmTarget` enum 迁移为 `dyn DmTarget` trait object：`DmTable` 保存 `Vec<DmTargetBox>`，table/control-plane 不再按 enum variant 分派 target 行为；`error`、`zero`、`linear`、`striped` 分别在 concrete target 文件中实现 `DmTarget`。这样新增 target 时仍需要在静态 factory `parse_target_with()` 中添加 target type 分支，但不需要继续把 table/status/deps/I/O 路径扩散成多处 enum match。
 
-系统验收也按这个顺序分层：`--dmsetup-cli` 覆盖控制面和 error/zero 基础 I/O，`--dataplane-edge` 覆盖 raw DM 边界和 zero 读写语义，raw linear / raw striped 覆盖窄数据面，linear / striped 基础 LVM2 覆盖单 segment grow/shrink，linear / striped cross-segment 覆盖追加 segment 和 shrink 回单段，mixed 覆盖 linear + striped table 组合。
+系统验收按职责分层：`--control-plane` 覆盖 dmsetup 控制面和 error/zero I/O；`--dataplane` 覆盖 raw linear、striped、mixed、error、zero 与真实 backing 布局；`--lvm2-topology` 覆盖同 boot 的 PV/VG/LV lifecycle 和 linear/striped/mixed topology；linear、striped、mixed integration 分别覆盖 LVM2 文件系统和 reboot persistence。
 
 ### 9.2 Error target 错误语义路线
 
@@ -533,7 +533,7 @@ NixOS guest 提供真实用户态工具链，包括 LVM2、dmsetup、e2fsprogs�
 
 ## 11. 测试与验收路线
 
-验证按三层组织：ktest 锁内核语义，dmsetup/NixOS smoke 锁最小用户态路径，LVM2/reboot 系统验收锁真实用户态链路。`error` / `zero` 这类无 backing target 优先用定向 ktest 和 dmsetup CLI 验证，`linear` 和 `striped` 按 target 特性分层：基础脚本验证单 segment 内扩容/缩容，进阶脚本独立验证 cross-segment/table，mixed 脚本验证真实 LVM2 linear + striped 组合。
+验证按两层组织：ktest 锁定内核语义，六个显式 NixOS system suite 锁定真实用户态路径。当前 `--control-plane` 同时覆盖 dmsetup 控制面和 error/zero I/O；`--dataplane` 覆盖 raw linear/striped/mixed/error/zero；`--lvm2-topology` 覆盖同一次启动内的 PV/VG/LV 生命周期、linear/striped/mixed topology；三个 integration suite 继续覆盖 ext2、grow/shrink（适用时）和 reboot persistence。
 
 写测试和 review 结论时需要先区分改动归属：DM 专属修改指 Device Mapper 自己的 ioctl 适配、table 生命周期、target 参数解析、status/deps、error/zero 直接完成语义、linear/striped 映射、BIO split/flush 等能力；Asterinas 内核框架修改指 DM 为跑通真实用户态而依赖或补齐的通用内核能力，例如 block registry/lease、devtmpfs runtime node、procfs、VFS/mount 生命周期、设备号和测试基础设施。前者应优先用 DM ktest 和 DM 系统入口证明，后者还需要说明为什么不是只服务某个 target，以及是否会影响非 DM 路径。
 
@@ -541,104 +541,61 @@ NixOS guest 提供真实用户态工具链，包括 LVM2、dmsetup、e2fsprogs�
 
 ktest 是在 QEMU 内核环境里运行的 Rust 测试，用来验证不依赖真实 LVM2/NixOS 脚本也能判断的 DM 内核语义。它回答的是：table 参数是否合法、ioctl 是否按 Linux DM ABI 返回、error/zero 直接完成语义是否正确、linear/striped 映射是否正确、BIO split/flush/readonly/suspend/resume 是否符合预期，以及失败的 table-load 是否会污染已有 active/inactive table。
 
-系统脚本证明真实用户态链路能跑通；ktest 证明内核语义本身是对的。做 review 时应先看改动属于哪一层，再选对应 ktest。
-
 | ktest 类别 | 对应代码层 | 主要验证什么 | 什么时候跑 |
 |---|---|---|---|
-| DM core / target ktest | `kernel/core/comps/device-mapper` | table、error target、zero target、linear target、striped target、BIO split/remap、flush、deps 去重 | 修改 table、target、数据面时跑 |
-| ioctl 层 ktest | `kernel/core` | `/dev/mapper/control` ioctl ABI、flags、active/inactive、status/deps、remove/rename/wait | 修改 ioctl、控制面、状态机时跑 |
+| DM core / target ktest | `kernel/core/comps/device-mapper` | table、各 target、BIO split/remap/completion、flush、deps 去重 | 修改 table、target、数据面时。 |
+| ioctl 层 ktest | `kernel/core` | `/dev/mapper/control` ABI、flags、active/inactive、status/deps、remove/rename/wait | 修改 ioctl、控制面、状态机时。 |
 
-定向 ktest 的 crate 选择由 [ktest_crate.sh](../myshell/ktest_crate.sh) 进入的目标目录决定。为了只跑目标 crate 的内核测试，应从仓库根目录调用该脚本；不要为了筛选 crate 临时修改根 [Cargo.toml](../Cargo.toml) 的 `default-members`，也不要在仓库根目录用 `make ktest CARGO_OSDK_TEST_ARGS="..."` 作为默认定向测试入口。
-
-标准流程：
-
-1. 从仓库根目录调用 `myshell/ktest_crate.sh <crate-dir> <test-path>`；
-2. 由脚本补齐 release、boot、KVM、initramfs、console、timeout 等公共参数；
-3. 脚本进入对应 crate 执行 `cargo osdk test`；
-4. 测试结束后查看 `<crate-dir>/ktest.log`，确认结果行、summary 和 `All crates tested.`。
-
-修改 table / target / BIO 数据面时：
+定向 ktest 必须从仓库根目录使用 [ktest_crate.sh](../myshell/ktest_crate.sh)：
 
 ```bash
 myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::<test_path>
-```
-
-适用改动：
-
-- error / zero 参数解析和无 backing 完成语义；
-- linear / striped 参数解析；
-- table 连续性、容量和 deps 去重；
-- linear sector remap；
-- striped chunk split/remap；
-- mixed table split；
-- flush fan-out 和错误传播。
-
-修改 ioctl / 控制面状态机时：
-
-```bash
 myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>
 ```
 
-适用改动：
+脚本进入目标 crate 并补齐 release、boot、KVM、initramfs、console 与 timeout 参数；结果位于 `<crate-dir>/ktest.log`。不要把根目录 `make ktest CARGO_OSDK_TEST_ARGS="..."` 当作默认定向入口。
 
-- `DM_DEV_CREATE` / `DM_DEV_REMOVE` / `DM_DEV_RENAME`；
-- `DM_TABLE_LOAD` / `DM_TABLE_CLEAR` / `DM_TABLE_STATUS` / `DM_TABLE_DEPS`；
-- `DM_DEV_SUSPEND` / resume；
-- active / inactive table；
-- readonly flag、wait event、flags 校验、buffer layout。
+### 11.2 分层系统验收矩阵
 
-`ktest.log` 只保留 ktest runner 的最终结果，不保留 QEMU 启动日志、OVMF/GRUB 输出或 kernel 普通日志。负测中出现的预期 `ERROR:` 仍可能打印到终端，但不会混入 `test ... ok/FAILED` 结果行。
+| suite | guest 数 | 覆盖范围 | 不替代的层次 |
+|---|---:|---|---|
+| `--control-plane` | 1 | dmsetup static discovery、tableless/table 生命周期、linear/striped/error/zero table/status/deps/info、events、rename/UUID、readonly、busy remove/remove_all，以及 error/zero I/O。 | 不替代 raw backing 布局或 LVM2/ext2/reboot 验收。 |
+| `--dataplane` | 1 | raw linear、striped、mixed、error、zero；非零 backing start、跨 target/chunk split、discard/write-zeroes 与 backing layout。 | 不替代 LVM2 topology、filesystem 或 reboot。 |
+| `--lvm2-topology` | 1 | static 查询、PV/VG/LV lifecycle、linear/striped/mixed create/grow/shrink、table/status/deps、scan/activation/remove。 | 不替代 ext2 数据或 reboot persistence。 |
+| `--linear-integration` | 3 | linear same-PV/cross-PV second segment、ext2、grow/shrink、三次启动恢复。 | 不替代 striped/mixed target。 |
+| `--striped-integration` | 3 | N-way striped、same-set/cross-set second segment、ext2、grow/shrink、三次启动恢复。 | 不替代 linear/mixed target。 |
+| `--mixed-integration` | 2 | linear + striped mixed LV、跨段 ext2 I/O、重启恢复。 | 不替代 linear/striped 的独立 grow/shrink。 |
 
-### 11.2 按 target 特性分层的系统验收矩阵
+### 11.3 系统测试入口与时间约束
 
-ktest 不放进本矩阵。它是公共内核语义测试层，内部通过 case 覆盖 error、zero、linear、striped 和 mixed；本矩阵只描述需要启动 NixOS guest、调用 dmsetup/LVM2/ext2 的系统验收脚本。
+组合入口：[myshell/run_dm_system_tests.sh](../myshell/run_dm_system_tests.sh)。所有 suite 均以显式参数启动：
 
-| 验收层级 | linear | striped | mixed |
-|---|---|---|---|
-| dmsetup raw 数据面 | `--linear-data`：raw linear cross-target BIO split/remap | `--striped-data`：raw striped chunk split/remap 和 backing 分布 | 暂不单独设 raw mixed 主入口 |
-| 基础 LVM2 单 segment | `--linear-lvm2`：单 PV、单 linear segment、同盘 grow/shrink、ext2 I/O、reboot recovery | `--striped-lvm2`：N PV / N-way、单 striped segment、同一组 PV grow/shrink、ext2 I/O、reboot recovery；默认 2-way，可用 `STRIPED_PV_COUNT=3` 等参数扩展 | 不单独设基础入口 |
-| 进阶 LVM2 cross-segment | `--linear-lvm2-cross-segment`：独立 2PV，先建单段 linear，再扩到第二块 PV 形成两段 linear table，reboot 后验证再 shrink 回单段 | `--striped-lvm2-cross-segment`：独立 2N PV，前 N 盘建基础 striped 段，后 N 盘扩容形成第二个 striped 段；默认 2→4 盘，可用 `STRIPED_CS_PV_COUNT=3` 验证 3→6 盘 | mixed 暂不做扩容/缩容专项 |
-| mixed 组合 | 参与 linear 段 | 参与 striped 段 | `--mixed-lvm2`：基础 linear 单盘段 + 基础 striped 双盘段，验证同一 LV 内 mixed table 读写和 reboot recovery |
-| 阶段验收 | 显式运行 linear 相关入口 | 显式运行 striped 相关入口 | 显式运行 mixed 入口 |
+```bash
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --control-plane
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dataplane
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --lvm2-topology
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-integration
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-integration
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-integration
+```
 
-矩阵原则：基础 LVM2 脚本负责“同一段/同一组盘内扩缩容”，进阶 cross-segment 脚本负责“独立从初始段扩出第二段”。PV 数量是 LVM2 生成目标 table 的触发条件；DM review 的核心是多 segment/table、跨 target 边界、status/deps、flush 和 reboot recovery 是否正确。
-
-### 11.3 系统测试入口
-
-组合入口：[myshell/run_dm_system_tests.sh](../myshell/run_dm_system_tests.sh)
-
-| 规范入口 | 覆盖范围 |
-|---|---|
-| `--quick` | control ABI smoke + raw linear cross-target BIO + raw striped BIO distribution。 |
-| `--dmsetup-cli` | dmsetup 静态查询、tableless、error/zero/linear/striped create/table/status/deps、load/reload/clear/resume、suspend/wait、rename/UUID、remove/remove_all。 |
-| `--lvm2-cli` | LVM2 PV/VG/LV 控制面子集，包括 linear/striped/mixed 命令模板在隔离测试盘上的对齐。 |
-| `--dataplane-edge` | raw DM 数据面边界：multi-segment linear、非零 backing start、striped chunk 边界、zero target 读零写丢弃。 |
-| `--linear-data` | raw linear cross-target BIO split/remap。 |
-| `--striped-data` | raw striped BIO split/remap 和 backing 分布。 |
-| `--linear-lvm2` | 单 PV、单 linear segment、同盘 grow/shrink、ext2 I/O、reboot recovery。 |
-| `--striped-lvm2` | N PV / N-way、单 striped segment、同组盘 grow/shrink、ext2 I/O、reboot recovery；默认 2-way，可通过 `STRIPED_PV_COUNT` 参数扩展。 |
-| `--linear-lvm2-cross-segment` | 独立 linear cross-PV segment、reboot recovery、shrink 回单段。 |
-| `--striped-lvm2-cross-segment` | 独立 striped N-to-2N cross-segment、reboot recovery、shrink 回单段；默认 2→4 盘，可通过 `STRIPED_CS_PV_COUNT` 参数扩展。 |
-| `--mixed-lvm2` | LVM2 linear + striped mixed table create、跨 segment/table ext2 I/O、reboot recovery；暂不做 mixed 扩容/缩容专项。 |
+`GUEST_READY_TIMEOUT=40` 是 QEMU 启动到 guest shell-ready 的硬上限；`GUEST_QEMU_TIMEOUT=180` 是单个 guest 从启动到退出的完整生命周期上限。公共 harness 分别提供 single、two、three guest 流程，且默认按行以 10ms 节流注入 guest 脚本，避免长脚本通过 QEMU serial 一次性灌入时丢失后续命令。
 
 ### 11.4 按改动范围选择验证
 
 | 改动范围 | 必跑验证 |
 |---|---|
-| Rust 格式或 DM core 小改 | `cargo fmt --check` + 对应定向 ktest |
-| 新增基础 target | target/table 定向 ktest + ioctl 定向 ktest；若改到用户态输出或脚本，再跑对应系统入口 |
-| ioctl/control/flags/event/wait | ioctl 层 ktest；改到 dmsetup 用户可见语义时跑 `--dmsetup-cli` |
-| zero/error 用户态语义 | target/table 定向 ktest + ioctl 定向 ktest + `--dmsetup-cli`；raw 数据面边界变化再跑 `--dataplane-edge` |
-| linear BIO split/remap | DM table/target ktest + `--linear-data` |
-| striped BIO split/remap | DM table/target ktest + `--striped-data` |
-| linear LVM2 基础单段扩缩容/恢复 | ktest + `--linear-lvm2` |
-| striped LVM2 基础单段扩缩容/恢复 | ktest + `--striped-lvm2` |
-| linear LVM2 cross-segment/recovery/shrink | ktest + `--linear-lvm2-cross-segment` |
-| striped LVM2 N-to-2N cross-segment/recovery/shrink | ktest + `--striped-lvm2-cross-segment` |
-| LVM2 linear + striped mixed table/recovery | ktest + `--mixed-lvm2` |
-| 阶段验收或发版前 DM 系统回归 | 按改动范围显式运行对应入口；quick 包含 control、linear raw 和 striped raw；linear 常用 `--linear-lvm2`、`--linear-lvm2-cross-segment`，striped 常用 `--striped-lvm2`、`--striped-lvm2-cross-segment` |
+| Rust 格式或 DM core 小改 | `cargo fmt --check`、对应定向 ktest。 |
+| ioctl/control/flags/event/wait | ioctl ktest；用户可见语义变化时加 `--control-plane`。 |
+| error/zero target 或其 I/O | target/table ktest；`--control-plane` 和/或 `--dataplane`。 |
+| linear/striped/mixed BIO split、remap、completion 或 range I/O | DM table/target ktest + `--dataplane`。 |
+| LVM2 PV/VG/LV 生命周期、same-boot table/status/deps | 相关 ktest + `--lvm2-topology`。 |
+| linear filesystem、跨 PV、shrink 或 reboot | `--linear-integration`。 |
+| striped filesystem、cross-set、shrink 或 reboot | `--striped-integration`。 |
+| mixed LVM2 ext2 或 reboot | `--mixed-integration`。 |
+| guest harness / suite 脚本 | 直接运行被改 suite，检查 timing marker、cleanup 和最终 pass marker。 |
 
-新增功能默认以相关定向 ktest 锁定内核语义；系统测试属于慢速验收，只在改动影响用户态链路、脚本逻辑、设备节点或阶段验收时运行。QEMU、ktest、NixOS 系统测试需要串行运行，避免镜像和测试盘锁冲突。
+QEMU、ktest、NixOS 系统测试必须串行运行，避免测试 image 和测试盘锁冲突。
 
 ## 12. 技术选型与设计决策汇总
 
@@ -700,9 +657,9 @@ ktest 不放进本矩阵。它是公共内核语义测试层，内部通过 case
 ### 14.3 系统验收
 
 - 每个小阶段至少有对应定向 ktest 或系统入口证明，不用全量 ktest 作为新增功能默认验收项。
-- 改动影响 dmsetup 用户可见语义时，`--dmsetup-cli` 需要通过并说明是否存在 GAP。
-- 改动影响 raw DM 数据面边界时，`--dataplane-edge` 或对应 raw data suite 需要通过。
-- 改动影响 LVM2 控制面或 reboot recovery 时，对应 LVM2 suite 需要通过。
+- 改动影响 dmsetup 用户可见语义时，`--control-plane` 需要通过并说明是否存在 GAP。
+- 改动影响 raw DM 数据面边界时，`--dataplane` 需要通过。
+- 改动影响 LVM2 控制面、topology 或 reboot recovery 时，对应 `--lvm2-topology` 或目标 integration suite 需要通过。
 - 系统测试需要显式选择入口；慢系统脚本只在相关链路变化或阶段验收时运行。
 
 ## 15. 附录
@@ -711,27 +668,22 @@ ktest 不放进本矩阵。它是公共内核语义测试层，内部通过 case
 
 | Target | 控制面 | 数据面 | 系统验收 | 当前边界 |
 |---|---|---|---|---|
-| `error` | table load/status/deps 已支持；version 为 `1.6.0` | Read/Write 返回 I/O error；Flush 对无 backing table 成功完成 | 定向 ktest、`--dmsetup-cli` 已覆盖 | 只模拟稳定错误 target，不等于真实 backing fault injection。 |
-| `zero` | table load/status/deps 已支持；version 为 `1.1.0` | Read 返回全 0；Write 丢弃并成功；Flush/Discard/WriteZeroes 对无 backing table 成功完成 | 定向 ktest、`--dmsetup-cli`、`--dataplane-edge` 已覆盖 | 普通 Write 丢弃仍是 zero target 自身语义；Discard/WriteZeroes 是通用 range BIO 在 zero 上的 direct-complete 特例。 |
-| `linear` | table load/status/deps 已支持；version 为 `1.4.0` | Read/Write/Discard/WriteZeroes remap 到 backing；Flush 参与 backing 去重 fan-out；跨 target BIO split 已支持 | ktest、`--linear-data`、`--linear-lvm2`、`--linear-lvm2-cross-segment` 已覆盖 | backing 不支持 range BIO 时返回不支持；不声明 Linux DM queue stacking 支持。 |
-| `striped` | table load/status/deps 已支持；version 为 `1.6.0` | Read/Write/Discard/WriteZeroes 按 stripe chunk remap 到 backing；Flush 参与 backing 去重 fan-out | ktest、`--striped-data`、`--striped-lvm2`、`--striped-lvm2-cross-segment` 已覆盖 | backing 不支持 range BIO 时返回不支持；不承诺 Linux striped 周边扩展语义。 |
-| `linear + striped mixed` | table load/status/deps 已支持 | 跨 target split + striped chunk split 已支持 | ktest、`--mixed-lvm2` 已覆盖 | 只表示同一 mapper table 内跨 target，不表示跨 LV。 |
+| `error` | table load/status/deps 已支持；version 为 `1.6.0` | Read/Write 返回 I/O error；Flush 对无 backing table 成功完成 | 定向 ktest、`--control-plane`、`--dataplane` 已覆盖 | 只模拟稳定错误 target，不等于真实 backing fault injection。 |
+| `zero` | table load/status/deps 已支持；version 为 `1.1.0` | Read 返回全 0；Write 丢弃并成功；Flush/Discard/WriteZeroes 对无 backing table 成功完成 | 定向 ktest、`--control-plane`、`--dataplane` 已覆盖 | 普通 Write 丢弃仍是 zero target 自身语义；Discard/WriteZeroes 是通用 range BIO 在 zero 上的 direct-complete 特例。 |
+| `linear` | table load/status/deps 已支持；version 为 `1.4.0` | Read/Write/Discard/WriteZeroes remap 到 backing；Flush 参与 backing 去重 fan-out；跨 target BIO split 已支持 | ktest、`--dataplane`、`--lvm2-topology`、`--linear-integration` 已覆盖 | backing 不支持 range BIO 时返回不支持；不声明 Linux DM queue stacking 支持。 |
+| `striped` | table load/status/deps 已支持；version 为 `1.6.0` | Read/Write/Discard/WriteZeroes 按 stripe chunk remap 到 backing；Flush 参与 backing 去重 fan-out | ktest、`--dataplane`、`--lvm2-topology`、`--striped-integration` 已覆盖 | backing 不支持 range BIO 时返回不支持；不承诺 Linux striped 周边扩展语义。 |
+| `linear + striped mixed` | table load/status/deps 已支持 | 跨 target split + striped chunk split 已支持 | ktest、`--dataplane`、`--lvm2-topology`、`--mixed-integration` 已覆盖 | 只表示同一 mapper table 内跨 target，不表示跨 LV。 |
 
 ### 15.2 系统验收脚本地图
 
 | 脚本 | 规范入口 | 作用 |
 |---|---|---|
-| [myshell/run_dmsetup_cli_semantics_test.sh](../myshell/run_dmsetup_cli_semantics_test.sh) | `--dmsetup-cli` | dmsetup 控制面和 error/zero 基础 I/O 语义审计。 |
-| [myshell/run_lvm2_cli_semantics_test.sh](../myshell/run_lvm2_cli_semantics_test.sh) | `--lvm2-cli` | LVM2 控制面命令模板在测试盘隔离参数下的 guest 对齐审计。 |
-| [myshell/run_dm_dataplane_edge_test.sh](../myshell/run_dm_dataplane_edge_test.sh) | `--dataplane-edge` | raw DM linear/striped/zero 数据面边界审计，包含 zero target 的 BLKDISCARD/BLKZEROOUT。 |
-| [myshell/dm_linear/run_control_abi_test.sh](../myshell/dm_linear/run_control_abi_test.sh) | `--quick` | linear control ABI smoke。 |
-| [myshell/dm_linear/run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh) | `--linear-data`、`--quick` | raw linear cross-target BIO regression。 |
-| [myshell/dm_linear/run_lvm2_linear_reboot_test.sh](../myshell/dm_linear/run_lvm2_linear_reboot_test.sh) | `--linear-lvm2` | 单 PV、单 segment linear，同盘 grow/shrink、ext2 I/O、reboot recovery。 |
-| [myshell/dm_linear/run_lvm2_linear_cross_segment_test.sh](../myshell/dm_linear/run_lvm2_linear_cross_segment_test.sh) | `--linear-lvm2-cross-segment` | 独立 2PV linear cross-segment、reboot recovery、shrink 回单段。 |
-| [myshell/dm_striped/run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh) | `--striped-data` | raw striped BIO distribution。 |
-| [myshell/dm_striped/run_lvm2_striped_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_reboot_test.sh) | `--striped-lvm2` | N PV / N-way 单 segment striped，同组盘 grow/shrink、ext2 I/O、reboot recovery；默认 2-way，可用 `STRIPED_PV_COUNT` 参数扩展。 |
-| [myshell/dm_striped/run_lvm2_striped_cross_segment_test.sh](../myshell/dm_striped/run_lvm2_striped_cross_segment_test.sh) | `--striped-lvm2-cross-segment` | 独立 striped N-to-2N cross-segment、reboot recovery、shrink 回单段；默认 2→4 盘，可用 `STRIPED_CS_PV_COUNT` 参数扩展。 |
-| [myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh](../myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh) | `--mixed-lvm2` | LVM2 linear + striped mixed table reboot。 |
+| [myshell/run_dm_control_plane_test.sh](../myshell/run_dm_control_plane_test.sh) | `--control-plane` | dmsetup 控制面、table 生命周期、error/zero I/O、event、rename/UUID、readonly 和 remove 语义。 |
+| [myshell/run_dm_dataplane_test.sh](../myshell/run_dm_dataplane_test.sh) | `--dataplane` | raw linear/striped/mixed/error/zero I/O、nonzero backing start、跨边界 split 和 backing 布局审计。 |
+| [myshell/run_lvm2_topology_test.sh](../myshell/run_lvm2_topology_test.sh) | `--lvm2-topology` | LVM2 PV/VG/LV lifecycle、linear/striped/mixed topology、activation 与 remove。 |
+| [myshell/dm_linear/run_lvm2_linear_integration_test.sh](../myshell/dm_linear/run_lvm2_linear_integration_test.sh) | `--linear-integration` | linear same-PV/cross-PV segment、ext2、grow/shrink 和三次启动恢复。 |
+| [myshell/dm_striped/run_lvm2_striped_integration_test.sh](../myshell/dm_striped/run_lvm2_striped_integration_test.sh) | `--striped-integration` | parameterized N-way striped、same-set/cross-set segment、ext2、grow/shrink 和三次启动恢复。 |
+| [myshell/dm_mixed/run_lvm2_mixed_integration_test.sh](../myshell/dm_mixed/run_lvm2_mixed_integration_test.sh) | `--mixed-integration` | LVM2 linear + striped mixed table、跨段 ext2 I/O 和两次启动恢复。 |
 
 ### 15.3 质量检查清单
 
@@ -754,9 +706,9 @@ ktest 不放进本矩阵。它是公共内核语义测试层，内部通过 case
 
 本附录从 [study.md](study.md) 迁入，用于集中维护标准 Linux/OpenEuler 与 Asterinas 的 `dmsetup` 用户可见语义对比。正文只保留架构、设计与验收路线；逐命令判定统一放在附录，避免学习记录和技术文档重复维护。
 
-本节用于批量对齐标准 Linux/OpenEuler 与 Asterinas 的 `dmsetup` 用户可见语义。基准入口是 [run_dmsetup_linux_cli_baseline.sh](../myshell/run_dmsetup_linux_cli_baseline.sh)，Asterinas guest 验证入口是 [run_dmsetup_cli_semantics_test.sh](../myshell/run_dmsetup_cli_semantics_test.sh)，统一通过 [run_dm_system_tests.sh](../myshell/run_dm_system_tests.sh) 的 `--dmsetup-cli` suite 运行。
+本节用于批量对齐标准 Linux/OpenEuler 与 Asterinas 的 `dmsetup` 用户可见语义。基准入口是 [run_dmsetup_linux_cli_baseline.sh](../myshell/run_dmsetup_linux_cli_baseline.sh)，Asterinas guest 验证入口是 [run_dm_control_plane_test.sh](../myshell/run_dm_control_plane_test.sh)，统一通过 [run_dm_system_tests.sh](../myshell/run_dm_system_tests.sh) 的 `--control-plane` suite 运行。
 
-本轮 Linux/OpenEuler 基准主体已在 2026-08-28 运行，基准结果已固化在下表；当时使用的 `/tmp/dmsetup-linux-baseline.log` 是临时日志，当前不作为现存依据。本机存在非测试 DM 设备 `openeuler-root`、`openeuler-swap`、`wdf`，因此 `EMPTY_LS`、`REMOVE_ALL_TEST_ONLY`、`REMOVE_ALL_EMPTY` 被标记为 `SKIPPED_HOST_UNSAFE`，没有在宿主机执行全局 `remove_all` 语义。Asterinas guest 已在 2026-09-01 重建 NixOS 后通过 `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dmsetup-cli` 完成复测：guest ready 18s，guest 内命令审计 11s，`SUMMARY_GAP_DMSETUP_CLI_SEMANTICS: 0`。zero target 相关 host baseline 脚本已补充，宿主侧完整基准待需要时重新运行。
+本轮 Linux/OpenEuler 基准主体已在 2026-08-28 运行，基准结果已固化在下表；当时使用的 `/tmp/dmsetup-linux-baseline.log` 是临时日志，当前不作为现存依据。本机存在非测试 DM 设备 `openeuler-root`、`openeuler-swap`、`wdf`，因此 `EMPTY_LS`、`REMOVE_ALL_TEST_ONLY`、`REMOVE_ALL_EMPTY` 被标记为 `SKIPPED_HOST_UNSAFE`，没有在宿主机执行全局 `remove_all` 语义。当前 control-plane guest 入口是 [run_dm_control_plane_test.sh](../myshell/run_dm_control_plane_test.sh)，并已在 2026-09-04 six-suite 验收中通过：`SUMMARY_GAP_DM_CONTROL_PLANE: 0`、`TEST_PASS_DM_CONTROL_PLANE` 与 `HOST_PASS_DM_CONTROL_PLANE`。zero target 相关 host baseline 脚本已补充，宿主侧完整基准待需要时重新运行。
 
 动态值归一化规则：`/dev/loopX` 记为 `<LOOP1>/<LOOP2>`，backing 设备号记为 `<DEV1>/<DEV2>`，`/dev/dm-N` 记为 `/dev/dm-<N>`，版本号记为 `<VERSION>`，event number 只记录关键变化。对齐状态按用户可见语义判断，不要求 stdout 字节级完全相同；例如本机支持更多 target，而 Asterinas 只列出当前已实现的 `error`、`linear`、`striped`、`zero`，仍属于符合当前阶段目标。
 
@@ -882,7 +834,7 @@ ktest 不放进本矩阵。它是公共内核语义测试层，内部通过 case
 
 本附录从 [study.md](study.md) 迁入，用于集中维护标准 Linux/OpenEuler 与 Asterinas 当前 LVM2 控制面子集的逐命令对齐状态。本节整体适用边界是测试盘隔离参数和无 udev 规则依赖；表格每行的当前结论只判断该命令模板在该前置条件下的用户可见语义是否对齐。
 
-本节用于对齐标准 Linux/OpenEuler 与 Asterinas 当前 Device Mapper 能支撑的 LVM2 控制面子集。主机基准入口是 [run_lvm2_linux_cli_baseline.sh](../myshell/run_lvm2_linux_cli_baseline.sh)，已在 2026-08-31 用临时 loop 设备完成实测：`SUMMARY_GAP_LVM2_LINUX_BASELINE: 0`，且 postflight 未发现非测试 LVM/DM 快照变化。Asterinas guest 同构入口是 [run_lvm2_cli_semantics_test.sh](../myshell/run_lvm2_cli_semantics_test.sh)，已通过 `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --lvm2-cli` 完成复测：`SUMMARY_GAP_LVM2_CLI_SEMANTICS: 0`。该结论只表示当前脚本覆盖的 linear/striped/mixed LVM2 控制面子集在限定场景下对齐，不代表完整 LVM2 兼容。
+本节用于对齐标准 Linux/OpenEuler 与 Asterinas 当前 Device Mapper 能支撑的 LVM2 控制面子集。主机基准入口是 [run_lvm2_linux_cli_baseline.sh](../myshell/run_lvm2_linux_cli_baseline.sh)，已在 2026-08-31 用临时 loop 设备完成实测：`SUMMARY_GAP_LVM2_LINUX_BASELINE: 0`，且 postflight 未发现非测试 LVM/DM 快照变化。当前 Asterinas guest 入口是 [run_lvm2_topology_test.sh](../myshell/run_lvm2_topology_test.sh)，并已在 2026-09-04 six-suite 验收中通过：`SUMMARY_GAP_LVM2_TOPOLOGY: 0`、`TEST_PASS_LVM2_TOPOLOGY` 与 `HOST_PASS_LVM2_TOPOLOGY`。该结论只表示当前脚本覆盖的 linear/striped/mixed LVM2 控制面子集在限定场景下对齐，不代表完整 LVM2 兼容。
 
 主机安全口径：所有 destructive 命令只允许作用于本次 manifest 中的测试 VG/LV/PV 和临时 loop device；不删除、不 deactivate、不清理用户已有 PV/VG/LV。
 

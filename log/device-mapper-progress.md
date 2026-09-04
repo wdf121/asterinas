@@ -4,238 +4,95 @@
 
 ## 当前状态
 
-截至 2026-09-03，`dm` 分支当前重点已推进到 Device Mapper target framework 可扩展性重构和 ktest 验证链路收敛。当前不声明完整 Device Mapper 或完整 LVM2 兼容；已确认的是当前实现范围内的 `error`、`linear`、`striped`、`zero` 以及 LVM2 生成的 linear/striped/mixed table 在测试场景下通过。DM table/control-plane 已从 closed `DmTarget` enum 迁移为 `dyn DmTarget` trait object，具体 target 语义下沉到各 target 文件；定向 ktest 默认通过 crate-local wrapper 运行。
+截至 2026-09-04，当前工作重点是稳固已实现的 Device Mapper 功能与验证链路，不新增 target 或扩大 Linux DM 兼容声明。已确认的实现范围包括 `error`、`zero`、`linear`、`striped`，以及同一 mapper/LV 内的 linear + striped mixed table。DM table/control-plane 已从 closed `DmTarget` enum 迁移为 `dyn DmTarget` trait object；定向 ktest 默认使用 crate-local wrapper。
 
-当前可用的系统测试入口集中在：
+当前六个 canonical NixOS system suite 均已通过，且每个实际 guest 的 shell-ready 时间均不超过 40 秒：
 
 ```text
-myshell/run_dm_system_tests.sh --quick
-myshell/run_dm_system_tests.sh --dmsetup-cli
-myshell/run_dm_system_tests.sh --lvm2-cli
-myshell/run_dm_system_tests.sh --dataplane-edge
-myshell/run_dm_system_tests.sh --linear-data
-myshell/run_dm_system_tests.sh --striped-data
-myshell/run_dm_system_tests.sh --linear-lvm2
-myshell/run_dm_system_tests.sh --striped-lvm2
-myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment
-myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
-myshell/run_dm_system_tests.sh --mixed-lvm2
+myshell/run_dm_system_tests.sh --control-plane
+myshell/run_dm_system_tests.sh --dataplane
+myshell/run_dm_system_tests.sh --lvm2-topology
+myshell/run_dm_system_tests.sh --linear-integration
+myshell/run_dm_system_tests.sh --striped-integration
+myshell/run_dm_system_tests.sh --mixed-integration
 ```
 
-系统测试仍要求串行执行；单个 QEMU guest 从启动到退出的完整生命周期默认 180 秒，超过约 3 分钟按异常处理。
+运行时统一使用：
+
+```bash
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh <suite>
+```
+
+`GUEST_READY_TIMEOUT=40` 限制 QEMU 启动到 guest shell-ready；`GUEST_QEMU_TIMEOUT=180` 限制单个 guest 的完整生命周期。系统测试必须串行执行。入口不提供无参数默认执行或历史兼容别名。
 
 ## 新对话接手阅读清单
 
-新开对话或上下文压缩后，优先阅读以下文件即可快速恢复当前工作状态：
+新开对话或上下文压缩后，优先阅读：
 
 ```text
 CLAUDE.md
 AGENTS.md
 log/device-mapper-progress.md
-log/device-mapper-optimization-v1.md
-log/2026-9-1.md
-log/2026-9-2.md
-log/2026-9-3.md
+log/2026-9-4.md
 docs/test.md
-docs/study.md
+docs/production-code-validation-chain.md
 docs/device-mapper-technical-maintenance.md
+docs/non-device-mapper-change-rationale.md
 ```
 
 阅读重点：
 
 - `CLAUDE.md`：协作规则，包括简体中文、精简汇报、新阶段先说明差异、默认不 push。
-- `AGENTS.md`：项目路径、容器路径、测试入口、系统测试串行和临时 ktest 约束。
-- `log/device-mapper-progress.md`：当前项目滚动状态和下一步优先级，是接手时的主入口。
-- `log/device-mapper-optimization-v1.md`：第一版优化专题文档，集中维护 P0-P5 优先级、改动对比、验证矩阵和剩余风险。
-- `log/2026-9-1.md`：guest 启动慢排查修复、`zero` target 核心/控制面/数据面覆盖、discard / write zeroes 通用 range BIO 与 DM 映射接入。
-- `log/2026-9-2.md`：文档、系统测试脚本、成功 marker、超时变量和 patches 收敛状态。
-- `log/2026-9-3.md`：`DmTarget` trait object 重构、crate-local ktest wrapper、runner 结果行拆分、`timeout --foreground` 修复和本轮验证结果。
-- `docs/test.md`：实际运行命令、suite 列表和 QEMU 生命周期约束。
-- `docs/study.md`：`/dev/mapper/control` 注册主线和适合复盘的学习材料。
-- `docs/device-mapper-technical-maintenance.md`：DM 技术维护主文档；附录集中维护 `dmsetup` / LVM2 控制面对齐矩阵。
+- `AGENTS.md`：容器路径、测试入口、系统测试串行和定向 ktest 约束。
+- `log/2026-9-4.md`：six-suite 收敛、公共 harness 变更、非对齐 striped 诊断与本轮真实验证记录。
+- `docs/test.md`：当前系统验收命令、suite 职责、marker 和超时含义。
+- `docs/production-code-validation-chain.md`：ktest 与 system test 的实际执行链路。
+- `docs/device-mapper-technical-maintenance.md`：DM 架构、target 边界、系统验证矩阵和 command alignment 附录。
+- `docs/non-device-mapper-change-rationale.md`：DM 依赖的通用内核与测试基础设施改动边界。
 
-当前接手结论：`dmsetup` 和 LVM2 控制面对齐已完成，`--dataplane-edge` 已通过，`error` / `zero` target 已完成核心 ktest、ioctl 层定向 ktest 和 guest 脚本覆盖。flush 数据面已通过现有 core ktest 收口确认；discard / write zeroes 已作为通用 block range BIO 增量接入，DM 可对 linear/striped remap，对 error 返回 I/O error，对 zero direct-complete，block ioctl 已支持 BLKDISCARD/BLKZEROOUT，virtio 后端按协商能力下发，NVMe 后端仍返回不支持。当前 DM target 表达已从 closed enum 迁移为 `dyn DmTarget` trait object，`DmTable` 持有 `Vec<DmTargetBox>`，target-local 语义由各 concrete target 实现；静态 factory 暂时保留。定向 ktest 默认用 `myshell/ktest_crate.sh <crate-dir> [filter]`，结果日志为 `<crate-dir>/ktest.log`。下一步优先根据新增 target 或数据面语义选择小阶段设计，而不是继续扩散 enum/match 分派。
+## 当前验证入口与职责
 
-本节是上下文交接入口；后续每完成一个小阶段，应同步更新阅读清单、当前接手结论和下一步优先级。
+| suite | 所有者与覆盖范围 |
+|---|---|
+| `--control-plane` | `dmsetup` discovery、tableless/table 生命周期、linear/striped/error/zero table/status/deps/info、events、rename/UUID、readonly、busy remove/remove_all；当前包含 error/zero I/O。 |
+| `--dataplane` | raw linear、striped、mixed、error、zero；nonzero backing start、跨 target/chunk split、flush、discard/write-zeroes、mapper readback 和 backing 布局。 |
+| `--lvm2-topology` | static LVM2 查询、PV/VG/LV lifecycle、linear/striped/mixed create/grow/shrink、table/status/deps、activation/scan/remove；不做 ext2 或 reboot persistence。 |
+| `--linear-integration` | linear same-PV/cross-PV second segment、ext2、grow/shrink 和三次启动恢复。 |
+| `--striped-integration` | parameterized N-way striped、same-set/cross-set second segment、ext2、grow/shrink 和三次启动恢复。 |
+| `--mixed-integration` | linear + striped mixed LV、跨段 ext2 I/O 和两次启动恢复。 |
+
+公共 harness [dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh) 提供 single、two、three guest 流程，并输出 started、shell-ready、completed 的 ISO 时间与 elapsed marker。默认 `GUEST_INPUT_LINE_DELAY=0.01`，按行节流注入 guest 脚本；设置为 `0` 才显式关闭节流。
 
 ## 已完成并验证的范围
 
-### dmsetup 控制面语义
+### DM core 与用户可见 ABI
 
-已新增并使用主机 Linux/OpenEuler 基准脚本与 Asterinas guest 同构脚本：
+- `/dev/mapper/control` 和 Linux DM 核心 ioctl 子集已支持：create/remove/remove_all/rename/status/list/wait、table load/clear/status/deps、active/inactive lifecycle、readonly 与主要 flags。
+- target 支持 `error`、`zero`、`linear`、`striped`，以及 linear + striped mixed table。
+- `error` 无 backing，Read/Write 返回 I/O error；`zero` Read 返回全零、Write 丢弃；二者无 backing Flush 均 direct-complete，deps 为空。
+- linear/striped 支持 Read/Write/Discard/WriteZeroes remap；table-level 与 target-level split 通过 completion 聚合保证原始 BIO 只完成一次。
+- Flush 对 backing 去重后 fan-out；无 backing table direct-complete。
 
-```text
-myshell/run_dmsetup_linux_cli_baseline.sh
-myshell/run_dmsetup_cli_semantics_test.sh
-myshell/run_dm_system_tests.sh --dmsetup-cli
-```
+### 2026-09-04 数据面与系统验收收敛
 
-已覆盖并对齐的用户可见语义包括：
+- 删除历史阶段性 system-test 入口，只保留六个 canonical suite；保留公共 harness、`myshell/ktest_crate.sh` 和 Linux baseline 对照脚本。
+- 公共 harness 增加独立的 40 秒 shell-ready timeout、180 秒 lifecycle timeout、guest timing marker、QEMU group cleanup 和 three-guest helper。
+- 修复长 guest shell script 一次性通过 serial 输入时可能丢失后续命令的问题：默认按行以 10ms 节流注入；这不是 DM I/O hang。
+- `--dataplane` 的非对齐 striped 场景从 mapper sector 2 单次写入 12 sectors，验证四个 child 的真实 backing 布局；Step 5 I/O 另有 20 秒诊断 timeout。
+- `aster-device-mapper` 新增精确 12-sector ktest，验证 `striped 2 4` 下 `[2,14)` Write 分成 2/4/4/2 sectors 的四个 child；前三个乱序完成后原 BIO 仍 pending，最后一个完成后原 BIO 只完成一次。
+- 六个 canonical suite 已逐个串行通过；所有实际 guest shell-ready 均在 40 秒上限内，未发现残留 QEMU。
 
-- `dmsetup version`、`targets`、`target-version`。
-- tableless `create`、`--notable`、`ls`、`info`、`remove`。
-- linear / striped / error / zero `create`、`table`、`status`、`deps`、`info`、`remove`。
-- error target 覆盖区间内 Read / Write 返回 I/O error，flush 对无 backing table 成功完成。
-- zero target 读取返回全 0，写入丢弃并成功完成，flush 对无 backing table 成功完成，BLKDISCARD/BLKZEROOUT 成功完成。
-- active / inactive table 的 `load`、`reload`、`clear`、`resume`。
-- `suspend`、`resume`、`wait --noflush`。
-- `rename OLD NEW`、`rename NAME NAME`、重复名 rename、`rename --setuuid`、`info -u UUID`。
-- `remove`、限定场景下的 `remove_all`。
+### 当前功能边界
 
-本轮修复过的控制面 GAP：
+当前不声明完整 Linux Device Mapper、完整 LVM2 用户体验或完整 udev/systemd 自动激活生态。尚不纳入：snapshot、thin、cache、crypt、mirror、raid 等 target 族，完整 sysfs DM 层级，DM-on-DM backing，queue limit/alignment/topology，真实 guest backing I/O error/partial completion 注入，以及 NVMe discard/write-zeroes 后端命令。
 
-- striped `dmsetup status` 输出改为标准 Linux 风格的运行状态参数。
-- `dmsetup wait` 不再被 load/suspend/resume 等普通状态操作错误唤醒。
-- `dmsetup rename NAME NAME` 改为返回 `EBUSY`，状态不变化。
-- ioctl wait 路径改用 signal-aware pause，使 `timeout 3 dmsetup wait ...` 可被信号中断。
+## 后续优先级
 
-2026-09-01 重建 NixOS 后，`--dmsetup-cli` 已通过，新增 `zero` target 无语义 GAP：
-
-```text
-CHECK_PASS_DMSETUP_ERROR_ZERO_CREATE_IO
-SUMMARY_GAP_DMSETUP_CLI_SEMANTICS: 0
-TEST_PASS_DMSETUP_CLI_SEMANTICS
-HOST_PASS_DMSETUP_CLI_SEMANTICS
-HOST_PASS_DM_SYSTEM_TESTS --dmsetup-cli
-```
-
-宿主机存在非测试 DM 设备时，空环境 `dmsetup remove_all` 仍不在宿主执行全局破坏性验证；对应结论以 guest 和安全边界说明为准。
-
-### LVM2 控制面语义
-
-已新增并使用主机 Linux/OpenEuler LVM2 baseline 与 Asterinas guest 同构 suite：
-
-```text
-myshell/run_lvm2_linux_cli_baseline.sh
-myshell/run_lvm2_cli_semantics_test.sh
-myshell/run_dm_system_tests.sh --lvm2-cli
-```
-
-当前覆盖的命令子集：
-
-- 查询：`pvs`、`vgs`、`lvs`、`lvs --segments`。
-- PV/VG 生命周期：`pvcreate`、`vgcreate`、`vgextend`、`pvscan`、`vgscan --mknodes`、`vgchange -ay/-an`。
-- LV：`lvcreate --type linear`、`lvcreate --type striped`、`lvextend`、`lvreduce`。
-- 删除闭环：`lvremove`、`vgremove`、`pvremove`。
-- 辅助判定：`dmsetup table/status/deps`。
-
-重要边界：表格里的 LVM2 命令是正常命令模板；实测时 host/guest 都追加测试隔离参数，包括只允许测试盘的 `--config`，以及 LVM2 支持时的 `--devices <测试盘列表>`。这用于保护宿主已有 PV/VG/LV，并关闭 udev 同步依赖；不是日常裸 LVM2 命令体验对齐。
-
-2026-08-31 已验证：
-
-```text
-PREFLIGHT_PASS_LVM2_LINUX_CLI_BASELINE
-SUMMARY_GAP_LVM2_LINUX_BASELINE: 0
-BASELINE_PASS_LVM2_LINUX_CLI_BASELINE
-SUMMARY_GAP_LVM2_CLI_SEMANTICS: 0
-TEST_PASS_LVM2_CLI_SEMANTICS
-HOST_PASS_DM_SYSTEM_TESTS --lvm2-cli
-```
-
-### raw DM 数据面边界实测
-
-已有基础数据面脚本：
-
-```text
-myshell/run_dm_system_tests.sh --linear-data
-myshell/run_dm_system_tests.sh --striped-data
-```
-
-新增边界审计入口：
-
-```text
-myshell/run_dm_system_tests.sh --dataplane-edge
-```
-
-该入口覆盖：
-
-- 三段 `linear` table。
-- 非零 backing start remap。
-- mapper readback 与三个 backing 落点校验。
-- `striped 2 4` 从 chunk 内部偏移开始写。
-- 跨多个 stripe 边界后的 mapper readback 与两个 backing 分布校验。
-- `zero` target 读全 0、写入丢弃成功、写后再次读取仍为全 0。
-- `zero` target 上 `blkdiscard` / `blkdiscard -z` 成功，覆盖 BLKDISCARD/BLKZEROOUT 到 range BIO direct-complete 路径。
-
-2026-09-01 已通过：
-
-```text
-CHECK_PASS_LINEAR_EDGE_MAPPER_READBACK
-CHECK_PASS_LINEAR_EDGE_BACKING_D1
-CHECK_PASS_LINEAR_EDGE_BACKING_D2
-CHECK_PASS_LINEAR_EDGE_BACKING_D3
-CHECK_PASS_STRIPED_EDGE_MAPPER_READBACK
-CHECK_PASS_STRIPED_EDGE_BACKING_D1
-CHECK_PASS_STRIPED_EDGE_BACKING_D2
-CHECK_PASS_ZERO_EDGE_READ_ZERO
-CHECK_PASS_ZERO_EDGE_WRITE_DISCARDED
-CHECK_PASS_ZERO_EDGE_READ_AFTER_WRITE_ZERO
-CHECK_PASS_ZERO_EDGE_BLKDISCARD
-CHECK_PASS_ZERO_EDGE_BLKZEROOUT
-TEST_PASS_DM_DATAPLANE_EDGE
-HOST_PASS_DM_SYSTEM_TESTS --dataplane-edge
-```
-
-### Flush 数据面收口
-
-2026-08-31 已 review 现有 flush 覆盖，未新增重复测试。当前 `aster-device-mapper` crate 已覆盖：
-
-- linear table flush 对 backing device 去重后每个 backing 只 flush 一次。
-- striped table flush fan-out 到每个 stripe backing。
-- linear + striped mixed table 中 shared backing flush 去重。
-- flush completion failure 返回 `IoError`。
-- backing enqueue flush 失败返回 `IoError`。
-- readonly mapper 允许 Read / Flush，拒绝 Write。
-- suspend 会等待已提交 flush 完成，并拒绝 suspend 期间的新 flush。
-
-已通过当前 device-mapper crate 全量 ktest：
-
-```text
-myshell/ktest_crate.sh kernel/core/comps/device-mapper
-
-test result: ok. 69 passed; 0 failed; 0 filtered out.
-```
-
-历史上曾尝试用 `flush` 和 `aster_device_mapper::table::tests::` 作为过滤条件，结果均未匹配到测试；有效验证以上述全 crate ktest 为准。
-
-## 当前文档状态
-
-- `docs/device-mapper-technical-maintenance.md` 已更新到 2026-09-03 状态，正文覆盖 error/zero/linear/striped/mixed 设计、`dyn DmTarget` target framework、table/control-plane 边界和分层验证路线；第 8 章集中说明 Read/Write remap/direct completion、split 聚合、Flush fan-out/direct completion，以及 discard/write zeroes 通用 range BIO 的 DM 映射边界；附录集中维护 `dmsetup` 和 LVM2 控制面对齐矩阵。
-- `docs/study.md` 已精简为 `/dev/mapper/control` 注册主线和后续学习材料，不再保留命令矩阵迁移记录。
-- `docs/test.md` 已按静态检查、crate-local ktest、系统验收 suite、底层命令说明的顺序记录当前验证链路；定向 ktest 默认入口为 `myshell/ktest_crate.sh`，结果日志为 `<crate-dir>/ktest.log`。
-- `log/device-mapper-optimization-v1.md` 已记录 target metadata/parser 收敛、`DmTarget` trait object 化、ktest wrapper 和 runner 结果行拆分。
-
-## 当前功能边界
-
-当前重点仍限于已实现的 `error`、`linear`、`striped` 和 `zero` target，以及基于既有 block/BIO/driver/ioctl 抽象增量接入的 discard / write zeroes range I/O：
-
-- `error`：无 backing 参数，Read / Write 稳定返回 I/O error，Flush 对无 backing table 成功完成，Discard / WriteZeroes 返回 I/O error，deps 为空。
-- `zero`：无 backing 参数，Read 返回全 0，Write 丢弃并成功完成，Flush / Discard / WriteZeroes 对无 backing table 成功完成，deps 为空。
-- `linear`：offset 平移、多 segment、跨 segment split、非零 backing start，Read / Write / Discard / WriteZeroes remap 到 backing。
-- `striped`：chunk 轮转分布、跨 chunk split、非 chunk 起点写入、backing 分布校验，Read / Write / Discard / WriteZeroes 按 stripe chunk remap 到 backing。
-- mixed：由 LVM2 生成同一 LV 内 linear + striped segments，用现有慢 suite 验证文件 I/O 和 reboot recovery。
-- block ioctl：支持 BLKDISCARD / BLKZEROOUT；legacy BLKSSZGET 已覆盖 util-linux `blkdiscard` 的前置查询。
-- backing driver：virtio block 按协商能力下发 discard / write-zeroes；NVMe 后端暂明确返回 NotSupported。
-
-尚未完成的数据面语义：
-
-- NVMe discard / write zeroes 真实后端命令接入。
-- backing I/O error 的真实 guest 注入。
-- partial completion 的真实 guest 注入。
-- queue limit / alignment / topology。
-- 并发 I/O 和压力场景。
-
-当前明确不纳入：snapshot、thin、cache、crypt、mirror、raid 等 target 族，以及完整 udev/systemd 自动激活生态语义。
-
-## 后续可做优先级
-
-1. 若继续拓展 DM target 功能，snapshot/thin/cache/mirror 等需要另起大阶段设计；更小的基础 target 也应先做 host baseline 与最小 guest 语义脚本。
-2. 若继续做 target framework 泛化，可在当前 `dyn DmTarget` 基础上评估 registry/manifest；本阶段只保留静态 factory，不提前引入全局注册机制。
-3. 若继续做数据面语义增强，可审计 queue limit / alignment / topology 的当前实现和测试覆盖；这属于“当前实现自洽性”审计，不声明完整 Linux DM queue stacking 对齐。
-4. backing I/O error / partial completion 已有 core 模拟测试；新增 `error` target 可支持 guest 侧稳定 I/O error 场景，但不等于真实 backing fault injection。
-5. NVMe discard / write zeroes 当前仅在 block/DM 语义层返回 NotSupported；真实 NVMe Dataset Management / Write Zeroes 命令接入需另起小阶段。
-6. 若要对齐日常裸 LVM2 命令体验，另起阶段专门测试默认 devices file、默认 udev/systemd 联动，不混入当前控制面矩阵。
-7. 若后续修改内核数据面，单个 GAP 修完后先跑相关 ktest；全部相关 GAP 修完后再统一跑系统 suite。
+1. 继续以当前六个 suite 和相关 ktest 稳固已实现功能；改动按 owner 选择窄验证，避免无关 system suite。
+2. 若审计数据面，优先评估 queue limit/alignment/topology、真实 backing error 和 partial completion；不要将这些解释为当前已支持的完整 queue stacking。
+3. 新 target 或 target registry 等扩展应另起小阶段，先说明原有行为、目标行为和最小验收路径。
+4. `patches/` 当前暂不处理；后续若更新 patch，再单独核对其与执行树和验证记录的一致性。
 
 ## 相关阶段日志
 
@@ -243,3 +100,5 @@ test result: ok. 69 passed; 0 failed; 0 filtered out.
 - `log/2026-8-31.md`：dmsetup 控制面语义对齐、LVM2 控制面 baseline/guest 同构、raw DM 数据面边界 guest 审计。
 - `log/2026-9-1.md`：guest 启动慢排查修复、`zero` target 核心/控制面/数据面覆盖、discard / write zeroes 通用 range BIO 与 DM 映射接入。
 - `log/2026-9-2.md`：源码注释、DM 文档事实、系统测试脚本口径、成功 marker、超时变量和 patches 同步记录。
+- `log/2026-9-3.md`：`DmTarget` trait object 重构、crate-local ktest wrapper、runner 结果行拆分、`timeout --foreground` 修复和验证结果。
+- `log/2026-9-4.md`：six-suite 收敛、公共 harness 输入节流、非对齐 striped 四 child ktest 和六套系统验收。
