@@ -273,25 +273,26 @@ cat <crate-dir>/ktest.log
 ### 3.1 表层命令
 
 ```bash
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh <suite>
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh <suite>
 ```
 
-常用 suite：
+可用 suite 是：
 
-```bash
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dmsetup-cli
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --lvm2-cli
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dataplane-edge
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2
+```text
+--control-plane
+--dataplane
+--lvm2-topology
+--linear-integration
+--striped-integration
+--mixed-integration
 ```
+
+入口要求显式选择一个 suite；不提供默认聚合或历史别名。
 
 ### 3.2 system test 的执行链路
 
-系统测试不是 ktest。它不把 `#[ktest]` 函数编进测试 kernel，而是启动一个 NixOS guest，在 guest 里运行真实用户态命令。
-
-链路：
+系统测试不是 ktest。它启动 NixOS guest，在 guest 内运行真实 `dmsetup`、LVM2、ext2 和 block I/O 命令。
 
 ```text
 myshell/run_dm_system_tests.sh <suite>
@@ -299,81 +300,46 @@ myshell/run_dm_system_tests.sh <suite>
   → 子脚本 source myshell/lib/dm_nixos_test.sh
   → dm_prepare_nixos_test
       → 检查无残留 QEMU
-      → 检查 target/nixos/asterinas.img 存在
+      → 检查 target/nixos/asterinas.img
       → 准备/重置 DM_TEST_IMAGES
-  → dm_run_guest_script 或 dm_run_two_guest_test
-      → setsid make run_nixos
-      → tools/nixos/run.sh 拼 QEMU 命令
-      → 挂载 NixOS root image 和测试 raw disk images
-      → 等待 guest log 出现 root@asterinas prompt
-      → 计算 *_guest_ready_after=<N>s
-      → 把 guest script 写入 QEMU stdin
-  → guest 内执行 dmsetup/LVM2/dd/mount/reboot 等命令
-  → guest 输出 CHECK_PASS_* 和 TEST_PASS_*
+  → dm_run_single_guest_test / dm_run_two_guest_test / dm_run_three_guest_test
+      → dm_run_guest_script：setsid make run_nixos
+      → tools/nixos/run.sh 拼 QEMU 命令并挂入测试盘
+      → 在 40 秒内等待 `root@asterinas` shell-ready
+      → 默认以 10ms 逐行节流注入 guest script
+      → 在 180 秒 guest 生命周期内等待退出
+  → guest 输出 CHECK_PASS_*、TEST_PASS_*
   → host 扫描日志，输出 HOST_PASS_* 或 HOST_FAIL_*
 ```
 
-### 3.3 system test 验证的层次
+`dm_run_three_guest_test` 用于 linear、striped integration：第一轮建卷和 grow，第二轮恢复与 shrink，第三轮再次恢复并只读校验。mixed integration 使用两轮 guest。
+
+### 3.3 system test 验证层次
 
 | suite | 验证层次 | 实际证明什么 |
 |---|---|---|
-| `--dmsetup-cli` | 真实 libdevmapper 控制面 | `/dev/mapper/control`、ioctl ABI、table/status/deps/remove 等用户可见语义 |
-| `--lvm2-cli` | 真实 LVM2 控制面 | PV/VG/LV 生命周期、DM table 生成、scan/activation、文件系统 I/O |
-| `--dataplane-edge` | raw DM 数据面 | dmsetup table → mapper I/O → backing disk 布局是否完全一致 |
-| `--linear-lvm2-cross-segment` | LVM2 linear 多 segment | 扩容形成多 segment、reboot recovery、shrink 回单段 |
-| `--striped-lvm2-cross-segment` | LVM2 striped 多 segment | N-to-2N striped segment、reboot recovery、shrink 回单段 |
-| `--mixed-lvm2` | mixed table | 同一 LV 内 linear + striped 混合 table 的 I/O 和恢复 |
+| `--control-plane` | 真实 libdevmapper 控制面 | `/dev/mapper/control`、table/status/deps/info、active/inactive 生命周期、events、rename/UUID、readonly、remove；并验证 error/zero I/O 语义。 |
+| `--dataplane` | raw DM 数据面 | linear、striped、mixed、error、zero 的 mapper I/O、跨 target/chunk split、direct completion 与 backing 布局。 |
+| `--lvm2-topology` | 真实 LVM2 同 boot 生命周期 | PV/VG/LV 查询与 create/grow/shrink、linear/striped/mixed segment、scan/activation/remove。 |
+| `--linear-integration` | LVM2 linear + ext2 + reboot | 同 PV 和跨 PV second segment、grow/shrink、三次启动恢复。 |
+| `--striped-integration` | LVM2 striped + ext2 + reboot | same-set 和 cross-set striped segment、grow/shrink、三次启动恢复。 |
+| `--mixed-integration` | LVM2 mixed + ext2 + reboot | linear + striped mixed table、跨段文件 I/O、两次启动恢复。 |
 
-### 3.4 guest ready marker 的含义
+### 3.4 时间 marker 与超时含义
 
-system test 输出类似：
-
-```text
-HOST_INFO_<TEST_ID> guest_guest_ready_after=<N>s
-HOST_INFO_<TEST_ID> first_guest_ready_after=<N>s
-HOST_INFO_<TEST_ID> second_guest_ready_after=<N>s
-```
-
-这个时间来自 [myshell/lib/dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh)：
+每个 guest 输出：
 
 ```text
-start_ts=$(date +%s)
-  → setsid make run_nixos 启动 QEMU
-  → tail 日志等待 root@asterinas
-  → elapsed=$(date +%s - start_ts)
-  → echo HOST_INFO_<TEST_ID> ..._guest_ready_after=<elapsed>s
+HOST_INFO_<TEST_ID> <label>_guest_started_at=<ISO8601>
+HOST_INFO_<TEST_ID> <label>_guest_ready_after=<seconds>s ready_timeout=40s lifecycle_timeout=180s
+HOST_INFO_<TEST_ID> <label>_guest_completed_at=<ISO8601> lifecycle_after=<seconds>s status=<status>
 ```
 
-它表示 guest shell 可接收命令，不表示 suite 完整完成。
+shell-ready 时间只证明 guest shell 已可接收命令；180 秒 lifecycle 上限覆盖 guest 内测试、同步和关机。ready 超过 40 秒即失败，不能用更长 lifecycle timeout 掩盖启动问题。
 
-### 3.5 为什么 system test 能证明真实数据面
+### 3.5 raw 数据面为何能证明映射正确
 
-以 `--dataplane-edge` 的 linear 三段 remap 为例：
-
-```text
-创建三块测试 disk image
-  → guest 内定位 /dev/vd* 对应 serial
-  → dmsetup create 三段 linear table
-  → 向 /dev/mapper/dm_linear_edge 写入可区分 sector payload
-  → 从 mapper 读回验证用户视角连续
-  → 从每个 backing disk 指定 offset 直接读出实际内容
-  → 与 payload 切片逐段比较
-```
-
-这证明的不只是 mapper readback 正确，还证明 logical sector 到 backing sector 的 remap、跨 segment BIO split、deps 顺序和 backing offset 都正确。
-
-striped 跨边界测试类似：
-
-```text
-创建 striped 2 4 table
-  → 从 mapper sector 2 开始写 12 sectors
-  → 覆盖 partial first chunk、完整 stripe row、partial final row
-  → mapper readback 验证用户视角
-  → 分别构造两个 backing disk 的 expected layout
-  → 直接读 backing disk 并比较
-```
-
-这能发现单纯 ktest mock 不容易覆盖的真实块设备布局错误。
+`--dataplane` 的 linear 三段和非对齐 striped 场景均从 mapper 写入可区分 payload，再分别从 mapper 与 backing disk 指定 sector 读回并对比。striped 场景使用 `striped 2 4`，从 mapper sector 2 写入 12 sectors，覆盖 partial chunk、完整 stripe row 和最终 partial chunk；它同时验证 table-level/target-level split、remap、completion 与真实 backing 落点，而不仅是 mapper 读回。
 
 ## 4. 推荐验证组合
 
@@ -403,7 +369,8 @@ myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::<tes
 如果改动影响真实数据面边界：
 
 ```bash
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dataplane-edge
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --dataplane
 ```
 
 ### 4.3 改 DM ioctl/control-plane
@@ -422,14 +389,21 @@ myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::test
 如果改变用户可见 dmsetup 语义：
 
 ```bash
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dmsetup-cli
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --control-plane
 ```
 
 如果改变 LVM2 可见行为或 segment 布局：
 
 ```bash
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --lvm2-topology
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --linear-integration
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --striped-integration
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --mixed-integration
 ```
 
 ### 4.4 测试前后检查 QEMU 残留

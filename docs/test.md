@@ -150,91 +150,70 @@ All crates tested.
 统一入口：
 
 ```bash
-GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh <suite>
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh <suite>
 ```
 
-当前入口要求显式传入 suite；不保留无参数默认运行、`--full` 或旧兼容别名。
+当前只接受一个显式 canonical suite；不保留无参数默认运行或历史兼容入口。
 
 ### 5.1 suite 与功能对应关系
 
 | suite | 子脚本 | 主要验证功能 |
 |---|---|---|
-| `--quick` | [run_control_abi_test.sh](../myshell/dm_linear/run_control_abi_test.sh)、[run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh)、[run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh) | control ABI smoke、raw linear cross-target BIO、raw striped BIO split/remap 与 backing 分布 |
-| `--dmsetup-cli` | [run_dmsetup_cli_semantics_test.sh](../myshell/run_dmsetup_cli_semantics_test.sh) | 对照标准 Linux/OpenEuler 的 dmsetup CLI 控制面语义，覆盖 tableless create、linear/striped/error/zero table、table/status/deps/info、rename、suspend/resume、wait、remove_all |
-| `--lvm2-cli` | [run_lvm2_cli_semantics_test.sh](../myshell/run_lvm2_cli_semantics_test.sh) | 对照标准 Linux/OpenEuler 的 LVM2 CLI 控制面语义，覆盖 PV/VG/LV 查询、linear/striped/mixed LV、扩缩容、scan/activation 和 remove 闭环 |
-| `--dataplane-edge` | [run_dm_dataplane_edge_test.sh](../myshell/run_dm_dataplane_edge_test.sh) | raw DM 数据面边界审计，覆盖三段 linear 非零 backing start、striped 非 chunk 起点写入、跨 stripe 边界分布、zero target direct-complete 路径 |
-| `--linear-data` | [run_cross_target_bio_regression.sh](../myshell/dm_linear/run_cross_target_bio_regression.sh) | raw linear cross-target BIO split/remap |
-| `--striped-data` | [run_raw_striped_bio_test.sh](../myshell/dm_striped/run_raw_striped_bio_test.sh) | raw striped BIO split/remap 和 backing 分布 |
-| `--linear-lvm2` | [run_lvm2_linear_reboot_test.sh](../myshell/dm_linear/run_lvm2_linear_reboot_test.sh) | 单 PV、单 linear segment、同盘 grow/shrink、ext2 I/O、reboot recovery |
-| `--striped-lvm2` | [run_lvm2_striped_reboot_test.sh](../myshell/dm_striped/run_lvm2_striped_reboot_test.sh) | N PV / N-way 单 striped segment、同组盘 grow/shrink、ext2 I/O、reboot recovery |
-| `--linear-lvm2-cross-segment` | [run_lvm2_linear_cross_segment_test.sh](../myshell/dm_linear/run_lvm2_linear_cross_segment_test.sh) | 独立 linear cross-segment table、reboot recovery、shrink 回单段 |
-| `--striped-lvm2-cross-segment` | [run_lvm2_striped_cross_segment_test.sh](../myshell/dm_striped/run_lvm2_striped_cross_segment_test.sh) | 独立 striped N-to-2N cross-segment table、reboot recovery、shrink 回单段 |
-| `--mixed-lvm2` | [run_lvm2_linear_striped_mixed_reboot_test.sh](../myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh) | 同一 LV 内 linear + striped mixed table、ext2 I/O、reboot recovery |
+| `--control-plane` | [run_dm_control_plane_test.sh](../myshell/run_dm_control_plane_test.sh) | `dmsetup` 静态查询、linear/striped/error/zero table 与对象生命周期、active/inactive table、event、rename/UUID、readonly、busy remove/remove_all；包含 error/zero 用户态 I/O 语义。 |
+| `--dataplane` | [run_dm_dataplane_test.sh](../myshell/run_dm_dataplane_test.sh) | raw linear、striped、mixed、error、zero 数据面；跨 target/chunk split、非零 backing start、mapper readback 和逐 backing 布局断言。 |
+| `--lvm2-topology` | [run_lvm2_topology_test.sh](../myshell/run_lvm2_topology_test.sh) | static LVM2 查询、PV/VG/LV 生命周期、linear/striped/mixed segment 增长与缩减、same-boot activation 和 remove。无 filesystem 或 reboot 验收。 |
+| `--linear-integration` | [run_lvm2_linear_integration_test.sh](../myshell/dm_linear/run_lvm2_linear_integration_test.sh) | linear LVM2、同 PV 与跨 PV 第二 segment、ext2、grow/shrink、三次启动后的 table/status/deps 和 MD5 恢复。 |
+| `--striped-integration` | [run_lvm2_striped_integration_test.sh](../myshell/dm_striped/run_lvm2_striped_integration_test.sh) | N-way striped、同 backing set 与第二 set、ext2、grow/shrink、三次启动后的 table/status/deps 和 MD5 恢复。 |
+| `--mixed-integration` | [run_lvm2_mixed_integration_test.sh](../myshell/dm_mixed/run_lvm2_mixed_integration_test.sh) | 同一 LV 中 linear + striped table、跨段 ext2 I/O、两次启动后的 table/status/deps 和 MD5 恢复。 |
+
+各 suite 都有独立的 target 与测试盘前置检查。重启前后的 table/MD5 检查分别证明当场状态和持久化恢复，不能互相替代。
 
 ### 5.2 按改动范围选择系统验收
 
 | 改动范围 | 推荐 suite | 说明 |
 |---|---|---|
-| 只改 DM core 内部 table/target/BIO 逻辑 | 先 ktest；必要时 `--dataplane-edge` 或相关 raw data suite | ktest 更快，系统 suite 用来确认真实 block device 行为 |
-| 改 `dmsetup` 可见 ioctl 语义、status、deps、info、rename、suspend/resume | `--dmsetup-cli`，必要时加 `--quick` | 验证 libdevmapper 与 `/dev/mapper/control` 交互 |
-| 改 linear 数据面或跨 target split | `--linear-data`、`--linear-lvm2-cross-segment` | raw BIO 覆盖边界，LVM2 覆盖用户态生成 table |
-| 改 striped map/chunk/stripe/deps | `--striped-data`、`--striped-lvm2`、`--striped-lvm2-cross-segment` | 覆盖 raw striped 和真实 LVM2 striped LV |
-| 改 mixed linear + striped table 或跨 segment I/O | `--mixed-lvm2` | 验证同一 LV 内 mixed table 与 reboot recovery |
-| 改 LVM2 交互、scan/activation、PV/VG/LV layout | `--lvm2-cli` 加对应 LVM2 suite | 需要真实 LVM2 CLI 和 NixOS guest |
-| 改测试脚本或 guest harness | 直接跑被改脚本对应 suite | 验证脚本自己的日志、marker、cleanup 和超时逻辑 |
+| 只改 DM core table/target/BIO 逻辑 | 先 ktest；必要时 `--dataplane` | ktest 锁定内核语义；dataplane 验证真实块设备的 raw remap 与 backing 布局。 |
+| 改 `dmsetup` ioctl、status、deps、info、rename、event、readonly 或 remove | `--control-plane` | 验证 libdevmapper 与 `/dev/mapper/control` 的控制面语义。 |
+| 改 error/zero 用户态 I/O、discard、write-zeroes | `--dataplane`；必要时加 `--control-plane` | 前者覆盖 raw I/O，后者覆盖对象/table 生命周期。 |
+| 改 linear 数据面或跨 target split | `--dataplane`、`--linear-integration` | raw BIO 覆盖边界；LVM2 覆盖跨 PV、filesystem 和恢复。 |
+| 改 striped map/chunk/stripe/deps | `--dataplane`、`--striped-integration` | raw striped 与可配置 N-way/cross-set LVM2 都需要覆盖。 |
+| 改 mixed linear + striped table 或跨段 I/O | `--dataplane`、`--mixed-integration` | 验证 raw mapper 与 LVM2 生成的混合 table。 |
+| 改 LVM2 查询、scan、activation、PV/VG/LV 生命周期 | `--lvm2-topology` 加对应 integration suite | 前者覆盖 same-boot 生命周期；后者覆盖目标级 ext2/reboot。 |
+| 改测试脚本或 guest harness | 直接跑被改脚本对应 suite | 检查 marker、cleanup、启动与生命周期超时。 |
 
-### 5.3 系统测试日志和通过标记
+### 5.3 系统测试日志、时间和通过标记
 
-系统验收脚本通过公共 harness [dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh) 运行。每个脚本启动时都会打印 host 侧日志路径：
+系统验收通过公共 harness [dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh) 运行。每个 guest 都会输出 host 侧日志路径及启动、shell-ready、完成时间：
 
 ```text
-HOST_INFO_<TEST_ID> log=/tmp/<test-log>.log
+HOST_INFO_<TEST_ID> <label>_guest_started_at=<ISO8601>
+HOST_INFO_<TEST_ID> <label>_guest_ready_after=<seconds>s ready_timeout=40s lifecycle_timeout=180s
+HOST_INFO_<TEST_ID> <label>_guest_completed_at=<ISO8601> lifecycle_after=<seconds>s status=<status>
 ```
 
-常见默认日志：
+| suite | 默认日志 | 关键 pass marker |
+|---|---|---|
+| `--control-plane` | `/tmp/dm-control-plane-test.log` | `SUMMARY_GAP_DM_CONTROL_PLANE: 0`、`TEST_PASS_DM_CONTROL_PLANE`、`HOST_PASS_DM_CONTROL_PLANE` |
+| `--dataplane` | `/tmp/dm-dataplane-test.log` | `TEST_PASS_DM_DATAPLANE`、`HOST_PASS_DM_DATAPLANE` |
+| `--lvm2-topology` | `/tmp/lvm2-topology-test.log` | `SUMMARY_GAP_LVM2_TOPOLOGY: 0`、`TEST_PASS_LVM2_TOPOLOGY`、`HOST_PASS_LVM2_TOPOLOGY` |
+| `--linear-integration` | `/tmp/dm-linear-integration-test.log` | 三个 `TEST_PASS_DM_LINEAR_INTEGRATION_*`、`HOST_PASS_DM_LINEAR_INTEGRATION` |
+| `--striped-integration` | `/tmp/dm-striped-integration-test.log` | 三个 `TEST_PASS_DM_STRIPED_INTEGRATION_*`、`HOST_PASS_DM_STRIPED_INTEGRATION` |
+| `--mixed-integration` | `/tmp/dm-mixed-integration-test.log` | 两个 `TEST_PASS_DM_MIXED_INTEGRATION_*`、`HOST_PASS_DM_MIXED_INTEGRATION` |
 
-| suite | 默认日志 |
-|---|---|
-| `--quick` 中 control ABI | `/tmp/dm-control-abi-test.log` |
-| `--dmsetup-cli` | `/tmp/dmsetup-cli-semantics-test.log` |
-| `--linear-data` | `/tmp/cross-target-bio-regression.log` |
-| `--striped-data` | `/tmp/dm-striped-raw-bio-test.log` |
-| `--linear-lvm2` | `/tmp/dm-linear-lvm2-reboot-test.log` |
-| `--striped-lvm2` | `/tmp/dm-striped-lvm2-reboot-test.log` |
-| `--linear-lvm2-cross-segment` | `/tmp/dm-linear-lvm2-cross-segment-test.log` |
-| `--striped-lvm2-cross-segment` | `/tmp/dm-striped-lvm2-cross-segment-test.log` |
-| `--mixed-lvm2` | `/tmp/dm-mixed-lvm2-reboot-test.log` |
-
-常见通过标记：
-
-| suite / script | 关键 pass marker |
-|---|---|
-| `run_dm_system_tests.sh <suite>` | `HOST_PASS_DM_SYSTEM_TESTS <suite>` |
-| `--quick` | `HOST_PASS_DM_CONTROL_ABI`、`HOST_PASS_CROSS_TARGET_BIO`、`HOST_PASS_DM_STRIPED_RAW_BIO`、`HOST_PASS_DM_SYSTEM_TESTS --quick` |
-| `--dmsetup-cli` | `SUMMARY_GAP_DMSETUP_CLI_SEMANTICS: 0`、`TEST_PASS_DMSETUP_CLI_SEMANTICS`、`HOST_PASS_DMSETUP_CLI_SEMANTICS` |
-| `--lvm2-cli` | `SUMMARY_GAP_LVM2_CLI_SEMANTICS: 0`、`TEST_PASS_LVM2_CLI_SEMANTICS`、`HOST_PASS_LVM2_CLI_SEMANTICS` |
-| `--dataplane-edge` | `TEST_PASS_DM_DATAPLANE_EDGE`、`HOST_PASS_DM_DATAPLANE_EDGE` |
-| `--linear-data` | `TEST_PASS_CROSS_TARGET_BIO`、`HOST_PASS_CROSS_TARGET_BIO` |
-| `--striped-data` | `TEST_PASS_DM_STRIPED_RAW_BIO`、`HOST_PASS_DM_STRIPED_RAW_BIO` |
-| `--linear-lvm2` | `TEST_PASS_DM_LINEAR_LVM2_REBOOT_FIRST`、`TEST_PASS_DM_LINEAR_LVM2_REBOOT_SECOND`、`HOST_PASS_DM_LINEAR_LVM2_REBOOT` |
-| `--striped-lvm2` | `TEST_PASS_DM_STRIPED_LVM2_REBOOT_FIRST`、`TEST_PASS_DM_STRIPED_LVM2_REBOOT_SECOND`、`HOST_PASS_DM_STRIPED_LVM2_REBOOT` |
-| `--linear-lvm2-cross-segment` | `TEST_PASS_DM_LINEAR_LVM2_CROSS_SEGMENT_FIRST`、`TEST_PASS_DM_LINEAR_LVM2_CROSS_SEGMENT_SECOND`、`HOST_PASS_DM_LINEAR_LVM2_CROSS_SEGMENT` |
-| `--striped-lvm2-cross-segment` | `TEST_PASS_DM_STRIPED_LVM2_CROSS_SEGMENT_FIRST`、`TEST_PASS_DM_STRIPED_LVM2_CROSS_SEGMENT_SECOND`、`HOST_PASS_DM_STRIPED_LVM2_CROSS_SEGMENT` |
-| `--mixed-lvm2` | `TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_FIRST`、`TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_SECOND`、`HOST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT` |
-
-失败时优先看终端里的 `HOST_FAIL_...` 或 `TEST_FAIL_...`，再打开 `HOST_INFO_<TEST_ID> log=...` 指向的完整日志，搜索最后一个 `=== STEP` 或 `=== CHECK`。
+wrapper 仅在子脚本成功后输出 `HOST_PASS_DM_SYSTEM_TESTS <suite>`。失败时优先查看 `HOST_FAIL_...` 或 `TEST_FAIL_...`，再从完整日志中定位最后一个 `=== STEP` 或 `=== CHECK`。
 
 ## 6. 系统测试背后的 guest、测试盘和超时
 
 | 项目 | 说明 |
 |---|---|
-| guest | 系统 suite 在 NixOS guest 中运行真实用户态工具，不是只跑内核单测 |
-| 完整生命周期超时 | `GUEST_QEMU_TIMEOUT=180` 控制单个 QEMU guest 从启动到退出的完整生命周期 |
-| 旧兼容变量 | `GUEST_READY_TIMEOUT` 只作为旧脚本兼容 alias |
-| 测试盘 | 由 [tools/nixos/run.sh](../tools/nixos/run.sh) 挂入 QEMU |
-| 默认测试盘 | `target/nixos/test.img`、`target/nixos/test2.img`、`target/nixos/test3.img` 等 |
-| 多盘变量 | `DM_TEST_IMAGES="target/nixos/test.img target/nixos/test2.img target/nixos/test3.img"` |
-| guest 内定位 | `aster-dm-disk-locator`、`aster-dm-disk-locator vdmtest2`、`aster-dm-disk-locator vdmtest3` |
+| guest | 系统 suite 在 NixOS guest 中运行真实用户态工具，不是只跑内核单测。 |
+| shell-ready 超时 | `GUEST_READY_TIMEOUT=40` 控制从 QEMU 启动到串口出现 `root@asterinas` 的上限；超时立即退出。 |
+| 完整生命周期超时 | `GUEST_QEMU_TIMEOUT=180` 控制单个 QEMU guest 从启动到退出的总上限；覆盖 LVM2、ext2 与 shutdown。 |
+| 测试盘 | 由 [tools/nixos/run.sh](../tools/nixos/run.sh) 挂入 QEMU。 |
+| 默认测试盘 | `target/nixos/test.img`、`target/nixos/test2.img`、`target/nixos/test3.img` 等。 |
+| 多盘变量 | `DM_TEST_IMAGES="target/nixos/test.img target/nixos/test2.img target/nixos/test3.img"`。 |
+| guest 内定位 | `aster-dm-disk-locator`、`aster-dm-disk-locator vdmtest2`、`aster-dm-disk-locator vdmtest3`。 |
 
 稳定 VirtIO serial：
 
@@ -341,18 +320,12 @@ raw BIO 测试通常用 `dd` 精确制造跨 target 或跨 stripe chunk I/O；LV
 |---|---|
 | DM table / target 数据面 ktest | `myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::table::tests::<test_name>` |
 | DM ioctl 控制面 ktest | `myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>` |
-| quick smoke | `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --quick` |
-| dmsetup CLI 语义 | `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dmsetup-cli` |
-| LVM2 CLI 语义 | `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --lvm2-cli` |
-| raw linear cross-target BIO | `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-data` |
-| raw striped BIO | `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-data` |
-| raw 数据面边界审计 | `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dataplane-edge` |
-| linear LVM2 基础 | `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2` |
-| linear cross-segment | `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-lvm2-cross-segment` |
-| striped LVM2 基础 | `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2` |
-| 3-way striped 基础 | `STRIPED_PV_COUNT=3 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2` |
-| striped N-to-2N cross-segment | `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment` |
-| 3-way 到 6 盘 striped cross-segment | `STRIPED_CS_PV_COUNT=3 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-lvm2-cross-segment` |
-| mixed linear + striped | `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-lvm2` |
+| dmsetup 控制面与对象生命周期 | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --control-plane` |
+| raw linear/striped/mixed/error/zero 数据面 | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dataplane` |
+| LVM2 PV/VG/LV 生命周期与同 boot topology | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --lvm2-topology` |
+| linear LVM2、ext2、跨 PV 与三次启动恢复 | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-integration` |
+| striped LVM2、ext2、跨 backing set 与三次启动恢复 | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-integration` |
+| 3-way striped integration | `STRIPED_PV_COUNT=3 GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-integration` |
+| mixed linear + striped、ext2 与 reboot 恢复 | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-integration` |
 
-阶段验收时按相关路径显式组合上述 suite；当前不提供无参数默认运行或 `--full` 聚合入口。
+阶段验收时按改动路径显式组合上述 suite；当前不提供无参数默认运行或历史兼容入口。
