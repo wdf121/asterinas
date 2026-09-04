@@ -669,6 +669,15 @@ impl BioSegment {
         Self::alloc_inner(nblocks, 0, nblocks * BLOCK_SIZE, direction)
     }
 
+    /// Allocates a sector-aligned test segment with an exact byte length.
+    ///
+    /// This is available only to kernel tests that need to exercise BIO splitting
+    /// at a sector boundary that does not coincide with a filesystem block.
+    #[cfg(ktest)]
+    pub fn alloc_exact(nblocks: usize, len: usize, direction: BioDirection) -> Self {
+        Self::alloc_inner(nblocks, 0, len, direction)
+    }
+
     /// The inner function that do the real segment allocation.
     ///
     /// Support two extended parameters:
