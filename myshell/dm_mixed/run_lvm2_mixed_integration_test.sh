@@ -6,15 +6,17 @@ set -euo pipefail
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     cat <<'EOF'
-Usage: myshell/dm_mixed/run_lvm2_linear_striped_mixed_reboot_test.sh
+Usage: myshell/dm_mixed/run_lvm2_mixed_integration_test.sh
 
-Runs a two-guest NixOS regression for an LVM2 LV whose dm table naturally mixes a linear segment and a striped segment.
+Runs a two-guest NixOS integration test for an LVM2 LV whose Device Mapper table
+contains a linear segment followed by a striped segment. It validates table
+shape, ext2 I/O across the segment boundary, deactivation, and reboot recovery.
 
 Optional environment variables:
   DM_TEST_IMAGES                         Backing test image list, default "target/nixos/test.img target/nixos/test2.img target/nixos/test3.img"
-  DM_MIXED_LVM2_REBOOT_LOG               Host-side log path, default /tmp/dm-mixed-lvm2-reboot-test.log
+  DM_MIXED_INTEGRATION_LOG               Host-side log path, default /tmp/dm-mixed-integration-test.log
   GUEST_QEMU_TIMEOUT                     Full QEMU lifecycle timeout in seconds, default 180
-  GUEST_READY_TIMEOUT                    Compatibility alias if GUEST_QEMU_TIMEOUT is unset
+  GUEST_READY_TIMEOUT                    Guest shell readiness timeout in seconds, default 40
   RESET_DM_TEST_IMAGES                   1 to delete test images before running, default 1
   MIXED_INITIAL_LV_MIB                   Initial linear LV size in MiB, default 256
   MIXED_EXTENDED_LV_MIB                  Extended mixed LV size in MiB, default 512
@@ -23,9 +25,9 @@ Optional environment variables:
   MIXED_STRIPED_CHUNK_KIB                LVM stripe chunk size in KiB, default 4
 
 Expected success markers:
-  TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_FIRST
-  TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_SECOND
-  HOST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT
+  TEST_PASS_DM_MIXED_INTEGRATION_FIRST
+  TEST_PASS_DM_MIXED_INTEGRATION_SECOND
+  HOST_PASS_DM_MIXED_INTEGRATION
 EOF
     exit 0
 fi
@@ -34,8 +36,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
 source "${SCRIPT_DIR}/../lib/dm_nixos_test.sh"
 
-TEST_ID=DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT
-LOG=${DM_MIXED_LVM2_REBOOT_LOG:-/tmp/dm-mixed-lvm2-reboot-test.log}
+TEST_ID=DM_MIXED_INTEGRATION
+LOG=${DM_MIXED_INTEGRATION_LOG:-/tmp/dm-mixed-integration-test.log}
 DM_TEST_IMAGE=${DM_TEST_IMAGE:-target/nixos/test.img}
 DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
 DM_TEST_IMAGE_3=${DM_TEST_IMAGE_3:-target/nixos/test3.img}
@@ -45,7 +47,8 @@ test "$#" -eq 3
 DM_TEST_IMAGE=$1
 DM_TEST_IMAGE_2=$2
 DM_TEST_IMAGE_3=$3
-GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-${GUEST_READY_TIMEOUT:-180}}
+GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-180}
+GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-40}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 MIXED_INITIAL_LV_MIB=${MIXED_INITIAL_LV_MIB:-256}
 MIXED_EXTENDED_LV_MIB=${MIXED_EXTENDED_LV_MIB:-512}
@@ -70,7 +73,7 @@ FIRST_GUEST_SCRIPT=$(mktemp /tmp/dm-mixed-lvm2-first.XXXXXX)
 cat >"${FIRST_GUEST_SCRIPT}" <<'GUEST_SCRIPT'
 stty -echo 2>/dev/null || true
 set -eu
-trap 'status=$?; echo TEST_FAIL_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_FIRST status=$status; sync; poweroff; exit $status' ERR
+trap 'status=$?; echo TEST_FAIL_DM_MIXED_INTEGRATION_FIRST status=$status; sync; poweroff; exit $status' ERR
 
 LVM_CONFIG='activation { udev_rules=0 }'
 MIXED_INITIAL_LV_MIB=__MIXED_INITIAL_LV_MIB__
@@ -230,7 +233,7 @@ vgchange --config "$LVM_CONFIG" -an mixed_vg
 sync
 echo CHECK_PASS_MIXED_LVM2_GROW_FILE_MD5
 
-echo TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_FIRST
+echo TEST_PASS_DM_MIXED_INTEGRATION_FIRST
 poweroff
 GUEST_SCRIPT
 
@@ -238,7 +241,7 @@ SECOND_GUEST_SCRIPT=$(mktemp /tmp/dm-mixed-lvm2-second.XXXXXX)
 cat >"${SECOND_GUEST_SCRIPT}" <<'GUEST_SCRIPT'
 stty -echo 2>/dev/null || true
 set -eu
-trap 'status=$?; echo TEST_FAIL_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_SECOND status=$status; sync; poweroff; exit $status' ERR
+trap 'status=$?; echo TEST_FAIL_DM_MIXED_INTEGRATION_SECOND status=$status; sync; poweroff; exit $status' ERR
 
 LVM_CONFIG='activation { udev_rules=0 }'
 MIXED_INITIAL_LV_MIB=__MIXED_INITIAL_LV_MIB__
@@ -339,7 +342,7 @@ vgchange --config "$LVM_CONFIG" -an mixed_vg
 sync
 echo CHECK_PASS_MIXED_LVM2_RECOVERED_FILE_MD5
 
-echo TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_SECOND
+echo TEST_PASS_DM_MIXED_INTEGRATION_SECOND
 poweroff
 GUEST_SCRIPT
 
@@ -358,6 +361,6 @@ dm_run_two_guest_test \
     "${TEST_ID}" \
     "${FIRST_GUEST_SCRIPT}" \
     "${SECOND_GUEST_SCRIPT}" \
-    TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_FIRST \
-    TEST_PASS_DM_MIXED_LVM2_LINEAR_STRIPED_REBOOT_SECOND \
+    TEST_PASS_DM_MIXED_INTEGRATION_FIRST \
+    TEST_PASS_DM_MIXED_INTEGRATION_SECOND \
     "${SUMMARY_INCLUDE}"
