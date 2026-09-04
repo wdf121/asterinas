@@ -508,6 +508,58 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DeferredRecordingBlockDevice {
+        id: DeviceId,
+        submitted_ranges: Mutex<Vec<Range<Sid>>>,
+        submitted_types: Mutex<Vec<BioType>>,
+        submitted_lengths: Mutex<Vec<usize>>,
+        pending: Mutex<Vec<SubmittedBio>>,
+    }
+
+    impl DeferredRecordingBlockDevice {
+        fn new(minor: u32) -> Arc<Self> {
+            Arc::new(Self {
+                id: DeviceId::new(MajorId::new(1), MinorId::new(minor)),
+                submitted_ranges: Mutex::new(Vec::new()),
+                submitted_types: Mutex::new(Vec::new()),
+                submitted_lengths: Mutex::new(Vec::new()),
+                pending: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn complete_pending(&self, index: usize) {
+            self.pending.lock().remove(index).complete(BioStatus::Complete);
+        }
+    }
+
+    impl BlockDevice for DeferredRecordingBlockDevice {
+        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            self.submitted_ranges.lock().push(bio.sid_range().clone());
+            self.submitted_types.lock().push(bio.type_());
+            self.submitted_lengths
+                .lock()
+                .push(bio.segments().iter().map(BioSegment::nbytes).sum());
+            self.pending.lock().push(bio);
+            Ok(())
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: 8,
+                nr_sectors: 1_024,
+            }
+        }
+
+        fn name(&self) -> String {
+            String::from("dm-table-deferred-test")
+        }
+
+        fn id(&self) -> DeviceId {
+            self.id
+        }
+    }
+
     #[ktest]
     fn remaps_bio_start_to_backing_device() {
         let backing = RecordingBlockDevice::new(1);
@@ -1153,11 +1205,11 @@ mod tests {
         assert_eq!(*backing.submitted_types.lock(), vec![BioType::WriteZeroes]);
     }
 
-    fn striped_dm_target(
+    fn striped_dm_target<T: BlockDevice + 'static>(
         logical_start: u64,
         length: u64,
         params: &str,
-        backings: &[Arc<RecordingBlockDevice>],
+        backings: &[Arc<T>],
     ) -> DmTargetBox {
         boxed(
             StripedTarget::new(
@@ -1238,6 +1290,51 @@ mod tests {
             *second.submitted_ranges.lock(),
             vec![Sid::new(200)..Sid::new(204)]
         );
+    }
+
+    #[ktest]
+    fn splits_twelve_sector_write_across_four_striped_children() {
+        let first = DeferredRecordingBlockDevice::new(1);
+        let second = DeferredRecordingBlockDevice::new(2);
+        let table = DmTable::new_targets(vec![striped_dm_target(
+            0,
+            24,
+            "2 4 1:1 0 1:2 0",
+            &[first.clone(), second.clone()],
+        )])
+        .unwrap();
+        let completion_status = Arc::new(Mutex::new(None));
+        let callback_status = completion_status.clone();
+        let write = Bio::new(
+            BioType::Write,
+            Sid::new(2),
+            vec![BioSegment::alloc_exact(2, 12 * 512, BioDirection::ToDevice)],
+            Some(Box::new(move |status| *callback_status.lock() = Some(status))),
+        );
+
+        table.enqueue(write.submit_for_test()).unwrap();
+
+        assert_eq!(
+            *first.submitted_ranges.lock(),
+            vec![Sid::new(2)..Sid::new(4), Sid::new(4)..Sid::new(8)]
+        );
+        assert_eq!(
+            *second.submitted_ranges.lock(),
+            vec![Sid::new(0)..Sid::new(4), Sid::new(4)..Sid::new(6)]
+        );
+        assert_eq!(*first.submitted_types.lock(), vec![BioType::Write, BioType::Write]);
+        assert_eq!(*second.submitted_types.lock(), vec![BioType::Write, BioType::Write]);
+        assert_eq!(*first.submitted_lengths.lock(), vec![2 * 512, 4 * 512]);
+        assert_eq!(*second.submitted_lengths.lock(), vec![4 * 512, 2 * 512]);
+        assert_eq!(*completion_status.lock(), None);
+
+        first.complete_pending(1);
+        second.complete_pending(0);
+        first.complete_pending(0);
+        assert_eq!(*completion_status.lock(), None);
+
+        second.complete_pending(0);
+        assert_eq!(*completion_status.lock(), Some(BioStatus::Complete));
     }
 
     #[ktest]
