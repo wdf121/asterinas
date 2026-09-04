@@ -64,10 +64,12 @@ dm_run_guest_script() {
     local script_file=$2
     local log_mode=$3
     local label=$4
-    local slug fifo start_line qemu_pid status dm_test_images start_ts elapsed timeout_seconds
+    local slug fifo start_line qemu_pid status dm_test_images start_ts elapsed ready_timeout_seconds lifecycle_timeout_seconds start_at completed_at input_line_delay
 
     dm_test_images=$(dm_test_images_env)
-    timeout_seconds=${GUEST_QEMU_TIMEOUT:-${GUEST_READY_TIMEOUT:-180}}
+    ready_timeout_seconds=${GUEST_READY_TIMEOUT:-40}
+    lifecycle_timeout_seconds=${GUEST_QEMU_TIMEOUT:-180}
+    input_line_delay=${GUEST_INPUT_LINE_DELAY:-0.01}
     slug=$(_dm_test_tmp_slug "${test_id}")
     fifo=$(mktemp -u "/tmp/${slug}-stdin.XXXXXX")
     mkfifo "${fifo}"
@@ -79,6 +81,8 @@ dm_run_guest_script() {
     fi
 
     start_ts=$(date +%s)
+    start_at=$(date -Is)
+    echo "HOST_INFO_${test_id} ${label}_guest_started_at=${start_at}"
     if [ "${log_mode}" = "append" ]; then
         DM_TEST_IMAGES="${dm_test_images}" \
         DM_TEST_IMAGE="${DM_TEST_IMAGE}" \
@@ -103,26 +107,30 @@ dm_run_guest_script() {
             if [ "${status}" -eq 0 ]; then
                 status=1
             fi
+            completed_at=$(date -Is)
             echo "HOST_FAIL_${test_id} ${label}_guest_exited_before_shell status=${status}"
+            echo "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s"
             return "${status}"
         fi
         elapsed=$(($(date +%s) - start_ts))
-        if [ "${elapsed}" -ge "${timeout_seconds}" ]; then
-            echo "HOST_FAIL_${test_id} ${label}_guest_lifecycle_timeout=${timeout_seconds}s"
+        if [ "${elapsed}" -ge "${ready_timeout_seconds}" ]; then
+            echo "HOST_FAIL_${test_id} ${label}_guest_ready_timeout=${ready_timeout_seconds}s"
             exec 3>&-
             kill -- "-${qemu_pid}" 2>/dev/null || kill "${qemu_pid}" 2>/dev/null || true
             wait "${qemu_pid}" || true
+            completed_at=$(date -Is)
+            echo "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s"
             return 124
         fi
         sleep 1
     done
 
     elapsed=$(($(date +%s) - start_ts))
-    echo "HOST_INFO_${test_id} ${label}_guest_ready_after=${elapsed}s"
-    if [ -n "${GUEST_INPUT_LINE_DELAY:-}" ] && [ "${GUEST_INPUT_LINE_DELAY}" != "0" ]; then
+    echo "HOST_INFO_${test_id} ${label}_guest_ready_after=${elapsed}s ready_timeout=${ready_timeout_seconds}s lifecycle_timeout=${lifecycle_timeout_seconds}s"
+    if [ "${input_line_delay}" != "0" ]; then
         while IFS= read -r line || [ -n "${line}" ]; do
             printf '%s\n' "${line}" >&3
-            sleep "${GUEST_INPUT_LINE_DELAY}"
+            sleep "${input_line_delay}"
         done <"${script_file}"
     else
         cat "${script_file}" >&3
@@ -131,10 +139,12 @@ dm_run_guest_script() {
 
     while kill -0 "${qemu_pid}" 2>/dev/null; do
         elapsed=$(($(date +%s) - start_ts))
-        if [ "${elapsed}" -ge "${timeout_seconds}" ]; then
-            echo "HOST_FAIL_${test_id} ${label}_guest_lifecycle_timeout=${timeout_seconds}s"
+        if [ "${elapsed}" -ge "${lifecycle_timeout_seconds}" ]; then
+            echo "HOST_FAIL_${test_id} ${label}_guest_lifecycle_timeout=${lifecycle_timeout_seconds}s"
             kill -- "-${qemu_pid}" 2>/dev/null || kill "${qemu_pid}" 2>/dev/null || true
             wait "${qemu_pid}" || true
+            completed_at=$(date -Is)
+            echo "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s"
             return 124
         fi
         sleep 1
@@ -142,6 +152,8 @@ dm_run_guest_script() {
 
     status=0
     wait "${qemu_pid}" || status=$?
+    completed_at=$(date -Is)
+    echo "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s status=${status}"
     return "${status}"
 }
 
@@ -234,6 +246,52 @@ dm_run_two_guest_test() {
     if [ "${second_status}" -ne 0 ] || dm_log_has_failure_marker || ! dm_log_has_marker "${second_pass}"; then
         dm_print_failure_context "${test_id}"
         echo "HOST_FAIL_${test_id} second_qemu_status=${second_status}"
+        exit 1
+    fi
+
+    echo "HOST_PASS_${test_id}"
+}
+
+# Runs a three-boot flow while preserving one host log and checking each guest's marker.
+# The third guest is used by integration suites that must verify persisted state after shrink.
+dm_run_three_guest_test() {
+    local test_id=$1
+    local first_script=$2
+    local second_script=$3
+    local third_script=$4
+    local first_pass=$5
+    local second_pass=$6
+    local third_pass=$7
+    local summary_include=$8
+    local first_status=0 second_status=0 third_status=0
+
+    dm_run_guest_script "${test_id}" "${first_script}" replace first || first_status=$?
+    rm -f "${first_script}"
+    if [ "${first_status}" -ne 0 ] || dm_log_has_failure_marker || ! dm_log_has_marker "${first_pass}"; then
+        dm_print_summary "${test_id}" "${summary_include}"
+        dm_print_failure_context "${test_id}"
+        echo "HOST_FAIL_${test_id} first_qemu_status=${first_status}"
+        rm -f "${second_script}" "${third_script}"
+        exit 1
+    fi
+
+    dm_run_guest_script "${test_id}" "${second_script}" append second || second_status=$?
+    rm -f "${second_script}"
+    if [ "${second_status}" -ne 0 ] || dm_log_has_failure_marker || ! dm_log_has_marker "${second_pass}"; then
+        dm_print_summary "${test_id}" "${summary_include}"
+        dm_print_failure_context "${test_id}"
+        echo "HOST_FAIL_${test_id} second_qemu_status=${second_status}"
+        rm -f "${third_script}"
+        exit 1
+    fi
+
+    dm_run_guest_script "${test_id}" "${third_script}" append third || third_status=$?
+    rm -f "${third_script}"
+
+    dm_print_summary "${test_id}" "${summary_include}"
+    if [ "${third_status}" -ne 0 ] || dm_log_has_failure_marker || ! dm_log_has_marker "${third_pass}"; then
+        dm_print_failure_context "${test_id}"
+        echo "HOST_FAIL_${test_id} third_qemu_status=${third_status}"
         exit 1
     fi
 

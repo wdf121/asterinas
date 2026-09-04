@@ -6,23 +6,24 @@ set -euo pipefail
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     cat <<'EOF'
-Usage: myshell/run_lvm2_cli_semantics_test.sh
+Usage: myshell/run_lvm2_topology_test.sh
 
-Runs one NixOS guest pass that executes the LVM2 commands recorded in the
-Linux/OpenEuler baseline order. Each single QEMU guest lifecycle is limited by
-GUEST_QEMU_TIMEOUT, default 180 seconds.
+Runs one NixOS guest pass for LVM2 topology and lifecycle semantics. It covers
+PV/VG/LV management, linear and striped growth across backing sets, mixed
+segment tables, activation recovery, and removal without filesystem or reboot
+checks.
 
 Optional environment variables:
   DM_TEST_IMAGES            Space-separated backing image paths, default four test images
-  LVM2_CLI_LOG              Host-side log path, default /tmp/lvm2-cli-semantics-test.log
+  LVM2_TOPOLOGY_LOG              Host-side log path, default /tmp/lvm2-topology-test.log
   GUEST_QEMU_TIMEOUT        Full QEMU lifecycle timeout in seconds, default 180
-  GUEST_READY_TIMEOUT       Compatibility alias if GUEST_QEMU_TIMEOUT is unset
+  GUEST_READY_TIMEOUT       Guest shell readiness timeout in seconds, default 40
   RESET_DM_TEST_IMAGES      1 to delete test images before running, default 1
 
 Expected success markers:
-  SUMMARY_GAP_LVM2_CLI_SEMANTICS: 0
-  TEST_PASS_LVM2_CLI_SEMANTICS
-  HOST_PASS_LVM2_CLI_SEMANTICS
+  SUMMARY_GAP_LVM2_TOPOLOGY: 0
+  TEST_PASS_LVM2_TOPOLOGY
+  HOST_PASS_LVM2_TOPOLOGY
 EOF
     exit 0
 fi
@@ -31,12 +32,13 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/..")
 source "${SCRIPT_DIR}/lib/dm_nixos_test.sh"
 
-TEST_ID=LVM2_CLI_SEMANTICS
-LOG=${LVM2_CLI_LOG:-/tmp/lvm2-cli-semantics-test.log}
+TEST_ID=LVM2_TOPOLOGY
+LOG=${LVM2_TOPOLOGY_LOG:-/tmp/lvm2-topology-test.log}
 DM_TEST_IMAGE=${DM_TEST_IMAGE:-target/nixos/test.img}
 DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
 DM_TEST_IMAGES=${DM_TEST_IMAGES:-target/nixos/test.img target/nixos/test2.img target/nixos/test3.img target/nixos/test4.img}
-GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-${GUEST_READY_TIMEOUT:-180}}
+GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-180}
+GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-40}
 GUEST_INPUT_LINE_DELAY=${GUEST_INPUT_LINE_DELAY:-0.01}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
@@ -45,13 +47,13 @@ dm_prepare_nixos_test "${TEST_ID}"
 echo "HOST_INFO_${TEST_ID} disks=${DM_TEST_IMAGES} serials=vdmtest,vdmtest2,vdmtest3,vdmtest4"
 echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 
-GUEST_SCRIPT_FILE=$(mktemp /tmp/lvm2-cli-semantics-guest.XXXXXX)
+GUEST_SCRIPT_FILE=$(mktemp /tmp/lvm2-topology-guest.XXXXXX)
 cat >"${GUEST_SCRIPT_FILE}" <<'GUEST_SCRIPT'
 stty -echo 2>/dev/null || true
-cat >/tmp/lvm2_cli_semantics_guest.sh <<'LVM2_GUEST_BODY'
+cat >/tmp/lvm2_topology_guest.sh <<'LVM2_GUEST_BODY'
 set -u
 
-PREFIX=lvm2_cli_sem
+PREFIX=lvm2_topology
 TEST_VG=${PREFIX}_vg
 LINEAR_LV=${PREFIX}_linear_lv
 STRIPED_LV=${PREFIX}_striped_lv
@@ -95,17 +97,17 @@ step() {
 finish_steps() {
     now=$(now_s)
     echo "STEP_DURATION_${STEP_LABEL}: $((now - STEP_START))s total=$((now - GUEST_TEST_START))s"
-    echo "GUEST_DURATION_LVM2_CLI_SEMANTICS: $((now - GUEST_TEST_START))s"
-    echo "SUMMARY_GAP_LVM2_CLI_SEMANTICS: ${GAP_COUNT}"
+    echo "GUEST_DURATION_LVM2_TOPOLOGY: $((now - GUEST_TEST_START))s"
+    echo "SUMMARY_GAP_LVM2_TOPOLOGY: ${GAP_COUNT}"
 }
 
 observe_gap() {
     GAP_COUNT=$((GAP_COUNT + 1))
-    echo "OBSERVE_GAP_LVM2_CLI_SEMANTICS $*"
+    echo "OBSERVE_GAP_LVM2_TOPOLOGY $*"
 }
 
 fail_precondition() {
-    echo "TEST_FAIL_LVM2_CLI_SEMANTICS $*"
+    echo "TEST_FAIL_LVM2_TOPOLOGY $*"
     exit 1
 }
 
@@ -220,7 +222,7 @@ cleanup_lvm() {
     pvremove --config "${LVM_CONFIG:-activation { udev_rules=0 }}" -ff -y ${DISK1:-} ${DISK2:-} ${DISK3:-} ${DISK4:-} >/dev/null 2>&1 || true
 }
 
-trap 'status=$?; if [ "${status}" -ne 0 ]; then echo TEST_FAIL_LVM2_CLI_SEMANTICS status=${status}; fi; cleanup_lvm; sync; poweroff; exit ${status}' EXIT
+trap 'status=$?; if [ "${status}" -ne 0 ]; then echo TEST_FAIL_LVM2_TOPOLOGY status=${status}; fi; cleanup_lvm; sync; poweroff; exit ${status}' EXIT
 
 step '=== STEP 1: locate LVM2 test disks ==='
 DISK1=$(locate_disk vdmtest) || fail_precondition locate_disk1_failed
@@ -357,15 +359,15 @@ cleanup_lvm
 sync
 finish_steps
 if [ "${GAP_COUNT}" -ne 0 ]; then
-    echo "TEST_FAIL_LVM2_CLI_SEMANTICS gap_count=${GAP_COUNT}"
+    echo "TEST_FAIL_LVM2_TOPOLOGY gap_count=${GAP_COUNT}"
     exit 1
 fi
-echo TEST_PASS_LVM2_CLI_SEMANTICS
+echo TEST_PASS_LVM2_TOPOLOGY
 poweroff
 LVM2_GUEST_BODY
-sh /tmp/lvm2_cli_semantics_guest.sh
+sh /tmp/lvm2_topology_guest.sh
 
 GUEST_SCRIPT
 
 SUMMARY_INCLUDE='^(TEST_PASS|TEST_FAIL|OBSERVE_|=== STEP|STATUS_|STEP_DURATION_|GUEST_DURATION_|SUMMARY_GAP_|TEST_DISK|DEV[0-9]=|LVM_DEVICES_SUPPORTED|HOST_FAIL|Kernel panic|panicked)'
-dm_run_single_guest_test "${TEST_ID}" "${GUEST_SCRIPT_FILE}" TEST_PASS_LVM2_CLI_SEMANTICS "${SUMMARY_INCLUDE}"
+dm_run_single_guest_test "${TEST_ID}" "${GUEST_SCRIPT_FILE}" TEST_PASS_LVM2_TOPOLOGY "${SUMMARY_INCLUDE}"

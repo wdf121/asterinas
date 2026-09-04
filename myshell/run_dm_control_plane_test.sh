@@ -6,24 +6,24 @@ set -euo pipefail
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     cat <<'EOF'
-Usage: myshell/run_dmsetup_cli_semantics_test.sh
+Usage: myshell/run_dm_control_plane_test.sh
 
-Runs one NixOS guest pass that executes the dmsetup commands recorded in
-Linux/OpenEuler baseline table order. Each single QEMU guest lifecycle is
-limited by GUEST_QEMU_TIMEOUT, default 180 seconds.
+Runs one NixOS guest pass for Device Mapper control-plane semantics. It covers
+dmsetup discovery, target metadata, table lifecycle, event handling, rename,
+read-only devices, busy removal, and cleanup behavior.
 
 Optional environment variables:
   DM_TEST_IMAGE              First backing test image path, default target/nixos/test.img
   DM_TEST_IMAGE_2            Second backing test image path, default target/nixos/test2.img
-  DMSETUP_CLI_LOG            Host-side log path, default /tmp/dmsetup-cli-semantics-test.log
+  DM_CONTROL_PLANE_LOG            Host-side log path, default /tmp/dm-control-plane-test.log
   GUEST_QEMU_TIMEOUT         Full QEMU lifecycle timeout in seconds, default 180
-  GUEST_READY_TIMEOUT        Compatibility alias if GUEST_QEMU_TIMEOUT is unset
+  GUEST_READY_TIMEOUT        Guest shell readiness timeout in seconds, default 40
   RESET_DM_TEST_IMAGES       1 to delete test images before running, default 1
 
 Expected success markers:
-  SUMMARY_GAP_DMSETUP_CLI_SEMANTICS: 0
-  TEST_PASS_DMSETUP_CLI_SEMANTICS
-  HOST_PASS_DMSETUP_CLI_SEMANTICS
+  SUMMARY_GAP_DM_CONTROL_PLANE: 0
+  TEST_PASS_DM_CONTROL_PLANE
+  HOST_PASS_DM_CONTROL_PLANE
 EOF
     exit 0
 fi
@@ -32,11 +32,12 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/..")
 source "${SCRIPT_DIR}/lib/dm_nixos_test.sh"
 
-TEST_ID=DMSETUP_CLI_SEMANTICS
-LOG=${DMSETUP_CLI_LOG:-/tmp/dmsetup-cli-semantics-test.log}
+TEST_ID=DM_CONTROL_PLANE
+LOG=${DM_CONTROL_PLANE_LOG:-/tmp/dm-control-plane-test.log}
 DM_TEST_IMAGE=${DM_TEST_IMAGE:-target/nixos/test.img}
 DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
-GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-${GUEST_READY_TIMEOUT:-180}}
+GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-180}
+GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-40}
 GUEST_INPUT_LINE_DELAY=${GUEST_INPUT_LINE_DELAY:-0.01}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
@@ -46,14 +47,14 @@ echo "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
 echo "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
 echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 
-GUEST_SCRIPT_FILE=$(mktemp /tmp/dmsetup-cli-semantics-guest.XXXXXX)
+GUEST_SCRIPT_FILE=$(mktemp /tmp/dm-control-plane-guest.XXXXXX)
 cat >"${GUEST_SCRIPT_FILE}" <<'GUEST_SCRIPT'
 stty -echo 2>/dev/null || true
-cat >/tmp/dmsetup_cli_semantics_guest.sh <<'DMSETUP_GUEST_BODY'
+cat >/tmp/dm_control_plane_guest.sh <<'DMSETUP_GUEST_BODY'
 set -u
 
-PREFIX=dm_cli_sem
-names='stdin notable linear_major linear_path striped_major striped_path error zero table_lifecycle state_event rename rename_existing renamed remove_active remove_tableless remove_all_a remove_all_b'
+PREFIX=dm_control
+names='stdin notable linear_major linear_path striped_major striped_path error zero table_lifecycle state_event rename rename_existing renamed readonly busy busy_other remove_active remove_tableless remove_all_a remove_all_b'
 GUEST_TEST_START=$(date +%s)
 STEP_START=${GUEST_TEST_START}
 STEP_LABEL=START
@@ -89,17 +90,17 @@ step() {
 finish_steps() {
     now=$(now_s)
     echo "STEP_DURATION_${STEP_LABEL}: $((now - STEP_START))s total=$((now - GUEST_TEST_START))s"
-    echo "GUEST_DURATION_DMSETUP_CLI_SEMANTICS: $((now - GUEST_TEST_START))s"
-    echo "SUMMARY_GAP_DMSETUP_CLI_SEMANTICS: ${GAP_COUNT}"
+    echo "GUEST_DURATION_DM_CONTROL_PLANE: $((now - GUEST_TEST_START))s"
+    echo "SUMMARY_GAP_DM_CONTROL_PLANE: ${GAP_COUNT}"
 }
 
 observe_gap() {
     GAP_COUNT=$((GAP_COUNT + 1))
-    echo "OBSERVE_GAP_DMSETUP_CLI_SEMANTICS $*"
+    echo "OBSERVE_GAP_DM_CONTROL_PLANE $*"
 }
 
 fail_precondition() {
-    echo "TEST_FAIL_DMSETUP_CLI_SEMANTICS $*"
+    echo "TEST_FAIL_DM_CONTROL_PLANE $*"
     exit 1
 }
 
@@ -174,8 +175,12 @@ run_expect_success() {
 run_expect_failure() {
     label=$1
     shift
-    if run_capture "${label}" "$@"; then
+    status=0
+    run_capture "${label}" "$@" || status=$?
+    if [ "${status}" -eq 0 ]; then
         observe_gap "${label}_unexpected_success"
+    elif [ "${status}" -eq 124 ]; then
+        observe_gap "${label}_timed_out"
     fi
     return 0
 }
@@ -192,8 +197,12 @@ run_shell_expect_success() {
 run_shell_expect_failure() {
     label=$1
     script=$2
-    if run_shell_capture "${label}" "${script}"; then
+    status=0
+    run_shell_capture "${label}" "${script}" || status=$?
+    if [ "${status}" -eq 0 ]; then
         observe_gap "${label}_unexpected_success"
+    elif [ "${status}" -eq 124 ]; then
+        observe_gap "${label}_timed_out"
     fi
     return 0
 }
@@ -311,10 +320,11 @@ finish_guest() {
     cleanup_dm
     sync
     finish_steps
-    if [ "${status}" -eq 0 ]; then
-        echo TEST_PASS_DMSETUP_CLI_SEMANTICS
+    if [ "${status}" -eq 0 ] && [ "${GAP_COUNT}" -eq 0 ]; then
+        echo TEST_PASS_DM_CONTROL_PLANE
     else
-        echo "TEST_FAIL_DMSETUP_CLI_SEMANTICS status=${status}"
+        status=1
+        echo "TEST_FAIL_DM_CONTROL_PLANE gaps=${GAP_COUNT}"
     fi
     poweroff
     exit "${status}"
@@ -418,8 +428,8 @@ run_expect_success ERROR_INFO dmsetup info "${error_name}"
 expect_table_line "${error_name}" "0 8 error " ERROR_TABLE
 run_expect_success ERROR_STATUS dmsetup status "${error_name}"
 expect_deps_count "${error_name}" 0 ERROR_DEPS
-run_shell_expect_failure ERROR_READ "timeout 5 dd if=/dev/mapper/${error_name} of=/dev/null bs=512 count=1 status=none"
-run_shell_expect_failure ERROR_WRITE "timeout 5 dd if=/dev/zero of=/dev/mapper/${error_name} bs=512 count=1 status=none"
+run_shell_expect_failure ERROR_READ "dd if=/dev/mapper/${error_name} of=/dev/null bs=512 count=1 status=none"
+run_shell_expect_failure ERROR_WRITE "dd if=/dev/zero of=/dev/mapper/${error_name} bs=512 count=1 status=none"
 run_expect_success ERROR_REMOVE dmsetup remove "${error_name}"
 zero_name=$(name zero)
 run_expect_success ZERO_CREATE dmsetup create "${zero_name}" --table "0 8 zero"
@@ -486,7 +496,22 @@ run_expect_success RENAME_REMOVE_NEW dmsetup remove "${rename_new}"
 run_expect_success RENAME_REMOVE_EXISTING dmsetup remove "${existing_name}"
 echo CHECK_PASS_DMSETUP_RENAME_UUID
 
-step '=== STEP 10: remove and remove_all ==='
+step '=== STEP 10: read-only and busy device lifecycle ==='
+readonly_name=$(name readonly)
+run_shell_expect_success READONLY_CREATE "printf '0 8 linear ${DEV} 0\\n' | dmsetup --readonly create ${readonly_name}"
+record_nodes READONLY_CREATE "${readonly_name}"
+run_shell_expect_success READONLY_READ "dd if=/dev/mapper/${readonly_name} of=/tmp/readonly-read.bin bs=512 count=1 status=none"
+run_shell_expect_failure READONLY_WRITE "dd if=/dev/zero of=/dev/mapper/${readonly_name} bs=512 count=1 conv=fsync status=none"
+run_expect_success READONLY_REMOVE dmsetup remove "${readonly_name}"
+
+busy_name=$(name busy)
+busy_other=$(name busy_other)
+run_shell_expect_success BUSY_CREATE "printf '0 8 linear ${DEV} 0\\n' | dmsetup create ${busy_name}"
+run_shell_expect_success BUSY_OTHER_CREATE "printf '0 8 linear ${DEV2} 0\\n' | dmsetup create ${busy_other}"
+run_shell_expect_success BUSY_REMOVE_AND_REMOVE_ALL "exec 9</dev/mapper/${busy_name}; if dmsetup remove ${busy_name}; then exit 1; fi; dmsetup info ${busy_name} >/dev/null; dmsetup remove_all || true; dmsetup info ${busy_name} >/dev/null; if dmsetup info ${busy_other} >/dev/null 2>&1; then exit 1; fi; exec 9<&-; dmsetup remove ${busy_name}"
+echo CHECK_PASS_DMSETUP_READONLY_BUSY_LIFECYCLE
+
+step '=== STEP 11: remove and remove_all ==='
 remove_active=$(name remove_active)
 remove_tableless=$(name remove_tableless)
 run_expect_success REMOVE_ACTIVE_CREATE dmsetup create "${remove_active}" --table "0 8 linear ${DEV} 0"
@@ -505,15 +530,11 @@ run_expect_failure REMOVE_ALL_INFO_B dmsetup info "${remove_all_b}"
 run_expect_success REMOVE_ALL_EMPTY dmsetup remove_all
 echo CHECK_PASS_DMSETUP_REMOVE_COMMANDS
 
-cleanup_dm
-sync
-finish_steps
-echo TEST_PASS_DMSETUP_CLI_SEMANTICS
-poweroff
+exit 0
 DMSETUP_GUEST_BODY
-sh /tmp/dmsetup_cli_semantics_guest.sh
+sh /tmp/dm_control_plane_guest.sh
 
 GUEST_SCRIPT
 
 SUMMARY_INCLUDE='TEST_|CHECK_PASS_|OBSERVE_|=== STEP|SCENARIO_|CMD_|STATUS_|DURATION_|STEP_DURATION_|GUEST_DURATION_|SUMMARY_GAP_|STDOUT_|STDERR_|TRIGGER_|EVENT_|NODE_|TEST_DISK=|TEST_DISK2=|DEV=|DEV2=|Name:|State:|UUID:|Tables present:|linear|striped|error|zero|dependencies|Command failed|Invalid argument|Input/output error|No such device|No devices found|Kernel panic|panicked'
-dm_run_single_guest_test "${TEST_ID}" "${GUEST_SCRIPT_FILE}" TEST_PASS_DMSETUP_CLI_SEMANTICS "${SUMMARY_INCLUDE}"
+dm_run_single_guest_test "${TEST_ID}" "${GUEST_SCRIPT_FILE}" TEST_PASS_DM_CONTROL_PLANE "${SUMMARY_INCLUDE}"
