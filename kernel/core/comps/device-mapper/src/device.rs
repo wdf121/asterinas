@@ -139,6 +139,13 @@ impl DmDevice {
         }
     }
 
+    /// Waits until every BIO accepted by this device has completed.
+    fn wait_for_io_drain(&self) {
+        self.io
+            .drained
+            .wait_until(|| (self.io.in_flight.load(Ordering::Acquire) == 0).then_some(()));
+    }
+
     /// Returns a cloned device name, including updates after rename.
     pub fn name(&self) -> String {
         self.name.lock().clone()
@@ -205,9 +212,7 @@ impl DmDevice {
             }
         };
 
-        self.io
-            .drained
-            .wait_until(|| (self.io.in_flight.load(Ordering::Acquire) == 0).then_some(()));
+        self.wait_for_io_drain();
 
         let mut state = self.state.lock();
         debug_assert_eq!(state.phase, DmDevicePhase::Suspending);
@@ -242,12 +247,25 @@ impl DmDevice {
 
     /// Activates the inactive table, if any, and resumes I/O.
     ///
-    /// On a running device, resuming with an inactive table atomically replaces
-    /// the active table; without an inactive table it remains idempotent. The
-    /// suspending phase must finish draining first so interleaved `resume` and
-    /// `suspend` cannot let new I/O cross the suspension barrier.
+    /// Replacing a running active table blocks new BIOs and waits for every BIO
+    /// already accepted by the old table to complete. This creates a table
+    /// generation barrier: after this function succeeds, newly accepted BIOs can
+    /// only use the replacement table. Resuming without a replacement table keeps
+    /// its existing idempotent or phase-restoration behavior.
     pub fn resume(&self) -> Result<(), DmError> {
-        {
+        self.resume_with_drain(true)
+    }
+
+    /// Activates the inactive table, if any, without waiting for old BIOs.
+    ///
+    /// The old table remains alive through BIO-held `Arc` references while new
+    /// BIOs begin using the replacement table immediately.
+    pub fn resume_no_flush(&self) -> Result<(), DmError> {
+        self.resume_with_drain(false)
+    }
+
+    fn resume_with_drain(&self, drain_replacement: bool) -> Result<(), DmError> {
+        let replacement = {
             let mut state = self.state.lock();
             if state.phase == DmDevicePhase::Suspending {
                 return Err(DmError::InvalidState);
@@ -256,13 +274,34 @@ impl DmDevice {
                 return Err(DmError::InvalidState);
             }
 
-            if let Some(table) = state.inactive.take() {
-                state.active = Some(table);
-            }
-            if state.phase == DmDevicePhase::Suspended {
-                state.phase = DmDevicePhase::Running;
+            if drain_replacement
+                && state.phase == DmDevicePhase::Running
+                && state.active.is_some()
+                && state.inactive.is_some()
+            {
+                state.phase = DmDevicePhase::Suspending;
+                state.inactive.take().expect("inactive table disappeared")
+            } else {
+                if let Some(table) = state.inactive.take() {
+                    state.active = Some(table);
+                }
+                if state.phase == DmDevicePhase::Suspended {
+                    state.phase = DmDevicePhase::Running;
+                }
+                return Ok(());
             }
         };
+
+        self.wait_for_io_drain();
+
+        let old_active = {
+            let mut state = self.state.lock();
+            debug_assert_eq!(state.phase, DmDevicePhase::Suspending);
+            let old_active = state.active.replace(replacement);
+            state.phase = DmDevicePhase::Running;
+            old_active
+        };
+        drop(old_active);
         Ok(())
     }
 

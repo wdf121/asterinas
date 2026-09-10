@@ -666,7 +666,12 @@ fn device_suspend(buffer: &mut [u8]) -> Result<()> {
     if flags & DM_SUSPEND_FLAG != 0 {
         device.suspend().map_err(map_dm_error)?;
     } else if !is_device_registered_as_block(&device) || is_mapper_alias_published(&device)? {
-        device.resume().map_err(map_dm_error)?;
+        (if flags & DM_NOFLUSH_FLAG != 0 {
+            device.resume_no_flush()
+        } else {
+            device.resume()
+        })
+        .map_err(map_dm_error)?;
     } else {
         activate_initial_table_and_publish_alias(&device)?;
     }
