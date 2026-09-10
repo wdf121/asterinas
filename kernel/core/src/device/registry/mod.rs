@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
 pub(crate) use block::{
-    open_count as block_open_count, register_mapper as register_block_mapper,
-    rename_mapper as rename_block_mapper, unregister_mapper as unregister_block_mapper,
+    has_mapper_alias as block_mapper_alias_is_published, open_count as block_open_count,
+    publish_mapper_alias as publish_block_mapper_alias,
+    register_mapper_primary as register_block_mapper_primary, rename_mapper as rename_block_mapper,
+    unregister_mapper as unregister_block_mapper,
 };
 use device_id::DeviceId;
 
