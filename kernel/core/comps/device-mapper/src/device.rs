@@ -72,6 +72,44 @@ pub struct DmDeviceStatus {
     pub event_nr: u32,
 }
 
+/// Rolls back an initial table activation unless committed.
+///
+/// This guard is only for first activation after the primary block node is
+/// registered. It lets the control plane publish the mapper alias after the
+/// table becomes usable, while restoring the exact table and phase if alias
+/// publication fails.
+pub struct InitialResumeGuard<'a> {
+    device: &'a DmDevice,
+    table: Arc<DmTable>,
+    previous_phase: DmDevicePhase,
+    committed: bool,
+}
+
+impl InitialResumeGuard<'_> {
+    /// Keeps the activated table and disables rollback.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for InitialResumeGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        let mut state = self.device.state.lock();
+        let active = state
+            .active
+            .take()
+            .expect("initial resume guard lost its active table");
+        assert!(Arc::ptr_eq(&active, &self.table));
+        assert!(state.inactive.is_none());
+        state.inactive = Some(active);
+        state.phase = self.previous_phase;
+    }
+}
+
 /// A runtime Device Mapper block device.
 pub struct DmDevice {
     id_owner: DmDeviceIdOwner,
@@ -175,6 +213,31 @@ impl DmDevice {
         debug_assert_eq!(state.phase, DmDevicePhase::Suspending);
         state.phase = DmDevicePhase::Suspended;
         Ok(())
+    }
+
+    /// Starts a rollback-capable first activation for mapper alias publication.
+    ///
+    /// The device must not already have an active table. If this guard is
+    /// dropped before [`InitialResumeGuard::commit`], it restores the same
+    /// table to inactive and restores the previous phase.
+    pub fn begin_initial_resume(&self) -> Result<InitialResumeGuard<'_>, DmError> {
+        let mut state = self.state.lock();
+        if state.phase == DmDevicePhase::Suspending || state.active.is_some() {
+            return Err(DmError::InvalidState);
+        }
+        let table = state.inactive.take().ok_or(DmError::InvalidState)?;
+        let previous_phase = state.phase;
+        state.active = Some(table.clone());
+        if state.phase == DmDevicePhase::Suspended {
+            state.phase = DmDevicePhase::Running;
+        }
+
+        Ok(InitialResumeGuard {
+            device: self,
+            table,
+            previous_phase,
+            committed: false,
+        })
     }
 
     /// Activates the inactive table, if any, and resumes I/O.
@@ -502,6 +565,52 @@ mod tests {
         assert_eq!(device.status().event_nr, 0);
         device.clear_inactive_table().unwrap();
         assert_eq!(device.status().event_nr, 0);
+    }
+
+    #[ktest]
+    fn initial_resume_guard_restores_running_device_table() {
+        let (device, table) = create_device_and_table();
+        device.load_table(table.clone());
+
+        {
+            let _guard = device.begin_initial_resume().unwrap();
+            assert!(Arc::ptr_eq(&device.active_table().unwrap(), &table));
+            assert!(device.inactive_table().is_none());
+            assert!(!device.status().suspended);
+        }
+
+        assert!(device.active_table().is_none());
+        assert!(Arc::ptr_eq(&device.inactive_table().unwrap(), &table));
+        assert!(!device.status().suspended);
+    }
+
+    #[ktest]
+    fn initial_resume_guard_restores_suspended_device_phase() {
+        let (device, table) = create_device_and_table();
+        device.suspend().unwrap();
+        device.load_table(table.clone());
+
+        {
+            let _guard = device.begin_initial_resume().unwrap();
+            assert!(Arc::ptr_eq(&device.active_table().unwrap(), &table));
+            assert!(!device.status().suspended);
+        }
+
+        assert!(device.active_table().is_none());
+        assert!(Arc::ptr_eq(&device.inactive_table().unwrap(), &table));
+        assert!(device.status().suspended);
+    }
+
+    #[ktest]
+    fn initial_resume_guard_commit_keeps_active_table() {
+        let (device, table) = create_device_and_table();
+        device.load_table(table.clone());
+
+        device.begin_initial_resume().unwrap().commit();
+
+        assert!(Arc::ptr_eq(&device.active_table().unwrap(), &table));
+        assert!(device.inactive_table().is_none());
+        assert!(!device.status().suspended);
     }
 
     #[ktest]

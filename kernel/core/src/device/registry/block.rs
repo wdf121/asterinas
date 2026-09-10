@@ -491,12 +491,47 @@ pub(super) fn lookup(id: DeviceId) -> Option<Arc<dyn Device>> {
     Some(block_file)
 }
 
-pub(crate) fn register_mapper(device: Arc<dyn BlockDevice>, mapper_name: &str) -> Result<()> {
-    validate_mapper_name(mapper_name)?;
+/// Registers the `/dev/dm-N` runtime node without publishing a mapper alias.
+///
+/// A first `DM_TABLE_LOAD` calls this before its table enters the inactive slot.
+/// The resulting block file accepts opens, but a `DmDevice` without an active
+/// table reports zero capacity and cannot dispatch mapping I/O.
+pub(crate) fn register_mapper_primary(device: Arc<dyn BlockDevice>) -> Result<()> {
     let primary_path = format!("dm-{}", device.id().minor().get());
+    register_runtime_primary(device, primary_path)
+}
+
+/// Publishes `/dev/mapper/<name>` for a mapper with an existing primary node.
+///
+/// The primary node must still be owned by this registration. Keeping that
+/// check here prevents an alias from being attached to a replaced devtmpfs node.
+pub(crate) fn publish_mapper_alias(id: DeviceId, mapper_name: &str) -> Result<()> {
+    validate_mapper_name(mapper_name)?;
+
+    let block_file = lookup_runtime_block_file(id)?;
+    let _lifecycle = block_file.lifecycle.lock();
+    if block_file.mapper_alias().is_some() {
+        return_errno_with_message!(Errno::EEXIST, "the mapper alias already exists");
+    }
+
+    let primary = block_file
+        .node()
+        .ok_or_else(|| Error::with_message(Errno::ESTALE, "the mapper primary node is missing"))?;
+    let current_primary = crate::device::runtime_node(block_file.path.as_str())?;
+    if current_primary != primary {
+        return_errno_with_message!(Errno::ESTALE, "the mapper primary node is no longer owned");
+    }
+
     let alias_path = format!("mapper/{mapper_name}");
-    let alias_target = format!("../{primary_path}");
-    register_runtime_with_alias(device, primary_path, Some((alias_path, alias_target)))
+    let alias_target = format!("../{}", block_file.path);
+    let alias = crate::device::add_runtime_symlink(&alias_path, &alias_target)?;
+    block_file.set_mapper_alias(alias_path, alias);
+    Ok(())
+}
+
+/// Reports whether this mapper runtime registration has published its alias.
+pub(crate) fn has_mapper_alias(id: DeviceId) -> Result<bool> {
+    Ok(lookup_runtime_block_file(id)?.mapper_alias().is_some())
 }
 
 pub(crate) fn rename_mapper(id: DeviceId, old_name: &str, new_name: &str) -> Result<()> {
@@ -531,24 +566,31 @@ pub(crate) fn unregister_mapper(id: DeviceId, mapper_name: &str) -> Result<Arc<d
     let block_file = lookup_runtime_block_file(id)?;
     let _lifecycle = block_file.lifecycle.lock();
     let expected_alias_path = format!("mapper/{mapper_name}");
-    let (alias_path, alias) = block_file.mapper_alias().ok_or_else(|| {
-        Error::with_message(Errno::ESTALE, "the mapper alias registration is missing")
-    })?;
-    if alias_path != expected_alias_path {
+    let alias = block_file.mapper_alias();
+    if let Some((alias_path, _)) = &alias
+        && alias_path != &expected_alias_path
+    {
         return_errno_with_message!(Errno::ENODEV, "the mapper name does not match the device");
     }
 
     let unregistration = begin_runtime_unregistration(&block_file)?;
-    if let Err(error) = remove_owned_node_or_accept_stale(&alias_path, &alias) {
-        abort_runtime_unregistration(unregistration, &block_file);
-        return Err(error);
-    }
-    block_file.clear_mapper_alias();
+    if let Some((alias_path, alias_node)) = &alias {
+        if let Err(error) = remove_owned_node_or_accept_stale(alias_path, alias_node) {
+            abort_runtime_unregistration(unregistration, &block_file);
+            return Err(error);
+        }
+        block_file.clear_mapper_alias();
 
-    if let Some(node) = block_file.node()
+        if let Some(node) = block_file.node()
+            && let Err(error) = remove_owned_node_or_accept_stale(block_file.path.as_str(), &node)
+        {
+            restore_mapper_alias(&block_file, alias_path.clone());
+            abort_runtime_unregistration(unregistration, &block_file);
+            return Err(error);
+        }
+    } else if let Some(node) = block_file.node()
         && let Err(error) = remove_owned_node_or_accept_stale(block_file.path.as_str(), &node)
     {
-        restore_mapper_alias(&block_file, alias_path);
         abort_runtime_unregistration(unregistration, &block_file);
         return Err(error);
     }
@@ -560,18 +602,16 @@ pub(crate) fn unregister_mapper(id: DeviceId, mapper_name: &str) -> Result<Arc<d
         }
         Err(error) => {
             restore_runtime_node(&block_file);
-            restore_mapper_alias(&block_file, alias_path);
+            if let Some((alias_path, _)) = alias {
+                restore_mapper_alias(&block_file, alias_path);
+            }
             let _ = block_file.try_start_accepting_opens();
             Err(map_block_registry_error(error))
         }
     }
 }
 
-fn register_runtime_with_alias(
-    device: Arc<dyn BlockDevice>,
-    path: String,
-    alias: Option<(String, String)>,
-) -> Result<()> {
+fn register_runtime_primary(device: Arc<dyn BlockDevice>, path: String) -> Result<()> {
     let registration =
         aster_block::register_pending(device.clone()).map_err(map_block_registry_error)?;
 
@@ -582,47 +622,55 @@ fn register_runtime_with_alias(
             return Err(error);
         }
     };
-    let meta = DevtmpfsInodeMeta::new(path.as_str());
-    let node = match add_runtime_node(DeviceType::Block, block_file.id().as_encoded_u64(), &meta) {
-        Ok(node) => node,
-        Err(error) => {
-            remove_wrapper_if_matches(&block_file);
-            let _ = aster_block::abort_registration(registration);
-            return Err(error);
-        }
-    };
-    block_file.set_node(node);
-
-    if let Some((alias_path, alias_target)) = alias {
-        let alias_node = match crate::device::add_runtime_symlink(&alias_path, &alias_target) {
-            Ok(alias_node) => alias_node,
-            Err(error) => {
-                if let Some(node) = block_file.node() {
-                    let _ = remove_owned_runtime_node(block_file.path.as_str(), &node);
-                }
-                remove_wrapper_if_matches(&block_file);
-                let _ = aster_block::abort_registration(registration);
-                return Err(error);
-            }
-        };
-        block_file.set_mapper_alias(alias_path, alias_node);
-    }
 
     if let Err(error) = aster_block::commit_registration(&registration) {
-        if let Some((alias_path, alias_node)) = block_file.mapper_alias() {
-            let _ = remove_owned_runtime_node(&alias_path, &alias_node);
-            block_file.clear_mapper_alias();
-        }
-        if let Some(node) = block_file.node() {
-            let _ = remove_owned_runtime_node(block_file.path.as_str(), &node);
-        }
         remove_wrapper_if_matches(&block_file);
         let _ = aster_block::abort_registration(registration);
         return Err(map_block_registry_error(error));
     }
     block_file.start_accepting_opens();
 
+    let meta = DevtmpfsInodeMeta::new(path.as_str());
+    let node = match add_runtime_node(DeviceType::Block, block_file.id().as_encoded_u64(), &meta) {
+        Ok(node) => node,
+        Err(error) => {
+            rollback_published_runtime_registration(&block_file);
+            return Err(error);
+        }
+    };
+    block_file.set_node(node);
+
     Ok(())
+}
+
+fn rollback_published_runtime_registration(block_file: &Arc<BlockFile>) {
+    if let Err(error) = block_file.stop_accepting_opens() {
+        warn!(
+            "failed to close unpublished block device {}: {:?}",
+            block_file.path, error
+        );
+        return;
+    }
+    let unregistration = match aster_block::begin_unregister(block_file.id()) {
+        Ok(unregistration) => unregistration,
+        Err(error) => {
+            warn!(
+                "failed to begin unregistering unpublished block device {}: {:?}",
+                block_file.path, error
+            );
+            let _ = block_file.try_start_accepting_opens();
+            return;
+        }
+    };
+    if let Err(error) = aster_block::commit_unregister(unregistration) {
+        warn!(
+            "failed to unregister unpublished block device {}: {:?}",
+            block_file.path, error
+        );
+        let _ = block_file.try_start_accepting_opens();
+        return;
+    }
+    remove_wrapper_if_matches(block_file);
 }
 
 /// Removes nodes that still belong to this registration; missing or replaced

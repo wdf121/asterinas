@@ -15,7 +15,8 @@ use device_id::DeviceId;
 pub(crate) use mem::{getrandom, geturandom};
 pub(crate) use pty::{PtyMaster, PtySlave, new_pty_pair};
 pub(crate) use registry::{
-    block_open_count, lookup, register_block_mapper, rename_block_mapper, unregister_block_mapper,
+    block_mapper_alias_is_published, block_open_count, lookup, publish_block_mapper_alias,
+    register_block_mapper_primary, rename_block_mapper, unregister_block_mapper,
 };
 use spin::Once;
 

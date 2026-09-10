@@ -13,8 +13,8 @@ use aster_block::{BlockDevice, BlockDeviceLease, id::Sid, lookup_lease};
 use aster_device_mapper::{
     DmDevice, DmError, DmManager, DmTable, TableError,
     target::{
-        DmTarget, DmTargetBox, DmTargetMetadata, DmTargetParseError, SUPPORTED_TARGETS,
-        TargetStatusMode, parse_target_with,
+        DmTargetMetadata, DmTargetParseError, SUPPORTED_TARGETS, TargetStatusMode,
+        parse_target_with,
     },
 };
 use device_id::{DeviceId, MajorId, MinorId};
@@ -24,8 +24,9 @@ use spin::Once;
 use crate::{
     context::current_userspace,
     device::{
-        Device, DeviceType, DevtmpfsInodeMeta, block_open_count, register_block_mapper,
-        registry::char, rename_block_mapper, unregister_block_mapper,
+        Device, DeviceType, DevtmpfsInodeMeta, block_mapper_alias_is_published, block_open_count,
+        publish_block_mapper_alias, register_block_mapper_primary, registry::char,
+        rename_block_mapper, unregister_block_mapper,
     },
     events::IoEvents,
     fs::{
@@ -498,7 +499,9 @@ fn device_rename(buffer: &mut [u8]) -> Result<()> {
         manager()
             .rename_uuid(&device.name(), value)
             .map_err(map_dm_error)?;
-    } else if is_device_registered_as_block(&device) {
+    } else if is_device_registered_as_block(&device)
+        && (device.active_table().is_some() || is_mapper_alias_published(&device)?)
+    {
         rename_device_runtime(manager(), &device, &value, rename_block_mapper)?;
     } else {
         manager()
@@ -550,19 +553,28 @@ fn is_device_registered_as_block(device: &DmDevice) -> bool {
     block_open_count(device.id()).is_some()
 }
 
-/// Registers `/dev/dm-N` and `/dev/mapper/<name>` once a table can be activated.
-fn register_device_runtime_if_needed(device: &Arc<DmDevice>) -> Result<()> {
-    if is_device_registered_as_block(device) {
-        return Ok(());
-    }
-    if device.active_table().is_none() && device.inactive_table().is_none() {
-        return Ok(());
-    }
-    let name = device.name();
-    register_block_mapper(device.clone(), &name)
+fn is_mapper_alias_published(device: &DmDevice) -> Result<bool> {
+    block_mapper_alias_is_published(device.id())
 }
 
-/// Unregisters runtime aliases if this mapped device has been made visible.
+/// Publishes a mapper primary node after its first table has been validated.
+fn register_mapper_primary_if_needed(device: &Arc<DmDevice>) -> Result<()> {
+    if !is_device_registered_as_block(device) {
+        register_block_mapper_primary(device.clone())?;
+    }
+    Ok(())
+}
+
+/// Activates a first table and publishes its mapper alias as one transaction.
+fn activate_initial_table_and_publish_alias(device: &DmDevice) -> Result<()> {
+    let activation = device.begin_initial_resume().map_err(map_dm_error)?;
+    let name = device.name();
+    publish_block_mapper_alias(device.id(), &name)?;
+    activation.commit();
+    Ok(())
+}
+
+/// Unregisters mapper runtime resources if its primary node has been published.
 fn unregister_device_runtime_if_registered(device: &DmDevice) -> Result<()> {
     if is_device_registered_as_block(device) {
         unregister_block_mapper(device.id(), &&device.name())?;
@@ -575,8 +587,20 @@ fn table_load(buffer: &mut [u8]) -> Result<()> {
     table_load_for_device(buffer, &device)
 }
 
-/// Parses `DM_TABLE_LOAD` target specs and installs a fully validated inactive table.
-fn table_load_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
+/// Parses `DM_TABLE_LOAD` target specs, publishes a first primary node, and installs an inactive table.
+fn table_load_for_device(buffer: &mut [u8], device: &Arc<DmDevice>) -> Result<()> {
+    table_load_for_device_with_primary(buffer, device, register_mapper_primary_if_needed)
+}
+
+/// Parses and validates a table before registering a first primary node and installing it inactive.
+fn table_load_for_device_with_primary<F>(
+    buffer: &mut [u8],
+    device: &Arc<DmDevice>,
+    register_primary: F,
+) -> Result<()>
+where
+    F: FnOnce(&Arc<DmDevice>) -> Result<()>,
+{
     let target_count = read_u32(buffer, OFF_TARGET_COUNT)?;
     let flags = read_u32(buffer, OFF_FLAGS)?;
     ostd::info!("[dm] table_load: target_count={}", target_count);
@@ -627,6 +651,7 @@ fn table_load_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     }
 
     let table = Arc::new(DmTable::new_targets(targets).map_err(map_table_error)?);
+    register_primary(device)?;
     if flags & DM_READONLY_FLAG != 0 {
         device.set_readonly();
     }
@@ -640,14 +665,10 @@ fn device_suspend(buffer: &mut [u8]) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
     if flags & DM_SUSPEND_FLAG != 0 {
         device.suspend().map_err(map_dm_error)?;
+    } else if !is_device_registered_as_block(&device) || is_mapper_alias_published(&device)? {
+        device.resume().map_err(map_dm_error)?;
     } else {
-        register_device_runtime_if_needed(&device)?;
-        if let Err(error) = device.resume().map_err(map_dm_error) {
-            if block_open_count(device.id()).is_some() && device.active_table().is_none() {
-                let _ = unregister_block_mapper(device.id(), &&device.name());
-            }
-            return Err(error);
-        }
+        activate_initial_table_and_publish_alias(&device)?;
     }
     fill_device_header(buffer, &device)
 }
@@ -1202,6 +1223,7 @@ mod tests {
         register, unregister,
     };
     use aster_device_mapper::target::{
+        DmTarget, DmTargetBox,
         error::ErrorTarget,
         linear::LinearTarget,
         striped::{StripedTarget, StripedTargetParams},
@@ -1391,9 +1413,13 @@ mod tests {
             .expect("expected striped target")
     }
 
+    fn table_load_for_test(buffer: &mut [u8], device: &Arc<DmDevice>) -> Result<()> {
+        table_load_for_device_with_primary(buffer, device, |_| Ok(()))
+    }
+
     fn assert_failed_table_load_preserves_state(
         buffer: &mut [u8],
-        device: &DmDevice,
+        device: &Arc<DmDevice>,
         errno: Errno,
     ) {
         let status_before = device.status();
@@ -1401,7 +1427,7 @@ mod tests {
         let inactive_before = device.inactive_table();
 
         assert_eq!(
-            table_load_for_device(buffer, device).unwrap_err().error(),
+            table_load_for_test(buffer, device).unwrap_err().error(),
             errno
         );
 
@@ -2201,10 +2227,12 @@ mod tests {
         .unwrap();
         table_status_for_device(&mut inactive_before, &device).unwrap();
         assert_eq!(read_u32(&inactive_before, OFF_TARGET_COUNT).unwrap(), 1);
+        assert_eq!(device.metadata().nr_sectors, 0);
 
         device.resume().unwrap();
         assert!(device.active_table().is_some());
         assert!(device.inactive_table().is_none());
+        assert_eq!(device.metadata().nr_sectors, 4);
 
         let mut active_after = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
         table_status_for_device(&mut active_after, &device).unwrap();
@@ -2652,7 +2680,7 @@ mod tests {
         let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
 
         assert_eq!(
-            table_load_for_device(&mut buffer, &device)
+            table_load_for_test(&mut buffer, &device)
                 .unwrap_err()
                 .error(),
             Errno::EINVAL
@@ -2679,7 +2707,7 @@ mod tests {
         write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
         write_error_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 8, 0);
 
-        table_load_for_device(&mut buffer, &device).unwrap();
+        table_load_for_test(&mut buffer, &device).unwrap();
         let table = device.inactive_table().unwrap();
         assert_eq!(table.target_count(), 1);
         let target = error_target(&table, 0);
@@ -2698,7 +2726,7 @@ mod tests {
         write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
         write_zero_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 8, 0);
 
-        table_load_for_device(&mut buffer, &device).unwrap();
+        table_load_for_test(&mut buffer, &device).unwrap();
         let table = device.inactive_table().unwrap();
         assert_eq!(table.target_count(), 1);
         let target = zero_target(&table, 0);
@@ -2753,7 +2781,7 @@ mod tests {
         write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
         write_linear_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 4, 0, "510:201 0");
 
-        table_load_for_device(&mut buffer, &device).unwrap();
+        table_load_for_test(&mut buffer, &device).unwrap();
 
         assert!(device.is_readonly());
         assert!(device.status().readonly);
@@ -2801,7 +2829,7 @@ mod tests {
             "510:102 200",
         );
 
-        table_load_for_device(&mut buffer, &device).unwrap();
+        table_load_for_test(&mut buffer, &device).unwrap();
         let table = device.inactive_table().unwrap();
         assert_eq!(table.target_count(), 2);
         let first_target = linear_target(&table, 0);
@@ -2846,7 +2874,7 @@ mod tests {
             params,
         );
 
-        table_load_for_device(&mut buffer, &device).unwrap();
+        table_load_for_test(&mut buffer, &device).unwrap();
         let table = device.inactive_table().unwrap();
         assert_eq!(table.target_count(), 1);
         let target = striped_target(&table, 0);
@@ -2906,7 +2934,7 @@ mod tests {
             striped_params,
         );
 
-        table_load_for_device(&mut buffer, &device).unwrap();
+        table_load_for_test(&mut buffer, &device).unwrap();
         let table = device.inactive_table().unwrap();
         assert_eq!(table.target_count(), 2);
         assert_eq!(table.length(), 20);
@@ -3060,7 +3088,7 @@ mod tests {
             "striped",
             striped_params,
         );
-        table_load_for_device(&mut load, &device).unwrap();
+        table_load_for_test(&mut load, &device).unwrap();
 
         let mut active_before_resume = test_buffer(DM_IOCTL_HEADER_SIZE + 48);
         write_u32(&mut active_before_resume, OFF_FLAGS, DM_STATUS_TABLE_FLAG).unwrap();
@@ -3211,7 +3239,7 @@ mod tests {
             striped_params,
         );
 
-        table_load_for_device(&mut buffer, &device).unwrap();
+        table_load_for_test(&mut buffer, &device).unwrap();
         device.resume().unwrap();
         let read = Bio::new(
             aster_block::bio::BioType::Read,
