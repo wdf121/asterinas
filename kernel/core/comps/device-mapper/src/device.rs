@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{string::String, sync::Arc};
+use alloc::{collections::VecDeque, string::String, sync::Arc};
 use core::{
     fmt::Debug,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -8,7 +8,7 @@ use core::{
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta,
-    bio::{BioEnqueueError, SubmittedBio},
+    bio::{BioEnqueueError, BioStatus, SubmittedBio},
 };
 use device_id::DeviceId;
 use ostd::sync::{Mutex, WaitQueue};
@@ -47,6 +47,9 @@ impl DmIoState {
 struct DmDeviceState {
     active: Option<Arc<DmTable>>,
     inactive: Option<Arc<DmTable>>,
+    // BIOs accepted while mapping is suspended, before any table generation
+    // has been selected for them. Resume replays them through its new active table.
+    postponed: VecDeque<SubmittedBio>,
     phase: DmDevicePhase,
     event_nr: u32,
 }
@@ -56,6 +59,7 @@ impl Default for DmDeviceState {
         Self {
             active: None,
             inactive: None,
+            postponed: VecDeque::new(),
             phase: DmDevicePhase::Running,
             event_nr: 0,
         }
@@ -86,9 +90,14 @@ pub struct InitialResumeGuard<'a> {
 }
 
 impl InitialResumeGuard<'_> {
-    /// Keeps the activated table and disables rollback.
+    /// Keeps the activated table, then replays BIOs postponed during suspension.
     pub fn commit(mut self) {
         self.committed = true;
+        let replay = {
+            let mut state = self.device.state.lock();
+            self.device.take_postponed_for_replay(&mut state)
+        };
+        self.device.replay_postponed(replay);
     }
 }
 
@@ -146,6 +155,72 @@ impl DmDevice {
             .wait_until(|| (self.io.in_flight.load(Ordering::Acquire) == 0).then_some(()));
     }
 
+    /// Takes postponed BIOs after the caller has selected a running active table.
+    ///
+    /// Reserving all completions while holding `state` prevents a following
+    /// suspend from observing zero in-flight BIOs before replay begins.
+    fn take_postponed_for_replay(
+        &self,
+        state: &mut DmDeviceState,
+    ) -> Option<(Arc<DmTable>, VecDeque<SubmittedBio>)> {
+        let table = state.active.clone()?;
+        let postponed = core::mem::take(&mut state.postponed);
+        self.io
+            .in_flight
+            .fetch_add(postponed.len(), Ordering::AcqRel);
+        Some((table, postponed))
+    }
+
+    /// Dispatches a BIO that has already been assigned to one table generation.
+    fn dispatch_assigned_bio(
+        &self,
+        table: Arc<DmTable>,
+        mut bio: SubmittedBio,
+        deferred_replay: bool,
+    ) -> Result<(), BioEnqueueError> {
+        if deferred_replay {
+            bio.complete_as_io_error_on_drop();
+        }
+
+        let io = self.io.clone();
+        let table_for_completion = table.clone();
+        bio.chain_complete_fn(move |_status| {
+            // This `Arc` keeps a replaced table and its backing leases alive
+            // until the lower-level BIO has completed.
+            let _table = table_for_completion;
+            io.finish();
+        });
+        if let Err(error) = table.enqueue(bio) {
+            if deferred_replay {
+                // Deferred BIOs have already been accepted. Their drop guard
+                // completes them with I/O error and releases `in_flight`.
+                return Ok(());
+            }
+            self.io.finish();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Replays postponed BIOs in submission order through the current active table.
+    fn replay_postponed(&self, replay: Option<(Arc<DmTable>, VecDeque<SubmittedBio>)>) {
+        let Some((table, postponed)) = replay else {
+            return;
+        };
+        for bio in postponed {
+            self.dispatch_assigned_bio(table.clone(), bio, true)
+                .expect("deferred replay must complete enqueue failures internally");
+        }
+    }
+
+    /// Completes BIOs that were accepted while suspended but cannot be replayed.
+    pub fn fail_postponed_bios(&self) {
+        let postponed = core::mem::take(&mut self.state.lock().postponed);
+        for bio in postponed {
+            bio.complete(BioStatus::IoError);
+        }
+    }
+
     /// Returns a cloned device name, including updates after rename.
     pub fn name(&self) -> String {
         self.name.lock().clone()
@@ -199,18 +274,16 @@ impl DmDevice {
         Ok(())
     }
 
-    /// Suspends new I/O and waits until I/O submitted to the old table finishes.
+    /// Suspends new mapping I/O after every assigned BIO has completed.
     pub fn suspend(&self) -> Result<(), DmError> {
         {
             let mut state = self.state.lock();
             match state.phase {
                 DmDevicePhase::Suspended => return Ok(()),
                 DmDevicePhase::Suspending => return Err(DmError::InvalidState),
-                DmDevicePhase::Running => {
-                    state.phase = DmDevicePhase::Suspending;
-                }
+                DmDevicePhase::Running => state.phase = DmDevicePhase::Suspending,
             }
-        };
+        }
 
         self.wait_for_io_drain();
 
@@ -218,6 +291,23 @@ impl DmDevice {
         debug_assert_eq!(state.phase, DmDevicePhase::Suspending);
         state.phase = DmDevicePhase::Suspended;
         Ok(())
+    }
+
+    /// Suspends new mapping I/O without draining already assigned BIOs.
+    ///
+    /// This is the `DM_NOFLUSH_FLAG` suspend policy. Old BIOs retain their
+    /// assigned table through completion-held `Arc` references, while later
+    /// BIOs are postponed until a resume selects the next active table.
+    pub fn suspend_no_flush(&self) -> Result<(), DmError> {
+        let mut state = self.state.lock();
+        match state.phase {
+            DmDevicePhase::Suspended => Ok(()),
+            DmDevicePhase::Suspending => Err(DmError::InvalidState),
+            DmDevicePhase::Running => {
+                state.phase = DmDevicePhase::Suspended;
+                Ok(())
+            }
+        }
     }
 
     /// Starts a rollback-capable first activation for mapper alias publication.
@@ -245,27 +335,13 @@ impl DmDevice {
         })
     }
 
-    /// Activates the inactive table, if any, and resumes I/O.
+    /// Activates the inactive table, if any, resumes mapping I/O, and replays postponed BIOs.
     ///
-    /// Replacing a running active table blocks new BIOs and waits for every BIO
-    /// already accepted by the old table to complete. This creates a table
-    /// generation barrier: after this function succeeds, newly accepted BIOs can
-    /// only use the replacement table. Resuming without a replacement table keeps
-    /// its existing idempotent or phase-restoration behavior.
+    /// A direct running replacement establishes a generation barrier by draining
+    /// the old table first. A suspended no-flush replacement does not repeat that
+    /// drain: old BIOs retain their table while postponed BIOs use the new table.
     pub fn resume(&self) -> Result<(), DmError> {
-        self.resume_with_drain(true)
-    }
-
-    /// Activates the inactive table, if any, without waiting for old BIOs.
-    ///
-    /// The old table remains alive through BIO-held `Arc` references while new
-    /// BIOs begin using the replacement table immediately.
-    pub fn resume_no_flush(&self) -> Result<(), DmError> {
-        self.resume_with_drain(false)
-    }
-
-    fn resume_with_drain(&self, drain_replacement: bool) -> Result<(), DmError> {
-        let replacement = {
+        let (replacement, replay) = {
             let mut state = self.state.lock();
             if state.phase == DmDevicePhase::Suspending {
                 return Err(DmError::InvalidState);
@@ -274,34 +350,41 @@ impl DmDevice {
                 return Err(DmError::InvalidState);
             }
 
-            if drain_replacement
-                && state.phase == DmDevicePhase::Running
+            if state.phase == DmDevicePhase::Running
                 && state.active.is_some()
                 && state.inactive.is_some()
             {
                 state.phase = DmDevicePhase::Suspending;
-                state.inactive.take().expect("inactive table disappeared")
+                (
+                    Some(state.inactive.take().expect("inactive table disappeared")),
+                    None,
+                )
             } else {
                 if let Some(table) = state.inactive.take() {
                     state.active = Some(table);
                 }
-                if state.phase == DmDevicePhase::Suspended {
-                    state.phase = DmDevicePhase::Running;
-                }
-                return Ok(());
+                state.phase = DmDevicePhase::Running;
+                (None, self.take_postponed_for_replay(&mut state))
             }
         };
 
-        self.wait_for_io_drain();
+        let replay = if let Some(replacement) = replacement {
+            self.wait_for_io_drain();
 
-        let old_active = {
-            let mut state = self.state.lock();
-            debug_assert_eq!(state.phase, DmDevicePhase::Suspending);
-            let old_active = state.active.replace(replacement);
-            state.phase = DmDevicePhase::Running;
-            old_active
+            let old_active = {
+                let mut state = self.state.lock();
+                debug_assert_eq!(state.phase, DmDevicePhase::Suspending);
+                let old_active = state.active.replace(replacement);
+                state.phase = DmDevicePhase::Running;
+                let replay = self.take_postponed_for_replay(&mut state);
+                (old_active, replay)
+            };
+            drop(old_active.0);
+            old_active.1
+        } else {
+            replay
         };
-        drop(old_active);
+        self.replay_postponed(replay);
         Ok(())
     }
 
@@ -353,36 +436,29 @@ impl DmDevice {
 }
 
 impl BlockDevice for DmDevice {
-    fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+    fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+        if self.is_readonly() && bio.type_().is_write_like() {
+            // Discard and write-zeroes are write-like because they can change
+            // persistent contents even though they carry no data segments.
+            return Err(BioEnqueueError::Refused);
+        }
+
         let table = {
-            let state = self.state.lock();
-            if state.phase != DmDevicePhase::Running {
-                return Err(BioEnqueueError::Refused);
+            let mut state = self.state.lock();
+            match state.phase {
+                DmDevicePhase::Running => {
+                    let table = state.active.clone().ok_or(BioEnqueueError::Refused)?;
+                    self.io.in_flight.fetch_add(1, Ordering::AcqRel);
+                    table
+                }
+                DmDevicePhase::Suspending | DmDevicePhase::Suspended => {
+                    state.postponed.push_back(bio);
+                    return Ok(());
+                }
             }
-            if self.is_readonly() && bio.type_().is_write_like() {
-                // Discard and write-zeroes are write-like because they can
-                // change persistent contents even though they carry no data
-                // segments.
-                return Err(BioEnqueueError::Refused);
-            }
-            let table = state.active.clone().ok_or(BioEnqueueError::Refused)?;
-            self.io.in_flight.fetch_add(1, Ordering::AcqRel);
-            table
         };
 
-        let io = self.io.clone();
-        let table_for_completion = table.clone();
-        bio.chain_complete_fn(move |_status| {
-            // This `Arc` also keeps the replaced table and its backing leases alive
-            // until the actual lower-level completion.
-            let _table = table_for_completion;
-            io.finish();
-        });
-        if let Err(error) = table.enqueue(bio) {
-            self.io.finish();
-            return Err(error);
-        }
-        Ok(())
+        self.dispatch_assigned_bio(table, bio, false)
     }
 
     fn metadata(&self) -> BlockDeviceMeta {
@@ -417,7 +493,7 @@ mod tests {
 
     use aster_block::{
         BlockDeviceLease,
-        bio::{Bio, BioDirection, BioSegment, BioStatus, BioType},
+        bio::{Bio, BioDirection, BioSegment, BioType},
         id::Sid,
     };
     use device_id::{MajorId, MinorId};
@@ -431,6 +507,9 @@ mod tests {
 
     #[derive(Debug)]
     struct TestBlockDevice;
+
+    #[derive(Debug)]
+    struct RejectingBlockDevice;
 
     #[derive(Debug)]
     struct DeferredBlockDevice {
@@ -480,6 +559,27 @@ mod tests {
 
         fn id(&self) -> DeviceId {
             DeviceId::new(MajorId::new(1), MinorId::new(2))
+        }
+    }
+
+    impl BlockDevice for RejectingBlockDevice {
+        fn enqueue(&self, _bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            Err(BioEnqueueError::Refused)
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: 16,
+                nr_sectors: 1_024,
+            }
+        }
+
+        fn name(&self) -> String {
+            String::from("dm-rejecting-backing-test")
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(1), MinorId::new(3))
         }
     }
 
@@ -680,29 +780,39 @@ mod tests {
     }
 
     #[ktest]
-    fn suspend_waits_for_submitted_io_and_blocks_new_io() {
+    fn suspend_drains_old_bios_and_replays_postponed_bios_after_resume() {
         let manager = DmManager::new().unwrap();
         let device = manager
-            .create("dm-deferred-test".to_string(), None, None)
+            .create("dm-suspend-postpone-test".to_string(), None, None)
             .unwrap();
-        let backing = DeferredBlockDevice::new();
-        let table = Arc::new(
+        let old_backing = DeferredBlockDevice::new();
+        let replacement_backing = DeferredBlockDevice::new();
+        let first = Arc::new(
             DmTable::new_single_linear(
                 Sid::new(0),
                 128,
                 Sid::new(16),
-                BlockDeviceLease::new_untracked(backing.clone()),
+                BlockDeviceLease::new_untracked(old_backing.clone()),
             )
             .unwrap(),
         );
-        device.load_table(table);
+        let replacement = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(32),
+                BlockDeviceLease::new_untracked(replacement_backing.clone()),
+            )
+            .unwrap(),
+        );
+        device.load_table(first);
         device.resume().unwrap();
 
-        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        let mut old_batch = io_util::batch::IoBatch::with_capacity(1);
         Bio::new(BioType::Flush, Sid::new(0), vec![], None)
-            .submit(device.as_ref(), &mut batch)
+            .submit(device.as_ref(), &mut old_batch)
             .unwrap();
-        assert!(backing.has_submitted_bio());
+        assert!(old_backing.has_submitted_bio());
 
         let suspend_finished = Arc::new(Mutex::new(false));
         {
@@ -719,18 +829,220 @@ mod tests {
             Task::yield_now();
         }
         assert!(!*suspend_finished.lock());
-        let mut refused_batch = io_util::batch::IoBatch::with_capacity(1);
-        assert_eq!(
-            Bio::new(BioType::Flush, Sid::new(0), vec![], None)
-                .submit(device.as_ref(), &mut refused_batch),
-            Err(BioEnqueueError::Refused)
-        );
 
-        backing.complete();
+        let mut postponed_batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(BioType::Flush, Sid::new(0), vec![], None)
+            .submit(device.as_ref(), &mut postponed_batch)
+            .unwrap();
+        assert_eq!(device.state.lock().postponed.len(), 1);
+        assert!(!replacement_backing.has_submitted_bio());
+
+        old_backing.complete();
         while !*suspend_finished.lock() {
             Task::yield_now();
         }
-        assert!(*suspend_finished.lock());
+        device.load_table(replacement);
+        device.resume().unwrap();
+        assert!(replacement_backing.has_submitted_bio());
+        replacement_backing.complete();
+        while device.io.in_flight.load(Ordering::Acquire) != 0 {
+            Task::yield_now();
+        }
+    }
+
+    #[ktest]
+    fn running_resume_waits_for_old_bios_before_replacing_active_table() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-resume-drain-test".to_string(), None, None)
+            .unwrap();
+        let old_backing = DeferredBlockDevice::new();
+        let first = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(16),
+                BlockDeviceLease::new_untracked(old_backing.clone()),
+            )
+            .unwrap(),
+        );
+        let replacement = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                64,
+                Sid::new(32),
+                BlockDeviceLease::new_untracked(Arc::new(TestBlockDevice)),
+            )
+            .unwrap(),
+        );
+        device.load_table(first.clone());
+        device.resume().unwrap();
+
+        let mut old_batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(BioType::Flush, Sid::new(0), vec![], None)
+            .submit(device.as_ref(), &mut old_batch)
+            .unwrap();
+        assert!(old_backing.has_submitted_bio());
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 1);
+
+        device.load_table(replacement.clone());
+        let resume_finished = Arc::new(Mutex::new(false));
+        {
+            let device = device.clone();
+            let resume_finished = resume_finished.clone();
+            TaskOptions::new(move || {
+                device.resume().unwrap();
+                *resume_finished.lock() = true;
+            })
+            .spawn()
+            .unwrap();
+        }
+
+        while !device.status().suspended {
+            Task::yield_now();
+        }
+        assert!(!*resume_finished.lock());
+        assert!(Arc::ptr_eq(&device.active_table().unwrap(), &first));
+        assert!(device.inactive_table().is_none());
+        let mut postponed_batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(BioType::Flush, Sid::new(0), vec![], None)
+            .submit(device.as_ref(), &mut postponed_batch)
+            .unwrap();
+        assert_eq!(device.state.lock().postponed.len(), 1);
+
+        old_backing.complete();
+        while !*resume_finished.lock() {
+            Task::yield_now();
+        }
+        assert!(Arc::ptr_eq(&device.active_table().unwrap(), &replacement));
+        assert!(!device.status().suspended);
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[ktest]
+    fn suspend_no_flush_replays_postponed_bios_without_waiting_for_old_bios() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-suspend-noflush-test".to_string(), None, None)
+            .unwrap();
+        let old_backing = DeferredBlockDevice::new();
+        let replacement_backing = DeferredBlockDevice::new();
+        let first = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(16),
+                BlockDeviceLease::new_untracked(old_backing.clone()),
+            )
+            .unwrap(),
+        );
+        let replacement = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                64,
+                Sid::new(32),
+                BlockDeviceLease::new_untracked(replacement_backing.clone()),
+            )
+            .unwrap(),
+        );
+        device.load_table(first);
+        device.resume().unwrap();
+
+        let mut old_batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(BioType::Flush, Sid::new(0), vec![], None)
+            .submit(device.as_ref(), &mut old_batch)
+            .unwrap();
+        assert!(old_backing.has_submitted_bio());
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 1);
+
+        device.suspend_no_flush().unwrap();
+        assert!(device.status().suspended);
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 1);
+
+        let mut postponed_batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(BioType::Flush, Sid::new(0), vec![], None)
+            .submit(device.as_ref(), &mut postponed_batch)
+            .unwrap();
+        assert_eq!(device.state.lock().postponed.len(), 1);
+        assert!(!replacement_backing.has_submitted_bio());
+
+        device.load_table(replacement.clone());
+        device.resume().unwrap();
+
+        assert!(Arc::ptr_eq(&device.active_table().unwrap(), &replacement));
+        assert!(!device.status().suspended);
+        assert!(old_backing.has_submitted_bio());
+        assert!(replacement_backing.has_submitted_bio());
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 2);
+
+        replacement_backing.complete();
+        while device.io.in_flight.load(Ordering::Acquire) != 1 {
+            Task::yield_now();
+        }
+        old_backing.complete();
+        while device.io.in_flight.load(Ordering::Acquire) != 0 {
+            Task::yield_now();
+        }
+    }
+
+    #[ktest]
+    fn replay_failure_completes_postponed_bio_with_io_error() {
+        let (device, first) = create_device_and_table();
+        let rejecting = Arc::new(RejectingBlockDevice) as Arc<dyn BlockDevice>;
+        let replacement = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(32),
+                BlockDeviceLease::new_untracked(rejecting),
+            )
+            .unwrap(),
+        );
+        device.load_table(first);
+        device.resume().unwrap();
+        device.suspend().unwrap();
+
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(
+            BioType::Read,
+            Sid::new(0),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        )
+        .submit(device.as_ref(), &mut batch)
+        .unwrap();
+        assert_eq!(device.state.lock().postponed.len(), 1);
+
+        device.load_table(replacement);
+        device.resume().unwrap();
+
+        assert!(batch.wait_all().is_err());
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[ktest]
+    fn fail_postponed_bios_completes_waiters_with_io_error() {
+        let (device, table) = create_device_and_table();
+        device.load_table(table);
+        device.resume().unwrap();
+        device.suspend().unwrap();
+
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(
+            BioType::Read,
+            Sid::new(0),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        )
+        .submit(device.as_ref(), &mut batch)
+        .unwrap();
+        assert_eq!(device.state.lock().postponed.len(), 1);
+
+        device.fail_postponed_bios();
+
+        assert!(batch.wait_all().is_err());
+        assert!(device.state.lock().postponed.is_empty());
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
     }
 
     #[ktest]

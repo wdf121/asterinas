@@ -417,6 +417,7 @@ fn create_device(buffer: &mut [u8]) -> Result<()> {
 fn remove_device(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
     unregister_device_runtime_if_registered(&device)?;
+    device.fail_postponed_bios();
     device.notify_event();
     manager().remove(&&device.name()).map_err(map_dm_error)?;
     clear_device_header(buffer)
@@ -431,6 +432,7 @@ fn remove_all(buffer: &mut [u8]) -> Result<()> {
         if unregister_device_runtime_if_registered(&device).is_err() {
             continue;
         }
+        device.fail_postponed_bios();
         device.notify_event();
         let _ = manager().remove(&&device.name());
     }
@@ -664,14 +666,14 @@ fn device_suspend(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
     let flags = read_u32(buffer, OFF_FLAGS)?;
     if flags & DM_SUSPEND_FLAG != 0 {
-        device.suspend().map_err(map_dm_error)?;
-    } else if !is_device_registered_as_block(&device) || is_mapper_alias_published(&device)? {
         (if flags & DM_NOFLUSH_FLAG != 0 {
-            device.resume_no_flush()
+            device.suspend_no_flush()
         } else {
-            device.resume()
+            device.suspend()
         })
         .map_err(map_dm_error)?;
+    } else if !is_device_registered_as_block(&device) || is_mapper_alias_published(&device)? {
+        device.resume().map_err(map_dm_error)?;
     } else {
         activate_initial_table_and_publish_alias(&device)?;
     }

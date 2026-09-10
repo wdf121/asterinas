@@ -156,6 +156,7 @@ impl Bio {
             current_sid_range,
             complete_fn,
             segments,
+            complete_as_io_error_on_drop: false,
         }
     }
 
@@ -196,6 +197,7 @@ impl Bio {
             current_sid_range,
             complete_fn,
             segments,
+            complete_as_io_error_on_drop: false,
         };
         if let Err(e) = block_device.enqueue(submitted_bio) {
             // Fail to submit, revert the status.
@@ -266,6 +268,10 @@ pub struct SubmittedBio {
     current_sid_range: Range<Sid>,
     complete_fn: Option<BioCompleteFn>,
     segments: Vec<BioSegment>,
+    // Deferred block layers have already accepted this BIO before replay. If a
+    // later mapping or backing enqueue error drops it, completion must still
+    // reach the original submitter instead of leaving it in Submit forever.
+    complete_as_io_error_on_drop: bool,
 }
 
 impl SubmittedBio {
@@ -315,6 +321,7 @@ impl SubmittedBio {
         self.validate_split_ranges(&ranges)?;
 
         let type_ = self.type_();
+        let complete_as_io_error_on_drop = self.complete_as_io_error_on_drop;
         let child_segments = ranges
             .iter()
             .map(|range| self.segments_for_child_range(range))
@@ -340,6 +347,7 @@ impl SubmittedBio {
                     current_sid_range: range,
                     complete_fn: Some(Box::new(move |status| completion.complete_child(status))),
                     segments,
+                    complete_as_io_error_on_drop,
                 }
             })
             .collect();
@@ -425,6 +433,14 @@ impl SubmittedBio {
         self.metadata.status()
     }
 
+    /// Arms completion with I/O error if a deferred replay path drops this BIO.
+    ///
+    /// Normal immediate submission must not enable this: its caller still owns
+    /// enqueue failure and restores the BIO from `Submit` to `Init`.
+    pub fn complete_as_io_error_on_drop(&mut self) {
+        self.complete_as_io_error_on_drop = true;
+    }
+
     /// Chains an additional completion callback after the original one.
     ///
     /// Stacked block devices use this to release their own in-flight references
@@ -449,22 +465,16 @@ impl SubmittedBio {
     /// The final status becomes visible only after the callback returns.
     ///
     /// When the driver finishes the request for this `Bio`, it will call this method.
-    pub fn complete(self, status: BioStatus) {
+    pub fn complete(mut self, status: BioStatus) {
         assert!(status != BioStatus::Init && status != BioStatus::Submit);
 
-        let Self {
-            metadata,
-            complete_fn,
-            segments,
-            ..
-        } = self;
-
-        drop(segments);
+        self.complete_as_io_error_on_drop = false;
+        let complete_fn = self.complete_fn.take();
 
         // Complete the `complete_fn` before publishing the status change,
         // so that the effects of the callback function are visible to users.
-        general_complete_fn(metadata.type_(), status, complete_fn);
-        let result = metadata.status.compare_exchange(
+        general_complete_fn(self.metadata.type_(), status, complete_fn);
+        let result = self.metadata.status.compare_exchange(
             BioStatus::Submit as u32,
             status as u32,
             Ordering::Release,
@@ -472,7 +482,27 @@ impl SubmittedBio {
         );
         assert!(result.is_ok());
 
-        metadata.wait_queue.wake_all();
+        self.metadata.wait_queue.wake_all();
+    }
+}
+
+impl Drop for SubmittedBio {
+    fn drop(&mut self) {
+        if !self.complete_as_io_error_on_drop || self.status() != BioStatus::Submit {
+            return;
+        }
+
+        self.complete_as_io_error_on_drop = false;
+        let complete_fn = self.complete_fn.take();
+        general_complete_fn(self.metadata.type_(), BioStatus::IoError, complete_fn);
+        let result = self.metadata.status.compare_exchange(
+            BioStatus::Submit as u32,
+            BioStatus::IoError as u32,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+        debug_assert!(result.is_ok());
+        self.metadata.wait_queue.wake_all();
     }
 }
 
@@ -1010,6 +1040,7 @@ mod tests {
             current_sid_range: sid_range,
             complete_fn: None,
             segments: Vec::new(),
+            complete_as_io_error_on_drop: false,
         }
     }
 
