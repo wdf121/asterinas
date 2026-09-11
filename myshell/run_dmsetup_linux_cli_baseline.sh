@@ -167,6 +167,13 @@ event_number() {
     dmsetup info "$1" 2>/dev/null | awk -F: '/Event number/ { gsub(/[[:space:]]/, "", $2); print $2; exit }'
 }
 
+capture_info_columns() {
+    local label=$1
+    shift
+    run_capture "${label}" dmsetup info -C --noheadings --separator '|' \
+        -o name,uuid,major,minor,open,segments,events,tables_loaded,suspended,readonly "$@"
+}
+
 record_nodes() {
     local label=$1
     local dev=$2
@@ -288,6 +295,20 @@ run_capture LINEAR_PATH_TABLE dmsetup table "${linear_path}" || true
 run_capture LINEAR_PATH_DEPS dmsetup deps "${linear_path}" || true
 run_capture LINEAR_PATH_REMOVE dmsetup remove "${linear_path}" || true
 
+discovery_name=$(name discovery)
+discovery_uuid="asterinas-dmsetup-discovery-uuid-$$"
+run_capture DISCOVERY_CREATE dmsetup create "${discovery_name}" --table "0 8 linear ${DEV1} 0" || true
+capture_info_columns DISCOVERY_INFO "${discovery_name}" || true
+run_capture DISCOVERY_LS_PRESENT dmsetup ls || true
+run_shell_capture DISCOVERY_OPEN "exec 9</dev/mapper/${discovery_name}; dmsetup info -C --noheadings --separator '|' -o name,uuid,major,minor,open,segments,events,tables_loaded,suspended,readonly '${discovery_name}'; exec 9<&-" || true
+run_shell_capture DISCOVERY_LOAD_INACTIVE "printf '0 4 linear ${DEV1} 0\\n4 4 linear ${DEV1} 4\\n' | dmsetup load '${discovery_name}'" || true
+capture_info_columns DISCOVERY_ACTIVE_WITH_INACTIVE "${discovery_name}" || true
+capture_info_columns DISCOVERY_INACTIVE --inactive "${discovery_name}" || true
+run_capture DISCOVERY_SET_UUID dmsetup rename "${discovery_name}" --setuuid "${discovery_uuid}" || true
+capture_info_columns DISCOVERY_BY_UUID -u "${discovery_uuid}" || true
+run_capture DISCOVERY_REMOVE dmsetup remove "${discovery_name}" || true
+run_capture DISCOVERY_LS_ABSENT dmsetup ls || true
+
 striped_major=$(name striped_major)
 run_shell_capture STRIPED_CREATE_MAJOR "printf '0 16 striped 2 4 ${DEV1} 0 ${DEV2} 0\\n' | dmsetup create ${striped_major}" || true
 record_nodes STRIPED_CREATE_MAJOR "${striped_major}"
@@ -345,6 +366,8 @@ run_capture TABLE_LIFECYCLE_REMOVE dmsetup remove "${table_name}" || true
 
 state_name=$(name state_event)
 run_capture STATE_CREATE dmsetup create "${state_name}" --table "0 8 linear ${DEV1} 0" || true
+run_capture MESSAGE_LINEAR dmsetup message "${state_name}" 0 status || true
+run_capture SETGEOMETRY dmsetup setgeometry "${state_name}" 1 1 8 0 || true
 echo "EVENT_STATE_AFTER_CREATE: $(event_number "${state_name}")"
 run_capture SUSPEND dmsetup suspend "${state_name}" || true
 run_capture INFO_AFTER_SUSPEND dmsetup info "${state_name}" || true
@@ -356,6 +379,11 @@ run_capture WAIT_ZERO timeout 3 dmsetup wait --noflush "${state_name}" 0 || true
 run_wait_old_event WAIT_OLD_EVENT "${state_name}" || true
 run_capture STATE_REMOVE dmsetup remove "${state_name}" || true
 
+deferred_name=$(name deferred_busy)
+run_capture DEFERRED_CREATE dmsetup create "${deferred_name}" --table "0 8 linear ${DEV1} 0" || true
+run_shell_capture DEFERRED_REMOVE_BUSY "exec 9</dev/mapper/${deferred_name}; dmsetup remove --deferred '${deferred_name}'; status=\$?; dmsetup info '${deferred_name}'; exec 9<&-; exit \${status}" || true
+run_capture DEFERRED_INFO_AFTER_CLOSE dmsetup info "${deferred_name}" || true
+
 rename_name=$(name rename)
 existing_name=$(name rename_existing)
 rename_new=$(name renamed)
@@ -364,12 +392,22 @@ run_capture RENAME_CREATE dmsetup create "${rename_name}" --table "0 8 linear ${
 run_capture RENAME_SAME_NAME dmsetup rename "${rename_name}" "${rename_name}" || true
 run_capture RENAME_EXISTING_CREATE dmsetup create "${existing_name}" --table "0 8 linear ${DEV2} 0" || true
 run_capture RENAME_DUPLICATE dmsetup rename "${rename_name}" "${existing_name}" || true
+event_before_rename=$(event_number "${rename_name}")
+echo "EVENT_BEFORE_RENAME: ${event_before_rename}"
 run_capture RENAME_NAME dmsetup rename "${rename_name}" "${rename_new}" || true
 record_nodes RENAME_NAME "${rename_new}"
 run_capture INFO_OLD_NAME_AFTER_RENAME dmsetup info "${rename_name}" || true
 run_capture INFO_NEW_NAME_AFTER_RENAME dmsetup info "${rename_new}" || true
+event_after_rename=$(event_number "${rename_new}")
+echo "EVENT_AFTER_RENAME: ${event_after_rename}"
+run_capture WAIT_STALE_AFTER_RENAME timeout 3 dmsetup wait --noflush "${rename_new}" "${event_before_rename}" || true
+run_capture WAIT_CURRENT_AFTER_RENAME timeout 3 dmsetup wait --noflush "${rename_new}" "${event_after_rename}" || true
 run_capture SET_UUID dmsetup rename "${rename_new}" --setuuid "${uuid_value}" || true
 run_capture INFO_BY_UUID dmsetup info -u "${uuid_value}" || true
+event_after_set_uuid=$(event_number "${rename_new}")
+echo "EVENT_AFTER_SET_UUID: ${event_after_set_uuid}"
+run_capture WAIT_STALE_AFTER_SET_UUID timeout 3 dmsetup wait --noflush "${rename_new}" "${event_after_rename}" || true
+run_capture WAIT_CURRENT_AFTER_SET_UUID timeout 3 dmsetup wait --noflush "${rename_new}" "${event_after_set_uuid}" || true
 run_capture RENAME_REMOVE_NEW dmsetup remove "${rename_new}" || true
 run_capture RENAME_REMOVE_EXISTING dmsetup remove "${existing_name}" || true
 
