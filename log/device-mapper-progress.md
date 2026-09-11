@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-截至 2026-09-10，当前工作重点是稳固已实现的 Device Mapper 功能与验证链路，不新增 target 或扩大 Linux DM 兼容声明。已确认的实现范围包括 `error`、`zero`、`linear`、`striped`，以及同一 mapper/LV 内的 linear + striped mixed table。DM table/control-plane 已从 closed `DmTarget` enum 迁移为 `dyn DmTarget` trait object；定向 ktest 默认使用 crate-local wrapper。`create -> load -> 首次 resume` 已按本机 Linux 的可观察生命周期对齐：load 后 `/dev/dm-X` 已发布但只有 inactive table、容量为 0、read 为 EOF，resume 后 active table 生效并发布 `/dev/mapper/<name>` alias。普通 suspend drain 已映射 BIO，`suspend --noflush` 不等待已映射 BIO；两者均 postpone 后续未映射 BIO 并在 resume 后按 active table replay。mapper 生命周期写操作以 per-device lifecycle guard 串行：某个 mapper drain 时，其他 mapper 的查询和 create 不再受全局控制锁阻塞；同 mapper 的 load/clear/remove/rename/resume 不会穿插。
+截至 2026-09-11，当前工作重点是稳固已实现的 Device Mapper 功能与验证链路，不新增 target 或扩大 Linux DM 兼容声明。已确认的实现范围包括 `error`、`zero`、`linear`、`striped`，以及同一 mapper/LV 内的 linear + striped mixed table。DM table/control-plane 已从 closed `DmTarget` enum 迁移为 `dyn DmTarget` trait object；定向 ktest 默认使用 crate-local wrapper。`create -> load -> 首次 resume` 已按本机 Linux 的可观察生命周期对齐：load 后 `/dev/dm-X` 已发布但只有 inactive table、容量为 0、read 为 EOF，resume 后 active table 生效并发布 `/dev/mapper/<name>` alias。首次 primary 在 pending block registration/wrapper 阶段先创建 `/dev/dm-X`，成功后才变为 Live 并开放 open gate；创建失败不留下 registry 或 wrapper。普通 suspend drain 已映射 BIO，`suspend --noflush` 不等待已映射 BIO；两者均 postpone 后续未映射 BIO 并在 resume 后按 active table replay。mapper 生命周期写操作以 per-device lifecycle guard 串行：某个 mapper drain 时，其他 mapper 的查询和 create 不再受全局控制锁阻塞；同 mapper 的 load/clear/remove/rename/resume 不会穿插。运行中 rename 保持旧 name 索引、预留新 name，alias 成功后才提交 manager name/UUID index 与 `DmDevice.name`；alias 失败不再依赖反向索引回滚。若 remove 的节点补偿失败，mapper 保持不可 lookup/open 的 `Removing` 隔离状态并返回 `EIO`，随后 remove 可重试继续注销，不能重新作为半发布的 Live 设备使用。
 
 当前六个 canonical NixOS system suite 均已通过，且每个实际 guest 的 shell-ready 时间均不超过 40 秒；2026-09-09 在首次 load/resume Linux 生命周期对齐后重建 NixOS 镜像并复跑 `--control-plane` 与 `--linear-integration`，均通过：
 
@@ -34,6 +34,7 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
 CLAUDE.md
 AGENTS.md
 log/device-mapper-progress.md
+log/2026-9-11.md
 log/2026-9-10.md
 log/2026-9-9.md
 docs/test.md
@@ -46,6 +47,7 @@ docs/non-device-mapper-change-rationale.md
 
 - `CLAUDE.md`：协作规则，包括简体中文、精简汇报、新阶段先说明差异、默认不 push。
 - `AGENTS.md`：容器路径、测试入口、系统测试串行和定向 ktest 约束。
+- `log/2026-9-11.md`：P2.1 runtime rename name reservation、P2.2 primary pending-to-Live 发布、P2.3 `Removing` 隔离重试，以及 core/ioctl/control-plane 验证记录。
 - `log/2026-9-10.md`：suspend/no-flush 语义纠正、postponed BIO replay、失败完成闭环与控制面系统验证。
 - `log/2026-9-9.md`：本机 Linux 生命周期基线、首次 load 后 primary 的 0-capacity/EOF、首次 resume alias 发布、定向 ktest、control-plane 与 linear LVM2 integration 验证记录。
 - `docs/test.md`：当前系统验收命令、suite 职责、marker 和超时含义。

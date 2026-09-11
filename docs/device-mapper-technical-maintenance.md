@@ -4,10 +4,10 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | v2.4 |
-| 状态 | 维护中，基于当前 `dm` 分支实现与 2026-09-09 验证结果整理 |
+| 版本 | v2.5 |
+| 状态 | 维护中，基于当前 `dm` 分支实现与 2026-09-11 验证结果整理 |
 | 目标读者 | 内核开发人员、架构评审人员、测试与集成维护人员 |
-| 更新时间 | 2026-09-09 |
+| 更新时间 | 2026-09-11 |
 | 相关进度 | [Device Mapper 项目进度](../log/device-mapper-progress.md) |
 
 ## 执行摘要
@@ -262,7 +262,7 @@ DM ioctl 层只处理 mapper 生命周期和 table 状态机，不承载 target 
 - `DM_TABLE_LOAD` 成功后，首次 mapper 发布 primary runtime node 并写入 inactive table；primary 容量为 0，mapper alias 尚不存在。
 - 首次 `DM_DEV_SUSPEND` resume 以可回滚事务激活 table 并发布 alias；已经有 alias 的 mapper resume 仅切换 table/phase。
 - `DM_DEV_SUSPEND` 带 `DM_SUSPEND_FLAG` 时挂起并等待在途 I/O；不带该 flag 时表示 resume。
-- 同一 mapper 的 load、clear、suspend/resume、remove、rename 通过 per-device lifecycle guard 串行。普通 suspend 或 running table replacement 在等待 in-flight BIO 时不持有全局 control lock，因此其他 mapper 的查询和 create 可以继续；guard 获取后必须按 manager 中的同一 `Arc` 身份复核，避免 stale lookup 在并发 remove 后继续修改已脱离索引的 device。
+- 同一 mapper 的 load、clear、suspend/resume、remove、rename 通过 per-device lifecycle guard 串行。普通 suspend 或 running table replacement 在等待 in-flight BIO 时不持有全局 control lock，因此其他 mapper 的查询和 create 可以继续；guard 获取后必须按 manager 中的同一 `Arc` 身份复核，避免 stale lookup 在并发 remove 后继续修改已脱离索引的 device。运行中 name rename 保持旧 name 索引并预留新 name，在不持 manager lock 的情况下移动 alias；仅在 alias 成功后一次提交 name/UUID index 与 `DmDevice.name`，失败时释放预留。
 - failed table load 不得污染 active/inactive table、`event_nr` 或 readonly 状态。
 - `DM_DEV_WAIT` 等待期间不持有 lifecycle guard；唤醒后取得该 guard 并复核 mapper 仍存在，再生成返回 header。
 
@@ -506,7 +506,7 @@ DM 与 Asterinas block registry 集成，用于：
 - 在 `/proc/devices` 暴露 `device-mapper` major；
 - 提供 legacy block ioctl 支撑 LVM2、mkfs、blkid。
 
-设计结论：runtime node 和 manager 索引必须保持一致。runtime node rename 失败时，manager 状态必须回滚。
+设计结论：runtime node 和 manager 索引必须保持一致。运行中 rename 先保留旧 name 索引、预留新 name，再在不持 manager lock 的情况下移动 alias；alias 失败只释放新 name 预留，成功后才一次提交 name/UUID index 与 device name。因此失败不会依赖可能被并发 create 阻断的反向索引回滚，也不会让 devtmpfs 操作阻塞无关 mapper。
 
 ### 10.2 首次 load/resume 的 Linux 生命周期对齐
 
@@ -515,9 +515,9 @@ DM 与 Asterinas block registry 集成，用于：
 ```text
 first table load
   -> 完整验证 dm_target_spec、target 参数、backing lease 与 table geometry
-  -> Pending RegisteredBlockDevice + pending BlockFile
-  -> Pending -> Live，open gate -> true
-  -> 创建 /dev/dm-X
+  -> Pending RegisteredBlockDevice + pending BlockFile，open gate 保持关闭
+  -> 创建 /dev/dm-X primary node
+  -> Pending -> Live，记录 node，open gate -> true
   -> 安装 inactive table
 
 first resume
@@ -530,7 +530,7 @@ first resume
 
 Loaded-inactive 时 primary 已可打开，但 `DmDevice::metadata()` 只读取 active table，故容量为 0，VFS 读取直接 EOF，任何 BIO 都不会进入 inactive table。首次 alias 发布期间 guard 持有同一 state lock，因此并发 metadata、状态查询与 BIO admission 不能观察或使用半激活 table。Active 时 alias 可跟随到同一 primary，active table 的容量和 I/O 同时可用。
 
-primary 注册失败发生在 `load_table()` 前，因此不改变 readonly、active 或 inactive；alias 发布失败不撤 primary，guard 尚未改变 table 或 phase，只释放 state lock，后续 resume 可以重试且不会产生 backing I/O。load 后 rename 仅更新 manager/device 名称，首次 resume 按新名称发布 alias；load 后 remove 能在无 alias 时撤销 primary、wrapper 和 Live registry。
+primary node 创建发生在 pending registration/wrapper 阶段：失败时移除 pending wrapper 并 abort registration，因尚未 Live 且 open gate 关闭，不会留下可 lookup/open 但无 `/dev/dm-X` 的 primary；随后 table 也尚未进入 `load_table()`。运行中 remove 若节点删除失败而 alias/primary 补偿也失败，block registry 保持 `Removing`、wrapper 继续拒绝 open，控制面返回 `EIO`；后续 remove 复用保存的 unregistration token 完成清理，而不会将缺失 node 的 mapper 重新宣布为 Live。alias 发布失败不撤 primary，guard 尚未改变 table 或 phase，只释放 state lock，后续 resume 可以重试且不会产生 backing I/O。load 后 rename 仅更新 manager/device 名称，首次 resume 按新名称发布 alias；load 后 remove 能在无 alias 时撤销 primary、wrapper 和 Live registry。
 
 当前 devtmpfs 仍没有跨 primary node 与 alias 的批量原子发布原语。本阶段对齐 Linux 的可观察生命周期、容量和 I/O 边界，不承诺复制其 uevent 内部时序。
 
