@@ -18,7 +18,7 @@ mod table;
 pub mod target;
 
 pub use device::{DmDevice, DmDeviceStatus};
-pub use manager::DmManager;
+pub use manager::{DmManager, RuntimeRenameReservation};
 pub use table::DmTable;
 
 /// Reasons why a core Device Mapper operation failed.
