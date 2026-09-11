@@ -506,10 +506,10 @@ fn device_rename(buffer: &mut [u8]) -> Result<()> {
     })
 }
 
-/// Moves both the manager name index and runtime block alias as one operation.
+/// Moves a runtime mapper alias and its manager name indexes as one transaction.
 fn rename_device_runtime<F>(
     manager: &DmManager,
-    device: &DmDevice,
+    device: &Arc<DmDevice>,
     new_name: &str,
     rename_alias: F,
 ) -> Result<()>
