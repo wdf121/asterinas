@@ -160,7 +160,7 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
 
 | suite | 子脚本 | 主要验证功能 |
 |---|---|---|
-| `--control-plane` | [run_dm_control_plane_test.sh](../myshell/run_dm_control_plane_test.sh) | `dmsetup` 静态查询、linear/striped/error/zero table 与对象生命周期、active/inactive table、event、rename/UUID、readonly、busy remove/remove_all；包含 error/zero 用户态 I/O 语义。 |
+| `--control-plane` | [run_dm_control_plane_test.sh](../myshell/run_dm_control_plane_test.sh) | `dmsetup` 静态查询、首次 `create --notable -> load -> resume` 的 Linux 生命周期：load 后 `/dev/dm-X`、0 容量/EOF 与 alias 缺失，resume 后 alias、4096-byte 容量和立即交叉读写；还覆盖 primary-only rename/remove、linear/striped/error/zero table 与对象生命周期、active/inactive table、event、rename/UUID、readonly、busy remove/remove_all，以及 error/zero 用户态 I/O 语义。 |
 | `--dataplane` | [run_dm_dataplane_test.sh](../myshell/run_dm_dataplane_test.sh) | raw linear、striped、mixed、error、zero 数据面；跨 target/chunk split、非零 backing start、mapper readback 和逐 backing 布局断言。 |
 | `--lvm2-topology` | [run_lvm2_topology_test.sh](../myshell/run_lvm2_topology_test.sh) | static LVM2 查询、PV/VG/LV 生命周期、linear/striped/mixed segment 增长与缩减、same-boot activation 和 remove。无 filesystem 或 reboot 验收。 |
 | `--linear-integration` | [run_lvm2_linear_integration_test.sh](../myshell/dm_linear/run_lvm2_linear_integration_test.sh) | linear LVM2、同 PV 与跨 PV 第二 segment、ext2、grow/shrink、三次启动后的 table/status/deps 和 MD5 恢复。 |
@@ -174,7 +174,7 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
 | 改动范围 | 推荐 suite | 说明 |
 |---|---|---|
 | 只改 DM core table/target/BIO 逻辑 | 先 ktest；必要时 `--dataplane` | ktest 锁定内核语义；dataplane 验证真实块设备的 raw remap 与 backing 布局。 |
-| 改 `dmsetup` ioctl、status、deps、info、rename、event、readonly 或 remove | `--control-plane` | 验证 libdevmapper 与 `/dev/mapper/control` 的控制面语义。 |
+| 改 `dmsetup` ioctl、status、deps、info、rename、event、readonly、remove 或首次 load/resume 生命周期 | `--control-plane` | 验证 libdevmapper 与 `/dev/mapper/control` 的控制面语义：load 后 primary 的 0-capacity/EOF 边界，resume 后 alias 与 active table 的可操作语义。 |
 | 改 error/zero 用户态 I/O、discard、write-zeroes | `--dataplane`；必要时加 `--control-plane` | 前者覆盖 raw I/O，后者覆盖对象/table 生命周期。 |
 | 改 linear 数据面或跨 target split | `--dataplane`、`--linear-integration` | raw BIO 覆盖边界；LVM2 覆盖跨 PV、filesystem 和恢复。 |
 | 改 striped map/chunk/stripe/deps | `--dataplane`、`--striped-integration` | raw striped 与可配置 N-way/cross-set LVM2 都需要覆盖。 |

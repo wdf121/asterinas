@@ -78,7 +78,7 @@
 |---|---|---|---|
 | 1 | data path target 查找效率 | table 已保证 target 连续有序，但 BIO split 每个 part 仍可能从头扫描 target。 | 起点定位一次，后续按 target index 顺序推进，避免 `O(parts * targets)`。 |
 | 2 | ioctl command / flag spec 表驱动 | command number、decode、handler、flag validation、wait lock 特例分散在多个 match/if。 | 建立 command spec，集中描述 handler、允许/拒绝 flags、锁策略。 |
-| 3 | 生命周期语义集中 | active/inactive、suspend/resume、wait/event、rename/remove 的 event 规则分散在 device 层和 ioctl 层。 | 建立 lifecycle API，明确哪些操作 bump event、wake waiters、切换 table。 |
+| 3 | 生命周期事件语义集中 | event/wait、rename/remove 的事件规则仍分散在 device 层和 ioctl 层。 | 继续收敛剩余 lifecycle API，明确哪些操作 bump event、wake waiters、切换 table。 |
 | 4 | target I/O 行为内聚 | remap、direct-complete、IoError、zero-fill 分散在 table 层和 target 层。 | 让 target 返回统一 I/O action，table 只负责 split、submit 和 completion aggregation。 |
 | 5 | range validation / 错误分类集中 | 各 target 重复做 length、overflow、range 校验，parse/load 错误映射仍较粗。 | 抽公共 range 校验和更细的 parse/load error，再统一映射 errno/message。 |
 | 6 | 系统测试 suite manifest | wrapper help、usage、case dispatch、marker 和 docs 表格重复维护。 | 用 suite manifest 驱动 dispatch/help/marker，减少漏改。 |
