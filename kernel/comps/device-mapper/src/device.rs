@@ -11,7 +11,7 @@ use aster_block::{
     bio::{BioEnqueueError, BioStatus, SubmittedBio},
 };
 use device_id::DeviceId;
-use ostd::sync::{Mutex, WaitQueue};
+use ostd::sync::{Mutex, MutexGuard, WaitQueue};
 
 use crate::{DmError, DmTable, manager::DmDeviceIdOwner};
 
@@ -76,46 +76,36 @@ pub struct DmDeviceStatus {
     pub event_nr: u32,
 }
 
-/// Rolls back an initial table activation unless committed.
+/// Holds the initial activation state private until alias publication commits.
 ///
-/// This guard is only for first activation after the primary block node is
-/// registered. It lets the control plane publish the mapper alias after the
-/// table becomes usable, while restoring the exact table and phase if alias
-/// publication fails.
+/// The first primary node is already openable before its mapper alias exists.
+/// Keeping `state` locked prevents BIO admission from selecting the inactive
+/// table while the control plane publishes that alias. Dropping the guard leaves
+/// the table and phase untouched, so a publication failure is retryable.
 pub struct InitialResumeGuard<'a> {
     device: &'a DmDevice,
-    table: Arc<DmTable>,
-    previous_phase: DmDevicePhase,
-    committed: bool,
+    state: Option<MutexGuard<'a, DmDeviceState>>,
 }
 
 impl InitialResumeGuard<'_> {
-    /// Keeps the activated table, then replays BIOs postponed during suspension.
+    /// Atomically exposes the first active table and reserves postponed BIO replay.
     pub fn commit(mut self) {
-        self.committed = true;
         let replay = {
-            let mut state = self.device.state.lock();
-            self.device.take_postponed_for_replay(&mut state)
+            let state = self
+                .state
+                .as_mut()
+                .expect("initial resume guard lost its state lock");
+            debug_assert!(state.active.is_none());
+            let table = state
+                .inactive
+                .take()
+                .expect("initial resume guard lost its inactive table");
+            state.active = Some(table);
+            state.phase = DmDevicePhase::Running;
+            self.device.take_postponed_for_replay(state)
         };
+        drop(self.state.take());
         self.device.replay_postponed(replay);
-    }
-}
-
-impl Drop for InitialResumeGuard<'_> {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-
-        let mut state = self.device.state.lock();
-        let active = state
-            .active
-            .take()
-            .expect("initial resume guard lost its active table");
-        assert!(Arc::ptr_eq(&active, &self.table));
-        assert!(state.inactive.is_none());
-        state.inactive = Some(active);
-        state.phase = self.previous_phase;
     }
 }
 
@@ -124,6 +114,7 @@ pub struct DmDevice {
     id_owner: DmDeviceIdOwner,
     name: Mutex<String>,
     uuid: Mutex<Option<String>>,
+    lifecycle: Mutex<()>,
     readonly: AtomicBool,
     state: Mutex<DmDeviceState>,
     io: Arc<DmIoState>,
@@ -141,11 +132,20 @@ impl DmDevice {
             id_owner,
             name: Mutex::new(name),
             uuid: Mutex::new(uuid),
+            lifecycle: Mutex::new(()),
             readonly: AtomicBool::new(readonly),
             state: Mutex::new(DmDeviceState::default()),
             io: Arc::new(DmIoState::new()),
             events: WaitQueue::new(),
         }
+    }
+
+    /// Serializes control-plane operations that change this mapper's lifecycle.
+    ///
+    /// The guard may be held while an operation drains assigned BIOs. It must be
+    /// acquired before `state`, and never while a global manager lock is held.
+    pub fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
+        self.lifecycle.lock()
     }
 
     /// Waits until every BIO accepted by this device has completed.
@@ -310,28 +310,23 @@ impl DmDevice {
         }
     }
 
-    /// Starts a rollback-capable first activation for mapper alias publication.
+    /// Starts a first activation transaction while keeping table state private.
     ///
-    /// The device must not already have an active table. If this guard is
-    /// dropped before [`InitialResumeGuard::commit`], it restores the same
-    /// table to inactive and restores the previous phase.
+    /// The device must have no active table and must not be draining. The returned
+    /// guard retains the state lock until [`InitialResumeGuard::commit`] installs
+    /// the inactive table as active. Dropping it leaves the table and phase intact.
     pub fn begin_initial_resume(&self) -> Result<InitialResumeGuard<'_>, DmError> {
-        let mut state = self.state.lock();
-        if state.phase == DmDevicePhase::Suspending || state.active.is_some() {
+        let state = self.state.lock();
+        if state.phase == DmDevicePhase::Suspending
+            || state.active.is_some()
+            || state.inactive.is_none()
+        {
             return Err(DmError::InvalidState);
-        }
-        let table = state.inactive.take().ok_or(DmError::InvalidState)?;
-        let previous_phase = state.phase;
-        state.active = Some(table.clone());
-        if state.phase == DmDevicePhase::Suspended {
-            state.phase = DmDevicePhase::Running;
         }
 
         Ok(InitialResumeGuard {
             device: self,
-            table,
-            previous_phase,
-            committed: false,
+            state: Some(state),
         })
     }
 
@@ -707,15 +702,12 @@ mod tests {
     }
 
     #[ktest]
-    fn initial_resume_guard_restores_running_device_table() {
+    fn initial_resume_guard_drop_keeps_running_device_table_inactive() {
         let (device, table) = create_device_and_table();
         device.load_table(table.clone());
 
         {
             let _guard = device.begin_initial_resume().unwrap();
-            assert!(Arc::ptr_eq(&device.active_table().unwrap(), &table));
-            assert!(device.inactive_table().is_none());
-            assert!(!device.status().suspended);
         }
 
         assert!(device.active_table().is_none());
@@ -724,15 +716,13 @@ mod tests {
     }
 
     #[ktest]
-    fn initial_resume_guard_restores_suspended_device_phase() {
+    fn initial_resume_guard_drop_keeps_suspended_device_phase_and_table_inactive() {
         let (device, table) = create_device_and_table();
         device.suspend().unwrap();
         device.load_table(table.clone());
 
         {
             let _guard = device.begin_initial_resume().unwrap();
-            assert!(Arc::ptr_eq(&device.active_table().unwrap(), &table));
-            assert!(!device.status().suspended);
         }
 
         assert!(device.active_table().is_none());
@@ -750,6 +740,123 @@ mod tests {
         assert!(Arc::ptr_eq(&device.active_table().unwrap(), &table));
         assert!(device.inactive_table().is_none());
         assert!(!device.status().suspended);
+    }
+
+    #[ktest]
+    fn initial_resume_guard_blocks_bios_until_commit() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-initial-resume-commit-test".to_string(), None, None)
+            .unwrap();
+        let backing = DeferredBlockDevice::new();
+        let table = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(16),
+                BlockDeviceLease::new_untracked(backing.clone()),
+            )
+            .unwrap(),
+        );
+        device.load_table(table);
+        let guard = device.begin_initial_resume().unwrap();
+        let started = Arc::new(Mutex::new(false));
+        let accepted = Arc::new(Mutex::new(None));
+        let finished = Arc::new(Mutex::new(false));
+
+        {
+            let device = device.clone();
+            let started = started.clone();
+            let accepted = accepted.clone();
+            let finished = finished.clone();
+            TaskOptions::new(move || {
+                *started.lock() = true;
+                let mut batch = io_util::batch::IoBatch::with_capacity(1);
+                let result = Bio::new(BioType::Flush, Sid::new(0), vec![], None)
+                    .submit(device.as_ref(), &mut batch);
+                *accepted.lock() = Some(result.is_ok());
+                if result.is_ok() {
+                    batch.wait_all().unwrap();
+                }
+                *finished.lock() = true;
+            })
+            .spawn()
+            .unwrap();
+        }
+
+        while !*started.lock() {
+            Task::yield_now();
+        }
+        Task::yield_now();
+        assert!(!backing.has_submitted_bio());
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
+
+        guard.commit();
+        while accepted.lock().is_none() {
+            Task::yield_now();
+        }
+        assert_eq!(*accepted.lock(), Some(true));
+        assert!(backing.has_submitted_bio());
+
+        backing.complete();
+        while !*finished.lock() {
+            Task::yield_now();
+        }
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[ktest]
+    fn initial_resume_guard_drop_refuses_blocked_bios_without_dispatch() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-initial-resume-failure-test".to_string(), None, None)
+            .unwrap();
+        let backing = DeferredBlockDevice::new();
+        let table = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(16),
+                BlockDeviceLease::new_untracked(backing.clone()),
+            )
+            .unwrap(),
+        );
+        device.load_table(table.clone());
+        let guard = device.begin_initial_resume().unwrap();
+        let started = Arc::new(Mutex::new(false));
+        let accepted = Arc::new(Mutex::new(None));
+
+        {
+            let device = device.clone();
+            let started = started.clone();
+            let accepted = accepted.clone();
+            TaskOptions::new(move || {
+                *started.lock() = true;
+                let mut batch = io_util::batch::IoBatch::with_capacity(1);
+                let result = Bio::new(BioType::Flush, Sid::new(0), vec![], None)
+                    .submit(device.as_ref(), &mut batch);
+                *accepted.lock() = Some(result.is_ok());
+            })
+            .spawn()
+            .unwrap();
+        }
+
+        while !*started.lock() {
+            Task::yield_now();
+        }
+        Task::yield_now();
+        assert!(!backing.has_submitted_bio());
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
+
+        drop(guard);
+        while accepted.lock().is_none() {
+            Task::yield_now();
+        }
+        assert_eq!(*accepted.lock(), Some(false));
+        assert!(device.active_table().is_none());
+        assert!(Arc::ptr_eq(&device.inactive_table().unwrap(), &table));
+        assert!(!backing.has_submitted_bio());
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
     }
 
     #[ktest]

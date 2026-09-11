@@ -153,6 +153,19 @@ impl DmManager {
             .cloned()
     }
 
+    /// Returns whether this manager still owns the exact device instance.
+    ///
+    /// Callers that release a global lookup lock before waiting on a per-device
+    /// lifecycle operation use this to reject an `Arc` that was removed and
+    /// replaced before their operation began.
+    pub fn is_current(&self, device: &Arc<DmDevice>) -> bool {
+        self.inner
+            .lock()
+            .by_name
+            .values()
+            .any(|current| Arc::ptr_eq(current, device))
+    }
+
     /// Returns a snapshot of all devices.
     pub fn devices(&self) -> Vec<Arc<DmDevice>> {
         self.inner.lock().by_name.values().cloned().collect()
