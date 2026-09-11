@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    sync::Arc,
+    vec::Vec,
+};
 
 use aster_block::{BlockDevice, MajorIdOwner, allocate_major_with_name};
 use device_id::{DeviceId, MinorId};
@@ -12,6 +17,7 @@ use crate::{DmDevice, DmError};
 struct ManagerInner {
     by_name: BTreeMap<String, Arc<DmDevice>>,
     name_by_uuid: BTreeMap<String, String>,
+    reserved_runtime_names: BTreeSet<String>,
 }
 
 /// Keeps a DM device number allocated until the device object is finally destroyed.
@@ -48,6 +54,49 @@ pub struct DmManager {
     inner: Mutex<ManagerInner>,
 }
 
+/// Reserves a runtime mapper name while its devtmpfs alias is being moved.
+///
+/// The caller must serialize conflicting lifecycle operations for `device` until
+/// this reservation is committed or dropped.
+pub struct RuntimeRenameReservation<'a> {
+    manager: &'a DmManager,
+    device: Arc<DmDevice>,
+    old_name: String,
+    new_name: String,
+    committed: bool,
+}
+
+impl RuntimeRenameReservation<'_> {
+    /// Commits the reserved name after its mapper alias has moved successfully.
+    pub fn commit(mut self) {
+        let mut inner = self.manager.inner.lock();
+        let device = inner
+            .by_name
+            .remove(&self.old_name)
+            .expect("runtime rename reservation lost its source device");
+        assert!(Arc::ptr_eq(&device, &self.device));
+        assert!(inner.reserved_runtime_names.remove(&self.new_name));
+        if let Some(uuid) = device.uuid() {
+            inner.name_by_uuid.insert(uuid, self.new_name.clone());
+        }
+        device.rename(self.new_name.clone());
+        inner.by_name.insert(self.new_name.clone(), device);
+        self.committed = true;
+    }
+}
+
+impl Drop for RuntimeRenameReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.manager
+                .inner
+                .lock()
+                .reserved_runtime_names
+                .remove(&self.new_name);
+        }
+    }
+}
+
 impl DmManager {
     /// Creates a manager and dynamically allocates a block major.
     pub fn new() -> Result<Self, DmError> {
@@ -62,6 +111,7 @@ impl DmManager {
             inner: Mutex::new(ManagerInner {
                 by_name: BTreeMap::new(),
                 name_by_uuid: BTreeMap::new(),
+                reserved_runtime_names: BTreeSet::new(),
             }),
         })
     }
@@ -90,7 +140,7 @@ impl DmManager {
         readonly: bool,
     ) -> Result<Arc<DmDevice>, DmError> {
         let mut inner = self.inner.lock();
-        if inner.by_name.contains_key(&name) {
+        if inner.by_name.contains_key(&name) || inner.reserved_runtime_names.contains(&name) {
             return Err(DmError::NameExists);
         }
         if uuid
@@ -166,6 +216,34 @@ impl DmManager {
             .any(|current| Arc::ptr_eq(current, device))
     }
 
+    /// Reserves a new name while a runtime mapper alias moves outside this lock.
+    ///
+    /// The caller must hold the device lifecycle guard so the source mapping
+    /// cannot be removed or renamed before [`RuntimeRenameReservation::commit`].
+    pub fn reserve_runtime_rename<'a>(
+        &'a self,
+        device: Arc<DmDevice>,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<RuntimeRenameReservation<'a>, DmError> {
+        let mut inner = self.inner.lock();
+        let current = inner.by_name.get(old_name).ok_or(DmError::DeviceNotFound)?;
+        if !Arc::ptr_eq(current, &device) {
+            return Err(DmError::DeviceNotFound);
+        }
+        if inner.by_name.contains_key(new_name) || inner.reserved_runtime_names.contains(new_name) {
+            return Err(DmError::NameExists);
+        }
+        inner.reserved_runtime_names.insert(String::from(new_name));
+        Ok(RuntimeRenameReservation {
+            manager: self,
+            device,
+            old_name: String::from(old_name),
+            new_name: String::from(new_name),
+            committed: false,
+        })
+    }
+
     /// Returns a snapshot of all devices.
     pub fn devices(&self) -> Vec<Arc<DmDevice>> {
         self.inner.lock().by_name.values().cloned().collect()
@@ -191,7 +269,7 @@ impl DmManager {
         if !inner.by_name.contains_key(old_name) {
             return Err(DmError::DeviceNotFound);
         }
-        if inner.by_name.contains_key(new_name) {
+        if inner.by_name.contains_key(new_name) || inner.reserved_runtime_names.contains(new_name) {
             return Err(DmError::NameExists);
         }
         let device = inner.by_name.remove(old_name).unwrap();
@@ -310,6 +388,65 @@ mod tests {
         assert_eq!(manager.lookup_name("dm-new").unwrap().id(), device.id());
         assert_eq!(manager.lookup_uuid("dm-uuid").unwrap().id(), device.id());
         assert_eq!(device.name(), "dm-new");
+    }
+
+    #[ktest]
+    fn runtime_rename_reservation_commits_name_and_uuid_indexes_together() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create(
+                "dm-reservation-old".to_string(),
+                Some("dm-reservation-uuid".to_string()),
+                None,
+            )
+            .unwrap();
+
+        let reservation = manager
+            .reserve_runtime_rename(device.clone(), "dm-reservation-old", "dm-reservation-new")
+            .unwrap();
+        assert_eq!(
+            manager
+                .create("dm-reservation-new".to_string(), None, None)
+                .unwrap_err(),
+            DmError::NameExists
+        );
+        reservation.commit();
+
+        assert!(manager.lookup_name("dm-reservation-old").is_none());
+        assert_eq!(
+            manager.lookup_name("dm-reservation-new").unwrap().id(),
+            device.id()
+        );
+        assert_eq!(
+            manager.lookup_uuid("dm-reservation-uuid").unwrap().id(),
+            device.id()
+        );
+        assert_eq!(device.name(), "dm-reservation-new");
+    }
+
+    #[ktest]
+    fn runtime_rename_reservation_drop_keeps_old_name_and_releases_new_name() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-reservation-old".to_string(), None, None)
+            .unwrap();
+
+        let reservation = manager
+            .reserve_runtime_rename(device.clone(), "dm-reservation-old", "dm-reservation-new")
+            .unwrap();
+        drop(reservation);
+
+        assert_eq!(
+            manager.lookup_name("dm-reservation-old").unwrap().id(),
+            device.id()
+        );
+        assert!(manager.lookup_name("dm-reservation-new").is_none());
+        assert_eq!(device.name(), "dm-reservation-old");
+        assert!(
+            manager
+                .create("dm-reservation-new".to_string(), None, None)
+                .is_ok()
+        );
     }
 
     #[ktest]

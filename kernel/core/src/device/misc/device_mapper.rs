@@ -522,22 +522,14 @@ where
         ));
     }
 
-    // Update the manager index first and roll back immediately if the alias move
-    // fails, avoiding unregister/re-register churn for `/dev/dm-N`, block
-    // registration, the open gate, or backing leases.
-    manager.rename(&old_name, new_name).map_err(map_dm_error)?;
-    if let Err(error) = rename_alias(device.id(), &old_name, new_name) {
-        if let Err(rollback_error) = manager.rename(new_name, &old_name) {
-            ostd::error!(
-                "failed to roll back Device Mapper rename {} -> {}: {:?}",
-                new_name,
-                old_name,
-                rollback_error
-            );
-        }
-        return Err(error);
-    }
-
+    // Keep the old name registered and reserve the new name while the VFS alias
+    // moves. The manager lock is released before the alias operation so an
+    // unrelated mapper is not blocked by devtmpfs work.
+    let reservation = manager
+        .reserve_runtime_rename(device.clone(), &old_name, new_name)
+        .map_err(map_dm_error)?;
+    rename_alias(device.id(), &old_name, new_name)?;
+    reservation.commit();
     Ok(())
 }
 
@@ -2884,6 +2876,23 @@ mod tests {
                     assert_eq!(rename_id, id);
                     assert_eq!(old, "dm-rollback-old");
                     assert_eq!(new, "dm-rollback-new");
+                    assert_eq!(
+                        manager
+                            .create("dm-rollback-old".to_string(), None, None)
+                            .unwrap_err(),
+                        DmError::NameExists
+                    );
+                    assert_eq!(
+                        manager
+                            .create("dm-rollback-new".to_string(), None, None)
+                            .unwrap_err(),
+                        DmError::NameExists
+                    );
+                    assert!(
+                        manager
+                            .create("dm-rollback-unrelated".to_string(), None, None)
+                            .is_ok()
+                    );
                     Err(Error::with_message(
                         Errno::EEXIST,
                         "mapper alias already exists",
@@ -2900,6 +2909,11 @@ mod tests {
         assert_eq!(manager.lookup_uuid("dm-rollback-uuid").unwrap().id(), id);
         assert_eq!(device.name(), "dm-rollback-old");
         assert_eq!(device.status(), status_before);
+        assert!(
+            manager
+                .create("dm-rollback-new".to_string(), None, None)
+                .is_ok()
+        );
     }
 
     #[ktest]
