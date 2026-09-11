@@ -155,12 +155,19 @@ impl PendingBlockDeviceRegistration {
 #[derive(Debug)]
 pub struct PendingBlockDeviceUnregistration {
     registered: Arc<RegisteredBlockDevice>,
+    restore_on_drop: bool,
 }
 
 impl PendingBlockDeviceUnregistration {
     /// Returns the ID of the device pending unregistration.
     pub fn id(&self) -> DeviceId {
         self.registered.id
+    }
+
+    /// Keeps the registration hidden if this token is dropped before cleanup finishes.
+    pub fn retain_removing(mut self) -> Self {
+        self.restore_on_drop = false;
+        self
     }
 }
 
@@ -185,6 +192,9 @@ impl Drop for PendingBlockDeviceRegistration {
 
 impl Drop for PendingBlockDeviceUnregistration {
     fn drop(&mut self) {
+        if !self.restore_on_drop {
+            return;
+        }
         let registry = DEVICE_REGISTRY.lock();
         let Some(current) = registry.get(&self.id().to_raw()) else {
             return;
@@ -349,22 +359,25 @@ pub fn begin_unregister(id: DeviceId) -> Result<PendingBlockDeviceUnregistration
 
     Ok(PendingBlockDeviceUnregistration {
         registered: registered.clone(),
+        restore_on_drop: true,
     })
 }
 
 /// Commits a pending block device unregistration.
 pub fn commit_unregister(
     unregistration: PendingBlockDeviceUnregistration,
-) -> Result<Arc<dyn BlockDevice>, Error> {
+) -> Result<Arc<dyn BlockDevice>, (PendingBlockDeviceUnregistration, Error)> {
     let mut registry = DEVICE_REGISTRY.lock();
     let id = unregistration.id().to_raw();
-    let current = registry.get(&id).ok_or(Error::NotFound)?;
+    let Some(current) = registry.get(&id) else {
+        return Err((unregistration, Error::NotFound));
+    };
     if !Arc::ptr_eq(current, &unregistration.registered) {
-        return Err(Error::Registered);
+        return Err((unregistration, Error::Registered));
     }
     let state = current.state.lock();
     if state.status != RegistrationStatus::Removing || state.lease_count != 0 {
-        return Err(Error::Busy);
+        return Err((unregistration, Error::Busy));
     }
     drop(state);
 
@@ -392,7 +405,7 @@ pub fn abort_unregister(unregistration: PendingBlockDeviceUnregistration) -> Res
 /// Unregisters an existing block device and returns it on success.
 pub fn unregister(id: DeviceId) -> Result<Arc<dyn BlockDevice>, Error> {
     let unregistration = begin_unregister(id)?;
-    commit_unregister(unregistration)
+    commit_unregister(unregistration).map_err(|(_, error)| error)
 }
 
 /// Collects all published block devices.
@@ -463,14 +476,23 @@ pub fn scan_partitions() {
 static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<RegisteredBlockDevice>>> =
     Mutex::new(BTreeMap::new());
 
+/// Returns whether a registration is being removed and must remain hidden.
+pub fn is_removing(id: DeviceId) -> bool {
+    let registry = DEVICE_REGISTRY.lock();
+    registry
+        .get(&id.to_raw())
+        .is_some_and(|registered| registered.state.lock().status == RegistrationStatus::Removing)
+}
+
 /// Returns all registered block device major:minor pairs for diagnostics.
 pub fn list() -> Vec<(u16, u32)> {
     let registry = DEVICE_REGISTRY.lock();
     registry
         .values()
-        .map(|r| {
-            let id = r.id;
-            (id.major().get(), id.minor().get())
+        .filter_map(|registered| {
+            let state = registered.state.lock();
+            (state.status == RegistrationStatus::Live)
+                .then_some((registered.id.major().get(), registered.id.minor().get()))
         })
         .collect()
 }

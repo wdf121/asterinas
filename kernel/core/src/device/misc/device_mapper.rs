@@ -414,8 +414,8 @@ fn create_device(buffer: &mut [u8]) -> Result<()> {
 
 /// Removes one mapped device after unregistering its runtime block-device alias.
 fn remove_device(buffer: &mut [u8]) -> Result<()> {
-    let device = lookup_device(buffer)?;
-    with_current_device_lifecycle(&device, |device| {
+    let device = lookup_device_allow_isolated(buffer)?;
+    with_current_device_lifecycle_allow_isolated(&device, |device| {
         unregister_device_runtime_if_registered(device)?;
         device.fail_postponed_bios();
         device.notify_event();
@@ -430,7 +430,7 @@ fn remove_all(buffer: &mut [u8]) -> Result<()> {
     // continue to be removed, and a single removal failure does not fail the
     // whole ioctl.
     for device in manager().devices() {
-        let _ = with_current_device_lifecycle(&device, |device| {
+        let _ = with_current_device_lifecycle_allow_isolated(&device, |device| {
             unregister_device_runtime_if_registered(device)?;
             device.fail_postponed_bios();
             device.notify_event();
@@ -822,7 +822,11 @@ fn get_target_version(buffer: &mut [u8]) -> Result<()> {
 }
 
 fn list_devices(buffer: &mut [u8]) -> Result<()> {
-    list_devices_for_devices(buffer, manager().devices())
+    let devices = manager()
+        .devices()
+        .into_iter()
+        .filter(|device| !aster_block::is_removing(device.id()));
+    list_devices_for_devices(buffer, devices)
 }
 
 /// Lists mapped device names and UUID extensions in Linux `DM_LIST_DEVICES` format.
@@ -867,11 +871,33 @@ where
     Ok(())
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DeviceLookupPolicy {
+    RejectIsolated,
+    AllowIsolated,
+}
+
 fn lookup_device(buffer: &[u8]) -> Result<Arc<DmDevice>> {
-    lookup_device_in_manager(buffer, manager())
+    lookup_device_with_policy(buffer, DeviceLookupPolicy::RejectIsolated)
+}
+
+fn lookup_device_allow_isolated(buffer: &[u8]) -> Result<Arc<DmDevice>> {
+    lookup_device_with_policy(buffer, DeviceLookupPolicy::AllowIsolated)
+}
+
+fn lookup_device_with_policy(buffer: &[u8], policy: DeviceLookupPolicy) -> Result<Arc<DmDevice>> {
+    lookup_device_in_manager_with_policy(buffer, manager(), policy)
 }
 
 fn lookup_device_in_manager(buffer: &[u8], manager: &DmManager) -> Result<Arc<DmDevice>> {
+    lookup_device_in_manager_with_policy(buffer, manager, DeviceLookupPolicy::RejectIsolated)
+}
+
+fn lookup_device_in_manager_with_policy(
+    buffer: &[u8],
+    manager: &DmManager,
+    policy: DeviceLookupPolicy,
+) -> Result<Arc<DmDevice>> {
     let raw_dev = read_u64(buffer, OFF_DEV)?;
     let name = optional_c_string(buffer, OFF_NAME, DM_NAME_LEN, "设备名称")?;
     let uuid = optional_c_string(buffer, OFF_UUID, DM_UUID_LEN, "设备 UUID")?;
@@ -892,7 +918,12 @@ fn lookup_device_in_manager(buffer: &[u8], manager: &DmManager) -> Result<Arc<Dm
         return_errno_with_message!(Errno::EINVAL, "必须指定 Device Mapper 设备");
     };
 
-    device.ok_or_else(|| Error::with_message(Errno::ENXIO, "Device Mapper 设备不存在"))
+    let device =
+        device.ok_or_else(|| Error::with_message(Errno::ENXIO, "Device Mapper 设备不存在"))?;
+    if policy == DeviceLookupPolicy::RejectIsolated && aster_block::is_removing(device.id()) {
+        return_errno_with_message!(Errno::ENXIO, "Device Mapper 设备正在删除");
+    }
+    Ok(device)
 }
 
 /// Runs one lifecycle mutation only if its looked-up mapper is still current.
@@ -904,7 +935,22 @@ fn with_current_device_lifecycle<T>(
     device: &Arc<DmDevice>,
     operation: impl FnOnce(&Arc<DmDevice>) -> Result<T>,
 ) -> Result<T> {
-    with_current_device_lifecycle_in(manager(), device, operation)
+    with_current_device_lifecycle_with_policy(device, DeviceLookupPolicy::RejectIsolated, operation)
+}
+
+fn with_current_device_lifecycle_allow_isolated<T>(
+    device: &Arc<DmDevice>,
+    operation: impl FnOnce(&Arc<DmDevice>) -> Result<T>,
+) -> Result<T> {
+    with_current_device_lifecycle_with_policy(device, DeviceLookupPolicy::AllowIsolated, operation)
+}
+
+fn with_current_device_lifecycle_with_policy<T>(
+    device: &Arc<DmDevice>,
+    policy: DeviceLookupPolicy,
+    operation: impl FnOnce(&Arc<DmDevice>) -> Result<T>,
+) -> Result<T> {
+    with_current_device_lifecycle_in_with_policy(manager(), device, policy, operation)
 }
 
 fn with_current_device_lifecycle_in<T>(
@@ -912,9 +958,26 @@ fn with_current_device_lifecycle_in<T>(
     device: &Arc<DmDevice>,
     operation: impl FnOnce(&Arc<DmDevice>) -> Result<T>,
 ) -> Result<T> {
+    with_current_device_lifecycle_in_with_policy(
+        manager,
+        device,
+        DeviceLookupPolicy::RejectIsolated,
+        operation,
+    )
+}
+
+fn with_current_device_lifecycle_in_with_policy<T>(
+    manager: &DmManager,
+    device: &Arc<DmDevice>,
+    policy: DeviceLookupPolicy,
+    operation: impl FnOnce(&Arc<DmDevice>) -> Result<T>,
+) -> Result<T> {
     let _lifecycle = device.lock_lifecycle();
     if !manager.is_current(device) {
         return_errno_with_message!(Errno::ENXIO, "Device Mapper 设备不存在");
+    }
+    if policy == DeviceLookupPolicy::RejectIsolated && aster_block::is_removing(device.id()) {
+        return_errno_with_message!(Errno::ENXIO, "Device Mapper 设备正在删除");
     }
     operation(device)
 }

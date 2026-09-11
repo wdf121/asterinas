@@ -152,6 +152,7 @@ struct BlockFile {
     lifecycle: Mutex<()>,
     node: Mutex<Option<Path>>,
     mapper_alias: Mutex<Option<(String, Path)>>,
+    removing: Mutex<Option<aster_block::PendingBlockDeviceUnregistration>>,
 }
 
 #[derive(Debug)]
@@ -186,6 +187,7 @@ impl BlockFile {
             lifecycle: Mutex::new(()),
             node: Mutex::new(None),
             mapper_alias: Mutex::new(None),
+            removing: Mutex::new(None),
         }
     }
 
@@ -197,6 +199,20 @@ impl BlockFile {
 
     fn node(&self) -> Option<Path> {
         self.node.lock().clone()
+    }
+
+    fn clear_node(&self) {
+        *self.node.lock() = None;
+    }
+
+    fn take_removing(&self) -> Option<aster_block::PendingBlockDeviceUnregistration> {
+        self.removing.lock().take()
+    }
+
+    fn retain_removing(&self, unregistration: aster_block::PendingBlockDeviceUnregistration) {
+        let mut removing = self.removing.lock();
+        assert!(removing.is_none());
+        *removing = Some(unregistration.retain_removing());
     }
 
     fn set_mapper_alias(&self, path: String, alias: Path) {
@@ -592,19 +608,19 @@ pub(crate) fn unregister_mapper(id: DeviceId, mapper_name: &str) -> Result<Arc<d
             return Err(error);
         }
         block_file.clear_mapper_alias();
+    }
 
-        if let Some(node) = block_file.node()
-            && let Err(error) = remove_owned_node_or_accept_stale(block_file.path.as_str(), &node)
-        {
-            restore_mapper_alias(&block_file, alias_path.clone());
-            abort_runtime_unregistration(unregistration, &block_file);
-            return Err(error);
+    if let Some(node) = block_file.node() {
+        if let Err(error) = remove_owned_node_or_accept_stale(block_file.path.as_str(), &node) {
+            return recover_primary_removal_failure(
+                unregistration,
+                &block_file,
+                alias.map(|(alias_path, _)| alias_path),
+                error,
+                restore_mapper_alias,
+            );
         }
-    } else if let Some(node) = block_file.node()
-        && let Err(error) = remove_owned_node_or_accept_stale(block_file.path.as_str(), &node)
-    {
-        abort_runtime_unregistration(unregistration, &block_file);
-        return Err(error);
+        block_file.clear_node();
     }
 
     match aster_block::commit_unregister(unregistration) {
@@ -612,12 +628,30 @@ pub(crate) fn unregister_mapper(id: DeviceId, mapper_name: &str) -> Result<Arc<d
             remove_wrapper_if_matches(&block_file);
             Ok(device)
         }
-        Err(error) => {
-            restore_runtime_node(&block_file);
-            if let Some((alias_path, _)) = alias {
-                restore_mapper_alias(&block_file, alias_path);
+        Err((unregistration, error)) => {
+            let primary_recovery = if block_file.node().is_none() {
+                restore_runtime_node(&block_file)
+            } else {
+                Ok(())
+            };
+            let alias_recovery = if let Some((alias_path, _)) = alias {
+                if block_file.mapper_alias().is_none() {
+                    restore_mapper_alias(&block_file, alias_path)
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            };
+            if let Err(recovery_error) = primary_recovery.and(alias_recovery) {
+                return Err(isolate_runtime_unregistration(
+                    unregistration,
+                    &block_file,
+                    &map_block_registry_error(error),
+                    &recovery_error,
+                ));
             }
-            let _ = block_file.try_start_accepting_opens();
+            abort_runtime_unregistration(unregistration, &block_file);
             Err(map_block_registry_error(error))
         }
     }
@@ -692,6 +726,9 @@ fn lookup_runtime_block_file(id: DeviceId) -> Result<Arc<BlockFile>> {
 fn begin_runtime_unregistration(
     block_file: &Arc<BlockFile>,
 ) -> Result<aster_block::PendingBlockDeviceUnregistration> {
+    if let Some(unregistration) = block_file.take_removing() {
+        return Ok(unregistration);
+    }
     block_file.stop_accepting_opens()?;
     match aster_block::begin_unregister(block_file.id()) {
         Ok(unregistration) => Ok(unregistration),
@@ -710,23 +747,61 @@ fn abort_runtime_unregistration(
     let _ = block_file.try_start_accepting_opens();
 }
 
-fn restore_runtime_node(block_file: &BlockFile) {
-    let meta = DevtmpfsInodeMeta::new(block_file.path.as_str());
-    match add_runtime_node(DeviceType::Block, block_file.id().as_encoded_u64(), &meta) {
-        Ok(restored) => *block_file.node.lock() = Some(restored),
-        Err(error) => warn!(
-            "failed to restore runtime block node {}: {:?}",
-            block_file.path, error
-        ),
+fn recover_primary_removal_failure<F>(
+    unregistration: aster_block::PendingBlockDeviceUnregistration,
+    block_file: &BlockFile,
+    alias_path: Option<String>,
+    operation_error: Error,
+    restore_alias: F,
+) -> Result<Arc<dyn BlockDevice>>
+where
+    F: FnOnce(&BlockFile, String) -> Result<()>,
+{
+    if let Some(alias_path) = alias_path
+        && let Err(recovery_error) = restore_alias(block_file, alias_path)
+    {
+        return Err(isolate_runtime_unregistration(
+            unregistration,
+            block_file,
+            &operation_error,
+            &recovery_error,
+        ));
     }
+    abort_runtime_unregistration(unregistration, block_file);
+    Err(operation_error)
 }
 
-fn restore_mapper_alias(block_file: &BlockFile, alias_path: String) {
+fn isolate_runtime_unregistration(
+    unregistration: aster_block::PendingBlockDeviceUnregistration,
+    block_file: &BlockFile,
+    operation_error: &Error,
+    recovery_error: &Error,
+) -> Error {
+    ostd::error!(
+        "failed to recover Device Mapper runtime removal for {}: operation={:?}, recovery={:?}",
+        block_file.path,
+        operation_error,
+        recovery_error
+    );
+    block_file.retain_removing(unregistration);
+    Error::with_message(
+        Errno::EIO,
+        "the Device Mapper runtime removal could not be recovered",
+    )
+}
+
+fn restore_runtime_node(block_file: &BlockFile) -> Result<()> {
+    let meta = DevtmpfsInodeMeta::new(block_file.path.as_str());
+    let restored = add_runtime_node(DeviceType::Block, block_file.id().as_encoded_u64(), &meta)?;
+    *block_file.node.lock() = Some(restored);
+    Ok(())
+}
+
+fn restore_mapper_alias(block_file: &BlockFile, alias_path: String) -> Result<()> {
     let alias_target = format!("../{}", block_file.path);
-    match crate::device::add_runtime_symlink(&alias_path, &alias_target) {
-        Ok(restored) => block_file.set_mapper_alias(alias_path, restored),
-        Err(error) => warn!("failed to restore mapper alias {}: {:?}", alias_path, error),
-    }
+    let restored = crate::device::add_runtime_symlink(&alias_path, &alias_target)?;
+    block_file.set_mapper_alias(alias_path, restored);
+    Ok(())
 }
 
 fn validate_mapper_name(name: &str) -> Result<()> {
@@ -879,6 +954,73 @@ mod tests {
         assert_eq!(error.error(), Errno::ENODEV);
         block_file.start_accepting_opens();
         assert!(block_file.open().is_ok());
+    }
+
+    #[ktest]
+    fn isolated_runtime_unregistration_stays_hidden_until_retry_commits() {
+        let device = TestBlockDevice::new(3);
+        let id = device.id();
+        aster_block::register(device).unwrap();
+        let block_file = Arc::new(BlockFile::new(
+            TestBlockDevice::new(3),
+            "runtime-block-removing".to_string(),
+        ));
+
+        let unregistration = begin_runtime_unregistration(&block_file).unwrap();
+        block_file.retain_removing(unregistration);
+        assert!(aster_block::lookup(id).is_none());
+        assert!(aster_block::lookup_lease(id).is_none());
+        let error = match block_file.open() {
+            Ok(_) => panic!("open unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.error(), Errno::ENODEV);
+
+        let unregistration = begin_runtime_unregistration(&block_file).unwrap();
+        aster_block::commit_unregister(unregistration).unwrap();
+        assert!(aster_block::lookup(id).is_none());
+    }
+
+    #[ktest]
+    fn failed_primary_removal_and_alias_recovery_keeps_device_isolated() {
+        let device = TestBlockDevice::new(4);
+        let id = device.id();
+        aster_block::register(device).unwrap();
+        let block_file = Arc::new(BlockFile::new(
+            TestBlockDevice::new(4),
+            "runtime-block-recovery-failure".to_string(),
+        ));
+        let unregistration = begin_runtime_unregistration(&block_file).unwrap();
+        let primary_error = Error::with_message(Errno::EIO, "injected primary remove failure");
+
+        assert_eq!(
+            recover_primary_removal_failure(
+                unregistration,
+                &block_file,
+                Some("mapper/runtime-block-recovery-failure".to_string()),
+                primary_error,
+                |_, _| {
+                    Err(Error::with_message(
+                        Errno::EIO,
+                        "injected alias restore failure",
+                    ))
+                },
+            )
+            .unwrap_err()
+            .error(),
+            Errno::EIO
+        );
+        assert!(aster_block::lookup(id).is_none());
+        assert!(aster_block::lookup_lease(id).is_none());
+        let error = match block_file.open() {
+            Ok(_) => panic!("open unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.error(), Errno::ENODEV);
+
+        let unregistration = begin_runtime_unregistration(&block_file).unwrap();
+        aster_block::commit_unregister(unregistration).unwrap();
+        assert!(aster_block::lookup(id).is_none());
     }
 
     #[ktest]
