@@ -4,9 +4,9 @@
 
 ## 当前状态
 
-截至 2026-09-04，当前工作重点是稳固已实现的 Device Mapper 功能与验证链路，不新增 target 或扩大 Linux DM 兼容声明。已确认的实现范围包括 `error`、`zero`、`linear`、`striped`，以及同一 mapper/LV 内的 linear + striped mixed table。DM table/control-plane 已从 closed `DmTarget` enum 迁移为 `dyn DmTarget` trait object；定向 ktest 默认使用 crate-local wrapper。
+截至 2026-09-10，当前工作重点是稳固已实现的 Device Mapper 功能与验证链路，不新增 target 或扩大 Linux DM 兼容声明。已确认的实现范围包括 `error`、`zero`、`linear`、`striped`，以及同一 mapper/LV 内的 linear + striped mixed table。DM table/control-plane 已从 closed `DmTarget` enum 迁移为 `dyn DmTarget` trait object；定向 ktest 默认使用 crate-local wrapper。`create -> load -> 首次 resume` 已按本机 Linux 的可观察生命周期对齐：load 后 `/dev/dm-X` 已发布但只有 inactive table、容量为 0、read 为 EOF，resume 后 active table 生效并发布 `/dev/mapper/<name>` alias。普通 suspend drain 已映射 BIO，`suspend --noflush` 不等待已映射 BIO；两者均 postpone 后续未映射 BIO 并在 resume 后按 active table replay。mapper 生命周期写操作以 per-device lifecycle guard 串行：某个 mapper drain 时，其他 mapper 的查询和 create 不再受全局控制锁阻塞；同 mapper 的 load/clear/remove/rename/resume 不会穿插。
 
-当前六个 canonical NixOS system suite 均已通过，且每个实际 guest 的 shell-ready 时间均不超过 40 秒：
+当前六个 canonical NixOS system suite 均已通过，且每个实际 guest 的 shell-ready 时间均不超过 40 秒；2026-09-09 在首次 load/resume Linux 生命周期对齐后重建 NixOS 镜像并复跑 `--control-plane` 与 `--linear-integration`，均通过：
 
 ```text
 myshell/run_dm_system_tests.sh --control-plane
@@ -34,7 +34,8 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
 CLAUDE.md
 AGENTS.md
 log/device-mapper-progress.md
-log/2026-9-4.md
+log/2026-9-10.md
+log/2026-9-9.md
 docs/test.md
 docs/production-code-validation-chain.md
 docs/device-mapper-technical-maintenance.md
@@ -45,7 +46,8 @@ docs/non-device-mapper-change-rationale.md
 
 - `CLAUDE.md`：协作规则，包括简体中文、精简汇报、新阶段先说明差异、默认不 push。
 - `AGENTS.md`：容器路径、测试入口、系统测试串行和定向 ktest 约束。
-- `log/2026-9-4.md`：six-suite 收敛、公共 harness 变更、非对齐 striped 诊断与本轮真实验证记录。
+- `log/2026-9-10.md`：suspend/no-flush 语义纠正、postponed BIO replay、失败完成闭环与控制面系统验证。
+- `log/2026-9-9.md`：本机 Linux 生命周期基线、首次 load 后 primary 的 0-capacity/EOF、首次 resume alias 发布、定向 ktest、control-plane 与 linear LVM2 integration 验证记录。
 - `docs/test.md`：当前系统验收命令、suite 职责、marker 和超时含义。
 - `docs/production-code-validation-chain.md`：ktest 与 system test 的实际执行链路。
 - `docs/device-mapper-technical-maintenance.md`：DM 架构、target 边界、系统验证矩阵和 command alignment 附录。
@@ -55,7 +57,7 @@ docs/non-device-mapper-change-rationale.md
 
 | suite | 所有者与覆盖范围 |
 |---|---|
-| `--control-plane` | `dmsetup` discovery、tableless/table 生命周期、linear/striped/error/zero table/status/deps/info、events、rename/UUID、readonly、busy remove/remove_all；当前包含 error/zero I/O。 |
+| `--control-plane` | `dmsetup` discovery、tableless/table 生命周期、首次 `create --notable -> load` 后 primary node、0 容量、EOF 与 alias 缺失，首次 resume 后 alias 和立即交叉读写、primary-only rename/remove、linear/striped/error/zero table/status/deps/info、events、rename/UUID、readonly、busy remove/remove_all；包含 error/zero I/O。 |
 | `--dataplane` | raw linear、striped、mixed、error、zero；nonzero backing start、跨 target/chunk split、flush、discard/write-zeroes、mapper readback 和 backing 布局。 |
 | `--lvm2-topology` | static LVM2 查询、PV/VG/LV lifecycle、linear/striped/mixed create/grow/shrink、table/status/deps、activation/scan/remove；不做 ext2 或 reboot persistence。 |
 | `--linear-integration` | linear same-PV/cross-PV second segment、ext2、grow/shrink 和三次启动恢复。 |

@@ -4,10 +4,10 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | v2.3 |
-| 状态 | 维护中，基于当前 `dm` 分支实现与 2026-09-04 验证结果整理 |
+| 版本 | v2.4 |
+| 状态 | 维护中，基于当前 `dm` 分支实现与 2026-09-09 验证结果整理 |
 | 目标读者 | 内核开发人员、架构评审人员、测试与集成维护人员 |
-| 更新时间 | 2026-09-04 |
+| 更新时间 | 2026-09-09 |
 | 相关进度 | [Device Mapper 项目进度](../log/device-mapper-progress.md) |
 
 ## 执行摘要
@@ -257,12 +257,14 @@ DM ioctl 层只处理 mapper 生命周期和 table 状态机，不承载 target 
 
 设计要点：
 
-- `DM_DEV_CREATE` 创建 mapper 对象和 runtime node。
+- `DM_DEV_CREATE` 仅创建 mapper 控制面对象、分配 `DeviceId` 并建立 manager 索引；不创建 runtime node。
 - `DM_TABLE_LOAD` 解析 target params，查找并持有 backing lease。
-- `DM_TABLE_LOAD` 成功后只更新 inactive table。
+- `DM_TABLE_LOAD` 成功后，首次 mapper 发布 primary runtime node 并写入 inactive table；primary 容量为 0，mapper alias 尚不存在。
+- 首次 `DM_DEV_SUSPEND` resume 以可回滚事务激活 table 并发布 alias；已经有 alias 的 mapper resume 仅切换 table/phase。
 - `DM_DEV_SUSPEND` 带 `DM_SUSPEND_FLAG` 时挂起并等待在途 I/O；不带该 flag 时表示 resume。
+- 同一 mapper 的 load、clear、suspend/resume、remove、rename 通过 per-device lifecycle guard 串行。普通 suspend 或 running table replacement 在等待 in-flight BIO 时不持有全局 control lock，因此其他 mapper 的查询和 create 可以继续；guard 获取后必须按 manager 中的同一 `Arc` 身份复核，避免 stale lookup 在并发 remove 后继续修改已脱离索引的 device。
 - failed table load 不得污染 active/inactive table、`event_nr` 或 readonly 状态。
-- `DM_DEV_WAIT` 等待时不能持有全局 control lock。
+- `DM_DEV_WAIT` 等待期间不持有 lifecycle guard；唤醒后取得该 guard 并复核 mapper 仍存在，再生成返回 header。
 
 ### 7.2 Linux DM ioctl 兼容子集地图
 
@@ -506,7 +508,33 @@ DM 与 Asterinas block registry 集成，用于：
 
 设计结论：runtime node 和 manager 索引必须保持一致。runtime node rename 失败时，manager 状态必须回滚。
 
-### 10.2 BlockDeviceLease 生命周期设计
+### 10.2 首次 load/resume 的 Linux 生命周期对齐
+
+本机 Linux 基线表明：`create --notable` 后没有 node；首次合法 `DM_TABLE_LOAD` 返回后先出现 `/dev/dm-X`，但只有 inactive table、容量为 0、read 为 EOF；首次 resume 才激活 table 并发布 `/dev/mapper/<name>`。Asterinas 以相同用户态顺序组织 mapper runtime：
+
+```text
+first table load
+  -> 完整验证 dm_target_spec、target 参数、backing lease 与 table geometry
+  -> Pending RegisteredBlockDevice + pending BlockFile
+  -> Pending -> Live，open gate -> true
+  -> 创建 /dev/dm-X
+  -> 安装 inactive table
+
+first resume
+  -> 读取 mapper name
+  -> InitialResumeGuard 持有 device state lock，不改变 inactive / phase
+  -> 验证 primary node 所有权并创建 /dev/mapper/<name> -> ../dm-X
+  -> commit guard：inactive -> active、phase -> Running、预留 postponed BIO replay
+  -> 释放 state lock 后 replay BIO
+```
+
+Loaded-inactive 时 primary 已可打开，但 `DmDevice::metadata()` 只读取 active table，故容量为 0，VFS 读取直接 EOF，任何 BIO 都不会进入 inactive table。首次 alias 发布期间 guard 持有同一 state lock，因此并发 metadata、状态查询与 BIO admission 不能观察或使用半激活 table。Active 时 alias 可跟随到同一 primary，active table 的容量和 I/O 同时可用。
+
+primary 注册失败发生在 `load_table()` 前，因此不改变 readonly、active 或 inactive；alias 发布失败不撤 primary，guard 尚未改变 table 或 phase，只释放 state lock，后续 resume 可以重试且不会产生 backing I/O。load 后 rename 仅更新 manager/device 名称，首次 resume 按新名称发布 alias；load 后 remove 能在无 alias 时撤销 primary、wrapper 和 Live registry。
+
+当前 devtmpfs 仍没有跨 primary node 与 alias 的批量原子发布原语。本阶段对齐 Linux 的可观察生命周期、容量和 I/O 边界，不承诺复制其 uevent 内部时序。
+
+### 10.3 BlockDeviceLease 生命周期设计
 
 DM table 持有 backing 时使用 `BlockDeviceLease`，不是裸 `Arc<dyn BlockDevice>`。
 
@@ -518,7 +546,7 @@ DM table 持有 backing 时使用 `BlockDeviceLease`，不是裸 `Arc<dyn BlockD
 
 替代方案：直接保存 `Arc<dyn BlockDevice>`。该方案实现更简单，但会绕过 block registry 生命周期约束，因此不采用。
 
-### 10.3 VFS mount 集成
+### 10.4 VFS mount 集成
 
 VFS mount source 解析到 block device 时，通过 [kernel/core/src/fs/vfs/fs_apis/registry.rs](../kernel/core/src/fs/vfs/fs_apis/registry.rs) 获取 `BlockDeviceLease`。
 
@@ -527,7 +555,7 @@ VFS mount source 解析到 block device 时，通过 [kernel/core/src/fs/vfs/fs_
 
 设计结论：mount 与 DM backing 共享同一套块设备生命周期模型，避免同一设备在 filesystem 或 DM 使用期间被注销。
 
-### 10.4 LVM2 系统功能路线
+### 10.5 LVM2 系统功能路线
 
 NixOS guest 提供真实用户态工具链，包括 LVM2、dmsetup、e2fsprogs、util-linux、strace 和测试盘 locator。测试盘通过 VirtIO block serial 暴露给 guest，脚本使用 locator 稳定定位测试盘，不硬编码 `/dev/vd*`。
 
@@ -543,7 +571,7 @@ ktest 是在 QEMU 内核环境里运行的 Rust 测试，用来验证不依赖�
 
 | ktest 类别 | 对应代码层 | 主要验证什么 | 什么时候跑 |
 |---|---|---|---|
-| DM core / target ktest | `kernel/core/comps/device-mapper` | table、各 target、BIO split/remap/completion、flush、deps 去重 | 修改 table、target、数据面时。 |
+| DM core / target ktest | `kernel/core/comps/device-mapper` | table、各 target、BIO split/remap/completion、flush、deps 去重、首次 resume guard 的 commit 与 table/phase 回滚 | 修改 table、target、数据面或首次激活事务时。 |
 | ioctl 层 ktest | `kernel/core` | `/dev/mapper/control` ABI、flags、active/inactive、status/deps、remove/rename/wait | 修改 ioctl、控制面、状态机时。 |
 
 定向 ktest 必须从仓库根目录使用 [ktest_crate.sh](../myshell/ktest_crate.sh)：
@@ -559,7 +587,7 @@ myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::test
 
 | suite | guest 数 | 覆盖范围 | 不替代的层次 |
 |---|---:|---|---|
-| `--control-plane` | 1 | dmsetup static discovery、tableless/table 生命周期、linear/striped/error/zero table/status/deps/info、events、rename/UUID、readonly、busy remove/remove_all，以及 error/zero I/O。 | 不替代 raw backing 布局或 LVM2/ext2/reboot 验收。 |
+| `--control-plane` | 1 | dmsetup static discovery、tableless/table 生命周期、首次 `create --notable -> load` 后 primary 的 0-capacity/EOF 与 alias 缺失、首次 resume 后 alias 与立即交叉读写、primary-only rename/remove、linear/striped/error/zero table/status/deps/info、events、rename/UUID、readonly、busy remove/remove_all，以及 error/zero I/O。 | 不替代 raw backing 布局或 LVM2/ext2/reboot 验收。 |
 | `--dataplane` | 1 | raw linear、striped、mixed、error、zero；非零 backing start、跨 target/chunk split、discard/write-zeroes 与 backing layout。 | 不替代 LVM2 topology、filesystem 或 reboot。 |
 | `--lvm2-topology` | 1 | static 查询、PV/VG/LV lifecycle、linear/striped/mixed create/grow/shrink、table/status/deps、scan/activation/remove。 | 不替代 ext2 数据或 reboot persistence。 |
 | `--linear-integration` | 3 | linear same-PV/cross-PV second segment、ext2、grow/shrink、三次启动恢复。 | 不替代 striped/mixed target。 |
@@ -586,7 +614,7 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --m
 | 改动范围 | 必跑验证 |
 |---|---|
 | Rust 格式或 DM core 小改 | `cargo fmt --check`、对应定向 ktest。 |
-| ioctl/control/flags/event/wait | ioctl ktest；用户可见语义变化时加 `--control-plane`。 |
+| ioctl/control/flags/event/wait 或首次 load/resume 生命周期 | ioctl ktest；`InitialResumeGuard` ktest；`--control-plane`，涉及 LVM2 activation 时加 `--linear-integration`。 |
 | error/zero target 或其 I/O | target/table ktest；`--control-plane` 和/或 `--dataplane`。 |
 | linear/striped/mixed BIO split、remap、completion 或 range I/O | DM table/target ktest + `--dataplane`。 |
 | LVM2 PV/VG/LV 生命周期、same-boot table/status/deps | 相关 ktest + `--lvm2-topology`。 |
