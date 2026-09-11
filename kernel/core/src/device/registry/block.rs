@@ -501,6 +501,18 @@ pub(crate) fn register_mapper_primary(device: Arc<dyn BlockDevice>) -> Result<()
     register_runtime_primary(device, primary_path)
 }
 
+#[cfg(ktest)]
+pub(crate) fn register_mapper_primary_with_node_creator<F>(
+    device: Arc<dyn BlockDevice>,
+    create_node: F,
+) -> Result<()>
+where
+    F: FnOnce(&DevtmpfsInodeMeta<'_>) -> Result<Path>,
+{
+    let primary_path = format!("dm-{}", device.id().minor().get());
+    register_runtime_primary_with_node_creator(device, primary_path, create_node)
+}
+
 /// Publishes `/dev/mapper/<name>` for a mapper with an existing primary node.
 ///
 /// The primary node must still be owned by this registration. Keeping that
@@ -612,6 +624,20 @@ pub(crate) fn unregister_mapper(id: DeviceId, mapper_name: &str) -> Result<Arc<d
 }
 
 fn register_runtime_primary(device: Arc<dyn BlockDevice>, path: String) -> Result<()> {
+    let dev_id = device.id().as_encoded_u64();
+    register_runtime_primary_with_node_creator(device, path, move |meta| {
+        add_runtime_node(DeviceType::Block, dev_id, meta)
+    })
+}
+
+fn register_runtime_primary_with_node_creator<F>(
+    device: Arc<dyn BlockDevice>,
+    path: String,
+    create_node: F,
+) -> Result<()>
+where
+    F: FnOnce(&DevtmpfsInodeMeta<'_>) -> Result<Path>,
+{
     let registration =
         aster_block::register_pending(device.clone()).map_err(map_block_registry_error)?;
 
@@ -623,54 +649,26 @@ fn register_runtime_primary(device: Arc<dyn BlockDevice>, path: String) -> Resul
         }
     };
 
+    let meta = DevtmpfsInodeMeta::new(path.as_str());
+    let node = match create_node(&meta) {
+        Ok(node) => node,
+        Err(error) => {
+            remove_wrapper_if_matches(&block_file);
+            let _ = aster_block::abort_registration(registration);
+            return Err(error);
+        }
+    };
+
     if let Err(error) = aster_block::commit_registration(&registration) {
+        let _ = remove_owned_node_or_accept_stale(path.as_str(), &node);
         remove_wrapper_if_matches(&block_file);
         let _ = aster_block::abort_registration(registration);
         return Err(map_block_registry_error(error));
     }
+    block_file.set_node(node);
     block_file.start_accepting_opens();
 
-    let meta = DevtmpfsInodeMeta::new(path.as_str());
-    let node = match add_runtime_node(DeviceType::Block, block_file.id().as_encoded_u64(), &meta) {
-        Ok(node) => node,
-        Err(error) => {
-            rollback_published_runtime_registration(&block_file);
-            return Err(error);
-        }
-    };
-    block_file.set_node(node);
-
     Ok(())
-}
-
-fn rollback_published_runtime_registration(block_file: &Arc<BlockFile>) {
-    if let Err(error) = block_file.stop_accepting_opens() {
-        warn!(
-            "failed to close unpublished block device {}: {:?}",
-            block_file.path, error
-        );
-        return;
-    }
-    let unregistration = match aster_block::begin_unregister(block_file.id()) {
-        Ok(unregistration) => unregistration,
-        Err(error) => {
-            warn!(
-                "failed to begin unregistering unpublished block device {}: {:?}",
-                block_file.path, error
-            );
-            let _ = block_file.try_start_accepting_opens();
-            return;
-        }
-    };
-    if let Err(error) = aster_block::commit_unregister(unregistration) {
-        warn!(
-            "failed to unregister unpublished block device {}: {:?}",
-            block_file.path, error
-        );
-        let _ = block_file.try_start_accepting_opens();
-        return;
-    }
-    remove_wrapper_if_matches(block_file);
 }
 
 /// Removes nodes that still belong to this registration; missing or replaced
@@ -881,6 +879,30 @@ mod tests {
         assert_eq!(error.error(), Errno::ENODEV);
         block_file.start_accepting_opens();
         assert!(block_file.open().is_ok());
+    }
+
+    #[ktest]
+    fn failed_runtime_primary_node_creation_leaves_no_registry_state() {
+        let device = TestBlockDevice::new(3);
+        let id = device.id();
+
+        assert_eq!(
+            register_mapper_primary_with_node_creator(device.clone(), |_| {
+                Err(Error::with_message(
+                    Errno::EIO,
+                    "injected primary node failure",
+                ))
+            })
+            .unwrap_err()
+            .error(),
+            Errno::EIO
+        );
+
+        assert!(lookup(id).is_none());
+        assert_eq!(open_count(id), None);
+        assert!(aster_block::lookup(id).is_none());
+        let retry = aster_block::register_pending(device).unwrap();
+        drop(retry);
     }
 
     #[ktest]

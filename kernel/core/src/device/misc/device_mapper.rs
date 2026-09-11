@@ -21,6 +21,8 @@ use device_id::{DeviceId, MajorId, MinorId};
 use ostd::mm::VmIo;
 use spin::Once;
 
+#[cfg(ktest)]
+use crate::device::register_block_mapper_primary_with_node_creator;
 use crate::{
     context::current_userspace,
     device::{
@@ -3090,6 +3092,37 @@ mod tests {
                 event_nr: 0,
             }
         );
+    }
+
+    #[ktest]
+    fn primary_node_creation_failure_keeps_first_table_unpublished() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-primary-node-failure-test".to_string(), None, None)
+            .unwrap();
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + table_status_record_len(0).unwrap());
+        write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+        write_error_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 8, 0);
+        let status_before = device.status();
+
+        assert_eq!(
+            table_load_for_device_with_primary(&mut buffer, &device, |device| {
+                register_block_mapper_primary_with_node_creator(device.clone(), |_| {
+                    Err(Error::with_message(
+                        Errno::EIO,
+                        "injected primary node failure",
+                    ))
+                })
+            })
+            .unwrap_err()
+            .error(),
+            Errno::EIO
+        );
+
+        assert_eq!(device.status(), status_before);
+        assert!(device.active_table().is_none());
+        assert!(device.inactive_table().is_none());
+        assert_eq!(block_open_count(device.id()), None);
     }
 
     #[ktest]
