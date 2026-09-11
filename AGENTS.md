@@ -132,6 +132,57 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --s
 GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-integration
 ```
 
+## Linux Device Mapper Semantic Alignment
+
+For existing target coverage, prioritize closing semantic and lifecycle gaps with
+standard upstream Linux Device Mapper over adding new targets. Do not treat
+"the final I/O works" as sufficient compatibility evidence for `dmsetup`,
+LVM2, or other user-visible Linux command behavior.
+
+Before designing, implementing, or reviewing a Linux DM ABI or command-semantics
+change, build a per-command observable-state matrix. Cover, when applicable:
+
+- DM identity and table state;
+- primary device node and mapper alias publication;
+- VFS open behavior and block I/O behavior;
+- block/VFS registry state, lifecycle events, and rollback boundaries;
+- command output, status/event values, and failure behavior.
+
+Use evidence in this order:
+
+1. Read upstream Linux source first to establish the standard semantic baseline.
+2. Compare the corresponding current Asterinas implementation against that baseline.
+3. If upstream source cannot locate the relevant behavior or cannot explain a
+   required user-space orchestration detail, inspect the external openEuler VM's
+   installed source, libdevmapper, rules, or diagnostic information as auxiliary
+   evidence only; it is not the semantic standard.
+4. If both source investigations remain insufficient, run the smallest possible
+   command sequence on the external openEuler VM and monitor the unresolved
+   observable state, such as nodes, table/status, events, open, and I/O results.
+
+Mark conclusions by evidence type: upstream source, Asterinas source, external
+openEuler auxiliary evidence, or minimal external-VM experiment. Never infer a
+user-visible node, alias, or command lifecycle solely from an internal kernel
+object state.
+
+Prioritize findings in a future user-visible command matrix as follows:
+
+1. **High — observable failure or data-safety risk.** The semantic difference
+   already causes command, open, mount, I/O, lifecycle, or data-integrity
+   failures; fix it before treating the relevant path as aligned.
+2. **Medium — observable Linux lifecycle mismatch.** Ordinary serial I/O may
+   still succeed, but userspace can observe a different node, alias, table,
+   status, event, or command-state transition than upstream Linux; schedule it
+   as semantic-alignment work.
+3. **Low — internal-only implementation difference.** The implementation order
+   differs but creates no user-visible behavior difference and no concurrent
+   safety risk; do not force source-level imitation.
+
+A short execution window does not remove an observable semantic difference. For
+example, publishing a mapper node and accepting open before its active table is
+installed is high priority if a concurrent I/O can be refused; publishing the
+same nodes at a different, but otherwise safe, command stage is medium priority.
+
 Project logging rules:
 
 - Before writing a dated log, run `date +%F` and write to `log/YYYY-M-D.md`.
