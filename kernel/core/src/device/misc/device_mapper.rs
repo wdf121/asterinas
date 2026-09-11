@@ -130,8 +130,6 @@ const DM_TARGET_SPEC_SIZE: usize = 40;
 const DM_TARGET_TYPE_LEN: usize = 16;
 
 static DM_MANAGER: Once<DmManager> = Once::new();
-static DM_CONTROL_LOCK: Mutex<()> = Mutex::new(());
-
 /// Character device object backing `/dev/mapper/control`.
 #[derive(Debug)]
 struct DmControlDevice {
@@ -251,12 +249,7 @@ impl PerOpenFileOps for DmControlFile {
         let command_result = version_result
             .and_then(|_| validate_input_flags(command, &buffer))
             .and_then(|_| {
-                let result = if command == DM_DEV_WAIT_CMD {
-                    device_wait(&mut buffer)
-                } else {
-                    let _guard = DM_CONTROL_LOCK.lock();
-                    handle_command(command, &mut buffer)
-                };
+                let result = handle_command(command, &mut buffer);
                 ostd::info!(
                     "[dm-ioctl] command={} result={:?} registered_devices={:?}",
                     command,
@@ -360,7 +353,11 @@ fn validate_input_flags(command: u8, buffer: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Dispatches commands that may mutate DM state while holding the global control lock.
+/// Dispatches one validated Device Mapper ioctl command.
+///
+/// Per-mapper lifecycle mutations acquire `DmDevice::lock_lifecycle` inside
+/// their handlers. This keeps unrelated mapper control commands independent
+/// while a suspend or table replacement waits for assigned BIOs to drain.
 fn handle_command(command: u8, buffer: &mut [u8]) -> Result<()> {
     match command {
         DM_VERSION_CMD => Ok(()),
@@ -416,11 +413,13 @@ fn create_device(buffer: &mut [u8]) -> Result<()> {
 /// Removes one mapped device after unregistering its runtime block-device alias.
 fn remove_device(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
-    unregister_device_runtime_if_registered(&device)?;
-    device.fail_postponed_bios();
-    device.notify_event();
-    manager().remove(&&device.name()).map_err(map_dm_error)?;
-    clear_device_header(buffer)
+    with_current_device_lifecycle(&device, |device| {
+        unregister_device_runtime_if_registered(device)?;
+        device.fail_postponed_bios();
+        device.notify_event();
+        manager().remove(&device.name()).map_err(map_dm_error)?;
+        clear_device_header(buffer)
+    })
 }
 
 /// Implements Linux-style best-effort removal across all mapped devices.
@@ -429,12 +428,12 @@ fn remove_all(buffer: &mut [u8]) -> Result<()> {
     // continue to be removed, and a single removal failure does not fail the
     // whole ioctl.
     for device in manager().devices() {
-        if unregister_device_runtime_if_registered(&device).is_err() {
-            continue;
-        }
-        device.fail_postponed_bios();
-        device.notify_event();
-        let _ = manager().remove(&&device.name());
+        let _ = with_current_device_lifecycle(&device, |device| {
+            unregister_device_runtime_if_registered(device)?;
+            device.fail_postponed_bios();
+            device.notify_event();
+            manager().remove(&device.name()).map_err(map_dm_error)
+        });
     }
     clear_device_header(buffer)
 }
@@ -455,20 +454,9 @@ fn device_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> 
 }
 
 fn device_wait(buffer: &mut [u8]) -> Result<()> {
-    let device = {
-        let _guard = DM_CONTROL_LOCK.lock();
-        lookup_device(buffer)?
-    };
+    let device = lookup_device(buffer)?;
     wait_for_device_event(buffer, &device)?;
-
-    let _guard = DM_CONTROL_LOCK.lock();
-    let current = manager()
-        .lookup_id(device.id())
-        .ok_or_else(|| Error::with_message(Errno::ENXIO, "Device Mapper 设备不存在"))?;
-    if !Arc::ptr_eq(&current, &device) {
-        return_errno_with_message!(Errno::ENXIO, "Device Mapper 设备不存在");
-    }
-    fill_device_header(buffer, &device)
+    with_current_device_lifecycle(&device, |device| fill_device_header(buffer, device))
 }
 
 #[cfg(ktest)]
@@ -494,24 +482,26 @@ fn device_rename(buffer: &mut [u8]) -> Result<()> {
     let data_start = data_start(buffer)?;
     let value = c_string_until(buffer, data_start, buffer.len(), "新设备名称或 UUID")?;
 
-    if flags & DM_UUID_FLAG != 0 {
-        if value.is_empty() {
-            return_errno_with_message!(Errno::EINVAL, "Device Mapper UUID 不能为空");
+    with_current_device_lifecycle(&device, |device| {
+        if flags & DM_UUID_FLAG != 0 {
+            if value.is_empty() {
+                return_errno_with_message!(Errno::EINVAL, "Device Mapper UUID 不能为空");
+            }
+            manager()
+                .rename_uuid(&device.name(), value)
+                .map_err(map_dm_error)?;
+        } else if is_device_registered_as_block(device)
+            && (device.active_table().is_some() || is_mapper_alias_published(device)?)
+        {
+            rename_device_runtime(manager(), device, &value, rename_block_mapper)?;
+        } else {
+            manager()
+                .rename(&device.name(), &value)
+                .map_err(map_dm_error)?;
         }
-        manager()
-            .rename_uuid(&device.name(), value)
-            .map_err(map_dm_error)?;
-    } else if is_device_registered_as_block(&device)
-        && (device.active_table().is_some() || is_mapper_alias_published(&device)?)
-    {
-        rename_device_runtime(manager(), &device, &value, rename_block_mapper)?;
-    } else {
-        manager()
-            .rename(&device.name(), &value)
-            .map_err(map_dm_error)?;
-    }
-    device.notify_event();
-    fill_device_header(buffer, &device)
+        device.notify_event();
+        fill_device_header(buffer, device)
+    })
 }
 
 /// Moves both the manager name index and runtime block alias as one operation.
@@ -569,9 +559,24 @@ fn register_mapper_primary_if_needed(device: &Arc<DmDevice>) -> Result<()> {
 
 /// Activates a first table and publishes its mapper alias as one transaction.
 fn activate_initial_table_and_publish_alias(device: &DmDevice) -> Result<()> {
-    let activation = device.begin_initial_resume().map_err(map_dm_error)?;
+    activate_initial_table_and_publish_alias_with(device, publish_block_mapper_alias)
+}
+
+/// Publishes a first mapper alias before committing the table activation.
+///
+/// The initial-resume guard retains the device state lock while `publish_alias`
+/// runs. Thus an error leaves the table inactive and prevents a concurrently
+/// opened primary node from dispatching I/O through the uncommitted table.
+fn activate_initial_table_and_publish_alias_with<F>(
+    device: &DmDevice,
+    publish_alias: F,
+) -> Result<()>
+where
+    F: FnOnce(DeviceId, &str) -> Result<()>,
+{
     let name = device.name();
-    publish_block_mapper_alias(device.id(), &name)?;
+    let activation = device.begin_initial_resume().map_err(map_dm_error)?;
+    publish_alias(device.id(), &name)?;
     activation.commit();
     Ok(())
 }
@@ -586,7 +591,7 @@ fn unregister_device_runtime_if_registered(device: &DmDevice) -> Result<()> {
 
 fn table_load(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
-    table_load_for_device(buffer, &device)
+    with_current_device_lifecycle(&device, |device| table_load_for_device(buffer, device))
 }
 
 /// Parses `DM_TABLE_LOAD` target specs, publishes a first primary node, and installs an inactive table.
@@ -665,25 +670,29 @@ where
 fn device_suspend(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
     let flags = read_u32(buffer, OFF_FLAGS)?;
-    if flags & DM_SUSPEND_FLAG != 0 {
-        (if flags & DM_NOFLUSH_FLAG != 0 {
-            device.suspend_no_flush()
+    with_current_device_lifecycle(&device, |device| {
+        if flags & DM_SUSPEND_FLAG != 0 {
+            (if flags & DM_NOFLUSH_FLAG != 0 {
+                device.suspend_no_flush()
+            } else {
+                device.suspend()
+            })
+            .map_err(map_dm_error)?;
+        } else if !is_device_registered_as_block(device) || is_mapper_alias_published(device)? {
+            device.resume().map_err(map_dm_error)?;
         } else {
-            device.suspend()
-        })
-        .map_err(map_dm_error)?;
-    } else if !is_device_registered_as_block(&device) || is_mapper_alias_published(&device)? {
-        device.resume().map_err(map_dm_error)?;
-    } else {
-        activate_initial_table_and_publish_alias(&device)?;
-    }
-    fill_device_header(buffer, &device)
+            activate_initial_table_and_publish_alias(device)?;
+        }
+        fill_device_header(buffer, device)
+    })
 }
 
 fn table_clear(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
-    device.clear_inactive_table().map_err(map_dm_error)?;
-    fill_device_header(buffer, &device)
+    with_current_device_lifecycle(&device, |device| {
+        device.clear_inactive_table().map_err(map_dm_error)?;
+        fill_device_header(buffer, device)
+    })
 }
 
 fn table_deps(buffer: &mut [u8]) -> Result<()> {
@@ -890,6 +899,30 @@ fn lookup_device_in_manager(buffer: &[u8], manager: &DmManager) -> Result<Arc<Dm
     };
 
     device.ok_or_else(|| Error::with_message(Errno::ENXIO, "Device Mapper 设备不存在"))
+}
+
+/// Runs one lifecycle mutation only if its looked-up mapper is still current.
+///
+/// A caller may wait on this mapper's lifecycle guard without blocking other
+/// mappers. Revalidating the `Arc` after acquiring that guard prevents a stale
+/// lookup from mutating a device that a concurrent remove already detached.
+fn with_current_device_lifecycle<T>(
+    device: &Arc<DmDevice>,
+    operation: impl FnOnce(&Arc<DmDevice>) -> Result<T>,
+) -> Result<T> {
+    with_current_device_lifecycle_in(manager(), device, operation)
+}
+
+fn with_current_device_lifecycle_in<T>(
+    manager: &DmManager,
+    device: &Arc<DmDevice>,
+    operation: impl FnOnce(&Arc<DmDevice>) -> Result<T>,
+) -> Result<T> {
+    let _lifecycle = device.lock_lifecycle();
+    if !manager.is_current(device) {
+        return_errno_with_message!(Errno::ENXIO, "Device Mapper 设备不存在");
+    }
+    operation(device)
 }
 
 fn selected_table(device: &DmDevice, flags: u32) -> Option<Arc<DmTable>> {
@@ -1236,7 +1269,10 @@ mod tests {
         striped::{StripedTarget, StripedTargetParams},
         zero::ZeroTarget,
     };
-    use ostd::prelude::ktest;
+    use ostd::{
+        prelude::ktest,
+        task::{Task, TaskOptions},
+    };
 
     use super::*;
 
@@ -1293,6 +1329,60 @@ mod tests {
 
         fn id(&self) -> DeviceId {
             self.id
+        }
+    }
+
+    #[derive(Debug)]
+    struct DeferredBacking {
+        submitted: Mutex<Option<aster_block::bio::SubmittedBio>>,
+    }
+
+    impl DeferredBacking {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                submitted: Mutex::new(None),
+            })
+        }
+
+        fn has_submitted_bio(&self) -> bool {
+            self.submitted.lock().is_some()
+        }
+
+        fn complete(&self) {
+            self.submitted
+                .lock()
+                .take()
+                .expect("deferred backing has no submitted BIO")
+                .complete(BioStatus::Complete);
+        }
+    }
+
+    impl BlockDevice for DeferredBacking {
+        fn enqueue(
+            &self,
+            bio: aster_block::bio::SubmittedBio,
+        ) -> core::result::Result<(), aster_block::bio::BioEnqueueError> {
+            let mut submitted = self.submitted.lock();
+            if submitted.is_some() {
+                return Err(aster_block::bio::BioEnqueueError::IsFull);
+            }
+            *submitted = Some(bio);
+            Ok(())
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: 8,
+                nr_sectors: 1_024,
+            }
+        }
+
+        fn name(&self) -> String {
+            String::from("dm-deferred-control-test-backing")
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(1), MinorId::new(99))
         }
     }
 
@@ -1422,6 +1512,233 @@ mod tests {
 
     fn table_load_for_test(buffer: &mut [u8], device: &Arc<DmDevice>) -> Result<()> {
         table_load_for_device_with_primary(buffer, device, |_| Ok(()))
+    }
+
+    #[ktest]
+    fn initial_alias_publication_failure_keeps_table_inactive() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-initial-alias-failure-test".to_string(), None, None)
+            .unwrap();
+        let table = single_linear_table(4, 100, 1);
+        device.load_table(table.clone());
+
+        assert_eq!(
+            activate_initial_table_and_publish_alias_with(&device, |id, name| {
+                assert_eq!(id, device.id());
+                assert_eq!(name, "dm-initial-alias-failure-test");
+                Err(Error::with_message(Errno::EIO, "injected alias failure"))
+            })
+            .unwrap_err()
+            .error(),
+            Errno::EIO
+        );
+
+        assert!(device.active_table().is_none());
+        assert!(Arc::ptr_eq(&device.inactive_table().unwrap(), &table));
+        assert!(!device.status().suspended);
+    }
+
+    #[ktest]
+    fn lifecycle_guard_allows_unrelated_mapper_operations_during_drain() {
+        let manager = Arc::new(DmManager::new().unwrap());
+        let first = manager
+            .create("dm-lifecycle-first".to_string(), None, None)
+            .unwrap();
+        let second = manager
+            .create("dm-lifecycle-second".to_string(), None, None)
+            .unwrap();
+        let deferred = DeferredBacking::new();
+        let active = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(16),
+                BlockDeviceLease::new_untracked(deferred.clone()),
+            )
+            .unwrap(),
+        );
+        first.load_table(active);
+        first.resume().unwrap();
+        first.load_table(single_linear_table(64, 32, 2));
+
+        let mut old_batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(aster_block::bio::BioType::Flush, Sid::new(0), vec![], None)
+            .submit(first.as_ref(), &mut old_batch)
+            .unwrap();
+        assert!(deferred.has_submitted_bio());
+
+        let suspend_entered = Arc::new(Mutex::new(false));
+        let suspend_finished = Arc::new(Mutex::new(false));
+        {
+            let manager = manager.clone();
+            let first = first.clone();
+            let suspend_entered = suspend_entered.clone();
+            let suspend_finished = suspend_finished.clone();
+            TaskOptions::new(move || {
+                with_current_device_lifecycle_in(manager.as_ref(), &first, |device| {
+                    *suspend_entered.lock() = true;
+                    device.suspend().map_err(map_dm_error)?;
+                    *suspend_finished.lock() = true;
+                    Ok(())
+                })
+                .unwrap();
+            })
+            .spawn()
+            .unwrap();
+        }
+
+        while !*suspend_entered.lock() || !first.status().suspended {
+            Task::yield_now();
+        }
+        assert!(!*suspend_finished.lock());
+
+        let mut second_status = test_buffer(DM_IOCTL_HEADER_SIZE);
+        device_status_for_device(&mut second_status, &second).unwrap();
+        assert_eq!(
+            read_u64(&second_status, OFF_DEV).unwrap(),
+            second.id().as_encoded_u64()
+        );
+        assert!(
+            manager
+                .create("dm-lifecycle-third".to_string(), None, None)
+                .is_ok()
+        );
+
+        let clear_entered = Arc::new(Mutex::new(false));
+        let clear_finished = Arc::new(Mutex::new(false));
+        {
+            let manager = manager.clone();
+            let first = first.clone();
+            let clear_entered = clear_entered.clone();
+            let clear_finished = clear_finished.clone();
+            TaskOptions::new(move || {
+                *clear_entered.lock() = true;
+                with_current_device_lifecycle_in(manager.as_ref(), &first, |device| {
+                    device.clear_inactive_table().map_err(map_dm_error)?;
+                    *clear_finished.lock() = true;
+                    Ok(())
+                })
+                .unwrap();
+            })
+            .spawn()
+            .unwrap();
+        }
+
+        while !*clear_entered.lock() {
+            Task::yield_now();
+        }
+        Task::yield_now();
+        assert!(!*clear_finished.lock());
+
+        deferred.complete();
+        while !*suspend_finished.lock() || !*clear_finished.lock() {
+            Task::yield_now();
+        }
+        old_batch.wait_all().unwrap();
+        assert!(first.inactive_table().is_none());
+    }
+
+    #[ktest]
+    fn lifecycle_guard_serializes_running_resume_drain() {
+        let manager = Arc::new(DmManager::new().unwrap());
+        let device = manager
+            .create("dm-lifecycle-resume".to_string(), None, None)
+            .unwrap();
+        let deferred = DeferredBacking::new();
+        let active = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(16),
+                BlockDeviceLease::new_untracked(deferred.clone()),
+            )
+            .unwrap(),
+        );
+        let replacement = single_linear_table(64, 32, 2);
+        device.load_table(active);
+        device.resume().unwrap();
+        device.load_table(replacement.clone());
+
+        let mut old_batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(aster_block::bio::BioType::Flush, Sid::new(0), vec![], None)
+            .submit(device.as_ref(), &mut old_batch)
+            .unwrap();
+        assert!(deferred.has_submitted_bio());
+
+        let resume_entered = Arc::new(Mutex::new(false));
+        let resume_finished = Arc::new(Mutex::new(false));
+        {
+            let manager = manager.clone();
+            let device = device.clone();
+            let resume_entered = resume_entered.clone();
+            let resume_finished = resume_finished.clone();
+            TaskOptions::new(move || {
+                with_current_device_lifecycle_in(manager.as_ref(), &device, |device| {
+                    *resume_entered.lock() = true;
+                    device.resume().map_err(map_dm_error)?;
+                    *resume_finished.lock() = true;
+                    Ok(())
+                })
+                .unwrap();
+            })
+            .spawn()
+            .unwrap();
+        }
+
+        while !*resume_entered.lock() || !device.status().suspended {
+            Task::yield_now();
+        }
+        assert!(!*resume_finished.lock());
+
+        let clear_entered = Arc::new(Mutex::new(false));
+        let clear_finished = Arc::new(Mutex::new(false));
+        {
+            let manager = manager.clone();
+            let device = device.clone();
+            let clear_entered = clear_entered.clone();
+            let clear_finished = clear_finished.clone();
+            TaskOptions::new(move || {
+                *clear_entered.lock() = true;
+                with_current_device_lifecycle_in(manager.as_ref(), &device, |device| {
+                    device.clear_inactive_table().map_err(map_dm_error)?;
+                    *clear_finished.lock() = true;
+                    Ok(())
+                })
+                .unwrap();
+            })
+            .spawn()
+            .unwrap();
+        }
+
+        while !*clear_entered.lock() {
+            Task::yield_now();
+        }
+        Task::yield_now();
+        assert!(!*clear_finished.lock());
+
+        deferred.complete();
+        while !*resume_finished.lock() || !*clear_finished.lock() {
+            Task::yield_now();
+        }
+        old_batch.wait_all().unwrap();
+        assert!(Arc::ptr_eq(&device.active_table().unwrap(), &replacement));
+    }
+
+    #[ktest]
+    fn lifecycle_guard_rejects_device_removed_before_operation() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-lifecycle-stale".to_string(), None, None)
+            .unwrap();
+        manager.remove(&device.name()).unwrap();
+
+        assert_eq!(
+            with_current_device_lifecycle_in(&manager, &device, |_| Ok(()))
+                .unwrap_err()
+                .error(),
+            Errno::ENXIO
+        );
     }
 
     fn assert_failed_table_load_preserves_state(
@@ -2430,6 +2747,63 @@ mod tests {
         assert_eq!(
             read_u32(&buffer, OFF_FLAGS).unwrap(),
             DM_EXISTS_FLAG | DM_INACTIVE_PRESENT_FLAG
+        );
+    }
+
+    #[ktest]
+    fn device_wait_returns_current_header_after_rename_events() {
+        DM_MANAGER.call_once(|| DmManager::new().unwrap());
+        let device = manager()
+            .create(
+                "dm-wait-rename-old".to_string(),
+                Some("dm-wait-rename-uuid-old".to_string()),
+                None,
+            )
+            .unwrap();
+        let id = device.id();
+
+        let mut rename = test_buffer(DM_IOCTL_HEADER_SIZE + 32);
+        write_u64(&mut rename, OFF_DEV, id.as_encoded_u64()).unwrap();
+        write_c_string(&mut rename, DM_IOCTL_HEADER_SIZE, "dm-wait-rename-new").unwrap();
+        device_rename(&mut rename).unwrap();
+
+        let mut name_wait = test_buffer(DM_IOCTL_HEADER_SIZE);
+        write_u64(&mut name_wait, OFF_DEV, id.as_encoded_u64()).unwrap();
+        write_u32(&mut name_wait, OFF_EVENT_NR, 0).unwrap();
+        device_wait(&mut name_wait).unwrap();
+        assert_eq!(read_u32(&name_wait, OFF_EVENT_NR).unwrap(), 1);
+        assert_eq!(
+            required_c_string(&name_wait, OFF_NAME, DM_NAME_LEN, "名称").unwrap(),
+            "dm-wait-rename-new"
+        );
+        assert_eq!(
+            required_c_string(&name_wait, OFF_UUID, DM_UUID_LEN, "UUID").unwrap(),
+            "dm-wait-rename-uuid-old"
+        );
+
+        let mut set_uuid = test_buffer(DM_IOCTL_HEADER_SIZE + 32);
+        write_u32(&mut set_uuid, OFF_FLAGS, DM_UUID_FLAG).unwrap();
+        write_u64(&mut set_uuid, OFF_DEV, id.as_encoded_u64()).unwrap();
+        write_c_string(
+            &mut set_uuid,
+            DM_IOCTL_HEADER_SIZE,
+            "dm-wait-rename-uuid-new",
+        )
+        .unwrap();
+        device_rename(&mut set_uuid).unwrap();
+
+        let mut uuid_wait = test_buffer(DM_IOCTL_HEADER_SIZE);
+        write_u64(&mut uuid_wait, OFF_DEV, id.as_encoded_u64()).unwrap();
+        write_u32(&mut uuid_wait, OFF_EVENT_NR, 1).unwrap();
+        device_wait(&mut uuid_wait).unwrap();
+        assert_eq!(read_u32(&uuid_wait, OFF_EVENT_NR).unwrap(), 2);
+        assert_eq!(
+            required_c_string(&uuid_wait, OFF_NAME, DM_NAME_LEN, "名称").unwrap(),
+            "dm-wait-rename-new"
+        );
+        assert_eq!(
+            required_c_string(&uuid_wait, OFF_UUID, DM_UUID_LEN, "UUID").unwrap(),
+            "dm-wait-rename-uuid-new"
         );
     }
 
@@ -3814,6 +4188,13 @@ mod tests {
                 Errno::EOPNOTSUPP
             );
         }
+        write_u32(&mut buffer, OFF_FLAGS, DM_DEFERRED_REMOVE).unwrap();
+        assert_eq!(
+            validate_input_flags(DM_DEV_REMOVE_CMD, &buffer)
+                .unwrap_err()
+                .error(),
+            Errno::EOPNOTSUPP
+        );
 
         write_u32(&mut buffer, OFF_FLAGS, DM_READONLY_FLAG).unwrap();
         validate_input_flags(DM_DEV_CREATE_CMD, &buffer).unwrap();
@@ -3865,10 +4246,16 @@ mod tests {
             decode_command(0xc138_fd11).unwrap(),
             DM_GET_TARGET_VERSION_CMD
         );
-        assert_eq!(
-            decode_command(0xc138_fd10).unwrap_err().error(),
-            Errno::ENOTTY
-        );
+        for unsupported_command in [
+            DM_IOCTL_COMMAND_PREFIX + 14,
+            DM_IOCTL_COMMAND_PREFIX + 15,
+            DM_IOCTL_COMMAND_PREFIX + 16,
+        ] {
+            assert_eq!(
+                decode_command(unsupported_command).unwrap_err().error(),
+                Errno::ENOTTY
+            );
+        }
         assert_eq!(decode_command(0).unwrap_err().error(), Errno::ENOTTY);
         assert_eq!(align_up(313, 8).unwrap(), 320);
     }
