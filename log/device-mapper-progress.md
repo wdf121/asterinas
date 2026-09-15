@@ -34,9 +34,9 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
 CLAUDE.md
 AGENTS.md
 log/device-mapper-progress.md
-log/2026-9-11.md
-log/2026-9-10.md
-log/2026-9-9.md
+log/daily/2026-9-11.md
+log/daily/2026-9-10.md
+log/daily/2026-9-9.md
 docs/test.md
 docs/production-code-validation-chain.md
 docs/device-mapper-technical-maintenance.md
@@ -47,9 +47,9 @@ docs/non-device-mapper-change-rationale.md
 
 - `CLAUDE.md`：协作规则，包括简体中文、精简汇报、新阶段先说明差异、默认不 push。
 - `AGENTS.md`：容器路径、测试入口、系统测试串行和定向 ktest 约束。
-- `log/2026-9-11.md`：P2.1 runtime rename name reservation、P2.2 primary pending-to-Live 发布、P2.3 `Removing` 隔离重试，以及 core/ioctl/control-plane 验证记录。
-- `log/2026-9-10.md`：suspend/no-flush 语义纠正、postponed BIO replay、失败完成闭环与控制面系统验证。
-- `log/2026-9-9.md`：本机 Linux 生命周期基线、首次 load 后 primary 的 0-capacity/EOF、首次 resume alias 发布、定向 ktest、control-plane 与 linear LVM2 integration 验证记录。
+- `log/daily/2026-9-11.md`：P2.1 runtime rename name reservation、P2.2 primary pending-to-Live 发布、P2.3 `Removing` 隔离重试，以及 core/ioctl/control-plane 验证记录。
+- `log/daily/2026-9-10.md`：suspend/no-flush 语义纠正、postponed BIO replay、失败完成闭环与控制面系统验证。
+- `log/daily/2026-9-9.md`：本机 Linux 生命周期基线、首次 load 后 primary 的 0-capacity/EOF、首次 resume alias 发布、定向 ktest、control-plane 与 linear LVM2 integration 验证记录。
 - `docs/test.md`：当前系统验收命令、suite 职责、marker 和超时含义。
 - `docs/production-code-validation-chain.md`：ktest 与 system test 的实际执行链路。
 - `docs/device-mapper-technical-maintenance.md`：DM 架构、target 边界、系统验证矩阵和 command alignment 附录。
@@ -100,9 +100,9 @@ docs/non-device-mapper-change-rationale.md
 
 ## 相关阶段日志
 
-- `log/2026-8-24.md`：mixed active/inactive ktest、striped 几何边界 ktest、mixed LVM2 系统验收、合入当前 main 并适配 `kernel/core` 目录迁移。
-- `log/2026-8-31.md`：dmsetup 控制面语义对齐、LVM2 控制面 baseline/guest 同构、raw DM 数据面边界 guest 审计。
-- `log/2026-9-1.md`：guest 启动慢排查修复、`zero` target 核心/控制面/数据面覆盖、discard / write zeroes 通用 range BIO 与 DM 映射接入。
-- `log/2026-9-2.md`：源码注释、DM 文档事实、系统测试脚本口径、成功 marker、超时变量和 patches 同步记录。
-- `log/2026-9-3.md`：`DmTarget` trait object 重构、crate-local ktest wrapper、runner 结果行拆分、`timeout --foreground` 修复和验证结果。
-- `log/2026-9-4.md`：six-suite 收敛、公共 harness 输入节流、非对齐 striped 四 child ktest 和六套系统验收。
+- `log/daily/2026-8-24.md`：mixed active/inactive ktest、striped 几何边界 ktest、mixed LVM2 系统验收、合入当前 main 并适配 `kernel/core` 目录迁移。
+- `log/daily/2026-8-31.md`：dmsetup 控制面语义对齐、LVM2 控制面 baseline/guest 同构、raw DM 数据面边界 guest 审计。
+- `log/daily/2026-9-1.md`：guest 启动慢排查修复、`zero` target 核心/控制面/数据面覆盖、discard / write zeroes 通用 range BIO 与 DM 映射接入。
+- `log/daily/2026-9-2.md`：源码注释、DM 文档事实、系统测试脚本口径、成功 marker、超时变量和 patches 同步记录。
+- `log/daily/2026-9-3.md`：`DmTarget` trait object 重构、crate-local ktest wrapper、runner 结果行拆分、`timeout --foreground` 修复和验证结果。
+- `log/daily/2026-9-4.md`：six-suite 收敛、公共 harness 输入节流、非对齐 striped 四 child ktest 和六套系统验收。
