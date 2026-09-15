@@ -104,7 +104,14 @@ impl InitialResumeGuard<'_> {
             state.phase = DmDevicePhase::Running;
             self.device.take_postponed_for_replay(state)
         };
+        let replay_count = replay.as_ref().map_or(0, |(_, bios)| bios.len());
         drop(self.state.take());
+        ostd::error!(
+            "[dm-debug] state initial-resume committed name={} id={:?} replay_postponed={}",
+            self.device.name(),
+            self.device.id(),
+            replay_count
+        );
         self.device.replay_postponed(replay);
     }
 }
@@ -216,8 +223,17 @@ impl DmDevice {
     /// Completes BIOs that were accepted while suspended but cannot be replayed.
     pub fn fail_postponed_bios(&self) {
         let postponed = core::mem::take(&mut self.state.lock().postponed);
+        let count = postponed.len();
         for bio in postponed {
             bio.complete(BioStatus::IoError);
+        }
+        if count != 0 {
+            ostd::error!(
+                "[dm-debug] state postponed-bios failed name={} id={:?} count={}",
+                self.name(),
+                self.id(),
+                count
+            );
         }
     }
 
@@ -259,8 +275,16 @@ impl DmDevice {
 
     /// Installs a fully validated mapping table as the inactive table.
     pub fn load_table(&self, table: Arc<DmTable>) {
-        let mut state = self.state.lock();
-        state.inactive = Some(table);
+        let target_count = table.target_count();
+        let capacity = table.length();
+        self.state.lock().inactive = Some(table);
+        ostd::error!(
+            "[dm-debug] state table-loaded name={} id={:?} slot=inactive targets={} sectors={}",
+            self.name(),
+            self.id(),
+            target_count,
+            capacity
+        );
     }
 
     /// Clears the inactive table.
@@ -269,8 +293,13 @@ impl DmDevice {
     /// operation is idempotent for an empty inactive slot and does not change
     /// the event number.
     pub fn clear_inactive_table(&self) -> Result<(), DmError> {
-        let mut state = self.state.lock();
-        state.inactive.take();
+        let cleared = self.state.lock().inactive.take().is_some();
+        ostd::error!(
+            "[dm-debug] state table-cleared name={} id={:?} cleared={}",
+            self.name(),
+            self.id(),
+            cleared
+        );
         Ok(())
     }
 
@@ -290,6 +319,12 @@ impl DmDevice {
         let mut state = self.state.lock();
         debug_assert_eq!(state.phase, DmDevicePhase::Suspending);
         state.phase = DmDevicePhase::Suspended;
+        drop(state);
+        ostd::error!(
+            "[dm-debug] state suspended name={} id={:?} mode=flush",
+            self.name(),
+            self.id()
+        );
         Ok(())
     }
 
@@ -305,6 +340,12 @@ impl DmDevice {
             DmDevicePhase::Suspending => Err(DmError::InvalidState),
             DmDevicePhase::Running => {
                 state.phase = DmDevicePhase::Suspended;
+                drop(state);
+                ostd::error!(
+                    "[dm-debug] state suspended name={} id={:?} mode=noflush",
+                    self.name(),
+                    self.id()
+                );
                 Ok(())
             }
         }
@@ -363,6 +404,7 @@ impl DmDevice {
             }
         };
 
+        let replaced_active = replacement.is_some();
         let replay = if let Some(replacement) = replacement {
             self.wait_for_io_drain();
 
@@ -379,7 +421,15 @@ impl DmDevice {
         } else {
             replay
         };
+        let replay_count = replay.as_ref().map_or(0, |(_, bios)| bios.len());
         self.replay_postponed(replay);
+        ostd::error!(
+            "[dm-debug] state resumed name={} id={:?} replaced_active={} replay_postponed={}",
+            self.name(),
+            self.id(),
+            replaced_active,
+            replay_count
+        );
         Ok(())
     }
 
@@ -410,10 +460,17 @@ impl DmDevice {
 
     /// Records one control-plane lifecycle event and wakes waiters.
     pub fn notify_event(&self) {
-        {
+        let event_nr = {
             let mut state = self.state.lock();
             state.event_nr = state.event_nr.wrapping_add(1);
-        }
+            state.event_nr
+        };
+        ostd::error!(
+            "[dm-debug] state event-published name={} id={:?} event_nr={}",
+            self.name(),
+            self.id(),
+            event_nr
+        );
         self.events.wake_all();
     }
 
