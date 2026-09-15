@@ -14,46 +14,37 @@
 | 1 | [CLAUDE.md](../CLAUDE.md) | 获取简体中文、写入确认、阶段边界和提交规则。 |
 | 2 | [AGENTS.md](../AGENTS.md) | 获取容器路径、定向 ktest、系统测试串行和资源检查要求。 |
 | 3 | [log/device-mapper-progress.md](../log/device-mapper-progress.md) | 获取当前实现范围、功能边界与 canonical suite。 |
-| 4 | [log/device-mapper-optimization-v2.md](../log/device-mapper-optimization-v2.md) | 获取生产代码优化与验证补强的优先级区分。 |
-| 5 | [log/2026-9-10.md](../log/2026-9-10.md) | 获取本阶段实际改动、验证和 Linux 基线记录。 |
-| 6 | [device-mapper-technical-maintenance.md](device-mapper-technical-maintenance.md) | 审查 DM 架构、生命周期与控制面事实。 |
-| 7 | [test.md](test.md) 和 [production-code-validation-chain.md](production-code-validation-chain.md) | 选择定向 ktest 与系统验收。 |
+| 4 | [todo/strace.md](../todo/strace.md) | 进入用户主导的 `strace` 学习主线，查看已完成观察与后续练习矩阵。 |
+| 5 | [log/device-mapper-optimization-v2.md](../log/device-mapper-optimization-v2.md) | 获取生产代码优化与验证补强的优先级区分。 |
+| 6 | [2026-9-11.md](../log/daily/2026-9-11.md) 和 [2026-9-10.md](../log/daily/2026-9-10.md) | 获取 P2 资源事务和前序阶段的实际改动、验证记录。 |
+| 7 | [device-mapper-technical-maintenance.md](device-mapper-technical-maintenance.md) | 审查 DM 架构、生命周期与控制面事实。 |
+| 8 | [test.md](test.md) 和 [production-code-validation-chain.md](production-code-validation-chain.md) | 选择定向 ktest 与系统验收。 |
 
 如果文档与当前代码、实际命令结果或 Git 工作区不一致，以当前代码和命令为准，并修正过期记录。
 
 ## 当前工作模式
 
-当前进入 **生产代码优化** 阶段。优先级必须是：
+当前以**用户主导的调试能力训练与控制面源码走读**为主，生产优化暂停。协作方式是：用户亲自运行命令、观察输出并先给出判断；Claude 先解释命令与预期观察点，再纠正推理链，不代替用户执行练习或提前给出答案。
 
-1. 生产代码的结构、扩展性、健壮性、状态/资源所有权、锁范围和真实数据面成本；
-2. 跟随生产改动的定向 ktest 与系统验收；
-3. 命令语义、脚本和文档的验证补强。
+当前两条主线：
 
-已完成的 `wait`、未支持命令、`info` / `ls` 工作属于验证补强，保留但不再抢占生产优化优先级。不要将只改测试、脚本或文档的工作报告为主要“优化”。
+1. **strace 与相关调试工具**：以 [todo/strace.md](../todo/strace.md) 为学习记录。已完成 `dmsetup version` 与 `dmsetup targets` 的 guest `strace` 观察，包括 control FD、`DM_VERSION`、`DM_LIST_VERSIONS`、用户态调用栈和终端 ioctl 分类；后续按文档的查询、生命周期、失败、等待与数据面矩阵继续。
+2. **控制面按命令走读**：公共路径已走完：`dmsetup` / libdevmapper → `/dev/mapper/control` → `DmControlFile::ioctl` → ioctl 命令解码与分派。后续以一个具体用户命令为单位，先从 CLI 可见语义和 `strace` 中的 ioctl 出发，再进入对应 handler、状态机和资源路径；不要跳回只按源码文件顺序阅读。
 
-## 当前停点：P2.1–P2.3 已验证，等待分点提交
+生产代码优化仅在用户明确说“恢复优化”后继续。P2.4 保持候选状态，未实现、未验证、不得写入完成记录。
 
-本阶段已完成三项 runtime 资源事务优化；生产代码、定向 ktest 与控制面系统验收均已通过，但尚未创建提交：
+## 当前停点：P2.1–P2.3 已提交归档；调试学习继续
 
-- **P2.1 runtime rename 资源事务**：旧 name 保持有效、新 name reservation 防止并发抢占；alias 成功后才提交 manager name/UUID index 与 `DmDevice.name`，失败只释放 reservation。
-- **P2.2 首次 primary 发布失败原子性**：pending registry/wrapper 拒绝 open，先创建 `/dev/dm-N`，成功后才转 Live、记录 node 并开放 open gate；失败不留下 registry、wrapper 或 inactive table。
-- **P2.3 remove 回滚隔离与重试**：补偿失败时保留 `Removing` token，registry lookup/lease 隐藏、wrapper 拒绝 open；控制面返回 `EIO`，后续 remove 可继续完成注销。
+P2 runtime 资源事务已完成并已提交归档：
 
-验证详情见 [log/2026-9-11.md](../log/2026-9-11.md)：P2.1 的 DM crate 全量与 ioctl failure-injection ktest、P2.2/P2.3 的 block registry/ioctl failure-injection ktest，以及三轮 `--control-plane` 都通过。
+- `3bf690ec1`：P2.1 runtime rename name reservation。
+- `fe7503aea`：P2.2 primary pending-to-Live 发布原子性。
+- `4f528a8c7`：P2.3 remove 失败隔离与重试。
+- `20c7927a1`：归档 P2 资源事务验证。
 
-后续候选（尚未选择或实现）：
+P2.4 的“隔离 mapper 控制面可见性”只停留在候选/设计层面；不要把此前未完成的实验性实现或计划当作当前代码事实。
 
-- `DmManager::lookup_id` 的线性扫描与稳定 ID 索引；
-- table target 查找、flush/deps 去重与 target catalog 的数据结构优化；
-- P2.4 中 manager index 与 runtime 注销最后提交边界的进一步审计。
-
-不要将候选合并成一个大重构；每次只选择一个生产问题，先说明优化前/后和最小验收，再经用户确认实施。
-
-## 本阶段已完成的可追溯工作
-
-- 已提交：`83b6187b3`（首次 load 的 primary/alias 生命周期）、`1815c7578`（running resume 换表屏障）、`37f7bba2b`（suspend/no-flush 语义对齐）、`c1848d8a9`（P1.3/P1.4 生命周期并发边界）。
-- 未提交：P2.1、P2.2、P2.3 的生产代码、ktest 日志和同步文档；提交时按逻辑点精确暂存，禁止 broad stage。
-- 最新控制面系统测试已通过；详见 [log/2026-9-11.md](../log/2026-9-11.md)。
+若恢复生产优化，先重新阅读当前代码和 `git status`，然后按“原行为 → 目标行为 → 最小验证”的节奏取得用户确认。
 
 ## 工作区接手检查
 
