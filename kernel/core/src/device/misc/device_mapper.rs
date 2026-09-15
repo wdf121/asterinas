@@ -12,10 +12,7 @@ use alloc::vec;
 use aster_block::{BlockDevice, BlockDeviceLease, id::Sid, lookup_lease};
 use aster_device_mapper::{
     DmDevice, DmError, DmManager, DmTable, TableError,
-    target::{
-        DmTargetMetadata, DmTargetParseError, SUPPORTED_TARGETS, TargetStatusMode,
-        parse_target_with,
-    },
+    target::{DmTargetParseError, TargetStatusMode, parse_target_with},
 };
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::mm::VmIo;
@@ -23,13 +20,19 @@ use spin::Once;
 
 #[cfg(ktest)]
 use crate::device::register_block_mapper_primary_with_node_creator;
+
+mod control;
+mod runtime;
+
+use control::{
+    ControlWorkflow, CreateRequest, DeviceSnapshot, LifecycleOutcome, LifecycleRequest,
+    QueryWorkflow, RemoveAllRequest, RenameRequest, TableLoadRequest, TargetVersionSnapshot,
+};
+use runtime::MapperRuntimeCoordinator;
+
 use crate::{
     context::current_userspace,
-    device::{
-        Device, DeviceType, DevtmpfsInodeMeta, block_mapper_alias_is_published, block_open_count,
-        publish_block_mapper_alias, register_block_mapper_primary, registry::char,
-        rename_block_mapper, unregister_block_mapper,
-    },
+    device::{Device, DeviceType, DevtmpfsInodeMeta, block_open_count, registry::char},
     events::IoEvents,
     fs::{
         file::{InodeType, PerOpenFileOps, StatusFlags},
@@ -209,70 +212,73 @@ impl PerOpenFileOps for DmControlFile {
     fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
         let raw_cmd = raw_ioctl.cmd();
         let command = decode_command(raw_cmd)?;
-
-        ostd::info!(
-            "[dm-ioctl] raw_cmd=0x{:08x} decoded_cmd={} arg={}",
-            raw_cmd,
-            command,
-            raw_ioctl.arg()
+        let command_name = command_name(command);
+        ostd::error!(
+            "[dm-debug] ioctl begin command={} raw=0x{:08x}",
+            command_name,
+            raw_cmd
         );
 
-        let mut header = vec![0u8; DM_IOCTL_HEADER_SIZE];
-        current_userspace!().read_bytes(raw_ioctl.arg(), &mut header)?;
+        let result = (|| {
+            let mut header = vec![0u8; DM_IOCTL_HEADER_SIZE];
+            current_userspace!().read_bytes(raw_ioctl.arg(), &mut header)?;
 
-        let data_size = read_u32(&header, OFF_DATA_SIZE)? as usize;
-        let data_start = read_u32(&header, OFF_DATA_START)? as usize;
+            let data_size = read_u32(&header, OFF_DATA_SIZE)? as usize;
+            let data_start = read_u32(&header, OFF_DATA_START)? as usize;
+            let name_in = optional_c_string(&header, OFF_NAME, DM_NAME_LEN, "name")?;
+            let dev_in = read_u64(&header, OFF_DEV)?;
+            let target_count = read_u32(&header, OFF_TARGET_COUNT)?;
+            let flags = read_u32(&header, OFF_FLAGS)?;
+            ostd::error!(
+                "[dm-debug] ioctl header command={} name={} dev=0x{:x} flags=0x{:x} targets={} data_size={} data_start={}",
+                command_name,
+                name_in.as_deref().unwrap_or("-"),
+                dev_in,
+                flags,
+                target_count,
+                data_size,
+                data_start
+            );
 
-        let name_in = optional_c_string(&header, OFF_NAME, DM_NAME_LEN, "name")?;
-        let uuid_in = optional_c_string(&header, OFF_UUID, DM_UUID_LEN, "uuid")?;
-        let dev_in = read_u64(&header, OFF_DEV)?;
-        let target_count = read_u32(&header, OFF_TARGET_COUNT)?;
-        let flags = read_u32(&header, OFF_FLAGS)?;
+            validate_ioctl_buffer_layout(data_size, data_start)?;
 
-        ostd::info!(
-            "[dm-ioctl] header: data_size={} data_start={} target_count={} flags=0x{:x} dev=0x{:x} name={:?} uuid={:?}",
-            data_size,
-            data_start,
-            target_count,
-            flags,
-            dev_in,
-            name_in,
-            uuid_in
-        );
+            let mut buffer = vec![0u8; data_size];
+            current_userspace!().read_bytes(raw_ioctl.arg(), &mut buffer)?;
 
-        validate_ioctl_buffer_layout(data_size, data_start)?;
-
-        let mut buffer = vec![0u8; data_size];
-        current_userspace!().read_bytes(raw_ioctl.arg(), &mut buffer)?;
-
-        let version_result = validate_client_version(&buffer);
-        write_version(&mut buffer)?;
-        let secure_data = flags & DM_SECURE_DATA_FLAG != 0;
-        let command_result = version_result
-            .and_then(|_| validate_input_flags(command, &buffer))
-            .and_then(|_| {
-                let result = handle_command(command, &mut buffer);
-                ostd::info!(
-                    "[dm-ioctl] command={} result={:?} registered_devices={:?}",
-                    command,
-                    result.as_ref().err().map(|e| e.error()),
-                    aster_block::list()
-                );
-                result
-            });
-        let write_result = current_userspace!().write_bytes(raw_ioctl.arg(), &buffer);
-        let result = match command_result {
-            Ok(()) => {
-                write_result?;
-                Ok(0)
+            let version_result = validate_client_version(&buffer);
+            write_version(&mut buffer)?;
+            let secure_data = flags & DM_SECURE_DATA_FLAG != 0;
+            let command_result = version_result
+                .and_then(|_| validate_input_flags(command, &buffer))
+                .and_then(|_| handle_command(command, &mut buffer));
+            let write_result = current_userspace!().write_bytes(raw_ioctl.arg(), &buffer);
+            let result = match command_result {
+                Ok(()) => {
+                    write_result?;
+                    Ok(0)
+                }
+                Err(error) => {
+                    let _ = write_result;
+                    Err(error)
+                }
+            };
+            if secure_data {
+                buffer.fill(0);
             }
-            Err(error) => {
-                let _ = write_result;
-                Err(error)
-            }
-        };
-        if secure_data {
-            buffer.fill(0);
+            result
+        })();
+
+        match &result {
+            Ok(status) => ostd::error!(
+                "[dm-debug] ioctl done command={} status={}",
+                command_name,
+                status
+            ),
+            Err(error) => ostd::error!(
+                "[dm-debug] ioctl done command={} errno={:?}",
+                command_name,
+                error.error()
+            ),
         }
         result
     }
@@ -312,6 +318,28 @@ fn decode_command(raw: u32) -> Result<u8> {
         | DM_LIST_VERSIONS_CMD
         | DM_GET_TARGET_VERSION_CMD => Ok(command),
         _ => return_errno_with_message!(Errno::ENOTTY, "尚未支持该 Device Mapper ioctl 命令"),
+    }
+}
+
+/// Returns a stable Linux Device Mapper command name for learning diagnostics.
+fn command_name(command: u8) -> &'static str {
+    match command {
+        DM_VERSION_CMD => "DM_VERSION",
+        DM_REMOVE_ALL_CMD => "DM_REMOVE_ALL",
+        DM_LIST_DEVICES_CMD => "DM_LIST_DEVICES",
+        DM_DEV_CREATE_CMD => "DM_DEV_CREATE",
+        DM_DEV_REMOVE_CMD => "DM_DEV_REMOVE",
+        DM_DEV_RENAME_CMD => "DM_DEV_RENAME",
+        DM_DEV_SUSPEND_CMD => "DM_DEV_SUSPEND",
+        DM_DEV_STATUS_CMD => "DM_DEV_STATUS",
+        DM_DEV_WAIT_CMD => "DM_DEV_WAIT",
+        DM_TABLE_LOAD_CMD => "DM_TABLE_LOAD",
+        DM_TABLE_CLEAR_CMD => "DM_TABLE_CLEAR",
+        DM_TABLE_DEPS_CMD => "DM_TABLE_DEPS",
+        DM_TABLE_STATUS_CMD => "DM_TABLE_STATUS",
+        DM_LIST_VERSIONS_CMD => "DM_LIST_VERSIONS",
+        DM_GET_TARGET_VERSION_CMD => "DM_GET_TARGET_VERSION",
+        _ => "DM_UNKNOWN",
     }
 }
 
@@ -395,48 +423,51 @@ fn create_device(buffer: &mut [u8]) -> Result<()> {
     };
 
     let readonly = flags & DM_READONLY_FLAG != 0;
-
-    ostd::info!(
-        "[dm] create_device: name={} uuid={:?} requested_minor={:?} readonly={}",
+    let request = CreateRequest {
         name,
         uuid,
         requested_minor,
-        readonly
+        readonly,
+    };
+    let device = ControlWorkflow::new(manager()).create(request)?;
+    ostd::error!(
+        "[dm-debug] control create committed name={} id={:?} readonly={} requested_minor={:?}",
+        device.name(),
+        device.id(),
+        readonly,
+        requested_minor
     );
-
-    let manager = manager();
-    let device = manager
-        .create_with_readonly(name.clone(), uuid, requested_minor, readonly)
-        .map_err(map_dm_error)?;
-    ostd::info!("[dm] create_device: created id={:?}", device.id());
     fill_device_header(buffer, &device)
 }
 
 /// Removes one mapped device after unregistering its runtime block-device alias.
 fn remove_device(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device_allow_isolated(buffer)?;
+    let workflow = ControlWorkflow::new(manager());
     with_current_device_lifecycle_allow_isolated(&device, |device| {
-        unregister_device_runtime_if_registered(device)?;
-        device.fail_postponed_bios();
-        device.notify_event();
-        manager().remove(&device.name()).map_err(map_dm_error)?;
+        workflow.remove(device)?;
+        ostd::error!(
+            "[dm-debug] control remove committed name={} id={:?}",
+            device.name(),
+            device.id()
+        );
         clear_device_header(buffer)
     })
 }
 
 /// Implements Linux-style best-effort removal across all mapped devices.
 fn remove_all(buffer: &mut [u8]) -> Result<()> {
-    // Linux `DM_REMOVE_ALL` is best effort: busy devices are kept while the rest
-    // continue to be removed, and a single removal failure does not fail the
-    // whole ioctl.
-    for device in manager().devices() {
-        let _ = with_current_device_lifecycle_allow_isolated(&device, |device| {
-            unregister_device_runtime_if_registered(device)?;
-            device.fail_postponed_bios();
-            device.notify_event();
-            manager().remove(&device.name()).map_err(map_dm_error)
-        });
-    }
+    let workflow = ControlWorkflow::new(manager());
+    let request = RemoveAllRequest::new(manager().devices());
+    let outcome = workflow.remove_all(request, |device| {
+        with_current_device_lifecycle_allow_isolated(device, |device| workflow.remove(device))
+    });
+    ostd::error!(
+        "[dm-debug] control remove-all committed attempted={} removed={} retained={}",
+        outcome.attempted,
+        outcome.removed,
+        outcome.attempted - outcome.removed
+    );
     clear_device_header(buffer)
 }
 
@@ -448,11 +479,9 @@ fn device_status(buffer: &mut [u8]) -> Result<()> {
 /// Fills status fields that depend on the selected active or inactive table.
 fn device_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
-    let target_count = selected_table(device, flags)
-        .map(|table| table.target_count())
-        .unwrap_or(0);
-    fill_device_header(buffer, device)?;
-    write_u32(buffer, OFF_TARGET_COUNT, target_count)
+    let snapshot = QueryWorkflow::table_metadata(device, flags & DM_QUERY_INACTIVE_TABLE_FLAG != 0);
+    fill_device_header_snapshot(buffer, &snapshot.device)?;
+    write_u32(buffer, OFF_TARGET_COUNT, snapshot.target_count as u32)
 }
 
 fn device_wait(buffer: &mut [u8]) -> Result<()> {
@@ -483,117 +512,54 @@ fn device_rename(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
     let data_start = data_start(buffer)?;
     let value = c_string_until(buffer, data_start, buffer.len(), "新设备名称或 UUID")?;
+    let request = if flags & DM_UUID_FLAG != 0 {
+        RenameRequest::Uuid(value)
+    } else {
+        RenameRequest::Name(value)
+    };
+    let kind = request.kind();
+    let workflow = ControlWorkflow::new(manager());
 
     with_current_device_lifecycle(&device, |device| {
-        if flags & DM_UUID_FLAG != 0 {
-            if value.is_empty() {
-                return_errno_with_message!(Errno::EINVAL, "Device Mapper UUID 不能为空");
-            }
-            manager()
-                .rename_uuid(&device.name(), value)
-                .map_err(map_dm_error)?;
-        } else if is_device_registered_as_block(device)
-            && (device.active_table().is_some() || is_mapper_alias_published(device)?)
-        {
-            rename_device_runtime(manager(), device, &value, rename_block_mapper)?;
-        } else {
-            manager()
-                .rename(&device.name(), &value)
-                .map_err(map_dm_error)?;
-        }
+        workflow.rename(device, &request)?;
         device.notify_event();
+        ostd::error!(
+            "[dm-debug] control rename committed kind={} name={} id={:?}",
+            kind,
+            device.name(),
+            device.id()
+        );
         fill_device_header(buffer, device)
     })
 }
 
-/// Moves a runtime mapper alias and its manager name indexes as one transaction.
-fn rename_device_runtime<F>(
-    manager: &DmManager,
-    device: &Arc<DmDevice>,
-    new_name: &str,
-    rename_alias: F,
-) -> Result<()>
-where
-    F: FnOnce(DeviceId, &str, &str) -> Result<()>,
-{
-    let old_name = device.name();
-    if new_name == old_name {
-        return Err(Error::with_message(
-            Errno::EBUSY,
-            "Device Mapper 设备名称未变化",
-        ));
-    }
-
-    // Keep the old name registered and reserve the new name while the VFS alias
-    // moves. The manager lock is released before the alias operation so an
-    // unrelated mapper is not blocked by devtmpfs work.
-    let reservation = manager
-        .reserve_runtime_rename(device.clone(), &old_name, new_name)
-        .map_err(map_dm_error)?;
-    rename_alias(device.id(), &old_name, new_name)?;
-    reservation.commit();
-    Ok(())
-}
-
-fn is_device_registered_as_block(device: &DmDevice) -> bool {
-    block_open_count(device.id()).is_some()
-}
-
-fn is_mapper_alias_published(device: &DmDevice) -> Result<bool> {
-    block_mapper_alias_is_published(device.id())
-}
-
-/// Publishes a mapper primary node after its first table has been validated.
-fn register_mapper_primary_if_needed(device: &Arc<DmDevice>) -> Result<()> {
-    if !is_device_registered_as_block(device) {
-        register_block_mapper_primary(device.clone())?;
-    }
-    Ok(())
-}
-
-/// Activates a first table and publishes its mapper alias as one transaction.
-fn activate_initial_table_and_publish_alias(device: &DmDevice) -> Result<()> {
-    activate_initial_table_and_publish_alias_with(device, publish_block_mapper_alias)
-}
-
-/// Publishes a first mapper alias before committing the table activation.
-///
-/// The initial-resume guard retains the device state lock while `publish_alias`
-/// runs. Thus an error leaves the table inactive and prevents a concurrently
-/// opened primary node from dispatching I/O through the uncommitted table.
-fn activate_initial_table_and_publish_alias_with<F>(
-    device: &DmDevice,
-    publish_alias: F,
-) -> Result<()>
-where
-    F: FnOnce(DeviceId, &str) -> Result<()>,
-{
-    let name = device.name();
-    let activation = device.begin_initial_resume().map_err(map_dm_error)?;
-    publish_alias(device.id(), &name)?;
-    activation.commit();
-    Ok(())
-}
-
-/// Unregisters mapper runtime resources if its primary node has been published.
-fn unregister_device_runtime_if_registered(device: &DmDevice) -> Result<()> {
-    if is_device_registered_as_block(device) {
-        unregister_block_mapper(device.id(), &&device.name())?;
-    }
-    Ok(())
-}
-
 fn table_load(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
-    with_current_device_lifecycle(&device, |device| table_load_for_device(buffer, device))
+    let target_count = read_u32(buffer, OFF_TARGET_COUNT)?;
+    let readonly = read_u32(buffer, OFF_FLAGS)? & DM_READONLY_FLAG != 0;
+    with_current_device_lifecycle(&device, |device| {
+        table_load_for_device(buffer, device)?;
+        ostd::error!(
+            "[dm-debug] control table-load committed name={} id={:?} targets={} readonly={} primary_registered={}",
+            device.name(),
+            device.id(),
+            target_count,
+            readonly,
+            MapperRuntimeCoordinator::new(manager()).is_registered(device)
+        );
+        Ok(())
+    })
 }
 
-/// Parses `DM_TABLE_LOAD` target specs, publishes a first primary node, and installs an inactive table.
+/// Parses `DM_TABLE_LOAD` target specs before the typed workflow publishes runtime state.
 fn table_load_for_device(buffer: &mut [u8], device: &Arc<DmDevice>) -> Result<()> {
-    table_load_for_device_with_primary(buffer, device, register_mapper_primary_if_needed)
+    let request = parse_table_load_request(buffer)?;
+    ControlWorkflow::new(manager()).load_table(device, request)?;
+    fill_device_header(buffer, device)
 }
 
-/// Parses and validates a table before registering a first primary node and installing it inactive.
+/// Parses and validates a table before handing its runtime commit to the workflow.
+#[cfg(ktest)]
 fn table_load_for_device_with_primary<F>(
     buffer: &mut [u8],
     device: &Arc<DmDevice>,
@@ -602,10 +568,15 @@ fn table_load_for_device_with_primary<F>(
 where
     F: FnOnce(&Arc<DmDevice>) -> Result<()>,
 {
+    let request = parse_table_load_request(buffer)?;
+    ControlWorkflow::load_table_with_primary(device, request, register_primary)?;
+    fill_device_header(buffer, device)
+}
+
+/// Decodes `DM_TABLE_LOAD` target specs into a fully validated workflow request.
+fn parse_table_load_request(buffer: &[u8]) -> Result<TableLoadRequest> {
     let target_count = read_u32(buffer, OFF_TARGET_COUNT)?;
     let flags = read_u32(buffer, OFF_FLAGS)?;
-    ostd::info!("[dm] table_load: target_count={}", target_count);
-    ostd::info!("[dm] table_load: device name={} found", device.name());
 
     if target_count == 0 {
         return_errno_with_message!(Errno::EINVAL, "映射表至少需要一个 target");
@@ -640,42 +611,44 @@ where
             &mut resolve_backing,
         )
         .map_err(map_target_parse_error)?;
-        ostd::info!(
-            "[dm] table_load: name={}, type={}, logical_start={}, length={}",
-            device.name(),
-            target.name(),
-            logical_start,
-            length
-        );
         targets.push(target);
         cursor = next_spec;
     }
 
     let table = Arc::new(DmTable::new_targets(targets).map_err(map_table_error)?);
-    register_primary(device)?;
-    if flags & DM_READONLY_FLAG != 0 {
-        device.set_readonly();
-    }
-    device.load_table(table);
-    ostd::info!("[dm] table_load: table loaded for {}", device.name());
-    fill_device_header(buffer, &device)
+    Ok(TableLoadRequest::new(table, flags & DM_READONLY_FLAG != 0))
 }
 
 fn device_suspend(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
     let flags = read_u32(buffer, OFF_FLAGS)?;
+    let request = if flags & DM_SUSPEND_FLAG != 0 {
+        LifecycleRequest::Suspend {
+            noflush: flags & DM_NOFLUSH_FLAG != 0,
+        }
+    } else {
+        LifecycleRequest::Resume
+    };
+    let workflow = ControlWorkflow::new(manager());
+
     with_current_device_lifecycle(&device, |device| {
-        if flags & DM_SUSPEND_FLAG != 0 {
-            (if flags & DM_NOFLUSH_FLAG != 0 {
-                device.suspend_no_flush()
-            } else {
-                device.suspend()
-            })
-            .map_err(map_dm_error)?;
-        } else if !is_device_registered_as_block(device) || is_mapper_alias_published(device)? {
-            device.resume().map_err(map_dm_error)?;
-        } else {
-            activate_initial_table_and_publish_alias(device)?;
+        match workflow.transition(device, request)? {
+            LifecycleOutcome::Suspended { noflush } => ostd::error!(
+                "[dm-debug] control suspend committed name={} id={:?} noflush={}",
+                device.name(),
+                device.id(),
+                noflush
+            ),
+            LifecycleOutcome::Resumed { initial: true } => ostd::error!(
+                "[dm-debug] control resume committed name={} id={:?} initial=true alias_published=true",
+                device.name(),
+                device.id()
+            ),
+            LifecycleOutcome::Resumed { initial: false } => ostd::error!(
+                "[dm-debug] control resume committed name={} id={:?} initial=false",
+                device.name(),
+                device.id()
+            ),
         }
         fill_device_header(buffer, device)
     })
@@ -683,8 +656,9 @@ fn device_suspend(buffer: &mut [u8]) -> Result<()> {
 
 fn table_clear(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
+    let workflow = ControlWorkflow::new(manager());
     with_current_device_lifecycle(&device, |device| {
-        device.clear_inactive_table().map_err(map_dm_error)?;
+        workflow.clear_inactive_table(device)?;
         fill_device_header(buffer, device)
     })
 }
@@ -697,13 +671,13 @@ fn table_deps(buffer: &mut [u8]) -> Result<()> {
 fn table_deps_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
     let start = data_start(buffer)?;
-    let table = selected_table(device, flags);
-    fill_device_header(buffer, device)?;
+    let snapshot = QueryWorkflow::table_deps(device, flags & DM_QUERY_INACTIVE_TABLE_FLAG != 0);
+    fill_device_header_snapshot(buffer, &snapshot.device)?;
 
-    let backing_ids = table.map(|table| table.backing_ids()).unwrap_or_default();
     let deps_len = 8usize
         .checked_add(
-            backing_ids
+            snapshot
+                .backing_ids
                 .len()
                 .checked_mul(8)
                 .ok_or_else(invalid_buffer)?,
@@ -713,9 +687,9 @@ fn table_deps_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
         set_buffer_full(buffer)?;
         return Ok(());
     }
-    write_u32(buffer, start, backing_ids.len() as u32)?;
+    write_u32(buffer, start, snapshot.backing_ids.len() as u32)?;
     write_u32(buffer, start + 4, 0)?;
-    for (index, id) in backing_ids.into_iter().enumerate() {
+    for (index, id) in snapshot.backing_ids.into_iter().enumerate() {
         write_u64(buffer, start + 8 + index * 8, id.as_encoded_u64())?;
     }
     Ok(())
@@ -730,41 +704,37 @@ fn table_status(buffer: &mut [u8]) -> Result<()> {
 fn table_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)?;
     let start = data_start(buffer)?;
-    let table = selected_table(device, flags);
-    fill_device_header(buffer, device)?;
-
-    let Some(table) = table else {
-        return Ok(());
-    };
-    write_u32(buffer, OFF_TARGET_COUNT, table.target_count() as u32)?;
-
     let mode = if flags & DM_STATUS_TABLE_FLAG != 0 {
         TargetStatusMode::Table
     } else {
         TargetStatusMode::Status
     };
+    let mut records =
+        QueryWorkflow::table_records(device, flags & DM_QUERY_INACTIVE_TABLE_FLAG != 0, mode);
+    fill_device_header_snapshot(buffer, records.device())?;
+    write_u32(buffer, OFF_TARGET_COUNT, records.target_count() as u32)?;
+
     let mut cursor = start;
-    for target in table.targets() {
-        let params = target.status_params(mode).map_err(map_table_error)?;
-        let record_len = table_status_record_len(params.len())?;
+    while let Some(target) = records.next_target()? {
+        let record_len = table_status_record_len(target.params.len())?;
         if available_from(buffer, cursor) < record_len {
             set_buffer_full(buffer)?;
             return Ok(());
         }
-        write_u64(buffer, cursor, target.logical_range().start.to_raw())?;
-        write_u64(buffer, cursor + 8, target.length())?;
+        write_u64(buffer, cursor, target.logical_start)?;
+        write_u64(buffer, cursor + 8, target.length)?;
         write_u32(buffer, cursor + 16, 0)?;
         write_u32(buffer, cursor + 20, cursor + record_len - start)?;
-        write_c_string_fixed(buffer, cursor + 24, DM_TARGET_TYPE_LEN, target.name())?;
-        write_c_string(buffer, cursor + DM_TARGET_SPEC_SIZE, &params)?;
+        write_c_string_fixed(buffer, cursor + 24, DM_TARGET_TYPE_LEN, target.name)?;
+        write_c_string(buffer, cursor + DM_TARGET_SPEC_SIZE, &target.params)?;
         cursor += record_len;
     }
     Ok(())
 }
 
 /// Computes the aligned ABI record length for one target-version entry.
-fn target_version_record_len(target: &DmTargetMetadata) -> Result<usize> {
-    align_up(16 + target.name().len() + 1, 8)
+fn target_version_record_len(target: &TargetVersionSnapshot) -> Result<usize> {
+    align_up(16 + target.name.len() + 1, 8)
 }
 
 /// Writes one target-version record into the variable ioctl output area.
@@ -772,53 +742,93 @@ fn write_target_version(
     buffer: &mut [u8],
     offset: usize,
     next: usize,
-    target: &DmTargetMetadata,
+    target: &TargetVersionSnapshot,
 ) -> Result<()> {
     let record_len = target_version_record_len(target)?;
     require_range(buffer, offset, record_len)?;
     write_u32(buffer, offset, next)?;
-    for (index, value) in target.version().into_iter().enumerate() {
+    for (index, value) in target.version.into_iter().enumerate() {
         write_u32(buffer, offset + 4 + index * 4, value)?;
     }
-    write_c_string(buffer, offset + 16, target.name())
+    write_c_string(buffer, offset + 16, target.name)
 }
 
-/// Lists all supported target versions from the target module metadata table.
+/// Logs one target-version record after its Linux `next` field is final.
+fn log_target_version_record(
+    operation: &str,
+    offset: usize,
+    next: usize,
+    target: &TargetVersionSnapshot,
+    record_len: usize,
+) {
+    ostd::error!(
+        "[dm-debug] {} record offset={} next={} version={}.{}.{} name={} record_len={}",
+        operation,
+        offset,
+        next,
+        target.version[0],
+        target.version[1],
+        target.version[2],
+        target.name,
+        record_len
+    );
+}
+
+/// Lists all supported target versions from the typed query snapshot.
 fn list_versions(buffer: &mut [u8]) -> Result<()> {
     let start = data_start(buffer)?;
     let mut cursor = start;
-    let mut previous = None;
+    let mut previous: Option<(usize, usize, TargetVersionSnapshot)> = None;
+    let mut records = 0;
 
-    for target in SUPPORTED_TARGETS {
-        let record_len = target_version_record_len(target)?;
+    for target in QueryWorkflow::target_versions() {
+        let record_len = target_version_record_len(&target)?;
         if available_from(buffer, cursor) < record_len {
             set_buffer_full(buffer)?;
             break;
         }
-        if let Some(previous) = previous {
-            write_u32(buffer, previous, cursor - previous)?;
+        if let Some((previous_offset, previous_len, previous_target)) = previous.take() {
+            let next = cursor - previous_offset;
+            write_u32(buffer, previous_offset, next)?;
+            log_target_version_record(
+                "list-versions",
+                previous_offset,
+                next,
+                &previous_target,
+                previous_len,
+            );
         }
-        write_target_version(buffer, cursor, 0, target)?;
-        previous = Some(cursor);
+        write_target_version(buffer, cursor, 0, &target)?;
+        previous = Some((cursor, record_len, target));
         cursor += record_len;
+        records += 1;
     }
+    if let Some((offset, record_len, target)) = previous {
+        log_target_version_record("list-versions", offset, 0, &target, record_len);
+    }
+    let buffer_full = read_u32(buffer, OFF_FLAGS)? & DM_BUFFER_FULL_FLAG != 0;
+    ostd::error!(
+        "[dm-debug] list-versions summary records={} buffer_full={}",
+        records,
+        buffer_full
+    );
     Ok(())
 }
 
 /// Looks up one target-version entry by Linux target type name.
 fn get_target_version(buffer: &mut [u8]) -> Result<()> {
     let name = required_c_string(buffer, OFF_NAME, DM_NAME_LEN, "target 名称")?;
-    let target = SUPPORTED_TARGETS
-        .iter()
-        .find(|target| target.name() == name)
+    let target = QueryWorkflow::target_version(&name)
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "未知的 Device Mapper target"))?;
     let start = data_start(buffer)?;
-    let record_len = target_version_record_len(target)?;
+    let record_len = target_version_record_len(&target)?;
     if available_from(buffer, start) < record_len {
         set_buffer_full(buffer)?;
         return Ok(());
     }
-    write_target_version(buffer, start, 0, target)
+    write_target_version(buffer, start, 0, &target)?;
+    log_target_version_record("get-target-version", start, 0, &target, record_len);
+    Ok(())
 }
 
 fn list_devices(buffer: &mut [u8]) -> Result<()> {
@@ -826,23 +836,30 @@ fn list_devices(buffer: &mut [u8]) -> Result<()> {
         .devices()
         .into_iter()
         .filter(|device| !aster_block::is_removing(device.id()));
-    list_devices_for_devices(buffer, devices)
+    list_devices_for_snapshots(buffer, QueryWorkflow::devices(devices))
 }
 
 /// Lists mapped device names and UUID extensions in Linux `DM_LIST_DEVICES` format.
+#[cfg(ktest)]
 fn list_devices_for_devices<I>(buffer: &mut [u8], devices: I) -> Result<()>
 where
     I: IntoIterator<Item = Arc<DmDevice>>,
 {
+    list_devices_for_snapshots(buffer, QueryWorkflow::devices(devices))
+}
+
+/// Encodes one immutable mapper snapshot sequence as Linux name-list records.
+fn list_devices_for_snapshots(
+    buffer: &mut [u8],
+    devices: impl IntoIterator<Item = DeviceSnapshot>,
+) -> Result<()> {
     let start = data_start(buffer)?;
     let mut cursor = start;
     let mut previous = None;
 
     for device in devices {
-        let name = device.name();
-        let uuid = device.uuid();
-        let name_len = name.len() + 1;
-        let uuid_len = uuid.as_ref().map_or(0, |uuid| uuid.len() + 1);
+        let name_len = device.name.len() + 1;
+        let uuid_len = device.uuid.as_ref().map_or(0, |uuid| uuid.len() + 1);
         let (extension_offset, record_len) = name_list_record_layout(name_len, uuid_len)?;
         if available_from(buffer, cursor) < record_len {
             set_buffer_full(buffer)?;
@@ -851,18 +868,18 @@ where
         if let Some(previous) = previous {
             write_u32(buffer, previous + 8, cursor - previous)?;
         }
-        write_u64(buffer, cursor, device.id().as_encoded_u64())?;
+        write_u64(buffer, cursor, device.id.as_encoded_u64())?;
         write_u32(buffer, cursor + 8, 0)?;
-        write_c_string(buffer, cursor + 12, &name)?;
+        write_c_string(buffer, cursor + 12, &device.name)?;
         let extension = cursor + extension_offset;
-        write_u32(buffer, extension, device.status().event_nr)?;
-        let name_list_flags = if uuid.is_some() {
+        write_u32(buffer, extension, device.status.event_nr)?;
+        let name_list_flags = if device.uuid.is_some() {
             DM_NAME_LIST_FLAG_HAS_UUID
         } else {
             DM_NAME_LIST_FLAG_DOESNT_HAVE_UUID
         };
         write_u32(buffer, extension + 4, name_list_flags)?;
-        if let Some(uuid) = uuid {
+        if let Some(uuid) = device.uuid {
             write_c_string(buffer, extension + 8, &uuid)?;
         }
         previous = Some(cursor);
@@ -982,41 +999,41 @@ fn with_current_device_lifecycle_in_with_policy<T>(
     operation(device)
 }
 
-fn selected_table(device: &DmDevice, flags: u32) -> Option<Arc<DmTable>> {
-    if flags & DM_QUERY_INACTIVE_TABLE_FLAG != 0 {
-        device.inactive_table()
-    } else {
-        device.active_table()
-    }
+fn fill_device_header(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
+    fill_device_header_snapshot(buffer, &QueryWorkflow::device(device))
 }
 
-fn fill_device_header(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
-    let status = device.status();
+/// Encodes ABI-owned header fields from one immutable mapper snapshot.
+fn fill_device_header_snapshot(buffer: &mut [u8], device: &DeviceSnapshot) -> Result<()> {
     let mut flags = DM_EXISTS_FLAG;
-    if status.readonly {
+    if device.status.readonly {
         flags |= DM_READONLY_FLAG;
     }
-    if status.suspended {
+    if device.status.suspended {
         flags |= DM_SUSPEND_FLAG;
     }
-    if status.has_active_table {
+    if device.status.has_active_table {
         flags |= DM_ACTIVE_PRESENT_FLAG;
     }
-    if status.has_inactive_table {
+    if device.status.has_inactive_table {
         flags |= DM_INACTIVE_PRESENT_FLAG;
     }
     write_u32(buffer, OFF_TARGET_COUNT, 0)?;
     write_u32(buffer, OFF_FLAGS, flags)?;
-    write_u32(buffer, OFF_EVENT_NR, status.event_nr)?;
-    write_u64(buffer, OFF_DEV, device.id().as_encoded_u64())?;
+    write_u32(buffer, OFF_EVENT_NR, device.status.event_nr)?;
+    write_u64(buffer, OFF_DEV, device.id.as_encoded_u64())?;
     write_u32(
         buffer,
         OFF_OPEN_COUNT,
-        block_open_count(device.id()).unwrap_or(0),
+        block_open_count(device.id).unwrap_or(0),
     )?;
-    write_c_string_fixed(buffer, OFF_NAME, DM_NAME_LEN, &&device.name())?;
-    let uuid = device.uuid().unwrap_or_default();
-    write_c_string_fixed(buffer, OFF_UUID, DM_UUID_LEN, &uuid)?;
+    write_c_string_fixed(buffer, OFF_NAME, DM_NAME_LEN, &device.name)?;
+    write_c_string_fixed(
+        buffer,
+        OFF_UUID,
+        DM_UUID_LEN,
+        device.uuid.as_deref().unwrap_or(""),
+    )?;
     buffer[DM_IOCTL_FIXED_PREFIX_SIZE..DM_IOCTL_HEADER_SIZE].fill(0);
     Ok(())
 }
@@ -1320,7 +1337,7 @@ mod tests {
         register, unregister,
     };
     use aster_device_mapper::target::{
-        DmTarget, DmTargetBox,
+        DmTarget, DmTargetBox, DmTargetMetadata, TargetIoAction,
         error::ErrorTarget,
         linear::LinearTarget,
         striped::{StripedTarget, StripedTargetParams},
@@ -1335,6 +1352,49 @@ mod tests {
 
     fn boxed<T: DmTarget + 'static>(target: T) -> DmTargetBox {
         Box::new(target)
+    }
+
+    #[derive(Debug)]
+    struct CountingStatusTarget {
+        range: Range<Sid>,
+        status_calls: Arc<Mutex<usize>>,
+    }
+
+    impl CountingStatusTarget {
+        fn new(start: u64, length: u64, status_calls: Arc<Mutex<usize>>) -> Self {
+            Self {
+                range: Sid::new(start)..Sid::new(start + length),
+                status_calls,
+            }
+        }
+    }
+
+    impl DmTarget for CountingStatusTarget {
+        #[cfg(ktest)]
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn metadata(&self) -> DmTargetMetadata {
+            DmTargetMetadata::new("counting", [1, 0, 0])
+        }
+
+        fn logical_range(&self) -> &Range<Sid> {
+            &self.range
+        }
+
+        fn for_each_backing_id(&self, _f: &mut dyn FnMut(DeviceId)) {}
+
+        fn for_each_backing<'a>(&'a self, _f: &mut dyn FnMut(&'a dyn BlockDevice)) {}
+
+        fn status_params(&self, _mode: TargetStatusMode) -> Result<String, TableError> {
+            *self.status_calls.lock() += 1;
+            Ok(String::new())
+        }
+
+        fn map_io_range(&self, _logical: Range<Sid>) -> Option<Vec<TargetIoAction<'_>>> {
+            None
+        }
     }
 
     fn test_buffer(size: usize) -> Vec<u8> {
@@ -1572,6 +1632,102 @@ mod tests {
     }
 
     #[ktest]
+    fn table_record_cursor_remains_stable_after_table_mutation() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-query-snapshot-stable".to_string(), None, None)
+            .unwrap();
+        device.load_table(single_zero_table(8));
+
+        let mut records = QueryWorkflow::table_records(&device, true, TargetStatusMode::Table);
+        device.clear_inactive_table().unwrap();
+        let target = records.next_target().unwrap().unwrap();
+
+        assert!(records.device().status.has_inactive_table);
+        assert_eq!(target.logical_start, 0);
+        assert_eq!(target.length, 8);
+        assert_eq!(target.name, "zero");
+        assert_eq!(target.params, "");
+        assert!(records.next_target().unwrap().is_none());
+    }
+
+    #[ktest]
+    fn remove_unregistration_failure_preserves_device_state() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-remove-unregister-failure".to_string(), None, None)
+            .unwrap();
+        let status_before = device.status();
+        let workflow = ControlWorkflow::new(&manager);
+
+        assert_eq!(
+            with_current_device_lifecycle_in(&manager, &device, |device| {
+                workflow.remove_with_unregistration(device, |_| {
+                    Err(Error::with_message(
+                        Errno::EIO,
+                        "injected unregistration failure",
+                    ))
+                })
+            })
+            .unwrap_err()
+            .error(),
+            Errno::EIO
+        );
+
+        assert!(Arc::ptr_eq(
+            &manager.lookup_name(&device.name()).unwrap(),
+            &device
+        ));
+        assert_eq!(device.status(), status_before);
+    }
+
+    #[ktest]
+    fn remove_detaches_current_device_after_runtime_unregistration() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-remove-detach".to_string(), None, None)
+            .unwrap();
+        let workflow = ControlWorkflow::new(&manager);
+
+        with_current_device_lifecycle_in(&manager, &device, |device| {
+            workflow.remove_with_unregistration(device, |_| Ok(()))
+        })
+        .unwrap();
+
+        assert!(manager.lookup_name(&device.name()).is_none());
+        assert_eq!(device.status().event_nr, 1);
+    }
+
+    #[ktest]
+    fn remove_all_retains_failed_devices_and_continues_snapshot() {
+        let manager = DmManager::new().unwrap();
+        let retained = manager
+            .create("dm-remove-all-retained".to_string(), None, None)
+            .unwrap();
+        let removed = manager
+            .create("dm-remove-all-removed".to_string(), None, None)
+            .unwrap();
+        let workflow = ControlWorkflow::new(&manager);
+        let outcome = workflow.remove_all(
+            RemoveAllRequest::new(vec![retained.clone(), removed.clone()]),
+            |device| {
+                if Arc::ptr_eq(device, &retained) {
+                    Err(Error::with_message(Errno::EBUSY, "injected busy mapper"))
+                } else {
+                    with_current_device_lifecycle_in(&manager, device, |device| {
+                        workflow.remove_with_unregistration(device, |_| Ok(()))
+                    })
+                }
+            },
+        );
+
+        assert_eq!(outcome.attempted, 2);
+        assert_eq!(outcome.removed, 1);
+        assert!(manager.lookup_name(&retained.name()).is_some());
+        assert!(manager.lookup_name(&removed.name()).is_none());
+    }
+
+    #[ktest]
     fn initial_alias_publication_failure_keeps_table_inactive() {
         let manager = DmManager::new().unwrap();
         let device = manager
@@ -1581,13 +1737,14 @@ mod tests {
         device.load_table(table.clone());
 
         assert_eq!(
-            activate_initial_table_and_publish_alias_with(&device, |id, name| {
-                assert_eq!(id, device.id());
-                assert_eq!(name, "dm-initial-alias-failure-test");
-                Err(Error::with_message(Errno::EIO, "injected alias failure"))
-            })
-            .unwrap_err()
-            .error(),
+            MapperRuntimeCoordinator::new(&manager)
+                .activate_initial_with(&device, |id, name| {
+                    assert_eq!(id, device.id());
+                    assert_eq!(name, "dm-initial-alias-failure-test");
+                    Err(Error::with_message(Errno::EIO, "injected alias failure"))
+                })
+                .unwrap_err()
+                .error(),
             Errno::EIO
         );
 
@@ -2008,6 +2165,37 @@ mod tests {
         table_deps_for_device(&mut deps, &device).unwrap();
         assert_eq!(read_u32(&deps, DM_IOCTL_HEADER_SIZE).unwrap(), 0);
         assert_eq!(read_u32(&deps, DM_IOCTL_HEADER_SIZE + 4).unwrap(), 0);
+    }
+
+    #[ktest]
+    fn table_status_stops_materializing_records_at_full_output_buffer() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-table-status-lazy-buffer".to_string(), None, None)
+            .unwrap();
+        let status_calls = Arc::new(Mutex::new(0));
+        device.load_table(Arc::new(
+            DmTable::new_targets(vec![
+                boxed(CountingStatusTarget::new(0, 4, status_calls.clone())),
+                boxed(CountingStatusTarget::new(4, 4, status_calls.clone())),
+            ])
+            .unwrap(),
+        ));
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
+        write_u32(
+            &mut buffer,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG | DM_STATUS_TABLE_FLAG,
+        )
+        .unwrap();
+
+        table_status_for_device(&mut buffer, &device).unwrap();
+
+        assert_eq!(*status_calls.lock(), 1);
+        assert_ne!(
+            read_u32(&buffer, OFF_FLAGS).unwrap() & DM_BUFFER_FULL_FLAG,
+            0
+        );
     }
 
     #[ktest]
@@ -2876,13 +3064,14 @@ mod tests {
             .unwrap();
         let id = device.id();
 
-        rename_device_runtime(&manager, &device, "dm-rename-new", |rename_id, old, new| {
-            assert_eq!(rename_id, id);
-            assert_eq!(old, "dm-rename-old");
-            assert_eq!(new, "dm-rename-new");
-            Ok(())
-        })
-        .unwrap();
+        MapperRuntimeCoordinator::new(&manager)
+            .rename_with(&device, "dm-rename-new", |rename_id, old, new| {
+                assert_eq!(rename_id, id);
+                assert_eq!(old, "dm-rename-old");
+                assert_eq!(new, "dm-rename-new");
+                Ok(())
+            })
+            .unwrap();
 
         assert!(manager.lookup_name("dm-rename-old").is_none());
         assert_eq!(manager.lookup_name("dm-rename-new").unwrap().id(), id);
@@ -2900,12 +3089,13 @@ mod tests {
         let mut called = false;
 
         assert_eq!(
-            rename_device_runtime(&manager, &device, "dm-rename-same", |_, _, _| {
-                called = true;
-                Ok(())
-            })
-            .unwrap_err()
-            .error(),
+            MapperRuntimeCoordinator::new(&manager)
+                .rename_with(&device, "dm-rename-same", |_, _, _| {
+                    called = true;
+                    Ok(())
+                })
+                .unwrap_err()
+                .error(),
             Errno::EBUSY
         );
 
@@ -2933,11 +3123,8 @@ mod tests {
         let id = device.id();
 
         assert_eq!(
-            rename_device_runtime(
-                &manager,
-                &device,
-                "dm-rollback-new",
-                |rename_id, old, new| {
+            MapperRuntimeCoordinator::new(&manager)
+                .rename_with(&device, "dm-rollback-new", |rename_id, old, new| {
                     assert_eq!(rename_id, id);
                     assert_eq!(old, "dm-rollback-old");
                     assert_eq!(new, "dm-rollback-new");
@@ -2962,10 +3149,9 @@ mod tests {
                         Errno::EEXIST,
                         "mapper alias already exists",
                     ))
-                }
-            )
-            .unwrap_err()
-            .error(),
+                })
+                .unwrap_err()
+                .error(),
             Errno::EEXIST
         );
 
@@ -4367,6 +4553,13 @@ mod tests {
             );
         }
         assert_eq!(decode_command(0).unwrap_err().error(), Errno::ENOTTY);
+        assert_eq!(command_name(DM_VERSION_CMD), "DM_VERSION");
+        assert_eq!(command_name(DM_TABLE_LOAD_CMD), "DM_TABLE_LOAD");
+        assert_eq!(
+            command_name(DM_GET_TARGET_VERSION_CMD),
+            "DM_GET_TARGET_VERSION"
+        );
+        assert_eq!(command_name(0xff), "DM_UNKNOWN");
         assert_eq!(align_up(313, 8).unwrap(), 320);
     }
 

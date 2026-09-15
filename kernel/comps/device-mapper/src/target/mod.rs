@@ -195,13 +195,80 @@ const LINEAR_METADATA: DmTargetMetadata = DmTargetMetadata::new("linear", [1, 4,
 const STRIPED_METADATA: DmTargetMetadata = DmTargetMetadata::new("striped", [1, 6, 0]);
 const ZERO_METADATA: DmTargetMetadata = DmTargetMetadata::new("zero", [1, 1, 0]);
 
-/// Ordered list of target types currently accepted by table-load and version ioctls.
-pub const SUPPORTED_TARGETS: &[DmTargetMetadata] = &[
-    ERROR_METADATA,
-    LINEAR_METADATA,
-    STRIPED_METADATA,
-    ZERO_METADATA,
+/// Parser implementation selected by one static target-catalogue entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetKind {
+    Error,
+    Linear,
+    Striped,
+    Zero,
+}
+
+/// One Linux-visible target declaration and its parser implementation.
+///
+/// The catalogue is the single source for discovery order, target-version records,
+/// name lookup, and parser selection. Target implementations retain their own
+/// parameter and backing-resolution rules.
+#[derive(Clone, Copy, Debug)]
+pub struct TargetCatalogEntry {
+    metadata: DmTargetMetadata,
+    kind: TargetKind,
+}
+
+impl TargetCatalogEntry {
+    const fn new(metadata: DmTargetMetadata, kind: TargetKind) -> Self {
+        Self { metadata, kind }
+    }
+
+    /// Returns the Linux target type name used by table-load and version ioctls.
+    pub fn name(&self) -> &'static str {
+        self.metadata.name()
+    }
+
+    /// Returns the Linux target-version triplet in catalogue order.
+    pub fn version(&self) -> [u32; 3] {
+        self.metadata.version()
+    }
+}
+
+/// Ordered target declarations currently accepted by table-load and version ioctls.
+pub const TARGET_CATALOG: &[TargetCatalogEntry] = &[
+    TargetCatalogEntry::new(ERROR_METADATA, TargetKind::Error),
+    TargetCatalogEntry::new(LINEAR_METADATA, TargetKind::Linear),
+    TargetCatalogEntry::new(STRIPED_METADATA, TargetKind::Striped),
+    TargetCatalogEntry::new(ZERO_METADATA, TargetKind::Zero),
 ];
+
+impl TargetKind {
+    /// Parses one target while preserving caller-owned backing token and lease hooks.
+    fn parse_with<E>(
+        self,
+        logical_start: Sid,
+        length: u64,
+        params: &str,
+        parse_backing: &mut impl FnMut(&str) -> Result<DeviceId, E>,
+        resolve_backing: &mut impl FnMut(DeviceId) -> Result<BlockDeviceLease, E>,
+    ) -> Result<DmTargetBox, DmTargetParseError<E>> {
+        match self {
+            Self::Error => Ok(Box::new(ErrorTarget::parse(logical_start, length, params)?)),
+            Self::Linear => Ok(Box::new(LinearTarget::parse_with(
+                logical_start,
+                length,
+                params,
+                parse_backing,
+                resolve_backing,
+            )?)),
+            Self::Striped => Ok(Box::new(StripedTarget::parse_with(
+                logical_start,
+                length,
+                params,
+                parse_backing,
+                resolve_backing,
+            )?)),
+            Self::Zero => Ok(Box::new(ZeroTarget::parse(logical_start, length, params)?)),
+        }
+    }
+}
 
 /// Error boundary between target semantics and environment-specific backing lookup.
 #[derive(Debug, Eq, PartialEq)]
@@ -229,25 +296,17 @@ pub fn parse_target_with<E>(
     parse_backing: &mut impl FnMut(&str) -> Result<DeviceId, E>,
     resolve_backing: &mut impl FnMut(DeviceId) -> Result<BlockDeviceLease, E>,
 ) -> Result<DmTargetBox, DmTargetParseError<E>> {
-    match target_type {
-        "error" => Ok(Box::new(ErrorTarget::parse(logical_start, length, params)?)),
-        "linear" => Ok(Box::new(LinearTarget::parse_with(
-            logical_start,
-            length,
-            params,
-            parse_backing,
-            resolve_backing,
-        )?)),
-        "striped" => Ok(Box::new(StripedTarget::parse_with(
-            logical_start,
-            length,
-            params,
-            parse_backing,
-            resolve_backing,
-        )?)),
-        "zero" => Ok(Box::new(ZeroTarget::parse(logical_start, length, params)?)),
-        _ => Err(DmTargetParseError::UnsupportedTarget),
-    }
+    let entry = TARGET_CATALOG
+        .iter()
+        .find(|entry| entry.name() == target_type)
+        .ok_or(DmTargetParseError::UnsupportedTarget)?;
+    entry.kind.parse_with(
+        logical_start,
+        length,
+        params,
+        parse_backing,
+        resolve_backing,
+    )
 }
 
 #[cfg(ktest)]
@@ -299,6 +358,23 @@ mod tests {
 
     fn backing(minor: u32) -> BlockDeviceLease {
         BlockDeviceLease::new_untracked(TestBlockDevice::new(minor))
+    }
+
+    #[ktest]
+    fn target_catalogue_preserves_linux_discovery_order() {
+        let entries = TARGET_CATALOG
+            .iter()
+            .map(|entry| (entry.name(), entry.version()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![
+                ("error", [1, 6, 0]),
+                ("linear", [1, 4, 0]),
+                ("striped", [1, 6, 0]),
+                ("zero", [1, 1, 0]),
+            ]
+        );
     }
 
     #[ktest]

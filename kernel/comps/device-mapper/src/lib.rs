@@ -12,6 +12,13 @@
 
 extern crate alloc;
 
+// Set this crate's log prefix for `ostd::log`.
+macro_rules! __log_prefix {
+    () => {
+        "device-mapper: "
+    };
+}
+
 mod device;
 mod manager;
 mod table;

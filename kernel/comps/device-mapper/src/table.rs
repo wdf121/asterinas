@@ -139,11 +139,17 @@ impl DmTable {
     }
 
     /// Maps one non-flush BIO into child actions, preserving one completion for the caller.
-    pub fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+    pub fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
         if bio.type_() == BioType::Flush {
             return self.enqueue_flush(bio);
         }
 
+        let plan = self.plan_normal_io(&bio)?;
+        Self::execute_normal_io(bio, plan)
+    }
+
+    /// Builds a non-flush mapping plan without changing the submitted BIO.
+    fn plan_normal_io(&self, bio: &SubmittedBio) -> Result<NormalIoPlan<'_>, BioEnqueueError> {
         let range = bio.sid_range();
         let length = range
             .end
@@ -155,8 +161,19 @@ impl DmTable {
             .to_raw()
             .checked_add(length)
             .ok_or(BioEnqueueError::Refused)?;
+        let mut parts = Vec::new();
+        for (range, target) in self.bio_parts(range.start, logical_end)? {
+            parts.extend(target.map_io_range(range).ok_or(BioEnqueueError::Refused)?);
+        }
+        Ok(NormalIoPlan { parts })
+    }
 
-        let parts = self.mapped_bio_parts(range.start, logical_end)?;
+    /// Executes one completed normal-I/O plan and aggregates split child completion.
+    fn execute_normal_io(
+        mut bio: SubmittedBio,
+        plan: NormalIoPlan<'_>,
+    ) -> Result<(), BioEnqueueError> {
+        let parts = plan.parts;
         if parts.len() == 1 {
             let part = parts.into_iter().next().unwrap();
             match part {
@@ -207,19 +224,6 @@ impl DmTable {
             }
         }
         Ok(())
-    }
-
-    /// Converts a logical BIO range into child actions after target-local mapping.
-    fn mapped_bio_parts(
-        &self,
-        start: Sid,
-        end: u64,
-    ) -> Result<Vec<TargetIoAction<'_>>, BioEnqueueError> {
-        let mut mapped_parts = Vec::new();
-        for (range, target) in self.bio_parts(start, end)? {
-            mapped_parts.extend(target.map_io_range(range).ok_or(BioEnqueueError::Refused)?);
-        }
-        Ok(mapped_parts)
     }
 
     /// Splits a logical range at DM target boundaries before target-local remapping.
@@ -296,6 +300,15 @@ impl DmTable {
         }
         Ok(())
     }
+}
+
+/// Borrowed target actions for one normal BIO before child submission begins.
+///
+/// The plan is intentionally scoped to `DmTable::enqueue`: each action borrows a
+/// table-owned target and backing lease, so it cannot outlive the table generation
+/// already retained by `DmDevice` until the original BIO completes.
+struct NormalIoPlan<'a> {
+    parts: Vec<TargetIoAction<'a>>,
 }
 
 /// Completes a BIO for the `zero` target without submitting backing I/O.
@@ -529,7 +542,10 @@ mod tests {
         }
 
         fn complete_pending(&self, index: usize) {
-            self.pending.lock().remove(index).complete(BioStatus::Complete);
+            self.pending
+                .lock()
+                .remove(index)
+                .complete(BioStatus::Complete);
         }
     }
 
@@ -1140,6 +1156,39 @@ mod tests {
     }
 
     #[ktest]
+    fn normal_io_plan_splits_at_target_boundaries_before_execution() {
+        let backing = RecordingBlockDevice::new(1);
+        let table = DmTable::new_targets(vec![
+            boxed(
+                LinearTarget::new(
+                    Sid::new(0),
+                    4,
+                    Sid::new(100),
+                    BlockDeviceLease::new_untracked(backing as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+            ),
+            boxed(ErrorTarget::new(Sid::new(4), 4).unwrap()),
+        ])
+        .unwrap();
+        let bio = Bio::new(
+            BioType::Write,
+            Sid::new(0),
+            vec![BioSegment::alloc(1, BioDirection::ToDevice)],
+            None,
+        )
+        .submit_for_test();
+
+        let plan = table.plan_normal_io(&bio).unwrap();
+
+        assert_eq!(plan.parts.len(), 2);
+        assert_eq!(plan.parts[0].logical_range(), &(Sid::new(0)..Sid::new(4)));
+        assert_eq!(plan.parts[1].logical_range(), &(Sid::new(4)..Sid::new(8)));
+        assert!(matches!(&plan.parts[0], TargetIoAction::Remap { .. }));
+        assert!(matches!(&plan.parts[1], TargetIoAction::Error { .. }));
+    }
+
+    #[ktest]
     fn split_bio_across_linear_and_error_targets_reports_io_error() {
         let backing = RecordingBlockDevice::new(1);
         let table = Arc::new(
@@ -1309,7 +1358,9 @@ mod tests {
             BioType::Write,
             Sid::new(2),
             vec![BioSegment::alloc_exact(2, 12 * 512, BioDirection::ToDevice)],
-            Some(Box::new(move |status| *callback_status.lock() = Some(status))),
+            Some(Box::new(move |status| {
+                *callback_status.lock() = Some(status)
+            })),
         );
 
         table.enqueue(write.submit_for_test()).unwrap();
@@ -1322,8 +1373,14 @@ mod tests {
             *second.submitted_ranges.lock(),
             vec![Sid::new(0)..Sid::new(4), Sid::new(4)..Sid::new(6)]
         );
-        assert_eq!(*first.submitted_types.lock(), vec![BioType::Write, BioType::Write]);
-        assert_eq!(*second.submitted_types.lock(), vec![BioType::Write, BioType::Write]);
+        assert_eq!(
+            *first.submitted_types.lock(),
+            vec![BioType::Write, BioType::Write]
+        );
+        assert_eq!(
+            *second.submitted_types.lock(),
+            vec![BioType::Write, BioType::Write]
+        );
         assert_eq!(*first.submitted_lengths.lock(), vec![2 * 512, 4 * 512]);
         assert_eq!(*second.submitted_lengths.lock(), vec![4 * 512, 2 * 512]);
         assert_eq!(*completion_status.lock(), None);
