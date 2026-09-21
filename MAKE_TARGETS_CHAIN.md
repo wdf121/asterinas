@@ -142,23 +142,9 @@ CARGO_OSDK_TEST_ARGS :=
 --grub-boot-protocol=multiboot2
 ```
 
-`ENABLE_KVM` 的默认值由 `tools/qemu_args.sh` 提供；QEMU acceleration 参数也由该脚本统一组织。
+`ENABLE_KVM` 的默认值由 `tools/qemu_args.sh` 提供；QEMU acceleration 参数也由该脚本直接写入其生成的参数列表。根 Makefile 和 NixOS runner 不再额外追加 `-accel kvm`。
 
-```text
---qemu-args="-accel kvm"
-```
-
-默认情况下，`make kernel` / `make run_kernel` 里的 OSDK 参数大致是：
-
-```text
---kcmd-args="loglevel=error"
---kcmd-args="earlycon"
---kcmd-args="console=hvc0"
---release
---boot-method="grub-rescue-iso"
---grub-boot-protocol=multiboot2
---qemu-args="-accel kvm"
-```
+`--qemu-args` 不由根 Makefile额外追加；OSDK 会读取根 `OSDK.toml` 的 `[qemu].args = "$(./tools/qemu_args.sh normal)"`。默认 x86_64 且 `ENABLE_KVM=1` 时，该脚本生成的参数中包含 `-accel kvm`。
 
 ### 3.2 release / release-lto 对栈大小的影响
 
@@ -535,11 +521,10 @@ cd kernel && cargo osdk build \
   --kcmd-args="console=hvc0" \
   --release \
   --boot-method="grub-rescue-iso" \
-  --grub-boot-protocol=multiboot2 \
-  --qemu-args="-accel kvm"
+  --grub-boot-protocol=multiboot2
 ```
 
-注意：这是 Makefile 拼出来的 OSDK CLI 参数；OSDK 内部还会读取根 `OSDK.toml`，拿到默认 boot/grub/qemu 配置。
+注意：这是 Makefile 拼出来的 OSDK CLI 参数；OSDK 内部还会读取根 `OSDK.toml`，其中 `[qemu].args` 调用 `tools/qemu_args.sh normal`。默认 KVM acceleration 因此来自该脚本，不是额外的 `--qemu-args` CLI 参数。
 
 ### 6.4 主要产物
 
@@ -609,11 +594,10 @@ cd kernel && cargo osdk run \
   --kcmd-args="console=hvc0" \
   --release \
   --boot-method="grub-rescue-iso" \
-  --grub-boot-protocol=multiboot2 \
-  --qemu-args="-accel kvm"
+  --grub-boot-protocol=multiboot2
 ```
 
-然后 `cargo-osdk` 会进一步展开为 QEMU 运行。
+然后 `cargo-osdk` 会读取 `OSDK.toml`，由其中调用的 `tools/qemu_args.sh normal` 生成 QEMU 参数并启动 QEMU。
 
 ### 7.4 QEMU 参数来源
 
@@ -662,13 +646,13 @@ log_file = "qemu-serial.log"
 -bios /root/ovmf/release/OVMF.fd
 ```
 
-再加上根 Makefile 传给 OSDK 的：
+`tools/qemu_args.sh normal` 生成的参数本身已经包含由 `ENABLE_KVM` 控制的 acceleration。默认 `ENABLE_KVM=1` 时，其中包含：
 
 ```text
---qemu-args="-accel kvm"
+-accel kvm
 ```
 
-最终 QEMU 会启用 KVM。
+根 Makefile 不再通过单独的 `--qemu-args` 重复追加。
 
 ### 7.5 日志文件
 
@@ -846,7 +830,7 @@ make run_iso
     ├── 加入 ISO cdrom 启动参数
     ├── 加入 NixOS 安装目标盘参数
     ├── 加入 Device Mapper 测试盘参数
-    ├── 根据 ENABLE_KVM 决定是否追加 -accel kvm
+    ├── tools/qemu_args.sh 已按 ENABLE_KVM 生成 acceleration 参数
     └── 执行 qemu-system-x86_64 ${QEMU_ARGS}
 ```
 
@@ -1080,7 +1064,7 @@ make run_nixos
     ├── 加入 NixOS 根磁盘 target/nixos/asterinas.img
     ├── 加入 Device Mapper 测试盘 target/nixos/test.img
     ├── 如果 DM_TEST_IMAGE_2 非空，再加入第二块测试盘
-    ├── 如果 ENABLE_KVM=1，追加 -accel kvm
+    ├── tools/qemu_args.sh 已按 ENABLE_KVM 生成 acceleration 参数
     └── 执行 qemu-system-x86_64 ${QEMU_ARGS}
 ```
 
@@ -1606,7 +1590,7 @@ target/nixos/test.img
 
 ### 15.7 `ENABLE_KVM=1` 默认打开
 
-默认 x86_64 下会追加：
+默认 x86_64 下，`tools/qemu_args.sh` 会在 `ENABLE_KVM=1` 时生成：
 
 ```text
 -accel kvm
