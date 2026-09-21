@@ -521,6 +521,30 @@ mod tests {
     }
 
     #[ktest]
+    fn releases_persistent_minor_after_last_device_reference_drops() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-persistent-minor".to_string(), None, Some(7))
+            .unwrap();
+        let removed = manager.remove("dm-persistent-minor").unwrap();
+
+        assert_eq!(
+            manager
+                .create("dm-persistent-minor-retry".to_string(), None, Some(7))
+                .unwrap_err(),
+            DmError::MinorBusy
+        );
+
+        drop(device);
+        drop(removed);
+        assert!(
+            manager
+                .create("dm-persistent-minor-retry".to_string(), None, Some(7))
+                .is_ok()
+        );
+    }
+
+    #[ktest]
     fn keeps_device_ids_owned_until_last_device_reference_drops() {
         let manager = DmManager::new().unwrap();
         let major = manager.major();

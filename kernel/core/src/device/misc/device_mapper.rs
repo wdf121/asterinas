@@ -8,6 +8,7 @@
 //! block-device IDs, and delegates target semantics to `aster-device-mapper`.
 
 use alloc::vec;
+use core::fmt::{Display, Formatter};
 
 use aster_block::{BlockDevice, BlockDeviceLease, id::Sid, lookup_lease};
 use aster_device_mapper::{
@@ -47,6 +48,20 @@ use crate::{
 };
 
 const DM_CONTROL_MINOR: u32 = 236;
+
+/// Formats one Linux block-device identity as its user-visible major:minor pair.
+struct DeviceIdLogLabel(DeviceId);
+
+impl Display for DeviceIdLogLabel {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(
+            formatter,
+            "{}:{}",
+            self.0.major().get(),
+            self.0.minor().get()
+        )
+    }
+}
 const DM_IOCTL_MAGIC: u32 = 0xfd;
 // The variable data member of `struct dm_ioctl` starts at byte 305 in the C
 // layout, but `sizeof(struct dm_ioctl)` is extended to 312 by `u64` alignment.
@@ -214,7 +229,7 @@ impl PerOpenFileOps for DmControlFile {
         let command = decode_command(raw_cmd)?;
         let command_name = command_name(command);
         ostd::error!(
-            "[dm-debug] ioctl begin command={} raw=0x{:08x}",
+            "[dm-debug] ioctl begin command={} raw_ioctl=0x{:08x}",
             command_name,
             raw_cmd
         );
@@ -230,7 +245,7 @@ impl PerOpenFileOps for DmControlFile {
             let target_count = read_u32(&header, OFF_TARGET_COUNT)?;
             let flags = read_u32(&header, OFF_FLAGS)?;
             ostd::error!(
-                "[dm-debug] ioctl header command={} name={} dev=0x{:x} flags=0x{:x} targets={} data_size={} data_start={}",
+                "[dm-debug] ioctl header command={} name={} encoded_dev=0x{:016x} flags=0x{:08x} targets={} data_size_bytes={} data_start_bytes={}",
                 command_name,
                 name_in.as_deref().unwrap_or("-"),
                 dev_in,
@@ -250,7 +265,13 @@ impl PerOpenFileOps for DmControlFile {
             let secure_data = flags & DM_SECURE_DATA_FLAG != 0;
             let command_result = version_result
                 .and_then(|_| validate_input_flags(command, &buffer))
-                .and_then(|_| handle_command(command, &mut buffer));
+                .and_then(|_| {
+                    if command == DM_DEV_WAIT_CMD {
+                        device_wait(&mut buffer)
+                    } else {
+                        handle_command(command, &mut buffer)
+                    }
+                });
             let write_result = current_userspace!().write_bytes(raw_ioctl.arg(), &buffer);
             let result = match command_result {
                 Ok(()) => {
@@ -431,9 +452,9 @@ fn create_device(buffer: &mut [u8]) -> Result<()> {
     };
     let device = ControlWorkflow::new(manager()).create(request)?;
     ostd::error!(
-        "[dm-debug] control create committed name={} id={:?} readonly={} requested_minor={:?}",
+        "[dm-debug] control create committed name={} dev={} readonly={} requested_minor={:?}",
         device.name(),
-        device.id(),
+        DeviceIdLogLabel(device.id()),
         readonly,
         requested_minor
     );
@@ -447,9 +468,9 @@ fn remove_device(buffer: &mut [u8]) -> Result<()> {
     with_current_device_lifecycle_allow_isolated(&device, |device| {
         workflow.remove(device)?;
         ostd::error!(
-            "[dm-debug] control remove committed name={} id={:?}",
+            "[dm-debug] control remove committed name={} dev={}",
             device.name(),
-            device.id()
+            DeviceIdLogLabel(device.id())
         );
         clear_device_header(buffer)
     })
@@ -486,8 +507,15 @@ fn device_status_for_device(buffer: &mut [u8], device: &DmDevice) -> Result<()> 
 
 fn device_wait(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_device(buffer)?;
-    wait_for_device_event(buffer, &device)?;
+    wait_for_device_event(buffer, &device).map_err(restart_interrupted_wait)?;
     with_current_device_lifecycle(&device, |device| fill_device_header(buffer, device))
+}
+
+fn restart_interrupted_wait(error: Error) -> Error {
+    match error.error() {
+        Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+        _ => error,
+    }
 }
 
 #[cfg(ktest)]
@@ -524,10 +552,10 @@ fn device_rename(buffer: &mut [u8]) -> Result<()> {
         workflow.rename(device, &request)?;
         device.notify_event();
         ostd::error!(
-            "[dm-debug] control rename committed kind={} name={} id={:?}",
+            "[dm-debug] control rename committed kind={} name={} dev={}",
             kind,
             device.name(),
-            device.id()
+            DeviceIdLogLabel(device.id())
         );
         fill_device_header(buffer, device)
     })
@@ -540,9 +568,9 @@ fn table_load(buffer: &mut [u8]) -> Result<()> {
     with_current_device_lifecycle(&device, |device| {
         table_load_for_device(buffer, device)?;
         ostd::error!(
-            "[dm-debug] control table-load committed name={} id={:?} targets={} readonly={} primary_registered={}",
+            "[dm-debug] control table-load committed name={} dev={} targets={} readonly={} primary_registered={}",
             device.name(),
-            device.id(),
+            DeviceIdLogLabel(device.id()),
             target_count,
             readonly,
             MapperRuntimeCoordinator::new(manager()).is_registered(device)
@@ -634,20 +662,20 @@ fn device_suspend(buffer: &mut [u8]) -> Result<()> {
     with_current_device_lifecycle(&device, |device| {
         match workflow.transition(device, request)? {
             LifecycleOutcome::Suspended { noflush } => ostd::error!(
-                "[dm-debug] control suspend committed name={} id={:?} noflush={}",
+                "[dm-debug] control suspend committed name={} dev={} noflush={}",
                 device.name(),
-                device.id(),
+                DeviceIdLogLabel(device.id()),
                 noflush
             ),
             LifecycleOutcome::Resumed { initial: true } => ostd::error!(
-                "[dm-debug] control resume committed name={} id={:?} initial=true alias_published=true",
+                "[dm-debug] control resume committed name={} dev={} initial=true alias_published=true",
                 device.name(),
-                device.id()
+                DeviceIdLogLabel(device.id())
             ),
             LifecycleOutcome::Resumed { initial: false } => ostd::error!(
-                "[dm-debug] control resume committed name={} id={:?} initial=false",
+                "[dm-debug] control resume committed name={} dev={} initial=false",
                 device.name(),
-                device.id()
+                DeviceIdLogLabel(device.id())
             ),
         }
         fill_device_header(buffer, device)
@@ -762,7 +790,7 @@ fn log_target_version_record(
     record_len: usize,
 ) {
     ostd::error!(
-        "[dm-debug] {} record offset={} next={} version={}.{}.{} name={} record_len={}",
+        "[dm-debug] {} record offset_bytes={} next_bytes={} version={}.{}.{} name={} record_len_bytes={}",
         operation,
         offset,
         next,
@@ -2769,14 +2797,78 @@ mod tests {
             .create("dm-device-status-test".to_string(), None, None)
             .unwrap();
 
-        let mut fresh_status = test_buffer(DM_IOCTL_HEADER_SIZE);
-        device_status_for_device(&mut fresh_status, &device).unwrap();
-        assert_eq!(read_u32(&fresh_status, OFF_TARGET_COUNT).unwrap(), 0);
-        assert_eq!(read_u32(&fresh_status, OFF_FLAGS).unwrap(), DM_EXISTS_FLAG);
+        let mut fresh_active = test_buffer(DM_IOCTL_HEADER_SIZE);
+        device_status_for_device(&mut fresh_active, &device).unwrap();
+        assert_eq!(read_u32(&fresh_active, OFF_TARGET_COUNT).unwrap(), 0);
+        assert_eq!(read_u32(&fresh_active, OFF_FLAGS).unwrap(), DM_EXISTS_FLAG);
+
+        let mut fresh_inactive = test_buffer(DM_IOCTL_HEADER_SIZE);
+        write_u32(&mut fresh_inactive, OFF_FLAGS, DM_QUERY_INACTIVE_TABLE_FLAG).unwrap();
+        device_status_for_device(&mut fresh_inactive, &device).unwrap();
+        assert_eq!(read_u32(&fresh_inactive, OFF_TARGET_COUNT).unwrap(), 0);
+        assert_eq!(
+            read_u32(&fresh_inactive, OFF_FLAGS).unwrap(),
+            DM_EXISTS_FLAG
+        );
+
+        let first = status_backing_lease(1);
+        let second = status_backing_lease(2);
+        let table = DmTable::new_linear(vec![
+            LinearTarget::new(Sid::new(0), 4, Sid::new(100), first).unwrap(),
+            LinearTarget::new(Sid::new(4), 4, Sid::new(200), second).unwrap(),
+        ])
+        .unwrap();
+        device.load_table(Arc::new(table));
+
+        let mut loaded_active = test_buffer(DM_IOCTL_HEADER_SIZE);
+        device_status_for_device(&mut loaded_active, &device).unwrap();
+        assert_eq!(read_u32(&loaded_active, OFF_TARGET_COUNT).unwrap(), 0);
+        assert_eq!(
+            read_u32(&loaded_active, OFF_FLAGS).unwrap(),
+            DM_EXISTS_FLAG | DM_INACTIVE_PRESENT_FLAG
+        );
+
+        let mut loaded_inactive = test_buffer(DM_IOCTL_HEADER_SIZE);
+        write_u32(
+            &mut loaded_inactive,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG,
+        )
+        .unwrap();
+        device_status_for_device(&mut loaded_inactive, &device).unwrap();
+        assert_eq!(read_u32(&loaded_inactive, OFF_TARGET_COUNT).unwrap(), 2);
+        assert_eq!(
+            read_u32(&loaded_inactive, OFF_FLAGS).unwrap(),
+            DM_EXISTS_FLAG | DM_INACTIVE_PRESENT_FLAG
+        );
+
+        device.resume().unwrap();
+
+        let mut resumed_active = test_buffer(DM_IOCTL_HEADER_SIZE);
+        device_status_for_device(&mut resumed_active, &device).unwrap();
+        assert_eq!(read_u32(&resumed_active, OFF_TARGET_COUNT).unwrap(), 2);
+        assert_eq!(
+            read_u32(&resumed_active, OFF_FLAGS).unwrap(),
+            DM_EXISTS_FLAG | DM_ACTIVE_PRESENT_FLAG
+        );
+
+        let mut resumed_inactive = test_buffer(DM_IOCTL_HEADER_SIZE);
+        write_u32(
+            &mut resumed_inactive,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG,
+        )
+        .unwrap();
+        device_status_for_device(&mut resumed_inactive, &device).unwrap();
+        assert_eq!(read_u32(&resumed_inactive, OFF_TARGET_COUNT).unwrap(), 0);
+        assert_eq!(
+            read_u32(&resumed_inactive, OFF_FLAGS).unwrap(),
+            DM_EXISTS_FLAG | DM_ACTIVE_PRESENT_FLAG
+        );
     }
 
     #[ktest]
-    fn resume_ioctl_activates_inactive_table_for_active_queries() {
+    fn resume_transition_activates_inactive_table_for_active_queries() {
         let manager = DmManager::new().unwrap();
         let device = manager
             .create("dm-resume-activates-table-test".to_string(), None, None)
@@ -2818,7 +2910,7 @@ mod tests {
     }
 
     #[ktest]
-    fn resume_ioctl_replaces_active_table_while_running() {
+    fn resume_transition_replaces_active_table_while_running() {
         let manager = DmManager::new().unwrap();
         let device = manager
             .create("dm-resume-replaces-table-test".to_string(), None, None)
@@ -3049,6 +3141,126 @@ mod tests {
         assert_eq!(
             required_c_string(&uuid_wait, OFF_UUID, DM_UUID_LEN, "UUID").unwrap(),
             "dm-wait-rename-uuid-new"
+        );
+    }
+
+    #[ktest]
+    fn blocking_device_wait_returns_updated_header_after_rename_and_setuuid() {
+        DM_MANAGER.call_once(|| DmManager::new().unwrap());
+        let device = manager()
+            .create(
+                "dm-blocking-wait-old".to_string(),
+                Some("dm-blocking-wait-uuid-old".to_string()),
+                None,
+            )
+            .unwrap();
+        let id = device.id();
+        let first_started = Arc::new(Mutex::new(false));
+        let first_finished = Arc::new(Mutex::new(false));
+        let first_header = Arc::new(Mutex::new(None));
+        {
+            let first_started = first_started.clone();
+            let first_finished = first_finished.clone();
+            let first_header = first_header.clone();
+            TaskOptions::new(move || {
+                let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
+                write_u64(&mut buffer, OFF_DEV, id.as_encoded_u64()).unwrap();
+                write_u32(&mut buffer, OFF_EVENT_NR, 0).unwrap();
+                *first_started.lock() = true;
+                device_wait(&mut buffer).unwrap();
+                *first_header.lock() = Some(buffer);
+                *first_finished.lock() = true;
+            })
+            .spawn()
+            .unwrap();
+        }
+        while !*first_started.lock() {
+            Task::yield_now();
+        }
+        Task::yield_now();
+        assert!(!*first_finished.lock());
+
+        let mut rename = test_buffer(DM_IOCTL_HEADER_SIZE + 32);
+        write_u64(&mut rename, OFF_DEV, id.as_encoded_u64()).unwrap();
+        write_c_string(&mut rename, DM_IOCTL_HEADER_SIZE, "dm-blocking-wait-new").unwrap();
+        device_rename(&mut rename).unwrap();
+
+        while !*first_finished.lock() {
+            Task::yield_now();
+        }
+        let first_header = first_header.lock().take().unwrap();
+        assert_eq!(read_u32(&first_header, OFF_EVENT_NR).unwrap(), 1);
+        assert_eq!(
+            required_c_string(&first_header, OFF_NAME, DM_NAME_LEN, "名称").unwrap(),
+            "dm-blocking-wait-new"
+        );
+        assert_eq!(
+            required_c_string(&first_header, OFF_UUID, DM_UUID_LEN, "UUID").unwrap(),
+            "dm-blocking-wait-uuid-old"
+        );
+
+        let second_started = Arc::new(Mutex::new(false));
+        let second_finished = Arc::new(Mutex::new(false));
+        let second_header = Arc::new(Mutex::new(None));
+        {
+            let second_started = second_started.clone();
+            let second_finished = second_finished.clone();
+            let second_header = second_header.clone();
+            TaskOptions::new(move || {
+                let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
+                write_u64(&mut buffer, OFF_DEV, id.as_encoded_u64()).unwrap();
+                write_u32(&mut buffer, OFF_EVENT_NR, 1).unwrap();
+                *second_started.lock() = true;
+                device_wait(&mut buffer).unwrap();
+                *second_header.lock() = Some(buffer);
+                *second_finished.lock() = true;
+            })
+            .spawn()
+            .unwrap();
+        }
+        while !*second_started.lock() {
+            Task::yield_now();
+        }
+        Task::yield_now();
+        assert!(!*second_finished.lock());
+
+        let mut set_uuid = test_buffer(DM_IOCTL_HEADER_SIZE + 32);
+        write_u32(&mut set_uuid, OFF_FLAGS, DM_UUID_FLAG).unwrap();
+        write_u64(&mut set_uuid, OFF_DEV, id.as_encoded_u64()).unwrap();
+        write_c_string(
+            &mut set_uuid,
+            DM_IOCTL_HEADER_SIZE,
+            "dm-blocking-wait-uuid-new",
+        )
+        .unwrap();
+        device_rename(&mut set_uuid).unwrap();
+
+        while !*second_finished.lock() {
+            Task::yield_now();
+        }
+        let second_header = second_header.lock().take().unwrap();
+        assert_eq!(read_u32(&second_header, OFF_EVENT_NR).unwrap(), 2);
+        assert_eq!(
+            required_c_string(&second_header, OFF_NAME, DM_NAME_LEN, "名称").unwrap(),
+            "dm-blocking-wait-new"
+        );
+        assert_eq!(
+            required_c_string(&second_header, OFF_UUID, DM_UUID_LEN, "UUID").unwrap(),
+            "dm-blocking-wait-uuid-new"
+        );
+
+        manager().remove("dm-blocking-wait-new").unwrap();
+    }
+
+    #[ktest]
+    fn device_wait_maps_interrupt_to_restartsys() {
+        assert_eq!(
+            restart_interrupted_wait(Error::new(Errno::EINTR)).error(),
+            Errno::ERESTARTSYS
+        );
+        assert_eq!(
+            restart_interrupted_wait(Error::new(Errno::ENXIO)).error(),
+            Errno::ENXIO
         );
     }
 
@@ -3375,7 +3587,7 @@ mod tests {
     }
 
     #[ktest]
-    fn loads_single_error_target_through_ioctl() {
+    fn loads_single_error_target_through_table_load_facade() {
         let manager = DmManager::new().unwrap();
         let device = manager
             .create("dm-error-load-test".to_string(), None, None)
@@ -3394,7 +3606,7 @@ mod tests {
     }
 
     #[ktest]
-    fn loads_single_zero_target_through_ioctl() {
+    fn loads_single_zero_target_through_table_load_facade() {
         let manager = DmManager::new().unwrap();
         let device = manager
             .create("dm-zero-load-test".to_string(), None, None)
@@ -3473,6 +3685,211 @@ mod tests {
     }
 
     #[ktest]
+    fn inactive_table_lease_follows_replacement_and_clear() {
+        let first = StatusBacking::new_with_major(510, 246);
+        let second = StatusBacking::new_with_major(510, 247);
+        let first_id = first.id();
+        let second_id = second.id();
+        register(first as Arc<dyn BlockDevice>).unwrap();
+        register(second as Arc<dyn BlockDevice>).unwrap();
+
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-inactive-lease-lifecycle-test".to_string(), None, None)
+            .unwrap();
+
+        let first_params = "510:246 0";
+        let mut first_load = test_buffer(
+            DM_IOCTL_HEADER_SIZE + table_status_record_len(first_params.len()).unwrap(),
+        );
+        write_u32(&mut first_load, OFF_TARGET_COUNT, 1).unwrap();
+        write_linear_target_spec(&mut first_load, DM_IOCTL_HEADER_SIZE, 0, 4, 0, first_params);
+        table_load_for_test(&mut first_load, &device).unwrap();
+
+        assert!(!device.status().has_active_table);
+        assert!(device.status().has_inactive_table);
+        assert_eq!(unregister(first_id).unwrap_err(), aster_block::Error::Busy);
+
+        let second_params = "510:247 0";
+        let mut second_load = test_buffer(
+            DM_IOCTL_HEADER_SIZE + table_status_record_len(second_params.len()).unwrap(),
+        );
+        write_u32(&mut second_load, OFF_TARGET_COUNT, 1).unwrap();
+        write_linear_target_spec(
+            &mut second_load,
+            DM_IOCTL_HEADER_SIZE,
+            0,
+            4,
+            0,
+            second_params,
+        );
+        table_load_for_test(&mut second_load, &device).unwrap();
+
+        unregister(first_id).unwrap();
+        assert_eq!(unregister(second_id).unwrap_err(), aster_block::Error::Busy);
+
+        device.clear_inactive_table().unwrap();
+        assert!(!device.status().has_inactive_table);
+        unregister(second_id).unwrap();
+    }
+
+    #[ktest]
+    fn failed_table_load_preserves_nonempty_state_and_releases_temporary_leases() {
+        for failure in ["missing", "capacity", "continuity"] {
+            let active = StatusBacking::new_with_major(510, 248);
+            let inactive = StatusBacking::new_with_major(510, 249);
+            let temporary = StatusBacking::new_with_major(510, 250);
+            let active_id = active.id();
+            let inactive_id = inactive.id();
+            let temporary_id = temporary.id();
+            register(active as Arc<dyn BlockDevice>).unwrap();
+            register(inactive as Arc<dyn BlockDevice>).unwrap();
+            register(temporary as Arc<dyn BlockDevice>).unwrap();
+
+            let manager = DmManager::new().unwrap();
+            let device = manager
+                .create(format!("dm-preserve-{failure}-test"), None, None)
+                .unwrap();
+
+            let active_params = "510:248 0";
+            let mut active_load = test_buffer(
+                DM_IOCTL_HEADER_SIZE + table_status_record_len(active_params.len()).unwrap(),
+            );
+            write_u32(&mut active_load, OFF_TARGET_COUNT, 1).unwrap();
+            write_linear_target_spec(
+                &mut active_load,
+                DM_IOCTL_HEADER_SIZE,
+                0,
+                4,
+                0,
+                active_params,
+            );
+            table_load_for_test(&mut active_load, &device).unwrap();
+            device.resume().unwrap();
+
+            let inactive_params = "510:249 0";
+            let mut inactive_load = test_buffer(
+                DM_IOCTL_HEADER_SIZE + table_status_record_len(inactive_params.len()).unwrap(),
+            );
+            write_u32(&mut inactive_load, OFF_TARGET_COUNT, 1).unwrap();
+            write_linear_target_spec(
+                &mut inactive_load,
+                DM_IOCTL_HEADER_SIZE,
+                0,
+                4,
+                0,
+                inactive_params,
+            );
+            table_load_for_test(&mut inactive_load, &device).unwrap();
+            device.set_readonly();
+            device.suspend().unwrap();
+
+            assert!(device.status().has_active_table);
+            assert!(device.status().has_inactive_table);
+            assert!(device.status().readonly);
+            assert!(device.status().suspended);
+            assert_eq!(unregister(active_id).unwrap_err(), aster_block::Error::Busy);
+            assert_eq!(
+                unregister(inactive_id).unwrap_err(),
+                aster_block::Error::Busy
+            );
+
+            let (mut failed_load, errno) = match failure {
+                "missing" => {
+                    let params = "2 4 510:250 0 510:251 0";
+                    let mut buffer = test_buffer(
+                        DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap(),
+                    );
+                    write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+                    write_target_spec(
+                        &mut buffer,
+                        DM_IOCTL_HEADER_SIZE,
+                        0,
+                        8,
+                        0,
+                        "striped",
+                        params,
+                    );
+                    (buffer, Errno::ENODEV)
+                }
+                "capacity" => {
+                    let params = "510:250 1020";
+                    let mut buffer = test_buffer(
+                        DM_IOCTL_HEADER_SIZE + table_status_record_len(params.len()).unwrap(),
+                    );
+                    write_u32(&mut buffer, OFF_TARGET_COUNT, 1).unwrap();
+                    write_linear_target_spec(&mut buffer, DM_IOCTL_HEADER_SIZE, 0, 8, 0, params);
+                    (buffer, Errno::EINVAL)
+                }
+                "continuity" => {
+                    let params = "510:250 0";
+                    let first_next = table_status_record_len(params.len()).unwrap();
+                    let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + first_next * 2);
+                    write_u32(&mut buffer, OFF_TARGET_COUNT, 2).unwrap();
+                    write_linear_target_spec(
+                        &mut buffer,
+                        DM_IOCTL_HEADER_SIZE,
+                        0,
+                        4,
+                        first_next as u32,
+                        params,
+                    );
+                    write_linear_target_spec(
+                        &mut buffer,
+                        DM_IOCTL_HEADER_SIZE + first_next,
+                        5,
+                        4,
+                        0,
+                        params,
+                    );
+                    (buffer, Errno::EINVAL)
+                }
+                _ => unreachable!(),
+            };
+
+            assert_failed_table_load_preserves_state(&mut failed_load, &device, errno);
+            device.suspend().unwrap();
+            assert_eq!(unregister(active_id).unwrap_err(), aster_block::Error::Busy);
+            assert_eq!(
+                unregister(inactive_id).unwrap_err(),
+                aster_block::Error::Busy
+            );
+            let temporary = unregister(temporary_id).unwrap();
+
+            device.clear_inactive_table().unwrap();
+            unregister(inactive_id).unwrap();
+            assert_eq!(unregister(active_id).unwrap_err(), aster_block::Error::Busy);
+            device.resume().unwrap();
+
+            register(temporary).unwrap();
+            let temporary_params = "510:250 0";
+            let mut replacement_load = test_buffer(
+                DM_IOCTL_HEADER_SIZE + table_status_record_len(temporary_params.len()).unwrap(),
+            );
+            write_u32(&mut replacement_load, OFF_TARGET_COUNT, 1).unwrap();
+            write_linear_target_spec(
+                &mut replacement_load,
+                DM_IOCTL_HEADER_SIZE,
+                0,
+                4,
+                0,
+                temporary_params,
+            );
+            table_load_for_test(&mut replacement_load, &device).unwrap();
+            device.resume().unwrap();
+
+            unregister(active_id).unwrap();
+            assert_eq!(
+                unregister(temporary_id).unwrap_err(),
+                aster_block::Error::Busy
+            );
+            drop(device);
+            drop(manager);
+            unregister(temporary_id).unwrap();
+        }
+    }
+
+    #[ktest]
     fn loads_multiple_targets_using_dm_target_spec_next_offsets() {
         let first = StatusBacking::new_with_major(510, 101);
         let second = StatusBacking::new_with_major(510, 102);
@@ -3525,7 +3942,7 @@ mod tests {
     }
 
     #[ktest]
-    fn loads_single_striped_target_through_ioctl() {
+    fn loads_single_striped_target_through_table_load_facade() {
         let first = StatusBacking::new_with_major(510, 220);
         let second = StatusBacking::new_with_major(510, 221);
         let first_id = first.id();
@@ -3569,7 +3986,7 @@ mod tests {
     }
 
     #[ktest]
-    fn loads_mixed_linear_and_striped_targets_through_ioctl() {
+    fn loads_mixed_linear_and_striped_targets_through_table_load_facade() {
         let linear = StatusBacking::new_with_major(510, 222);
         let striped_first = StatusBacking::new_with_major(510, 223);
         let striped_second = StatusBacking::new_with_major(510, 224);
@@ -3865,6 +4282,15 @@ mod tests {
             read_u64(&deps, DM_IOCTL_HEADER_SIZE + 24).unwrap(),
             striped_second_id.as_encoded_u64()
         );
+        assert_eq!(unregister(linear_id).unwrap_err(), aster_block::Error::Busy);
+        assert_eq!(
+            unregister(striped_first_id).unwrap_err(),
+            aster_block::Error::Busy
+        );
+        assert_eq!(
+            unregister(striped_second_id).unwrap_err(),
+            aster_block::Error::Busy
+        );
 
         drop(device);
         drop(manager);
@@ -3951,7 +4377,7 @@ mod tests {
 
     #[ktest]
     fn rejects_unsupported_table_targets_without_changing_device_state() {
-        for target_type in ["unknown", "error", "snapshot"] {
+        for target_type in ["unknown", "snapshot"] {
             let manager = DmManager::new().unwrap();
             let device = manager
                 .create(format!("dm-unsupported-{target_type}-test"), None, None)
@@ -4091,7 +4517,7 @@ mod tests {
     }
 
     #[ktest]
-    fn rejects_striped_range_errors_through_ioctl_without_changing_device_state() {
+    fn rejects_striped_range_errors_through_table_load_facade_without_changing_device_state() {
         let backing = StatusBacking::new_with_major(510, 227);
         let backing_id = backing.id();
         register(backing as Arc<dyn BlockDevice>).unwrap();
@@ -4127,7 +4553,7 @@ mod tests {
     }
 
     #[ktest]
-    fn rejects_linear_range_errors_through_ioctl_without_changing_device_state() {
+    fn rejects_linear_range_errors_through_table_load_facade_without_changing_device_state() {
         let backing = StatusBacking::new_with_major(510, 231);
         let backing_id = backing.id();
         register(backing as Arc<dyn BlockDevice>).unwrap();
@@ -4155,7 +4581,8 @@ mod tests {
     }
 
     #[ktest]
-    fn rejects_non_contiguous_linear_tables_through_ioctl_without_changing_device_state() {
+    fn rejects_non_contiguous_linear_tables_through_table_load_facade_without_changing_device_state()
+     {
         let backing = StatusBacking::new_with_major(510, 232);
         let backing_id = backing.id();
         register(backing as Arc<dyn BlockDevice>).unwrap();

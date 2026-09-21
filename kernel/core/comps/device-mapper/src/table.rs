@@ -372,7 +372,7 @@ impl FlushCompletion {
 
 #[cfg(ktest)]
 mod tests {
-    use alloc::{string::String, vec};
+    use alloc::{format, string::String, vec};
 
     use aster_block::{
         BlockDeviceMeta,
@@ -382,10 +382,13 @@ mod tests {
     use ostd::{mm::VmIo, prelude::ktest, sync::Mutex};
 
     use super::*;
-    use crate::target::{
-        error::ErrorTarget,
-        striped::{StripedTarget, StripedTargetParams},
-        zero::ZeroTarget,
+    use crate::{
+        DmManager,
+        target::{
+            error::ErrorTarget,
+            striped::{StripedTarget, StripedTargetParams},
+            zero::ZeroTarget,
+        },
     };
 
     fn boxed<T: DmTarget + 'static>(target: T) -> DmTargetBox {
@@ -732,6 +735,69 @@ mod tests {
     }
 
     #[ktest]
+    fn waits_for_later_children_after_nonfinal_enqueue_failure() {
+        let refused = RecordingBlockDevice::new_failing_enqueue(1);
+        let second = DeferredRecordingBlockDevice::new(2);
+        let third = DeferredRecordingBlockDevice::new(3);
+        let table = DmTable::new_linear(vec![
+            LinearTarget::new(
+                Sid::new(0),
+                4,
+                Sid::new(100),
+                BlockDeviceLease::new_untracked(refused.clone() as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+            LinearTarget::new(
+                Sid::new(4),
+                4,
+                Sid::new(200),
+                BlockDeviceLease::new_untracked(second.clone() as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+            LinearTarget::new(
+                Sid::new(8),
+                4,
+                Sid::new(300),
+                BlockDeviceLease::new_untracked(third.clone() as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let completions = Arc::new(Mutex::new(Vec::new()));
+        let callback_completions = completions.clone();
+        let read = Bio::new(
+            BioType::Read,
+            Sid::new(0),
+            vec![BioSegment::alloc_exact(
+                2,
+                12 * 512,
+                BioDirection::FromDevice,
+            )],
+            Some(Box::new(move |status| {
+                callback_completions.lock().push(status);
+            })),
+        );
+
+        table.enqueue(read.submit_for_test()).unwrap();
+
+        assert!(refused.submitted_ranges.lock().is_empty());
+        assert_eq!(
+            *second.submitted_ranges.lock(),
+            vec![Sid::new(200)..Sid::new(204)]
+        );
+        assert_eq!(
+            *third.submitted_ranges.lock(),
+            vec![Sid::new(300)..Sid::new(304)]
+        );
+        assert!(completions.lock().is_empty());
+
+        second.complete_pending(0);
+        assert!(completions.lock().is_empty());
+        third.complete_pending(0);
+        assert_eq!(*completions.lock(), vec![BioStatus::IoError]);
+    }
+
+    #[ktest]
     fn reports_io_error_when_split_child_completes_with_error() {
         let first = RecordingBlockDevice::new(1);
         let second = RecordingBlockDevice::new_with_bio_status(2, BioStatus::IoError);
@@ -964,6 +1030,59 @@ mod tests {
         assert_eq!(table.length(), 192);
         assert_eq!(table.metadata().nr_sectors, 192);
         assert_eq!(table.metadata().max_nr_segments_per_bio, 4);
+    }
+
+    #[ktest]
+    fn rejects_dm_device_backing_for_linear_and_striped_targets() {
+        let manager = DmManager::new().unwrap();
+        let backing = manager
+            .create(String::from("dm-table-backing-test"), None, None)
+            .unwrap();
+        let inner = RecordingBlockDevice::new(9);
+        let inner_table = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(0),
+                BlockDeviceLease::new_untracked(inner as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+        );
+        backing.load_table(inner_table);
+        backing.resume().unwrap();
+        assert_eq!(backing.metadata().nr_sectors, 128);
+
+        let linear = LinearTarget::new(
+            Sid::new(0),
+            8,
+            Sid::new(0),
+            BlockDeviceLease::new_untracked(backing.clone() as Arc<dyn BlockDevice>),
+        )
+        .unwrap();
+        assert!(matches!(
+            DmTable::new_linear(vec![linear]),
+            Err(TableError::UnsupportedBackingDevice)
+        ));
+
+        let params = StripedTargetParams::parse(&format!(
+            "1 4 {}:{} 0",
+            backing.id().major().get(),
+            backing.id().minor().get()
+        ))
+        .unwrap();
+        let striped = StripedTarget::new(
+            Sid::new(0),
+            8,
+            params,
+            vec![BlockDeviceLease::new_untracked(
+                backing as Arc<dyn BlockDevice>,
+            )],
+        )
+        .unwrap();
+        assert!(matches!(
+            DmTable::new_targets(vec![boxed(striped)]),
+            Err(TableError::UnsupportedBackingDevice)
+        ));
     }
 
     #[ktest]
