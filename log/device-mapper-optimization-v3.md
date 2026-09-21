@@ -2,7 +2,7 @@
 
 > 状态：进行中
 >
-> 最后核对：2026-09-15
+> 最后核对：2026-09-17
 >
 > 本文记录第三版的架构收敛，不将未完成的系统验收、候选设计或后续 target 扩展写成已实现事实。第二版的 P1/P2/P3 优先级编号继续由 [device-mapper-optimization-v2.md](device-mapper-optimization-v2.md) 解释；本文使用 `V3.x` 标识第三版内的独立优化点，避免混淆。
 
@@ -15,7 +15,7 @@
 - `aster-device-mapper` 不反向依赖 VFS、devtmpfs、raw ioctl buffer 或内核 errno；这些属于内核集成层。
 - 每个优化点先通过最窄 ktest，再按影响范围串行运行一个 canonical system suite；系统验收受已知外部缺口阻断时，必须如实记录。
 
-当前已实施 **V3.1 runtime 生命周期协调器**、**V3.1.1 低频控制面学习日志**、**V3.2.1 typed lifecycle requests**、**V3.2.2 typed table-load workflow**、**V3.2.3 typed removal workflow**、**V3.3 query snapshot**、**V3.3.1 demand-shaped query snapshot**、**V3.4 static target catalogue** 与 **V3.5 normal I/O plan/execute**。V3.1 的定向 ktest 与编译检查通过；完整 `--control-plane` 在步骤 9 被既有 `DM_DEV_WAIT` 分派 panic 阻断，故尚未取得 wait 路径的完整控制面系统验收。V3.1.1 已完成定向 ktest、带符号 NixOS guest 的命令驱动观察和日志断言；不以完整 control-plane suite 作为其完成条件。V3.2.1 与 V3.2.2 均已完成 ioctl ktest 和包含新 workflow 的 NixOS zero mapper 窄生命周期验证。V3.2.3、V3.3、V3.3.1 与 V3.4 均已完成定向 ktest 和 `--control-plane-non-wait` 系统回归；V3.5 已完成 table ktest 和 `--dataplane` 系统回归。V3.3.1 已修正静态 review 确认的 P2 表查询资源回退。所有这些 suite 均不改变生产 `DM_DEV_WAIT` 分派。
+当前已实施 **V3.1 runtime 生命周期协调器**、**V3.1.1 低频控制面学习日志**、**V3.2.1 typed lifecycle requests**、**V3.2.2 typed table-load workflow**、**V3.2.3 typed removal workflow**、**V3.3 query snapshot**、**V3.3.1 demand-shaped query snapshot**、**V3.4 static target catalogue** 与 **V3.5 normal I/O plan/execute**。V3.1–V3.5 的定向 ktest、编译检查与各自风险范围的系统验收均已完成；V3.3.1 已修正静态 review 确认的 P2 表查询资源回退。独立的 `DM_DEV_WAIT` 修复现已完成生产 dispatch 分流、等待阶段的 lifecycle 隔离，以及仅该 ioctl 的 `EINTR → ERESTARTSYS` 映射；重建镜像后的完整 `--control-plane` 和完整 `--dataplane` 均通过。V3 当时新增的 C 级 `SA_RESTART` 回归虽通过严格编译，但完整 initramfs regression 因 TDX 依赖的外部 GitHub 下载返回 502 未能进入 guest，因此当时删除了该未完成实际验收的用例；后续 V4 focused DM 回归已重新实现并在 guest 中关闭这一缺口，见下文后续注记。
 
 ## 2. 当前架构边界
 
@@ -75,17 +75,20 @@ flowchart TB
 | ktest | `initial_alias_publication_failure_keeps_table_inactive` | 通过 | alias 发布失败仍保留 inactive table。 |
 | ktest | `rename_runtime` 过滤的成功、同名拒绝、alias 失败回滚用例 | 通过 | reservation 和 manager/device name 回滚语义未改变。 |
 | ktest | `primary_node_creation_failure_keeps_first_table_unpublished` | 通过 | primary node 发布失败不安装或暴露首 table。 |
-| 系统验收 | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --control-plane` | 阻断 | guest 29 秒 ready、56 秒退出；步骤 1–8 通过，步骤 9 的 `dmsetup wait` 触发既有 `DM_DEV_WAIT` 分派 panic。不能据此声称 control-plane suite 已通过。 |
+| 系统验收 | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --control-plane` | 历史阻断，后续已解除 | 当时 guest 29 秒 ready、56 秒退出；步骤 1–8 通过，步骤 9 的 `dmsetup wait` 触发既有 `DM_DEV_WAIT` 分派 panic。这不是 V3.1 引入的问题；独立修复后，重建镜像的完整 `--control-plane` 已通过。 |
 
-### 3.5 已知阻断，不属于 V3.1 改动
+### 3.5 历史阻断与后续独立修复
 
-当前 `decode_command()` 接受 `DM_DEV_WAIT_CMD`，但通用 `handle_command()` 对它执行 `unreachable!()`；已有 `device_wait()` helper 未接入生产 dispatch。该问题早于 V3.1，且当前由用户后续独立调试与修复。
+V3.1 验证时，`decode_command()` 虽接受 `DM_DEV_WAIT_CMD`，通用 `handle_command()` 却会执行 `unreachable!()`，已有 `device_wait()` helper 未接入生产 dispatch。该问题早于 V3.1，后续作为独立修复处理，未混入 V3.1–V3.5 的架构收敛范围。
 
-因此：
+独立修复已完成：
 
-- 不将 `DM_DEV_WAIT` 修复混入 V3.1 或后续第三版架构重构提交。
-- 在该独立问题修复前，`--control-plane` 不能作为 V3.1 的完整通过证据。
-- 后续若重跑控制面 suite，应先确认 wait 路径不持 lifecycle guard 等待事件，事件变化后再进行 manager current-`Arc` 复核和 header 回写。
+- `DM_DEV_WAIT` 在 ioctl façade 中于通用 command dispatch 前分流，等待阶段不持有 mapper lifecycle guard。
+- event 变化后获取 lifecycle guard，复核 manager current-`Arc` 与 `Removing` 状态，再回写当前 header。
+- 仅将该可中断 wait 的 `EINTR` 映射为 `ERESTARTSYS`，保留其他 ioctl 与其他 errno 的原有语义。
+- 新增的 Rust ioctl ktest `device_wait_maps_interrupt_to_restartsys` 通过；重建镜像后的完整 `--control-plane` 通过。
+
+真实用户态 `SA_RESTART` 信号回归曾实现为 C 测试，但完整 initramfs regression 在打包 TDX 依赖时受外部 GitHub 下载 `qgs_msg_lib.cpp` 返回 502 阻断，无法进入 guest；该用例已删除，不将其执行结果记为已验证。
 
 ### 3.6 V3.1.1：低频控制面学习日志
 
@@ -120,7 +123,7 @@ flowchart TB
 | guest 命令观察 | `version`、`targets`、zero create/load/resume/suspend/clear/remove、未知 mapper 查询 | 通过 | 启动到首个 marker 前无新增 `[dm-debug]`；`targets` 实测为 `DM_VERSION → DM_LIST_VERSIONS`；zero 生命周期的控制和状态提交均可关联。 |
 | 数据面静默断言 | zero mapper Read/Write 的 `DM_CMD_BEGIN/END zero-io` 区间 | 通过 | 区间内没有 `[dm-debug]`，没有逐 BIO 日志。 |
 
-边界：`DM_DEV_WAIT` 仍会在既有 dispatch 异常处中断。本项不修复该问题，也不声称完整 `--control-plane` suite 已通过。
+边界：本项验证当时 `DM_DEV_WAIT` 仍在既有 dispatch 异常处中断，故不以完整 `--control-plane` suite 作为本项完成条件。该独立问题现已修复，重建镜像后的完整 `--control-plane` 已通过；这不改变 V3.1.1 的日志验证边界。
 
 ## 4. V3.2.1：typed lifecycle requests
 
@@ -158,7 +161,7 @@ flowchart TB
 | 调试镜像 | `make nixos RELEASE=0 LOG_LEVEL=error` | 通过 | guest 包含 V3.2.1 workflow。 |
 | guest 窄验收 | `dmsetup version`、`targets`、zero `create --notable → load → resume → info → suspend → clear → remove` | 通过 | guest 输出 `V32_GUEST_PASS`；`info` 显示 `LIVE`；create/load/resume/suspend/clear/remove 的 ioctl done 均为 status 0。 |
 
-完整 `--control-plane` 仍未运行，因为其步骤 9 会命中独立的 `DM_DEV_WAIT` panic；该阻断与本项无关，不能用窄 guest 验收替代该 suite 对 wait/后续步骤的证明。
+本项的窄验收当时仍受独立 `DM_DEV_WAIT` panic 阻断，不能替代完整 suite 对 wait/后续步骤的证明。该独立问题现已修复，重建镜像后的完整 `--control-plane` 已通过。
 
 ## 5. V3.2.2：typed table-load workflow
 
@@ -199,7 +202,7 @@ flowchart TB
 | 调试镜像 | `make nixos RELEASE=0 LOG_LEVEL=error` | 通过 | guest 包含 V3.2.2 workflow。 |
 | guest 窄验收 | `dmsetup version`、`targets`、zero `create --notable → load → resume → info → suspend → clear → remove` | 通过 | 输出 `V322_GUEST_PASS`；`DM_TABLE_LOAD` 显示 primary 已注册和 inactive table 已安装；`info` 显示 `LIVE`，关键 ioctl 均为 status 0。 |
 
-完整 `--control-plane` 仍未运行，因为其步骤 9 会命中独立的 `DM_DEV_WAIT` panic；该阻断与本项无关，不能用窄 guest 验收替代该 suite 对 wait/后续步骤的证明。
+本项的窄验收当时仍受独立 `DM_DEV_WAIT` panic 阻断，不能替代完整 suite 对 wait/后续步骤的证明。该独立问题现已修复，重建镜像后的完整 `--control-plane` 已通过。
 
 ## 6. V3.2.3：typed removal workflow
 
@@ -222,7 +225,7 @@ flowchart TB
 | 单设备 remove | ioctl handler 直接执行 runtime unregister → postponed BIO fail → event publish → manager detach。 | `ControlWorkflow::remove()` 统一执行同一顺序；façade 仍持 lifecycle guard、记录日志并回写 header。 |
 | 注销失败 | handler 中的 early return 隐含保证后续状态不变。 | `remove_with_unregistration()` 显式将 runtime 注销设为 event/detach 前唯一可失败步骤；失败时 mapper state、event 和 manager index 保持不变。 |
 | remove-all | façade 手写 snapshot 遍历、best-effort 忽略和计数。 | `RemoveAllRequest` 表达已捕获 snapshot，workflow 返回 `RemoveAllOutcome`；façade 只提供每设备 guard/current-`Arc` 复核。 |
-| 系统回归 | 完整控制面脚本在 `DM_DEV_WAIT` panic 后无法覆盖后续 rename、busy、remove-all。 | 新 suite 只跳过 wait assertions，仍在真实内核/guest 中执行剩余控制面路径，并明确标记为 non-wait。 |
+| 系统回归 | 历史上完整控制面脚本在 `DM_DEV_WAIT` panic 后无法覆盖后续 rename、busy、remove-all。 | 新 suite 仅跳过 wait assertions，仍在真实内核/guest 中执行剩余控制面路径，并明确标记为 non-wait；后续独立修复后完整 `--control-plane` 已通过。 |
 
 ### 必须保持的不变量
 
@@ -243,7 +246,7 @@ flowchart TB
 | 调试镜像 | `make nixos RELEASE=0 LOG_LEVEL=error` | 通过 | 最终重试后完成包含 V3.2.3 的 NixOS 镜像构建。 |
 | 系统回归 | 独立 `v323-*` 测试盘上的 `--control-plane-non-wait` | 通过 | guest 30 秒 ready、82 秒正常退出；`CHECK_PASS` 覆盖 suspend/resume、rename/UUID、readonly/busy、remove/remove-all，`SUMMARY_GAP_DM_CONTROL_PLANE: 0`，并输出 `HOST_PASS_DM_SYSTEM_TESTS --control-plane-non-wait`。 |
 
-完整 `--control-plane` 仍因独立 `DM_DEV_WAIT` panic 未通过；V3.2.3 不以 non-wait suite 取代该最终验证。
+本项的 non-wait suite 是在独立 `DM_DEV_WAIT` panic 仍存在时取得的范围内证据，不替代完整 wait 验证；后续独立修复后，完整 `--control-plane` 已通过。
 
 ## 7. V3.3：query snapshot
 
@@ -286,7 +289,7 @@ flowchart TB
 | 调试镜像 | `make nixos RELEASE=0 LOG_LEVEL=error` | 通过 | 最终镜像包含 V3.3 query workflow。 |
 | 系统回归 | 独立 `v33-*` 测试盘上的 `--control-plane-non-wait` | 通过 | guest 35 秒 ready、85 秒正常退出；输出 `CHECK_SKIP_DMSETUP_WAIT`、全部后续 `CHECK_PASS`、`SUMMARY_GAP_DM_CONTROL_PLANE: 0` 和 `HOST_PASS_DM_SYSTEM_TESTS --control-plane-non-wait`。 |
 
-完整 `--control-plane` 仍因独立 `DM_DEV_WAIT` panic 未通过；V3.3 不以 non-wait suite 取代该最终验证。
+本项的 non-wait suite 是在独立 `DM_DEV_WAIT` panic 仍存在时取得的范围内证据，不替代完整 wait 验证；后续独立修复后，完整 `--control-plane` 已通过。
 
 ## 8. V3.3.1：demand-shaped query snapshot
 
@@ -333,7 +336,7 @@ flowchart TB
 | 调试镜像 | `make nixos RELEASE=0 LOG_LEVEL=error` | 通过 | 最终镜像包含 demand-shaped query snapshot。 |
 | 系统回归 | 独立 `v331-*` 测试盘上的 `--control-plane-non-wait` | 通过 | guest 51 秒 ready、105 秒正常退出；输出 `CHECK_SKIP_DMSETUP_WAIT`、全部后续 `CHECK_PASS`、`SUMMARY_GAP_DM_CONTROL_PLANE: 0` 和 `HOST_PASS_DM_SYSTEM_TESTS --control-plane-non-wait`。 |
 
-静态 review 的唯一 P2 已关闭。完整 `--control-plane` 仍因独立 `DM_DEV_WAIT` panic 未通过，本项不以 non-wait suite 取代该最终 wait 验证。
+静态 review 的唯一 P2 已关闭。本项 non-wait suite 是在独立 `DM_DEV_WAIT` panic 仍存在时取得的范围内证据，不替代完整 wait 验证；后续独立修复后，完整 `--control-plane` 已通过。
 
 ## 9. V3.4：static target catalogue
 
@@ -375,7 +378,7 @@ flowchart TB
 | 调试镜像 | `make nixos RELEASE=0 LOG_LEVEL=error` | 通过 | 最终镜像包含 V3.4 catalogue。 |
 | 系统回归 | 独立 `v34-*` 测试盘上的 `--control-plane-non-wait` | 通过 | guest 30 秒 ready、81 秒正常退出；输出 `CHECK_SKIP_DMSETUP_WAIT`、全部后续 `CHECK_PASS`、`SUMMARY_GAP_DM_CONTROL_PLANE: 0` 和 `HOST_PASS_DM_SYSTEM_TESTS --control-plane-non-wait`。 |
 
-完整 `--control-plane` 仍因独立 `DM_DEV_WAIT` panic 未通过；V3.4 不以 non-wait suite 取代该最终验证。
+本项的 non-wait suite 是在独立 `DM_DEV_WAIT` panic 仍存在时取得的范围内证据，不替代完整 wait 验证；后续独立修复后，完整 `--control-plane` 已通过。
 
 ## 10. V3.5：normal I/O plan/execute
 
@@ -418,15 +421,17 @@ flowchart TB
 
 首次 `--dataplane` 使用默认 `0.01s` 串口行间隔时，在 mixed step 的后续 shell 输入发生字节串扰；mixed mapper 和 linear backing 已通过，随后 `md5sum` 参数损坏并使 guest 重启，最终 host lifecycle timeout。使用全新测试盘与 `0.1s` 间隔后完整通过，因此该失败记录为 guest 输入传输问题，不作为 V3.5 数据面语义失败证据。
 
-完整 `--control-plane` 仍因独立 `DM_DEV_WAIT` panic 未通过；该问题未被 V3.5 改动。
+完整 `--control-plane` 在 V3.5 验证时仍受独立 `DM_DEV_WAIT` panic 阻断；该问题不由 V3.5 改动引入。后续独立修复后，重建镜像的完整 `--control-plane` 已通过。
 
 ## 11. 第三版完成边界
 
 第三版预定的内部架构收敛点 **V3.1–V3.5 已全部完成并按各自风险范围验证**；V3.3.1 已关闭静态 review 确认的唯一 P2 查询资源回退。runtime lifecycle coordinator、typed mutation workflow、demand-shaped query snapshot、static target catalogue 与 normal I/O plan/execute 已分别建立明确职责边界。
 
-这不表示 Device Mapper 已实现完整 Linux 功能，也不表示所有 canonical suite 已完全通过。当前明确保留：
+独立的 `DM_DEV_WAIT` 修复已解除其对完整控制面验收的历史阻断：生产 dispatch、等待期间的 lifecycle 隔离、event 后 current-`Arc`/`Removing` 重验与 `EINTR → ERESTARTSYS` 映射均已完成；重建镜像后的完整 `--control-plane` 和 `--dataplane` 均通过。
 
-- `DM_DEV_WAIT` 生产 dispatch 仍由用户独立调试；在其修复前，完整 `--control-plane` 不能作为通过证据。
+这不表示 Device Mapper 已实现完整 Linux 功能。当前明确保留：
+
+- V3 当时的真实用户态 `SA_RESTART` 回归没有 guest 执行证据：对应 C 用例因 TDX 依赖外部下载 502 阻断而删除，不能以严格编译替代当时验收。后续于 2026-09-21 在 V4 focused `device/device_mapper` 回归中重新加入真实信号场景并通过：无 `SA_RESTART` 时保留 `EINTR` 对照；带 `SA_RESTART` 时 signal handler 已执行、原 ioctl 在事件前不返回，并在 rename 后成功返回和回填 header。该 focused ELF 共 7 个测试函数、累计 159 passed、0 failed；这是后续关闭记录，不倒改 V3 当时的历史结果，也不代表完整 initramfs regression。
 - 新 target、动态 plugin registry、DM-on-DM stacking、queue-limit 主动拆分、target 查找性能重写、deferred remove 和其他未支持 ioctl 不属于第三版范围。
 - 后续若开启新优化版本，应另行定义目标、用户可见不变量和对应的 canonical 验收，不将其追溯并入 V3.1–V3.5。
 
