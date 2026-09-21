@@ -1,331 +1,111 @@
-# Device Mapper 测试执行结构与命令说明
+# Asterinas 开发测试手册
 
-本文整理 `dm` 分支中 Device Mapper 相关生产代码完成后应如何验证：先做静态检查，再用 ktest 验证内核内部语义，最后按改动范围选择 NixOS/LVM2 系统验收 suite。`make kernel`、`make nixos`、`dmsetup`、LVM2、文件系统和数据校验命令放在后半部分，作为脚本背后的命令说明。
+本文用于把**改动位置或行为**转换为可执行的测试动作：
 
-## 1. 基本执行环境
-
-| 项目 | 路径 / 约定 |
-|---|---|
-| 宿主仓库路径 | `/root/atom/asterinas` |
-| 容器内仓库路径 | `/root/asterinas` |
-| 默认执行位置 | 容器 `myAsterinas` 内的 `/root/asterinas` |
-| 命令书写约定 | 除非明确标注为宿主命令，本文命令都默认已在容器内执行 |
-| 并发约束 | QEMU、ktest、NixOS 系统测试串行运行，避免共享镜像、测试盘或 `test/initramfs/build/ext2.img` 锁冲突 |
-
-## 2. 推荐验证顺序
-
-| 顺序 | 验证层级 | 默认入口 | 主要目的 | 何时必须跑 |
-|---|---|---|---|---|
-| 1 | 静态检查 | `cargo fmt --check`、`git diff --check`、`git status --short` | 先排除格式、空白、冲突标记和工作区状态问题 | 每次生产代码改动后 |
-| 2 | ktest | `myshell/ktest_crate.sh <crate-dir> <test-path>` | 在测试内核里验证 DM core、target、table、ioctl 等内核内部语义 | 改到 Rust 生产代码时优先跑 |
-| 3 | 系统验收 suite | `GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh <suite>` | 在 NixOS guest 里用真实 `dmsetup` / LVM2 / 文件系统 / block device 验证用户可见语义 | 改到用户态链路、ioctl ABI、设备节点、LVM2 交互、脚本，或阶段验收时 |
-| 4 | 底层命令说明 | `make kernel`、`make nixos`、`dmsetup`、PV/VG/LV、`dd`、`md5sum` 等 | 帮助理解脚本背后做了什么，便于定位失败 | 不作为日常逐条手敲流程 |
-
-## 3. 静态检查
-
-常用命令：
-
-```bash
-cargo fmt --check
-git diff --check
-git status --short
+```text
+改动位置或行为 → 最低测试层 → 命令 → 日志 → 通过判定 → 是否升级到下一层
 ```
 
-| 命令 | 用途 | 通过标准 | 不能证明什么 |
+命令默认在仓库根目录执行。修改先通过静态准入；随后从最能定位问题的运行时层开始，不以更高层测试替代更低层的定点断言。
+
+## 1. 三个运行时测试层的分工
+
+| 层 | 如何运行 | 主要回答的问题 | 何时继续向上验证 |
 |---|---|---|---|
-| `cargo fmt --check` | 调用当前 Rust toolchain 的 `rustfmt` 检查 Rust 文件格式 | 无格式 diff 输出，退出码为 0 | 不证明代码能编译，也不证明语义正确 |
-| `cargo fmt --all --check` | 覆盖 workspace 的 Rust 格式检查 | 整个 workspace 无格式 diff 输出 | 不替代 clippy、ktest 或系统测试 |
-| `git diff --check` | 检查当前 diff 中 trailing whitespace、空白错误、冲突标记等提交前问题 | 无 warning/error 输出 | 不检查 Rust 语义，不判断测试是否通过 |
-| `git status --short` | 查看当前修改、未跟踪文件和暂存状态 | 输出与本轮预期修改一致 | 不说明 diff 内容是否正确 |
+| ktest | 目标 Cargo crate 被编译进 test kernel，`#[ktest]` 在内核态运行。 | 内部对象、算法、状态机、锁/并发、资源生命周期和局部错误路径是否正确？ | 改动穿过 syscall、ioctl、设备节点、VFS 或其他用户 ABI 时。 |
+| initramfs C 回归 | 最小 guest 中，shell runner 执行 C ELF；程序直接调用 libc/syscall。 | 原始用户 ABI 的参数、buffer、返回值、errno 与基础 VFS/设备语义是否正确？ | 改动还影响真实 CLI、用户库、系统服务、发行版配置或安装后工作流时。 |
+| NixOS/ISO 系统测试 | 启动 NixOS guest，测试框架向 guest 注入 shell/CLI 命令。 | 真实用户工具、用户库、服务、文件系统、网络、安装和发行版集成是否可用？ | 系统测试失败后，应回到 C 回归或 ktest 补最小可定位用例。 |
 
-如果只改了 Markdown、日志或测试说明，静态检查通常只需要 `git diff --check` 和 `git status --short`；如果改了 Rust 代码，再加 `cargo fmt --check` 或 `cargo fmt --all --check`。
+三层都在 guest 中触达真实内核，但观察点不同：ktest 直接观察内核内部语义，C 回归直接观察原始用户 ABI，NixOS 测试观察完整用户空间工作流。
 
-## 4. ktest：内核内部语义验证
+## 2. 静态准入
 
-### 4.1 统一入口
+先按改动范围选择预检；这些检查通过后再运行后续三层测试。
 
-当前定向 ktest 默认从仓库根目录调用 [ktest_crate.sh](../myshell/ktest_crate.sh)：
-
-```bash
-myshell/ktest_crate.sh <crate-dir> [cargo-osdk-test-filter-or-args...]
-```
-
-参数含义：
-
-| 参数 | 含义 | 示例 |
-|---|---|---|
-| `<crate-dir>` | 相对仓库根目录的目标 crate 路径，脚本会进入该目录运行 `cargo osdk test` | `kernel/core/comps/device-mapper`、`kernel/core` |
-| `[cargo-osdk-test-filter-or-args...]` | 原样透传给 `cargo osdk test`；最常用的是测试过滤路径 | `aster_device_mapper::table::tests::<test_name>` |
-
-脚本封装的默认环境变量：
-
-| 变量 | 默认值 | 作用 |
-|---|---|---|
-| `KTEST_LOGLEVEL` | `error` | 设置内核日志级别，减少无关输出 |
-| `KTEST_TIMEOUT` | `180s` | 单次 ktest 完整生命周期超时 |
-| `KTEST_TIMEOUT_KILL` | `10s` | `timeout` 到期后的强制终止等待时间 |
-| `RELEASE` | `1` | 默认用 release profile 编译测试内核 |
-| `BOOT_METHOD` | `grub-rescue-iso` | OSDK 启动方式 |
-| `BOOT_PROTOCOL` | `multiboot2` | GRUB boot protocol |
-| `ENABLE_KVM` | `1` | 默认给 QEMU 加 `-accel kvm`，避免退化到 TCG 慢启动 |
-| `KTEST_CONSOLE` | `hvc0` | ktest serial 输出使用的 console |
-| `INITRAMFS` | `/root/asterinas/test/initramfs/build/initramfs.cpio.gz` | 测试内核使用的 initramfs |
-
-脚本执行链路：
-
-| 阶段 | `ktest_crate.sh` 做什么 | 为什么需要 |
-|---|---|---|
-| 1 | 校验 `<crate-dir>/Cargo.toml` 存在 | 防止在错误目录启动 OSDK 测试 |
-| 2 | 组装 release、boot、console、KVM、initramfs、`timeout --foreground` 参数 | 避免每次手写公共参数，也避免漏掉 KVM/initramfs；`--foreground` 避免交互终端里 QEMU 被 job-control stop |
-| 3 | 运行期间保留终端输出，并用 OSDK 原始日志作为提取来源 | 终端仍能看到 QEMU/ktest 进度，最终结果日志不混入启动噪声 |
-| 4 | `cd` 到目标 crate 目录 | 让 `cargo osdk test` 选择正确 crate |
-| 5 | 执行 `cargo osdk test ... <filter>` | 编译测试内核、启动 QEMU、在 guest 内运行 ktest runner |
-| 6 | 从原始输出提取当前 crate 的 ktest 结果到 `<crate-dir>/ktest.log` | 日志只保留每个 ktest 的结果，不保留 QEMU 启动和 kernel 杂项日志 |
-| 7 | 删除 QEMU 原始日志 | 最终只留下一个结果日志 |
-
-### 4.2 按改动范围选择 ktest
-
-| 改动范围 | 推荐 ktest crate | 推荐过滤路径 | 主要验证内容 |
+| 改动范围 | 命令 | 查看位置 | 通过判定 |
 |---|---|---|---|
-| DM target 参数解析、target metadata、target status、target map 逻辑 | `kernel/core/comps/device-mapper` | `aster_device_mapper::target::<target>::tests::<test_name>` | concrete target 的 parse/status/map 行为 |
-| DM table 连续性、跨 target BIO split、mapped BIO 聚合、flush fan-out、deps 去重 | `kernel/core/comps/device-mapper` | `aster_device_mapper::table::tests::<test_name>` | DM core 数据面和 table 语义 |
-| `DmDevice`、BIO enqueue、child completion、target action 组合 | `kernel/core/comps/device-mapper` | `aster_device_mapper::<module>::tests::<test_name>` | mapper 内部 I/O 路径 |
-| `/dev/mapper/control` ioctl、table load、active/inactive table、status/deps、suspend/resume | `kernel/core` | `aster_core::device::misc::device_mapper::tests::<test_name>` | DM ioctl 控制面和 core 的连接 |
-| block device 注册、devtmpfs 节点、misc device、用户可见设备路径 | `kernel/core`，必要时再跑系统 suite | `aster_core::<related_module>::tests::<test_name>` | 内核框架与 DM 控制面的集成 |
-| 只改文档、日志或注释，未改变 Rust 语义 | 通常不需要 ktest | 无 | 用静态检查和文档 diff 检查即可 |
+| 任意已修改文件 | `git diff --check` | 终端输出。 | 无输出且退出码为 0。 |
+| Rust 文件 | `cargo fmt --check` | 终端输出。 | 无格式差异且退出码为 0。 |
+| 准备进行项目级静态验证 | `make check` | 终端输出。 | workspace lint、Rust 格式/clippy、Nix、initramfs C/Nix、NixOS 测试代码格式和 typos 全部通过。 |
 
-常用示例：
+`git diff --check` 覆盖 diff 的通用文本问题，`cargo fmt --check` 仅覆盖 Rust，`make check` 是项目聚合检查。三者都不证明内核已启动、用户 ABI 正确或端到端流程可用。
 
-```bash
-myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::table::tests::<test_name>
-```
+## 3. ktest：内核内部逻辑
 
-```bash
-myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>
-```
+以下命令均已在项目容器内按所列执行目录实测通过，使用默认 dev 构建和本地依赖缓存。执行目录相对于容器仓库根目录 `/root/asterinas`；未实测的根 workspace 和 core 全量入口不列入此表。无 selector 的命令按当前目录选择测试 crate，执行前必须确认目录。
 
-不传测试过滤路径时，脚本会跑目标 crate 的全部 ktest；日常定位优先传完整测试路径，阶段验收或大范围重构后再考虑扩大范围。
+**默认回归清单**：DM、block 各运行一次 crate 全量，core 运行以下三个模块。
 
-### 4.3 ktest 日志和通过标记
+| 测试范围 | 执行目录 | 直接命令 | 覆盖范围 / 文件 |
+|---|---|---|---|
+| `aster-device-mapper` 全量 | `kernel/core/comps/device-mapper` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test` | `device.rs`、`manager.rs`、`table.rs`、`target/**`。 |
+| core：DM ioctl / runtime 模块 | `kernel/core` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon aster_core::device::misc::device_mapper::tests` | `kernel/core/src/device/misc/device_mapper.rs`。 |
+| core：runtime block registry 模块 | `kernel/core` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon aster_core::device::registry::block::tests` | `kernel/core/src/device/registry/block.rs`。 |
+| `aster-block` 全量 | `kernel/core/comps/block` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test` | BIO、注册/注销与 lease、device ID、partition、request queue。 |
+| core：动态设备路径模块 | `kernel/core` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon aster_core::device::tests` | `kernel/core/src/device/mod.rs`：动态 devtmpfs 路径校验。 |
 
-[ktest_crate.sh](../myshell/ktest_crate.sh) 启动前会打印结果日志路径：
+**定向排障入口**：以下模块已包含在对应 crate 全量中；仅在定位失败或局部复测时使用，不需要在全量通过后逐条重复执行。
 
-```text
-ktest_crate: result log: /root/asterinas/<crate-dir>/ktest.log
-```
+| 测试范围 | 执行目录 | 直接命令 | 覆盖范围 / 文件 |
+|---|---|---|---|
+| DM component：table 模块 | `kernel/core/comps/device-mapper` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_device_mapper::table::tests` | `kernel/core/comps/device-mapper/src/table.rs`。 |
+| DM component：manager 模块 | `kernel/core/comps/device-mapper` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_device_mapper::manager::tests` | `kernel/core/comps/device-mapper/src/manager.rs`。 |
+| block component：BIO 模块 | `kernel/core/comps/block` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_block::bio::tests` | `kernel/core/comps/block/src/bio.rs`。 |
+| block component：注册与 lease | `kernel/core/comps/block` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_block::tests` | `kernel/core/comps/block/src/lib.rs`：注册、注销、lease 与事务回滚。 |
+| block component：device ID 模块 | `kernel/core/comps/block` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_block::device_id::tests` | `kernel/core/comps/block/src/device_id.rs`：major 快照与持有期。 |
+| block component：partition 模块 | `kernel/core/comps/block` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_block::partition::tests` | `kernel/core/comps/block/src/partition.rs`：range BIO 偏移与溢出。 |
+| block component：request queue 模块 | `kernel/core/comps/block` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_block::request_queue::tests` | `kernel/core/comps/block/src/request_queue.rs`：range 合并与 segment 上限。 |
 
-最终只保留一个日志文件：目标 crate 目录下的 `ktest.log`。它从当前 crate 的 `running ... tests in crate "..."` 开始，只记录 ktest runner 的测试结果、summary 和必要 failure 信息；QEMU 启动日志、OVMF/GRUB 输出、kernel 普通日志不会保留在该结果日志中。
+以下 console/日志说明适用于当前默认 x86_64、非 TDX 配置。ktest 结果经 early serial 输出，不能与普通内核的 `/dev/console` 选择混为一谈。
 
-常用查看命令：
+| 参数 / 日志 | 默认或写法 | 作用 | 手动查看 |
+|---|---|---|---|
+| `CONSOLE=hvc0` | 未显式设置 `CONSOLE` 时默认。 | virtconsole 接终端；ktest 结果走独立 UART，不在终端显示。 | `less qemu-serial.log` |
+| `CONSOLE=ttyS0` | `make ktest` 默认；手动 ktest 表中显式指定。 | UART 接终端；ktest 结果同时显示在终端并写入 `qemu.log`。 | `less qemu.log` |
+| 模块 selector | `crate::...::tests` | 一次选择该模块中的全部 `#[ktest]`；不需要逐个填写函数名。 | 在仓库根目录按上述 console 设置查看对应日志。 |
+| 无 selector | 上表 DM、block crate 全量命令。 | 执行当前目录所选 crate 在当前构建配置下的全部 ktest；不代表 core 或 workspace 全量已验证。 | 同上。 |
+| 离线依赖 | `CARGO_NET_OFFLINE=true` | 仅使用本地缓存；缓存缺失时报错，不自动联网拉取。 | 命令终端输出。 |
+| core early console | `--kcmd-args=earlycon` | 启用 core 的早期串口；只设置 `CONSOLE=ttyS0` 不会启用它。 | 结果输出到终端和根目录 `qemu.log`。 |
 
-```bash
-cat <crate-dir>/ktest.log
-```
+core 链入的早期参数解析器默认关闭 early console；未传 `earlycon` 时，ktest 的 `early_print!` 输出会被丢弃。上表 core 模块均使用带 `--kcmd-args=earlycon` 的命令实测通过。DM/block 使用 OSTD 默认开启 early console 的解析器，保留其已实测通过的原命令，不额外添加参数。
 
-通过时应能看到类似：
+上表所列测试入口均使用仓库根目录的 OSDK manifest，QEMU 日志因此位于**仓库根目录**，不是调用命令的 crate 目录；查看日志的命令应在仓库根目录执行。`hvc0` 下的 `qemu.log` 记录 virtconsole/终端 mux 输出，不是 ktest UART 结果日志；`ttyS0` 下不会为本轮创建 `qemu-serial.log`，已有同名文件可能是旧日志。
 
-```text
-running ... tests in crate "..."
-test <module_path>::<test_name> ... ok
-test result: ok. ... passed; 0 failed; ... filtered out.
-All crates tested.
-```
+## 4. initramfs：启动与原始用户 ABI 回归
 
-负测中被测代码可能会在终端打印预期内的 `ERROR:` 日志；`ktest.log` 只保留最终测试结果行，所以不会把错误路径日志混进 `test ... ok` 同一行。
+### 4.1 按改动位置或行为执行
 
-### 4.4 ktest 失败排查
+| 改动位置或行为 | 命令 | 结果日志与通过判定 | 升级条件 |
+|---|---|---|---|
+| 启动协议、早期初始化、rootfs、initramfs 可用性 | `make run_kernel AUTO_TEST=boot` | 根目录 `qemu.log` 最后 100 行；命令成功且含 `Successfully booted.`。 | 启动后用户 ABI 也变化时，执行相关 regression selector。 |
+| 一个 regression 目录，例如设备、文件系统或进程类别 | `make run_kernel AUTO_TEST=regression REGRESSION_TESTS=<directory>` | 根目录 `qemu.log` 最后 100 行；每个目录完成且最终含 `All regression tests passed.`。 | 该 ABI 被真实工具、服务或发行版配置使用时，执行 NixOS suite。 |
+| 单个 C ELF | `make run_kernel AUTO_TEST=regression REGRESSION_TESTS=<directory>/<binary>` | 同上；输出应包含该 ELF 的运行与成功信息，以及最终回归成功标记。 | 同上。 |
+| 修改多个类别或准备全量基础回归 | `make run_kernel AUTO_TEST=regression` | 同上；省略 `REGRESSION_TESTS` 会遍历 `/test` 下的全部一级测试目录。 | 对真实发行版行为继续 NixOS。 |
 
-| 现象 | 优先怀疑 | 排查方向 |
+`REGRESSION_TESTS` 可以给出一个或多个相对 selector。目录 selector 执行该目录的 `run_test.sh`；ELF selector 直接执行对应测试程序。不要传绝对路径、`.`、路径穿越或包含空格的 selector。
+
+### 4.2 C 程序、shell runner 与日志
+
+C ELF 负责构造 syscall/ioctl 输入、检查返回值和 errno，并以非零退出码报告失败；目录的 `run_test.sh` 负责按顺序调度多个 ELF，并用 `set -e` 传播失败。二者不是互相替代关系。
+
+根 `Makefile` 以根目录 `qemu.log` 的最后 100 行判断启动和 regression 结果；`qemu-serial.log` 是 UART 输出副本，适合辅助排查，但不是该判定的来源。
+
+## 5. NixOS 与 ISO：完整用户空间流程
+
+### 5.1 NixOS suite
+
+| 改动位置或行为 | 构建与运行命令 | 产物、日志与通过判定 |
 |---|---|---|
-| 超过约 3 分钟没有关键进展 | 过滤路径不正确、选错 crate、QEMU 卡住、镜像锁冲突、资源压力 | 看终端输出、`<crate-dir>/ktest.log`、`pgrep -af '[q]emu-system'`、`free -h`、`uptime` |
-| QEMU 启动很慢 | 没有 KVM、退化到 TCG、宿主资源压力 | 确认脚本默认 `ENABLE_KVM=1`，看终端输出里的 QEMU 命令和资源状态 |
-| 命令退出 0 但 `ktest.log` 没有结果 | serial/mux 原始输出没有出现 ktest marker，或 console 参数不匹配 | 确认 `KTEST_CONSOLE=hvc0`，并检查终端输出是否到达 ktest runner |
-| 只跑了 0 个目标测试 | 测试过滤路径写错或 crate 不匹配 | 使用完整模块路径，确认 crate 前缀是 `aster_device_mapper` 或 `aster_core` |
-| `ktest.log` 中有 `FAILED` | Rust 生产代码语义错误或测试断言失败 | 查看 `ktest.log` 中对应 test name、failure 段和终端上下文 |
+| `distro/**`、NixOS 配置、服务、真实 CLI/用户库流程、网络或文件系统工作流 | `make nixos NIXOS_TEST_SUITE=<suite>`<br>`make run_nixos NIXOS_TEST_SUITE=<suite>` | 镜像：`target/nixos/asterinas.img`。日志：根目录 `qemu.log`、`qemu-serial.log`。所选 suite 的进程退出码为 0，汇总 `Failed: 0`。 |
+| 只重跑 suite 内一个用例 | `make run_nixos NIXOS_TEST_SUITE=<suite> NIXOS_TEST_CASE=<case>` | 同上；日志中应只出现所选 case 的执行结果。 |
+| 调整 suite 执行时限 | `make run_nixos NIXOS_TEST_SUITE=<suite> NIXOS_TEST_TIMEOUT=<duration>` | 同上；`<duration>` 使用测试框架接受的时间格式。 |
 
-必要时只停止自己本轮启动的异常 QEMU/ktest 进程；不要用重启容器、清系统 cache 或修改启动协议来掩盖问题。
+`<suite>` 对应 `test/nixos/tests/<suite>/`。系统测试应在 C 回归已能证明原始 ABI 正确后，用于确认真实用户空间仍能把该 ABI 组合成可用工作流。
 
-## 5. 系统验收 suite：用户可见语义验证
+### 5.2 ISO 与安装后验证
 
-统一入口：
-
-```bash
-GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
-  myshell/run_dm_system_tests.sh <suite>
-```
-
-当前只接受一个显式 canonical suite；不保留无参数默认运行或历史兼容入口。
-
-### 5.1 suite 与功能对应关系
-
-| suite | 子脚本 | 主要验证功能 |
+| 改动位置或行为 | 构建与运行命令 | 产物、日志与通过判定 |
 |---|---|---|
-| `--control-plane` | [run_dm_control_plane_test.sh](../myshell/run_dm_control_plane_test.sh) | `dmsetup` 静态查询、首次 `create --notable -> load -> resume` 的 Linux 生命周期：load 后 `/dev/dm-X`、0 容量/EOF 与 alias 缺失，resume 后 alias、4096-byte 容量和立即交叉读写；还覆盖 primary-only rename/remove、linear/striped/error/zero table 与对象生命周期、active/inactive table、event、rename/UUID、readonly、busy remove/remove_all，以及 error/zero 用户态 I/O 语义。 |
-| `--dataplane` | [run_dm_dataplane_test.sh](../myshell/run_dm_dataplane_test.sh) | raw linear、striped、mixed、error、zero 数据面；跨 target/chunk split、非零 backing start、mapper readback 和逐 backing 布局断言。 |
-| `--lvm2-topology` | [run_lvm2_topology_test.sh](../myshell/run_lvm2_topology_test.sh) | static LVM2 查询、PV/VG/LV 生命周期、linear/striped/mixed segment 增长与缩减、same-boot activation 和 remove。无 filesystem 或 reboot 验收。 |
-| `--linear-integration` | [run_lvm2_linear_integration_test.sh](../myshell/dm_linear/run_lvm2_linear_integration_test.sh) | linear LVM2、同 PV 与跨 PV 第二 segment、ext2、grow/shrink、三次启动后的 table/status/deps 和 MD5 恢复。 |
-| `--striped-integration` | [run_lvm2_striped_integration_test.sh](../myshell/dm_striped/run_lvm2_striped_integration_test.sh) | N-way striped、同 backing set 与第二 set、ext2、grow/shrink、三次启动后的 table/status/deps 和 MD5 恢复。 |
-| `--mixed-integration` | [run_lvm2_mixed_integration_test.sh](../myshell/dm_mixed/run_lvm2_mixed_integration_test.sh) | 同一 LV 中 linear + striped table、跨段 ext2 I/O、两次启动后的 table/status/deps 和 MD5 恢复。 |
+| ISO、安装器、发行版引导或安装后配置 | `make iso NIXOS_TEST_SUITE=<suite>`<br>`make run_iso`<br>`make run_nixos NIXOS_TEST_SUITE=<suite>` | ISO 链接：`target/nixos/iso_image/`。安装日志：根目录 `qemu.log`、`qemu-serial.log`。ISO 测试输出 `Congratulations!`，随后安装后的 suite 以 `Failed: 0` 验证。 |
 
-各 suite 都有独立的 target 与测试盘前置检查。重启前后的 table/MD5 检查分别证明当场状态和持久化恢复，不能互相替代。
-
-### 5.2 按改动范围选择系统验收
-
-| 改动范围 | 推荐 suite | 说明 |
-|---|---|---|
-| 只改 DM core table/target/BIO 逻辑 | 先 ktest；必要时 `--dataplane` | ktest 锁定内核语义；dataplane 验证真实块设备的 raw remap 与 backing 布局。 |
-| 改 `dmsetup` ioctl、status、deps、info、rename、event、readonly、remove 或首次 load/resume 生命周期 | `--control-plane` | 验证 libdevmapper 与 `/dev/mapper/control` 的控制面语义：load 后 primary 的 0-capacity/EOF 边界，resume 后 alias 与 active table 的可操作语义。 |
-| 改 error/zero 用户态 I/O、discard、write-zeroes | `--dataplane`；必要时加 `--control-plane` | 前者覆盖 raw I/O，后者覆盖对象/table 生命周期。 |
-| 改 linear 数据面或跨 target split | `--dataplane`、`--linear-integration` | raw BIO 覆盖边界；LVM2 覆盖跨 PV、filesystem 和恢复。 |
-| 改 striped map/chunk/stripe/deps | `--dataplane`、`--striped-integration` | raw striped 与可配置 N-way/cross-set LVM2 都需要覆盖。 |
-| 改 mixed linear + striped table 或跨段 I/O | `--dataplane`、`--mixed-integration` | 验证 raw mapper 与 LVM2 生成的混合 table。 |
-| 改 LVM2 查询、scan、activation、PV/VG/LV 生命周期 | `--lvm2-topology` 加对应 integration suite | 前者覆盖 same-boot 生命周期；后者覆盖目标级 ext2/reboot。 |
-| 改测试脚本或 guest harness | 直接跑被改脚本对应 suite | 检查 marker、cleanup、启动与生命周期超时。 |
-
-### 5.3 系统测试日志、时间和通过标记
-
-系统验收通过公共 harness [dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh) 运行。每个 guest 都会输出 host 侧日志路径及启动、shell-ready、完成时间：
-
-```text
-HOST_INFO_<TEST_ID> <label>_guest_started_at=<ISO8601>
-HOST_INFO_<TEST_ID> <label>_guest_ready_after=<seconds>s ready_timeout=40s lifecycle_timeout=180s
-HOST_INFO_<TEST_ID> <label>_guest_completed_at=<ISO8601> lifecycle_after=<seconds>s status=<status>
-```
-
-| suite | 默认日志 | 关键 pass marker |
-|---|---|---|
-| `--control-plane` | `/tmp/dm-control-plane-test.log` | `SUMMARY_GAP_DM_CONTROL_PLANE: 0`、`TEST_PASS_DM_CONTROL_PLANE`、`HOST_PASS_DM_CONTROL_PLANE` |
-| `--dataplane` | `/tmp/dm-dataplane-test.log` | `TEST_PASS_DM_DATAPLANE`、`HOST_PASS_DM_DATAPLANE` |
-| `--lvm2-topology` | `/tmp/lvm2-topology-test.log` | `SUMMARY_GAP_LVM2_TOPOLOGY: 0`、`TEST_PASS_LVM2_TOPOLOGY`、`HOST_PASS_LVM2_TOPOLOGY` |
-| `--linear-integration` | `/tmp/dm-linear-integration-test.log` | 三个 `TEST_PASS_DM_LINEAR_INTEGRATION_*`、`HOST_PASS_DM_LINEAR_INTEGRATION` |
-| `--striped-integration` | `/tmp/dm-striped-integration-test.log` | 三个 `TEST_PASS_DM_STRIPED_INTEGRATION_*`、`HOST_PASS_DM_STRIPED_INTEGRATION` |
-| `--mixed-integration` | `/tmp/dm-mixed-integration-test.log` | 两个 `TEST_PASS_DM_MIXED_INTEGRATION_*`、`HOST_PASS_DM_MIXED_INTEGRATION` |
-
-wrapper 仅在子脚本成功后输出 `HOST_PASS_DM_SYSTEM_TESTS <suite>`。失败时优先查看 `HOST_FAIL_...` 或 `TEST_FAIL_...`，再从完整日志中定位最后一个 `=== STEP` 或 `=== CHECK`。
-
-## 6. 系统测试背后的 guest、测试盘和超时
-
-| 项目 | 说明 |
-|---|---|
-| guest | 系统 suite 在 NixOS guest 中运行真实用户态工具，不是只跑内核单测。 |
-| shell-ready 超时 | `GUEST_READY_TIMEOUT=40` 控制从 QEMU 启动到串口出现 `root@asterinas` 的上限；超时立即退出。 |
-| 完整生命周期超时 | `GUEST_QEMU_TIMEOUT=180` 控制单个 QEMU guest 从启动到退出的总上限；覆盖 LVM2、ext2 与 shutdown。 |
-| 测试盘 | 由 [tools/nixos/run.sh](../tools/nixos/run.sh) 挂入 QEMU。 |
-| 默认测试盘 | `target/nixos/test.img`、`target/nixos/test2.img`、`target/nixos/test3.img` 等。 |
-| 多盘变量 | `DM_TEST_IMAGES="target/nixos/test.img target/nixos/test2.img target/nixos/test3.img"`。 |
-| guest 内定位 | `aster-dm-disk-locator`、`aster-dm-disk-locator vdmtest2`、`aster-dm-disk-locator vdmtest3`。 |
-
-稳定 VirtIO serial：
-
-```text
-vdmtest
-vdmtest2
-vdmtest3
-```
-
-使用 locator 是为了避免硬编码 `/dev/vda`、`/dev/vdb`、`/dev/vdc`，防止多盘枚举顺序变化导致误测。
-
-## 7. 支撑性构建和清理命令
-
-这些命令通常由脚本或 Makefile 间接使用；日常执行测试时不需要逐条手敲，除非镜像缺失、构建产物过期或测试盘被旧状态污染。
-
-| 命令 | 作用 | 常见使用时机 |
-|---|---|---|
-| `make kernel` | 构建 initramfs，并通过 `cargo osdk build` 构建内核 | 需要单独确认 kernel 可构建时 |
-| `make ktest` | 构建 initramfs，并通过 `cargo osdk test` 跑默认 kernel-mode tests | 全量默认 ktest；定向 DM ktest 优先用 `myshell/ktest_crate.sh` |
-| `make nixos` | 构建 NixOS guest image，产物通常是 `target/nixos/asterinas.img` | 系统 suite 提示 NixOS image 不存在，或 NixOS 配置变更后 |
-| `make rm_dm` | 清理 DM/LVM2 测试盘 image | 重复系统验收前需要回到干净测试盘状态时 |
-
-显式清理多块测试盘：
-
-```bash
-DM_TEST_IMAGES="target/nixos/test.img target/nixos/test2.img target/nixos/test3.img" make rm_dm
-```
-
-## 8. `dmsetup` 命令说明
-
-`dmsetup` 命令主要由系统 suite 在 guest 内执行，用来验证 libdevmapper 与 Asterinas DM 控制面的用户可见语义。
-
-| 命令 | 主要验证点 |
-|---|---|
-| `dmsetup version` | `/dev/mapper/control` 可打开，version ioctl 可用，libdevmapper 能和内核 DM 控制面通信 |
-| `dmsetup targets` | `linear`、`striped`、`error`、`zero` target metadata 暴露正确 |
-| `dmsetup create` | 创建设备、加载 table、resume 激活；覆盖 linear/striped/error/zero table |
-| `dmsetup table <mapper>` | table 输出格式、target type、logical start、length、backing major:minor、striped 参数 |
-| `dmsetup status <mapper>` | mapper 状态和 target status 输出 |
-| `dmsetup deps <mapper>` | backing dependency 数量和 major:minor 是否符合 table |
-| `dmsetup info <mapper>` | mapper name、active/suspended 状态、open count、event 信息 |
-| `dmsetup rename` | rename 后新名字可用、旧名字不可用，table/status 不被破坏 |
-| `dmsetup suspend --noflush` / `dmsetup resume --noflush` | suspend/resume 状态切换，`--noflush` flag 兼容 |
-| `dmsetup wait --noflush <mapper> 0` | `DM_DEV_WAIT` 最小语义和 event number 等待路径 |
-| `dmsetup remove` / `dmsetup remove_all` | 普通 remove、busy remove 失败、remove_all 只删除 non-busy mapper |
-
-典型 table 示例：
-
-```text
-0 524288 linear 253:64 2048
-524288 524288 striped 2 8 253:80 2048 253:96 2048
-```
-
-含义：第一段是 linear segment，第二段是 2-way striped segment，chunk size 为 8 sectors。
-
-## 9. LVM2 PV / VG / LV 命令说明
-
-LVM2 suite 用真实 LVM2 命令生成 DM table，重点验证 Asterinas 能否承接 Linux 用户态工具生成的控制面和数据面行为。
-
-所有 LVM2 系统测试都会尽量禁用 udev 自动联动，直接测试 libdevmapper 与 Asterinas DM core：
-
-```bash
-LVM_CONFIG='activation { udev_rules=0 }'
-```
-
-| 类别 | 典型命令 | 主要验证点 |
-|---|---|---|
-| PV | `pvcreate`、`pvscan`、`pvs` | 初始化测试盘、reboot 后重新发现 PV、确认 PV 所属 VG |
-| VG | `vgcreate`、`vgextend`、`vgscan --mknodes`、`vgchange -ay/-an`、`vgs` | 创建/扩展 VG、reboot 后扫描并补 mapper 节点、激活/停用 VG |
-| linear LV | `lvcreate --type linear`、`lvextend`、`lvreduce`、`lvs --segments` | 单 PV linear、追加 linear segment、shrink 回单段、查看 segment 布局 |
-| striped LV | `lvcreate --type striped -i <count> -I <chunk>K`、`lvextend -i ... -I ...` | N-way striped、stripe count、chunk size、deps 与 PV 数一致 |
-| mixed LV | 先 `lvcreate --type linear`，再 `lvextend --type striped` | 同一 LV 内生成 linear + striped mixed table |
-
-shrink 顺序必须是先缩文件系统，再缩 LV：
-
-```bash
-e2fsck -f -y "$MAPPER_DEVICE"
-resize2fs "$MAPPER_DEVICE" <smaller-size>
-lvreduce --config "$LVM_CONFIG" -y -L <smaller-size> <vg>/<lv>
-```
-
-## 10. 文件系统和数据校验命令说明
-
-| 命令 | 用途 |
-|---|---|
-| `mkfs.ext2 -F -b 4096 "$MAPPER_DEVICE"` | 在 mapper 上创建 ext2，强制格式化并使用 4 KiB block size |
-| `blkid "$MAPPER_DEVICE"` | 确认 mapper 上存在文件系统标识 |
-| `mount -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"` | 首轮 guest 中读写挂载 |
-| `mount -o ro -t ext2 "$MAPPER_DEVICE" "$MOUNT_DIR"` | reboot 后只读挂载并校验数据 |
-| `umount "$MOUNT_DIR"` | 卸载，通常在 offline resize 或 guest 结束前执行 |
-| `e2fsck -f -y "$MAPPER_DEVICE"` | resize 前后检查文件系统一致性 |
-| `resize2fs "$MAPPER_DEVICE"` | LV grow 后扩容 ext2 |
-| `resize2fs "$MAPPER_DEVICE" <smaller-size>` | LV shrink 前缩小 ext2 |
-| `dd ... conv=fsync status=none` | raw BIO 测试或 LVM2 文件写入，`conv=fsync` 确保同步落盘 |
-| `md5sum -c <file>.md5` | 验证 mapper 读回数据、backing 分布或 reboot 后文件数据未损坏 |
-| `sync` | guest 关机前同步文件数据和 LVM 元数据 |
-| `df -h` / `du -sh` | 辅助确认文件系统容量和测试文件占用 |
-
-raw BIO 测试通常用 `dd` 精确制造跨 target 或跨 stripe chunk I/O；LVM2 reboot 测试通常用 `md5sum` 验证首轮 guest 写入的数据在第二轮 guest 中仍可读且内容一致。
-
-## 11. 常用测试选择速查
-
-| 目标 | 命令 |
-|---|---|
-| DM table / target 数据面 ktest | `myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::table::tests::<test_name>` |
-| DM ioctl 控制面 ktest | `myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>` |
-| dmsetup 控制面与对象生命周期 | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --control-plane` |
-| raw linear/striped/mixed/error/zero 数据面 | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --dataplane` |
-| LVM2 PV/VG/LV 生命周期与同 boot topology | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --lvm2-topology` |
-| linear LVM2、ext2、跨 PV 与三次启动恢复 | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --linear-integration` |
-| striped LVM2、ext2、跨 backing set 与三次启动恢复 | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-integration` |
-| 3-way striped integration | `STRIPED_PV_COUNT=3 GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --striped-integration` |
-| mixed linear + striped、ext2 与 reboot 恢复 | `GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-integration` |
-
-阶段验收时按改动路径显式组合上述 suite；当前不提供无参数默认运行或历史兼容入口。
+`make run_iso` 完成安装流程；安装完成不等于安装后的系统功能已经验证，因此需要再运行与改动相关的 NixOS suite。

@@ -1,6 +1,6 @@
 # Device Mapper 整体架构图草稿
 
-本文只作为技术文档配图草稿，正式位置和正文说明待确认后再合入 [device-mapper-technical-maintenance.md](device-mapper-technical-maintenance.md)。
+本文只作为技术文档配图草稿，正式位置和正文说明待确认后再合入 [device-mapper-technical-design-and-implementation.md](device-mapper-technical-design-and-implementation.md)。
 
 > 特别说明：图 0 描述的是为 Device Mapper control 接入而对 Asterinas `device` 框架做的更改，不是 DM table/target/BIO 数据面本身。它解释的是 `/dev/mapper/control` 如何在用户态 `dmsetup` 运行前由内核启动期注册出来。图 1 开始进入运行期控制面，描述用户态通过 control ioctl 创建具体 mapper 块设备入口的过程。
 
@@ -208,14 +208,11 @@ flowchart TB
 | QEMU 参数脚本适配 DM 多盘场景 | [/root/atom/asterinas/tools/qemu_args.sh](../tools/qemu_args.sh) |
 | **文档与记录** |  |
 | 协作与当前分支说明 | [/root/atom/asterinas/AGENTS.md](../AGENTS.md) |
-| DM 技术维护文档 | [/root/atom/asterinas/docs/device-mapper-technical-maintenance.md](device-mapper-technical-maintenance.md) |
+| DM 技术设计与实现说明 | [/root/atom/asterinas/docs/device-mapper-technical-design-and-implementation.md](device-mapper-technical-design-and-implementation.md) |
 | DM 配图与定位索引草稿 | [/root/atom/asterinas/docs/img.md](img.md) |
 | 非 DM 内核框架修改说明 | [/root/atom/asterinas/docs/non-device-mapper-change-rationale.md](non-device-mapper-change-rationale.md) |
-| striped 跨 segment 手工说明 | [/root/atom/asterinas/docs/striped-cross-segment-manual.md](striped-cross-segment-manual.md) |
 | DM 测试记录/说明 | [/root/atom/asterinas/docs/test.md](test.md) |
-| DM 分支对比与测试保障文档 | [/root/atom/asterinas/docs/DM分支对比与提交测试保障文档.docx](DM分支对比与提交测试保障文档.docx) |
-| Asterinas DM 分支对比与测试保障文档 | [/root/atom/asterinas/docs/Asterinas_DM_分支对比与提交测试保障文档.docx](Asterinas_DM_分支对比与提交测试保障文档.docx) |
-| 删除过期组件目录说明 | [/root/atom/asterinas/kernel/comps/README.md](../kernel/comps/README.md) |
+| DM 技术设计 DOCX | [/root/atom/asterinas/docs/Asterinas_DeviceMapper_技术设计与实现说明.docx](Asterinas_DeviceMapper_技术设计与实现说明.docx) |
 
 ## Device Mapper 函数到 ktest 索引
 
@@ -280,12 +277,12 @@ flowchart TB
 
 ### ktest 运行粒度
 
-| 改动范围 | 优先命令策略 | 说明 |
+| 改动范围 | 执行目录与命令 | 说明 |
 |---|---|---|
-| 单个函数 | `myshell/ktest_crate.sh <crate-dir> 完整测试函数名` | 最快确认当前函数对应场景，例如 `myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::target::linear::tests::maps_end_exclusive_sector_range`。 |
-| 单个模块 | `myshell/ktest_crate.sh <crate-dir> 模块路径或测试名前缀` | 适合改 `linear.rs`、`striped.rs`、`table.rs` 这类模块；脚本会补齐 release、boot、KVM 和 initramfs 参数。 |
-| 整个 DM crate | `myshell/ktest_crate.sh kernel/core/comps/device-mapper` | 覆盖 DM crate 内部 ktest；结果查看 `kernel/core/comps/device-mapper/ktest.log`。 |
-| ioctl ABI 或完整控制面 | `myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>` | 覆盖 core ioctl 层 ktest，验证 `/dev/mapper/control` 的 Linux ABI 语义。 |
+| 单个函数 | 在 `<crate-dir>` 执行 `CONSOLE=ttyS0 cargo osdk test <完整测试函数名>` | 最快确认当前函数对应场景。 |
+| 单个模块 | 在 `<crate-dir>` 执行 `CONSOLE=ttyS0 cargo osdk test <crate>::<module>::tests` | 适合改 `linear.rs`、`striped.rs`、`table.rs` 等模块，一次运行模块全部 ktest。 |
+| 整个 DM crate | 在 `kernel/core/comps/device-mapper` 执行 `CONSOLE=ttyS0 cargo osdk test` | 覆盖 DM crate 内部 ktest；从仓库根目录查看本轮 `qemu.log`。 |
+| ioctl ABI 或完整控制面 | 在 `kernel/core` 执行 `CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon aster_core::device::misc::device_mapper::tests` | 覆盖 core ioctl 层 ktest，验证 `/dev/mapper/control` 的 Linux ABI 语义；日志仍位于仓库根目录。 |
 | 阶段验收 | 跑对应 NixOS/LVM2 系统测试 | 验证 `dmsetup`/LVM2 用户态工具到 block I/O 的完整链路。 |
 
 ## 整体取舍建议
