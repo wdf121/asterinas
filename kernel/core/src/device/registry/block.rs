@@ -1024,6 +1024,44 @@ mod tests {
     }
 
     #[ktest]
+    fn failed_primary_removal_and_alias_recovery_restores_live_device() {
+        let device = TestBlockDevice::new(5);
+        let id = device.id();
+        aster_block::register(device).unwrap();
+        let block_file = Arc::new(BlockFile::new(
+            TestBlockDevice::new(5),
+            "runtime-block-recovery-success".to_string(),
+        ));
+        let unregistration = begin_runtime_unregistration(&block_file).unwrap();
+        let primary_error = Error::with_message(Errno::EIO, "injected primary remove failure");
+        let mut alias_restored = false;
+
+        assert_eq!(
+            recover_primary_removal_failure(
+                unregistration,
+                &block_file,
+                Some("mapper/runtime-block-recovery-success".to_string()),
+                primary_error,
+                |_, _| {
+                    alias_restored = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err()
+            .error(),
+            Errno::EIO
+        );
+        assert!(alias_restored);
+        assert!(aster_block::lookup(id).is_some());
+        assert!(aster_block::lookup_lease(id).is_some());
+        let opened = block_file.open().unwrap();
+        drop(opened);
+
+        let unregistration = begin_runtime_unregistration(&block_file).unwrap();
+        aster_block::commit_unregister(unregistration).unwrap();
+    }
+
+    #[ktest]
     fn failed_runtime_primary_node_creation_leaves_no_registry_state() {
         let device = TestBlockDevice::new(3);
         let id = device.id();
