@@ -18,6 +18,7 @@
 #  - VIRTIOFS_SOCKET: vhost-user socket path for the virtio-fs server;
 #  - INITRAMFS: "on" or "off"; when "off", attach `rootfs.img` as an extra block device.
 #  - CONSOLE: "hvc0" to enable virtio console;
+#  - ENABLE_KVM: "1" to enable KVM acceleration (default), or "0" to use TCG;
 #  - SMP: number of CPUs;
 #  - MEM: amount of memory, e.g. "8G";
 #  - VNC_PORT: VNC port, default is "42";
@@ -31,6 +32,7 @@ VSOCK=${VSOCK:-"off"}
 VIRTIOFS=${VIRTIOFS:-"off"}
 NETDEV=${NETDEV:-"user"}
 CONSOLE=${CONSOLE:-"hvc0"}
+ENABLE_KVM=${ENABLE_KVM:-1}
 XFSTESTS_NEEDS_BLOCK_DEVICES=${XFSTESTS_NEEDS_BLOCK_DEVICES:-false}
 
 if [ "$XFSTESTS_NEEDS_BLOCK_DEVICES" != "true" ] && \
@@ -119,13 +121,24 @@ if [ "$1" = "riscv" ]; then
     exit 0
 fi
 
+if [ "${ENABLE_KVM}" = "1" ]; then
+    KVM_ARGS="-accel kvm"
+else
+    KVM_ARGS=""
+fi
+
 if [ "$1" = "tdx" ]; then
+    if [ "${ENABLE_KVM}" != "1" ]; then
+        echo "TDX requires ENABLE_KVM=1" 1>&2
+        exit 1
+    fi
     TDX_OBJECT='{ "qom-type": "tdx-guest", "id": "tdx0", "sept-ve-disable": true, "quote-generation-socket": { "type": "vsock", "cid": "1", "port": "4050" } }'
     if [ "$INITRAMFS" = "off" ]; then
         ROOTFS_TDX_DEVICE_ARGS="-device virtio-blk-pci,bus=pcie.0,addr=0xb,drive=rootfs,serial=vrootfs,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off"
     fi
 
     QEMU_ARGS="\
+        $KVM_ARGS \
         -m ${MEM:-8G} \
         -smp ${SMP:-1} \
         -vga none \
@@ -160,6 +173,7 @@ if [ "$1" = "tdx" ]; then
 fi
 
 COMMON_QEMU_ARGS="\
+    $KVM_ARGS \
     -cpu Icelake-Server,+x2apic \
     -smp ${SMP:-1} \
     -m ${MEM:-8G} \

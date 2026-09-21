@@ -7,7 +7,6 @@ TARGET_ARCH ?= x86_64
 BENCHMARK ?= none
 BOOT_METHOD ?= grub-rescue-iso
 BOOT_PROTOCOL ?= multiboot2
-ENABLE_KVM ?= 1
 INTEL_TDX ?= 0
 MEM ?= 8G
 OVMF ?= on
@@ -207,12 +206,6 @@ else ifeq ($(BOOT_PROTOCOL), linux-legacy32)
 CARGO_OSDK_COMMON_ARGS += --linux-x86-legacy-boot --grub-boot-protocol="linux" --strip-elf
 else
 CARGO_OSDK_COMMON_ARGS += --grub-boot-protocol=$(BOOT_PROTOCOL)
-endif
-
-ifeq ($(ENABLE_KVM), 1)
-	ifeq ($(TARGET_ARCH), x86_64)
-	CARGO_OSDK_COMMON_ARGS += --qemu-args="-accel kvm"
-	endif
 endif
 
 # Skip GZIP to make encoding and decoding of initramfs faster
