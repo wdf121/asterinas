@@ -15,6 +15,12 @@ DNS_SERVER ?= none
 # Set Nix's cached tarballs to be live for a longer period of time (30 days) to avoid network traffics.
 # Nix's default value is rather small (1 hour or 3600 seconds).
 NIXPKGS_CACHE_TTL := 2592000 # In seconds
+INTEL_TDX ?= 0
+ifeq ($(INTEL_TDX),1)
+ENABLE_TDX_ATTEST := true
+else
+ENABLE_TDX_ATTEST := false
+endif
 MKFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))
 CUR_DIR := $(patsubst %/,%,$(dir $(MKFILE_PATH)))
 BUILD_DIR := $(CUR_DIR)/build
@@ -56,6 +62,7 @@ BOOT_IMAGE_NIX_ARGS := \
 	--arg enableBenchmarkTest $(ENABLE_BENCHMARK_TEST) \
 	--arg enableConformanceTest $(ENABLE_CONFORMANCE_TEST) \
 	--arg enableRegressionTest $(ENABLE_REGRESSION_TEST) \
+	--arg enableTdxAttest $(ENABLE_TDX_ATTEST) \
 	--argstr conformanceTestSuite $(CONFORMANCE_TEST_SUITE) \
 	--argstr conformanceTestWorkDir $(CONFORMANCE_TEST_WORKDIR) \
 	--argstr regressionTestPlatform $(REGRESSION_TEST_PLATFORM) \
