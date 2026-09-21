@@ -59,20 +59,78 @@ dm_prepare_nixos_test() {
     dm_reset_test_images
 }
 
-dm_run_guest_script() {
+_dm_stop_process_group() {
+    local leader_pid=${1:-}
+    local grace_seconds=${2:-5}
+    local grace_deadline
+
+    if [ -z "${leader_pid}" ]; then
+        return
+    fi
+    if kill -0 -- "-${leader_pid}" 2>/dev/null; then
+        kill -TERM -- "-${leader_pid}" 2>/dev/null || true
+        grace_deadline=$(($(date +%s) + grace_seconds))
+        while kill -0 -- "-${leader_pid}" 2>/dev/null &&
+              [ "$(date +%s)" -lt "${grace_deadline}" ]; do
+            sleep 1
+        done
+        if kill -0 -- "-${leader_pid}" 2>/dev/null; then
+            kill -KILL -- "-${leader_pid}" 2>/dev/null || true
+        fi
+    fi
+    wait "${leader_pid}" 2>/dev/null || true
+}
+
+_dm_stop_guest_process_group() {
+    _dm_stop_process_group "$@"
+}
+
+dm_run_guest_script() (
     local test_id=$1
     local script_file=$2
     local log_mode=$3
     local label=$4
-    local slug fifo start_line qemu_pid status dm_test_images start_ts elapsed ready_timeout_seconds lifecycle_timeout_seconds start_at completed_at input_line_delay
+    local slug fifo start_line status feeder_status
+    local dm_test_images start_ts now_ts elapsed ready_timeout_seconds
+    local lifecycle_timeout_seconds lifecycle_deadline ready_deadline start_at completed_at
+    local input_line_delay ready_timeout_input lifecycle_timeout_input
+    local qemu_pid= feeder_pid= fifo_guard_open=0 feeder_fd_open=0
+    local qemu_reaped=0 qemu_status=0
 
     dm_test_images=$(dm_test_images_env)
-    ready_timeout_seconds=${GUEST_READY_TIMEOUT:-40}
-    lifecycle_timeout_seconds=${GUEST_QEMU_TIMEOUT:-180}
+    ready_timeout_input=${GUEST_READY_TIMEOUT:-40}
+    lifecycle_timeout_input=${GUEST_QEMU_TIMEOUT:-180}
+    for timeout_value in "${ready_timeout_input}" "${lifecycle_timeout_input}"; do
+        case "${timeout_value}" in
+            ''|*[!0-9]*)
+                echo "HOST_FAIL_${test_id} ${label}_invalid_timeout=${timeout_value:-<empty>}"
+                return 2
+                ;;
+        esac
+        if ((10#${timeout_value} <= 0)); then
+            echo "HOST_FAIL_${test_id} ${label}_invalid_timeout=${timeout_value}"
+            return 2
+        fi
+    done
+    ready_timeout_seconds=$((10#${ready_timeout_input}))
+    lifecycle_timeout_seconds=$((10#${lifecycle_timeout_input}))
     input_line_delay=${GUEST_INPUT_LINE_DELAY:-0.01}
     slug=$(_dm_test_tmp_slug "${test_id}")
     fifo=$(mktemp -u "/tmp/${slug}-stdin.XXXXXX")
+
+    trap '
+        if [ "${feeder_fd_open}" -eq 1 ]; then exec 3>&-; fi
+        if [ "${fifo_guard_open}" -eq 1 ]; then exec 4>&-; fi
+        if [ -n "${feeder_pid}" ]; then _dm_stop_process_group "${feeder_pid}" 1; fi
+        if [ -n "${qemu_pid}" ]; then _dm_stop_guest_process_group "${qemu_pid}"; fi
+        rm -f "${fifo}"
+    ' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
     mkfifo "${fifo}"
+    exec 4<>"${fifo}"
+    fifo_guard_open=1
 
     if [ -f "${LOG}" ]; then
         start_line=$(wc -l <"${LOG}")
@@ -81,29 +139,37 @@ dm_run_guest_script() {
     fi
 
     start_ts=$(date +%s)
+    lifecycle_deadline=$((start_ts + lifecycle_timeout_seconds))
+    ready_deadline=$((start_ts + ready_timeout_seconds))
+    if [ "${ready_deadline}" -gt "${lifecycle_deadline}" ]; then
+        ready_deadline=${lifecycle_deadline}
+    fi
     start_at=$(date -Is)
     echo "HOST_INFO_${test_id} ${label}_guest_started_at=${start_at}"
     if [ "${log_mode}" = "append" ]; then
         DM_TEST_IMAGES="${dm_test_images}" \
         DM_TEST_IMAGE="${DM_TEST_IMAGE}" \
         DM_TEST_IMAGE_2="${DM_TEST_IMAGE_2}" \
-        setsid make run_nixos <"${fifo}" >>"${LOG}" 2>&1 &
+        setsid make run_nixos 3>&- 4>&- <"${fifo}" >>"${LOG}" 2>&1 &
     else
         DM_TEST_IMAGES="${dm_test_images}" \
         DM_TEST_IMAGE="${DM_TEST_IMAGE}" \
         DM_TEST_IMAGE_2="${DM_TEST_IMAGE_2}" \
-        setsid make run_nixos <"${fifo}" >"${LOG}" 2>&1 &
+        setsid make run_nixos 3>&- 4>&- <"${fifo}" >"${LOG}" 2>&1 &
     fi
     qemu_pid=$!
-
     exec 3>"${fifo}"
-    rm -f "${fifo}"
+    feeder_fd_open=1
+    exec 4>&-
+    fifo_guard_open=0
 
     while ! tail -n "+$((start_line + 1))" "${LOG}" | grep -aq 'root@asterinas'; do
         if ! kill -0 "${qemu_pid}" 2>/dev/null; then
             exec 3>&-
+            feeder_fd_open=0
             status=0
             wait "${qemu_pid}" || status=$?
+            qemu_pid=
             if [ "${status}" -eq 0 ]; then
                 status=1
             fi
@@ -112,12 +178,17 @@ dm_run_guest_script() {
             echo "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s"
             return "${status}"
         fi
-        elapsed=$(($(date +%s) - start_ts))
-        if [ "${elapsed}" -ge "${ready_timeout_seconds}" ]; then
-            echo "HOST_FAIL_${test_id} ${label}_guest_ready_timeout=${ready_timeout_seconds}s"
+        now_ts=$(date +%s)
+        if [ "${now_ts}" -ge "${ready_deadline}" ]; then
             exec 3>&-
-            kill -- "-${qemu_pid}" 2>/dev/null || kill "${qemu_pid}" 2>/dev/null || true
-            wait "${qemu_pid}" || true
+            feeder_fd_open=0
+            if [ "${now_ts}" -ge "${lifecycle_deadline}" ]; then
+                echo "HOST_FAIL_${test_id} ${label}_guest_lifecycle_timeout=${lifecycle_timeout_seconds}s phase=ready"
+            else
+                echo "HOST_FAIL_${test_id} ${label}_guest_ready_timeout=${ready_timeout_seconds}s"
+            fi
+            _dm_stop_guest_process_group "${qemu_pid}"
+            qemu_pid=
             completed_at=$(date -Is)
             echo "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s"
             return 124
@@ -127,36 +198,107 @@ dm_run_guest_script() {
 
     elapsed=$(($(date +%s) - start_ts))
     echo "HOST_INFO_${test_id} ${label}_guest_ready_after=${elapsed}s ready_timeout=${ready_timeout_seconds}s lifecycle_timeout=${lifecycle_timeout_seconds}s"
-    if [ "${input_line_delay}" != "0" ]; then
-        while IFS= read -r line || [ -n "${line}" ]; do
-            printf '%s\n' "${line}" >&3
-            sleep "${input_line_delay}"
-        done <"${script_file}"
-    else
-        cat "${script_file}" >&3
-    fi
+    setsid bash -c '
+        script_file=$1
+        input_line_delay=$2
+        status=0
+        if [ "${input_line_delay}" != "0" ]; then
+            mapfile -t input_lines <"${script_file}" || status=$?
+            if [ "${status}" -eq 0 ]; then
+                for ((index = 0; index < ${#input_lines[@]}; index++)); do
+                    if [ "${index}" -gt 0 ]; then
+                        sleep "${input_line_delay}" || {
+                            status=$?
+                            break
+                        }
+                    fi
+                    printf "%s\n" "${input_lines[index]}" >&3 || {
+                        status=$?
+                        break
+                    }
+                done
+            fi
+        else
+            cat "${script_file}" >&3 || status=$?
+        fi
+        exec 3>&-
+        exit "${status}"
+    ' dm-guest-feeder "${script_file}" "${input_line_delay}" 4>&- &
+    feeder_pid=$!
     exec 3>&-
+    feeder_fd_open=0
+    rm -f "${fifo}"
 
-    while kill -0 "${qemu_pid}" 2>/dev/null; do
-        elapsed=$(($(date +%s) - start_ts))
-        if [ "${elapsed}" -ge "${lifecycle_timeout_seconds}" ]; then
-            echo "HOST_FAIL_${test_id} ${label}_guest_lifecycle_timeout=${lifecycle_timeout_seconds}s"
-            kill -- "-${qemu_pid}" 2>/dev/null || kill "${qemu_pid}" 2>/dev/null || true
-            wait "${qemu_pid}" || true
+    while kill -0 "${feeder_pid}" 2>/dev/null; do
+        if ! kill -0 "${qemu_pid}" 2>/dev/null; then
+            qemu_status=0
+            wait "${qemu_pid}" || qemu_status=$?
+            qemu_pid=
+            qemu_reaped=1
+            for _ in 1 2; do
+                if ! kill -0 "${feeder_pid}" 2>/dev/null; then
+                    break
+                fi
+                sleep 1
+            done
+            if kill -0 "${feeder_pid}" 2>/dev/null; then
+                _dm_stop_process_group "${feeder_pid}" 1
+                feeder_pid=
+                if [ "${qemu_status}" -eq 0 ]; then
+                    qemu_status=1
+                fi
+                completed_at=$(date -Is)
+                echo "HOST_FAIL_${test_id} ${label}_guest_exited_during_input status=${qemu_status}"
+                echo "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s"
+                return "${qemu_status}"
+            fi
+            break
+        fi
+        if [ "$(date +%s)" -ge "${lifecycle_deadline}" ]; then
+            echo "HOST_FAIL_${test_id} ${label}_guest_lifecycle_timeout=${lifecycle_timeout_seconds}s phase=input"
+            _dm_stop_process_group "${feeder_pid}" 1
+            feeder_pid=
+            _dm_stop_guest_process_group "${qemu_pid}"
+            qemu_pid=
             completed_at=$(date -Is)
             echo "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s"
             return 124
         fi
         sleep 1
     done
+    feeder_status=0
+    wait "${feeder_pid}" || feeder_status=$?
+    feeder_pid=
+    if [ "${feeder_status}" -ne 0 ]; then
+        echo "HOST_FAIL_${test_id} ${label}_guest_input_failure status=${feeder_status}"
+        _dm_stop_guest_process_group "${qemu_pid}"
+        qemu_pid=
+        completed_at=$(date -Is)
+        echo "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s"
+        return "${feeder_status}"
+    fi
 
-    status=0
-    wait "${qemu_pid}" || status=$?
+    if [ "${qemu_reaped}" -eq 0 ]; then
+        while kill -0 "${qemu_pid}" 2>/dev/null; do
+            if [ "$(date +%s)" -ge "${lifecycle_deadline}" ]; then
+                echo "HOST_FAIL_${test_id} ${label}_guest_lifecycle_timeout=${lifecycle_timeout_seconds}s phase=execution_or_shutdown"
+                _dm_stop_guest_process_group "${qemu_pid}"
+                qemu_pid=
+                completed_at=$(date -Is)
+                echo "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s"
+                return 124
+            fi
+            sleep 1
+        done
+
+        qemu_status=0
+        wait "${qemu_pid}" || qemu_status=$?
+        qemu_pid=
+    fi
     completed_at=$(date -Is)
-    echo "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s status=${status}"
-    return "${status}"
-}
-
+    echo "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s status=${qemu_status}"
+    return "${qemu_status}"
+)
 dm_print_summary() {
     local test_id=$1
     local include=$2
