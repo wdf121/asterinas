@@ -9,12 +9,12 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
 Usage: myshell/run_dm_dataplane_test.sh
 
 Runs one NixOS guest pass for Device Mapper data-plane semantics. It validates
-large BIOs across target and stripe boundaries, non-zero backing starts,
+userspace transfers across target and stripe boundaries, non-zero backing starts,
 non-aligned striped ranges, mixed target tables, and direct-complete target
 behavior.
 
 Optional environment variables:
-  DM_TEST_IMAGES            Space-separated backing image paths, default four test images
+  DM_TEST_IMAGES            Space-separated backing image paths, default three test images
   DM_DATAPLANE_LOG          Host-side log path, default /tmp/dm-dataplane-test.log
   GUEST_QEMU_TIMEOUT        Full QEMU lifecycle timeout in seconds, default 180
   GUEST_READY_TIMEOUT       Guest shell readiness timeout in seconds, default 40
@@ -37,20 +37,33 @@ TEST_ID=DM_DATAPLANE
 LOG=${DM_DATAPLANE_LOG:-/tmp/dm-dataplane-test.log}
 DM_TEST_IMAGE=${DM_TEST_IMAGE:-target/nixos/test.img}
 DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
-DM_TEST_IMAGES=${DM_TEST_IMAGES:-target/nixos/test.img target/nixos/test2.img target/nixos/test3.img target/nixos/test4.img}
+DM_TEST_IMAGES=${DM_TEST_IMAGES:-target/nixos/test.img target/nixos/test2.img target/nixos/test3.img}
 GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-180}
 GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-40}
+GUEST_INPUT_LINE_DELAY=${GUEST_INPUT_LINE_DELAY:-0.05}
 DM_DATAPLANE_STEP5_IO_TIMEOUT=${DM_DATAPLANE_STEP5_IO_TIMEOUT:-20}
-export DM_DATAPLANE_STEP5_IO_TIMEOUT
+case "${DM_DATAPLANE_STEP5_IO_TIMEOUT}" in
+    ''|*[!0-9]*)
+        echo "DM_DATAPLANE_STEP5_IO_TIMEOUT must be a positive decimal integer" >&2
+        exit 2
+        ;;
+esac
+if ((10#${DM_DATAPLANE_STEP5_IO_TIMEOUT} <= 0)); then
+    echo "DM_DATAPLANE_STEP5_IO_TIMEOUT must be a positive decimal integer" >&2
+    exit 2
+fi
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
-echo "HOST_INFO_${TEST_ID} disks=${DM_TEST_IMAGES} serials=vdmtest,vdmtest2,vdmtest3,vdmtest4"
+echo "HOST_INFO_${TEST_ID} disks=${DM_TEST_IMAGES} serials=vdmtest,vdmtest2,vdmtest3"
 echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
+echo "HOST_INFO_${TEST_ID} step5_io_timeout=${DM_DATAPLANE_STEP5_IO_TIMEOUT}s"
 
 GUEST_SCRIPT_FILE=$(mktemp /tmp/dm-dataplane-guest.XXXXXX)
-cat >"${GUEST_SCRIPT_FILE}" <<'GUEST_SCRIPT'
+printf 'export DM_DATAPLANE_STEP5_IO_TIMEOUT=%s\n' \
+    "${DM_DATAPLANE_STEP5_IO_TIMEOUT}" >"${GUEST_SCRIPT_FILE}"
+cat >>"${GUEST_SCRIPT_FILE}" <<'GUEST_SCRIPT'
 stty -echo 2>/dev/null || true
 set -eu
 
@@ -141,7 +154,7 @@ printf 'DEV1=%s\nDEV2=%s\nDEV3=%s\n' "$DEV1" "$DEV2" "$DEV3"
 cleanup_dm
 echo CHECK_PASS_DATAPLANE_SETUP
 
-echo '=== STEP 2: one 4 KiB BIO crosses two linear targets ==='
+echo '=== STEP 2: one 4 KiB userspace transfer crosses two linear targets ==='
 dd if=/dev/zero of="$DISK1" bs=4096 count=1 conv=fsync status=none
 dd if=/dev/zero of="$DISK2" bs=4096 count=1 conv=fsync status=none
 printf '0 4 linear %s 0\n4 4 linear %s 0\n' "$DEV1" "$DEV2" | dmsetup create dm_linear_cross
@@ -187,7 +200,7 @@ compare_file LINEAR_SEGMENTS_BACKING_D2 /tmp/linear-segments-expected-d2.bin /tm
 compare_file LINEAR_SEGMENTS_BACKING_D3 /tmp/linear-segments-expected-d3.bin /tmp/linear-segments-actual-d3.bin
 dmsetup remove dm_linear_segments
 
-echo '=== STEP 4: one 8 KiB BIO crosses four striped chunks ==='
+echo '=== STEP 4: one 8 KiB userspace transfer crosses four striped chunks ==='
 dd if=/dev/zero of="$DISK1" bs=8192 count=1 conv=fsync status=none
 dd if=/dev/zero of="$DISK2" bs=8192 count=1 conv=fsync status=none
 printf '0 16 striped 2 4 %s 0 %s 0\n' "$DEV1" "$DEV2" | dmsetup create dm_striped_aligned
@@ -210,7 +223,8 @@ compare_file STRIPED_ALIGNED_BACKING_D1 /tmp/striped-aligned-expected-d1.bin /tm
 compare_file STRIPED_ALIGNED_BACKING_D2 /tmp/striped-aligned-expected-d2.bin /tmp/striped-aligned-actual-d2.bin
 dmsetup remove dm_striped_aligned
 
-STEP5_IO_TIMEOUT=${DM_DATAPLANE_STEP5_IO_TIMEOUT:-20}
+STEP5_IO_TIMEOUT=${DM_DATAPLANE_STEP5_IO_TIMEOUT}
+echo "GUEST_INFO_DM_DATAPLANE step5_io_timeout=${STEP5_IO_TIMEOUT}s"
 
 echo '=== STEP 5: striped I/O starts inside a chunk and spans boundaries ==='
 dd if=/dev/zero of="$DISK1" bs=4096 count=4 conv=fsync status=none
@@ -241,7 +255,7 @@ compare_file STRIPED_OFFSET_BACKING_D1 /tmp/striped-offset-expected-d1.bin /tmp/
 compare_file STRIPED_OFFSET_BACKING_D2 /tmp/striped-offset-expected-d2.bin /tmp/striped-offset-actual-d2.bin
 dmsetup remove dm_striped_offset
 
-echo '=== STEP 6: one BIO crosses a linear-to-striped target boundary ==='
+echo '=== STEP 6: one userspace transfer crosses a linear-to-striped target boundary ==='
 dd if=/dev/zero of="$DISK1" bs=8192 count=1 conv=fsync status=none
 dd if=/dev/zero of="$DISK2" bs=8192 count=1 conv=fsync status=none
 dd if=/dev/zero of="$DISK3" bs=8192 count=1 conv=fsync status=none
