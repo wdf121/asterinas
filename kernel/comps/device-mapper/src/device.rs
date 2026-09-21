@@ -2,7 +2,7 @@
 
 use alloc::{collections::VecDeque, string::String, sync::Arc};
 use core::{
-    fmt::Debug,
+    fmt::{Debug, Display, Formatter},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -14,6 +14,20 @@ use device_id::DeviceId;
 use ostd::sync::{Mutex, MutexGuard, WaitQueue};
 
 use crate::{DmError, DmTable, manager::DmDeviceIdOwner};
+
+/// Formats one mapper block-device identity as its Linux-visible major:minor pair.
+struct DeviceIdLogLabel(DeviceId);
+
+impl Display for DeviceIdLogLabel {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(
+            formatter,
+            "{}:{}",
+            self.0.major().get(),
+            self.0.minor().get()
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DmDevicePhase {
@@ -107,9 +121,9 @@ impl InitialResumeGuard<'_> {
         let replay_count = replay.as_ref().map_or(0, |(_, bios)| bios.len());
         drop(self.state.take());
         ostd::error!(
-            "[dm-debug] state initial-resume committed name={} id={:?} replay_postponed={}",
+            "[dm-debug] state initial-resume committed name={} dev={} replay_postponed={}",
             self.device.name(),
-            self.device.id(),
+            DeviceIdLogLabel(self.device.id()),
             replay_count
         );
         self.device.replay_postponed(replay);
@@ -229,9 +243,9 @@ impl DmDevice {
         }
         if count != 0 {
             ostd::error!(
-                "[dm-debug] state postponed-bios failed name={} id={:?} count={}",
+                "[dm-debug] state postponed-bios failed name={} dev={} count={}",
                 self.name(),
-                self.id(),
+                DeviceIdLogLabel(self.id()),
                 count
             );
         }
@@ -279,9 +293,9 @@ impl DmDevice {
         let capacity = table.length();
         self.state.lock().inactive = Some(table);
         ostd::error!(
-            "[dm-debug] state table-loaded name={} id={:?} slot=inactive targets={} sectors={}",
+            "[dm-debug] state table-loaded name={} dev={} slot=inactive targets={} sectors={}",
             self.name(),
-            self.id(),
+            DeviceIdLogLabel(self.id()),
             target_count,
             capacity
         );
@@ -295,9 +309,9 @@ impl DmDevice {
     pub fn clear_inactive_table(&self) -> Result<(), DmError> {
         let cleared = self.state.lock().inactive.take().is_some();
         ostd::error!(
-            "[dm-debug] state table-cleared name={} id={:?} cleared={}",
+            "[dm-debug] state table-cleared name={} dev={} cleared={}",
             self.name(),
-            self.id(),
+            DeviceIdLogLabel(self.id()),
             cleared
         );
         Ok(())
@@ -321,9 +335,9 @@ impl DmDevice {
         state.phase = DmDevicePhase::Suspended;
         drop(state);
         ostd::error!(
-            "[dm-debug] state suspended name={} id={:?} mode=flush",
+            "[dm-debug] state suspended name={} dev={} mode=flush",
             self.name(),
-            self.id()
+            DeviceIdLogLabel(self.id())
         );
         Ok(())
     }
@@ -342,9 +356,9 @@ impl DmDevice {
                 state.phase = DmDevicePhase::Suspended;
                 drop(state);
                 ostd::error!(
-                    "[dm-debug] state suspended name={} id={:?} mode=noflush",
+                    "[dm-debug] state suspended name={} dev={} mode=noflush",
                     self.name(),
-                    self.id()
+                    DeviceIdLogLabel(self.id())
                 );
                 Ok(())
             }
@@ -424,9 +438,9 @@ impl DmDevice {
         let replay_count = replay.as_ref().map_or(0, |(_, bios)| bios.len());
         self.replay_postponed(replay);
         ostd::error!(
-            "[dm-debug] state resumed name={} id={:?} replaced_active={} replay_postponed={}",
+            "[dm-debug] state resumed name={} dev={} replaced_active={} replay_postponed={}",
             self.name(),
-            self.id(),
+            DeviceIdLogLabel(self.id()),
             replaced_active,
             replay_count
         );
@@ -466,9 +480,9 @@ impl DmDevice {
             state.event_nr
         };
         ostd::error!(
-            "[dm-debug] state event-published name={} id={:?} event_nr={}",
+            "[dm-debug] state event-published name={} dev={} event_nr={}",
             self.name(),
-            self.id(),
+            DeviceIdLogLabel(self.id()),
             event_nr
         );
         self.events.wake_all();
@@ -529,7 +543,7 @@ impl BlockDevice for DmDevice {
 }
 
 impl Debug for DmDevice {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DmDevice")
             .field("id", &self.id())
             .field("name", &self.name)
@@ -541,12 +555,13 @@ impl Debug for DmDevice {
 
 #[cfg(ktest)]
 mod tests {
-    use alloc::{string::ToString, vec};
+    use alloc::{boxed::Box, string::ToString, vec};
 
     use aster_block::{
-        BlockDeviceLease,
+        BlockDeviceLease, allocate_major,
         bio::{Bio, BioDirection, BioSegment, BioType},
         id::Sid,
+        lookup, lookup_lease, register, unregister,
     };
     use device_id::{MajorId, MinorId};
     use ostd::{
@@ -565,12 +580,18 @@ mod tests {
 
     #[derive(Debug)]
     struct DeferredBlockDevice {
+        id: DeviceId,
         submitted: Mutex<Option<SubmittedBio>>,
     }
 
     impl DeferredBlockDevice {
         fn new() -> Arc<Self> {
+            Self::with_id(DeviceId::new(MajorId::new(1), MinorId::new(2)))
+        }
+
+        fn with_id(id: DeviceId) -> Arc<Self> {
             Arc::new(Self {
+                id,
                 submitted: Mutex::new(None),
             })
         }
@@ -610,7 +631,7 @@ mod tests {
         }
 
         fn id(&self) -> DeviceId {
-            DeviceId::new(MajorId::new(1), MinorId::new(2))
+            self.id
         }
     }
 
@@ -1085,18 +1106,24 @@ mod tests {
 
     #[ktest]
     fn suspend_no_flush_replays_postponed_bios_without_waiting_for_old_bios() {
+        let major_owner = allocate_major().unwrap();
+        let old_id = DeviceId::new(major_owner.get(), MinorId::new(1));
+        let replacement_id = DeviceId::new(major_owner.get(), MinorId::new(2));
+        let old_backing = DeferredBlockDevice::with_id(old_id);
+        let replacement_backing = DeferredBlockDevice::with_id(replacement_id);
+        register(old_backing.clone() as Arc<dyn BlockDevice>).unwrap();
+        register(replacement_backing.clone() as Arc<dyn BlockDevice>).unwrap();
+
         let manager = DmManager::new().unwrap();
         let device = manager
             .create("dm-suspend-noflush-test".to_string(), None, None)
             .unwrap();
-        let old_backing = DeferredBlockDevice::new();
-        let replacement_backing = DeferredBlockDevice::new();
         let first = Arc::new(
             DmTable::new_single_linear(
                 Sid::new(0),
                 128,
                 Sid::new(16),
-                BlockDeviceLease::new_untracked(old_backing.clone()),
+                lookup_lease(old_id).unwrap(),
             )
             .unwrap(),
         );
@@ -1105,17 +1132,27 @@ mod tests {
                 Sid::new(0),
                 64,
                 Sid::new(32),
-                BlockDeviceLease::new_untracked(replacement_backing.clone()),
+                lookup_lease(replacement_id).unwrap(),
             )
             .unwrap(),
         );
         device.load_table(first);
         device.resume().unwrap();
 
+        let old_completions = Arc::new(AtomicUsize::new(0));
+        let old_completions_for_callback = old_completions.clone();
         let mut old_batch = io_util::batch::IoBatch::with_capacity(1);
-        Bio::new(BioType::Flush, Sid::new(0), vec![], None)
-            .submit(device.as_ref(), &mut old_batch)
-            .unwrap();
+        Bio::new(
+            BioType::Flush,
+            Sid::new(0),
+            vec![],
+            Some(Box::new(move |status| {
+                assert_eq!(status, BioStatus::Complete);
+                old_completions_for_callback.fetch_add(1, Ordering::AcqRel);
+            })),
+        )
+        .submit(device.as_ref(), &mut old_batch)
+        .unwrap();
         assert!(old_backing.has_submitted_bio());
         assert_eq!(device.io.in_flight.load(Ordering::Acquire), 1);
 
@@ -1123,10 +1160,20 @@ mod tests {
         assert!(device.status().suspended);
         assert_eq!(device.io.in_flight.load(Ordering::Acquire), 1);
 
+        let replacement_completions = Arc::new(AtomicUsize::new(0));
+        let replacement_completions_for_callback = replacement_completions.clone();
         let mut postponed_batch = io_util::batch::IoBatch::with_capacity(1);
-        Bio::new(BioType::Flush, Sid::new(0), vec![], None)
-            .submit(device.as_ref(), &mut postponed_batch)
-            .unwrap();
+        Bio::new(
+            BioType::Flush,
+            Sid::new(0),
+            vec![],
+            Some(Box::new(move |status| {
+                assert_eq!(status, BioStatus::Complete);
+                replacement_completions_for_callback.fetch_add(1, Ordering::AcqRel);
+            })),
+        )
+        .submit(device.as_ref(), &mut postponed_batch)
+        .unwrap();
         assert_eq!(device.state.lock().postponed.len(), 1);
         assert!(!replacement_backing.has_submitted_bio());
 
@@ -1134,19 +1181,54 @@ mod tests {
         device.resume().unwrap();
 
         assert!(Arc::ptr_eq(&device.active_table().unwrap(), &replacement));
+        drop(replacement);
         assert!(!device.status().suspended);
         assert!(old_backing.has_submitted_bio());
         assert!(replacement_backing.has_submitted_bio());
         assert_eq!(device.io.in_flight.load(Ordering::Acquire), 2);
+        assert_eq!(old_completions.load(Ordering::Acquire), 0);
+        assert_eq!(replacement_completions.load(Ordering::Acquire), 0);
+        assert_eq!(unregister(old_id).unwrap_err(), aster_block::Error::Busy);
+        assert_eq!(
+            unregister(replacement_id).unwrap_err(),
+            aster_block::Error::Busy
+        );
 
         replacement_backing.complete();
-        while device.io.in_flight.load(Ordering::Acquire) != 1 {
-            Task::yield_now();
-        }
+        postponed_batch.wait_all().unwrap();
+        assert_eq!(replacement_completions.load(Ordering::Acquire), 1);
+        assert_eq!(old_completions.load(Ordering::Acquire), 0);
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 1);
+        assert!(!replacement_backing.has_submitted_bio());
+        assert!(old_backing.has_submitted_bio());
+        assert_eq!(unregister(old_id).unwrap_err(), aster_block::Error::Busy);
+        assert_eq!(
+            unregister(replacement_id).unwrap_err(),
+            aster_block::Error::Busy
+        );
+
         old_backing.complete();
-        while device.io.in_flight.load(Ordering::Acquire) != 0 {
-            Task::yield_now();
-        }
+        old_batch.wait_all().unwrap();
+        assert_eq!(old_completions.load(Ordering::Acquire), 1);
+        assert_eq!(replacement_completions.load(Ordering::Acquire), 1);
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
+        assert!(!old_backing.has_submitted_bio());
+        assert!(!replacement_backing.has_submitted_bio());
+        assert_eq!(device.state.lock().postponed.len(), 0);
+
+        drop(unregister(old_id).unwrap());
+        assert!(lookup(old_id).is_none());
+        assert_eq!(
+            unregister(replacement_id).unwrap_err(),
+            aster_block::Error::Busy
+        );
+
+        drop(device);
+        drop(manager);
+        drop(unregister(replacement_id).unwrap());
+        assert!(lookup(replacement_id).is_none());
+        assert_eq!(old_completions.load(Ordering::Acquire), 1);
+        assert_eq!(replacement_completions.load(Ordering::Acquire), 1);
     }
 
     #[ktest]
