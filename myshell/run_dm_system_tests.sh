@@ -8,7 +8,6 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 SUITE_ORDER=(
     --control-plane
-    --control-plane-non-wait
     --dataplane
     --lvm2-topology
     --linear-integration
@@ -18,7 +17,6 @@ SUITE_ORDER=(
 
 declare -A SUITE_SCRIPTS=(
     [--control-plane]="run_dm_control_plane_test.sh"
-    [--control-plane-non-wait]="run_dm_control_plane_non_wait_test.sh"
     [--dataplane]="run_dm_dataplane_test.sh"
     [--lvm2-topology]="run_lvm2_topology_test.sh"
     [--linear-integration]="dm_linear/run_lvm2_linear_integration_test.sh"
@@ -28,7 +26,6 @@ declare -A SUITE_SCRIPTS=(
 
 declare -A SUITE_DESCRIPTIONS=(
     [--control-plane]="dmsetup discovery, tables, lifecycle, events, rename, read-only, and removal semantics"
-    [--control-plane-non-wait]="control-plane regression excluding only blocked DM_DEV_WAIT assertions"
     [--dataplane]="raw linear, striped, mixed, zero, and error target I/O semantics"
     [--lvm2-topology]="PV/VG/LV topology, segment growth, activation, and removal semantics"
     [--linear-integration]="linear LVM2, ext2, same-PV and cross-PV growth, reboot, and shrink"
