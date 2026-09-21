@@ -120,6 +120,21 @@ where
     KtestResult::Ok
 }
 
+/// Returns whether a whitelist selects a test by either its module path or its
+/// complete path including the function name.
+///
+/// A module selector such as `device_mapper::tests` selects every test in that
+/// module, while a function selector such as `tests::some_test` selects only
+/// that function.
+fn test_matches_whitelist(whitelist: &SuffixTrie, module_path: &str, fn_name: &str) -> bool {
+    let mut test_path = KtestPath::from(module_path);
+    if whitelist.contains(test_path.iter()) {
+        return true;
+    }
+    test_path.push_back(fn_name);
+    whitelist.contains(test_path.iter())
+}
+
 fn run_crate_ktests(crate_: &KtestCrate, whitelist: &Option<SuffixTrie>) -> KtestResult {
     let crate_name = crate_.name();
     early_print!(
@@ -133,13 +148,11 @@ fn run_crate_ktests(crate_: &KtestCrate, whitelist: &Option<SuffixTrie>) -> Ktes
     let mut failed_tests: Vec<(KtestItem, KtestError)> = Vec::new();
     for module in crate_.iter() {
         for test in module.iter() {
-            if let Some(trie) = whitelist {
-                let mut test_path = KtestPath::from(test.info().module_path);
-                test_path.push_back(test.info().fn_name);
-                if !trie.contains(test_path.iter()) {
-                    filtered += 1;
-                    continue;
-                }
+            if let Some(trie) = whitelist
+                && !test_matches_whitelist(trie, test.info().module_path, test.info().fn_name)
+            {
+                filtered += 1;
+                continue;
             }
             early_print!(
                 "test {}::{} ...\n",
