@@ -82,39 +82,40 @@ git diff --check
 git status --short
 ```
 
-To narrowly run `aster-device-mapper` crate ktests, call the repository wrapper
-from the repository root. The wrapper enters the target crate and supplies the
-release, boot, KVM, initramfs, console, and timeout arguments:
+Run targeted ktests from the target Cargo crate directory with an explicit
+serial console. Use the module `::tests` selector to run all tests in that
+module:
 
 ```bash
-myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::table::tests::<test_name>
-```
+cd kernel/core/comps/device-mapper
+CONSOLE=ttyS0 cargo osdk test aster_device_mapper::table::tests
 
-To narrowly run `aster-core` ioctl-layer ktests, use the same wrapper with the
-`kernel/core` crate directory:
-
-```bash
-myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>
+cd ../../
+CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon \
+  aster_core::device::misc::device_mapper::tests
 ```
 
 Do not use root `make ktest CARGO_OSDK_TEST_ARGS="..."` as the default targeted
-ktest entry because it can override Makefile-provided release, KVM, and
-initramfs arguments. Use `myshell/ktest_crate.sh <crate-dir> <test-path>` for
-targeted ktests. The wrapper writes one result log at `<crate-dir>/ktest.log`;
-it contains the current crate's ktest results and omits QEMU startup and kernel
-noise. It uses `timeout --foreground` so QEMU stays in the invoking terminal's
-foreground process group during interactive runs.
+ktest entry. Run `CONSOLE=ttyS0 cargo osdk test [module::tests]` from the target
+crate directory. Core tests additionally require `--kcmd-args=earlycon` for
+observable ktest output. Inspect QEMU logs from the repository root: with the
+current default x86_64 non-TDX `ttyS0` path, use `qemu.log`; `hvc0` uses
+`qemu-serial.log`. A pre-existing serial log may be stale when the current run
+uses `ttyS0`.
 
 Run QEMU, ktest, and NixOS system tests serially to avoid image lock conflicts,
 especially around `test/initramfs/build/ext2.img`. For new NixOS system suite
 runs, set `GUEST_READY_TIMEOUT=40` and `GUEST_QEMU_TIMEOUT=180`: the former
 limits boot to the guest shell, while the latter limits the complete lifecycle
-of each QEMU guest. If a ktest/QEMU/NixOS run makes no relevant progress for
-about three minutes, suspect command filtering, wrong crate working directory,
-root `make ktest` argument override, missing KVM or initramfs arguments,
-leftover processes, or image-lock issues; inspect output and processes, stop
-only processes started for the current run if needed, and retry with
-`myshell/ktest_crate.sh` from the repository root.
+of each QEMU guest. DM system suites inherit the Makefile default `RELEASE=1`.
+Use `RELEASE=0` only for an explicitly requested debugging run; debug-mode
+results are diagnostic evidence and do not replace release acceptance. If a
+ktest/QEMU/NixOS run makes no relevant progress for about three minutes,
+suspect command filtering, wrong crate working directory, root `make ktest`
+argument override, missing KVM or initramfs arguments, leftover processes, or
+image-lock issues; inspect output and processes, stop only processes started
+for the current run, then retry from the target crate directory with
+`CONSOLE=ttyS0 cargo osdk test`.
 
 Do not modify KVM, RELEASE, QEMU, NixOS boot protocol, or `myshell/br.sh` unless
 explicitly requested. Run DM system tests through explicit canonical suite
