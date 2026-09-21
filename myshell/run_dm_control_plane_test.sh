@@ -19,7 +19,6 @@ Optional environment variables:
   GUEST_QEMU_TIMEOUT         Full QEMU lifecycle timeout in seconds, default 180
   GUEST_READY_TIMEOUT        Guest shell readiness timeout in seconds, default 40
   RESET_DM_TEST_IMAGES       1 to delete test images before running, default 1
-  DM_CONTROL_PLANE_SKIP_WAIT 1 to skip only DM_DEV_WAIT assertions, default 0
 
 Expected success markers:
   SUMMARY_GAP_DM_CONTROL_PLANE: 0
@@ -41,14 +40,6 @@ GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-180}
 GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-40}
 GUEST_INPUT_LINE_DELAY=${GUEST_INPUT_LINE_DELAY:-0.01}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
-DM_CONTROL_PLANE_SKIP_WAIT=${DM_CONTROL_PLANE_SKIP_WAIT:-0}
-case "${DM_CONTROL_PLANE_SKIP_WAIT}" in
-    0|1) ;;
-    *)
-        echo "DM_CONTROL_PLANE_SKIP_WAIT must be 0 or 1" >&2
-        exit 2
-        ;;
-esac
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
@@ -57,12 +48,10 @@ echo "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
 echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 
 GUEST_SCRIPT_FILE=$(mktemp /tmp/dm-control-plane-guest.XXXXXX)
-printf 'export DM_CONTROL_PLANE_SKIP_WAIT=%s\n' "${DM_CONTROL_PLANE_SKIP_WAIT}" >"${GUEST_SCRIPT_FILE}"
-cat >>"${GUEST_SCRIPT_FILE}" <<'GUEST_SCRIPT'
+cat >"${GUEST_SCRIPT_FILE}" <<'GUEST_SCRIPT'
 stty -echo 2>/dev/null || true
 cat >/tmp/dm_control_plane_guest.sh <<'DMSETUP_GUEST_BODY'
 set -u
-SKIP_WAIT=${DM_CONTROL_PLANE_SKIP_WAIT:-0}
 
 PREFIX=dm_control
 names='stdin notable first_publish first_rename first_renamed first_remove linear_major linear_path discovery striped_major striped_path error zero table_lifecycle state_event rename rename_existing renamed readonly busy busy_other deferred_busy remove_active remove_tableless remove_all_a remove_all_b'
@@ -358,34 +347,31 @@ expect_deps_count() {
     grep_expect "${label}_count" "${count} dependencies" "/tmp/${label}.out"
 }
 
-run_wait_old_event() {
+run_wait_current_event_unchanged_by_suspend() {
     label=$1
     dev=$2
-    event=$(event_number "${dev}")
-    out="/tmp/${label}.out"
-    err="/tmp/${label}.err"
+    event_before=$(event_number "${dev}")
     trigger_out="/tmp/${label}.trigger.out"
     trigger_err="/tmp/${label}.trigger.err"
     echo "SCENARIO_BEGIN_${label}"
-    echo "EVENT_BEFORE_${label}: ${event}"
-    echo "CMD_${label}: timeout 3 dmsetup wait --noflush ${dev} ${event}; trigger=dmsetup suspend --noflush ${dev}"
-    timeout 3 dmsetup wait --noflush "${dev}" "${event}" >"${out}" 2>"${err}" &
-    wait_pid=$!
-    sleep 1
+    echo "EVENT_BEFORE_${label}: ${event_before}"
     timeout 3 dmsetup suspend --noflush "${dev}" >"${trigger_out}" 2>"${trigger_err}"
     trigger_status=$?
-    wait "${wait_pid}"
-    status=$?
+    event_after=$(event_number "${dev}")
     echo "TRIGGER_STATUS_${label}: ${trigger_status}"
-    echo "STATUS_${label}: ${status}"
-    print_stream STDOUT "${label}" "${out}"
-    print_stream STDERR "${label}" "${err}"
+    echo "EVENT_AFTER_${label}: ${event_after}"
     print_stream TRIGGER_STDOUT "${label}" "${trigger_out}"
     print_stream TRIGGER_STDERR "${label}" "${trigger_err}"
-    timeout 3 dmsetup resume --noflush "${dev}" >/dev/null 2>&1 || true
-    if [ "${status}" -ne 124 ]; then
-        observe_gap "${label}_status_${status}_expected_124"
+    if [ "${trigger_status}" -ne 0 ]; then
+        observe_gap "${label}_suspend_status_${trigger_status}_expected_0"
     fi
+    if [ -z "${event_before}" ] || [ "${event_after}" != "${event_before}" ]; then
+        observe_gap "${label}_event_${event_after}_expected_${event_before}"
+    fi
+    run_expect_status 124 "${label}_WAIT_CURRENT" \
+        timeout 3 dmsetup wait --noflush "${dev}" "${event_after}"
+    timeout 3 dmsetup resume --noflush "${dev}" >/dev/null 2>&1 || \
+        observe_gap "${label}_resume_failed"
     echo "SCENARIO_END_${label}"
     return 0
 }
@@ -652,12 +638,7 @@ run_expect_success RESUME dmsetup resume "${state_name}"
 run_expect_success INFO_AFTER_RESUME dmsetup info "${state_name}"
 run_expect_success SUSPEND_NOFLUSH dmsetup suspend --noflush "${state_name}"
 run_expect_success RESUME_NOFLUSH dmsetup resume --noflush "${state_name}"
-if [ "${SKIP_WAIT}" = 1 ]; then
-    echo CHECK_SKIP_DMSETUP_WAIT
-else
-    run_expect_status 124 WAIT_ZERO timeout 3 dmsetup wait --noflush "${state_name}" 0
-    run_wait_old_event WAIT_OLD_EVENT "${state_name}"
-fi
+run_wait_current_event_unchanged_by_suspend WAIT_CURRENT_EVENT "${state_name}"
 run_expect_success STATE_REMOVE dmsetup remove "${state_name}"
 echo CHECK_PASS_DMSETUP_SUSPEND_RESUME_WAIT
 
@@ -679,20 +660,16 @@ event_after_rename=$(event_number "${rename_new}")
 if [ -z "${event_before_rename}" ] || [ -z "${event_after_rename}" ] || [ "${event_after_rename}" -ne "$((event_before_rename + 1))" ]; then
     observe_gap WAIT_RENAME_EVENT_INCREMENT
 fi
-if [ "${SKIP_WAIT}" != 1 ]; then
-    run_expect_status 0 WAIT_STALE_AFTER_RENAME timeout 3 dmsetup wait --noflush "${rename_new}" "${event_before_rename}"
-    run_expect_status 124 WAIT_CURRENT_AFTER_RENAME timeout 3 dmsetup wait --noflush "${rename_new}" "${event_after_rename}"
-fi
+run_expect_status 0 WAIT_STALE_AFTER_RENAME timeout 3 dmsetup wait --noflush "${rename_new}" "${event_before_rename}"
+run_expect_status 124 WAIT_CURRENT_AFTER_RENAME timeout 3 dmsetup wait --noflush "${rename_new}" "${event_after_rename}"
 run_expect_success SET_UUID dmsetup rename "${rename_new}" --setuuid "${uuid_value}"
 run_expect_success INFO_BY_UUID dmsetup info -u "${uuid_value}"
 event_after_set_uuid=$(event_number "${rename_new}")
 if [ -z "${event_after_set_uuid}" ] || [ "${event_after_set_uuid}" -ne "$((event_after_rename + 1))" ]; then
     observe_gap WAIT_SET_UUID_EVENT_INCREMENT
 fi
-if [ "${SKIP_WAIT}" != 1 ]; then
-    run_expect_status 0 WAIT_STALE_AFTER_SET_UUID timeout 3 dmsetup wait --noflush "${rename_new}" "${event_after_rename}"
-    run_expect_status 124 WAIT_CURRENT_AFTER_SET_UUID timeout 3 dmsetup wait --noflush "${rename_new}" "${event_after_set_uuid}"
-fi
+run_expect_status 0 WAIT_STALE_AFTER_SET_UUID timeout 3 dmsetup wait --noflush "${rename_new}" "${event_after_rename}"
+run_expect_status 124 WAIT_CURRENT_AFTER_SET_UUID timeout 3 dmsetup wait --noflush "${rename_new}" "${event_after_set_uuid}"
 run_expect_success RENAME_REMOVE_NEW dmsetup remove "${rename_new}"
 run_expect_success RENAME_REMOVE_EXISTING dmsetup remove "${existing_name}"
 echo CHECK_PASS_DMSETUP_RENAME_UUID
