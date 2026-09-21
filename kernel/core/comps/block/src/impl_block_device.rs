@@ -344,3 +344,224 @@ pub(super) fn general_complete_fn(
         complete_fn(bio_status);
     }
 }
+
+#[cfg(ktest)]
+mod tests {
+    use alloc::boxed::Box;
+
+    use device_id::{DeviceId, MajorId, MinorId};
+    use io_util::IoError;
+    use ostd::{prelude::ktest, sync::Mutex};
+
+    use super::*;
+    use crate::{BlockDeviceMeta, bio::SubmittedBio};
+
+    #[derive(Clone, Copy, Debug)]
+    enum EnqueueMode {
+        Reject,
+        Complete(BioStatus),
+        Defer,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct RecordedBio {
+        type_: BioType,
+        range: Range<Sid>,
+        segment_count: usize,
+    }
+
+    #[derive(Debug)]
+    struct RangeBlockDevice {
+        mode: EnqueueMode,
+        recorded: Mutex<Vec<RecordedBio>>,
+        pending: Mutex<Vec<SubmittedBio>>,
+    }
+
+    impl RangeBlockDevice {
+        fn new(mode: EnqueueMode) -> Arc<Self> {
+            Arc::new(Self {
+                mode,
+                recorded: Mutex::new(Vec::new()),
+                pending: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn complete_next(&self, status: BioStatus) {
+            self.pending.lock().remove(0).complete(status);
+        }
+    }
+
+    impl BlockDevice for RangeBlockDevice {
+        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            if matches!(self.mode, EnqueueMode::Reject) {
+                return Err(BioEnqueueError::Refused);
+            }
+
+            self.recorded.lock().push(RecordedBio {
+                type_: bio.type_(),
+                range: bio.sid_range().clone(),
+                segment_count: bio.segments().len(),
+            });
+            match self.mode {
+                EnqueueMode::Complete(status) => bio.complete(status),
+                EnqueueMode::Defer => self.pending.lock().push(bio),
+                EnqueueMode::Reject => unreachable!(),
+            }
+            Ok(())
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: 8,
+                nr_sectors: 1_024,
+            }
+        }
+
+        fn name(&self) -> String {
+            String::from("range-wrapper-test")
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(510), MinorId::new(1))
+        }
+    }
+
+    #[ktest]
+    fn synchronous_range_wrappers_submit_expected_bios() {
+        let device = RangeBlockDevice::new(EnqueueMode::Complete(BioStatus::Complete));
+
+        assert_eq!(
+            (device.as_ref() as &dyn BlockDevice)
+                .discard_sectors(Sid::new(8), 4)
+                .unwrap(),
+            BioStatus::Complete
+        );
+        assert_eq!(
+            (device.as_ref() as &dyn BlockDevice)
+                .write_zeroes_sectors(Sid::new(20), 6)
+                .unwrap(),
+            BioStatus::Complete
+        );
+        assert_eq!(
+            *device.recorded.lock(),
+            vec![
+                RecordedBio {
+                    type_: BioType::Discard,
+                    range: Sid::new(8)..Sid::new(12),
+                    segment_count: 0,
+                },
+                RecordedBio {
+                    type_: BioType::WriteZeroes,
+                    range: Sid::new(20)..Sid::new(26),
+                    segment_count: 0,
+                },
+            ]
+        );
+    }
+
+    #[ktest]
+    fn asynchronous_range_wrappers_share_batch_and_complete_once() {
+        let device = RangeBlockDevice::new(EnqueueMode::Defer);
+        let completions = Arc::new(Mutex::new(Vec::new()));
+        let mut batch = IoBatch::with_capacity(2);
+
+        let discard_completions = completions.clone();
+        (device.as_ref() as &dyn BlockDevice)
+            .discard_sectors_async(
+                Sid::new(32),
+                3,
+                Some(Box::new(move |status| {
+                    discard_completions.lock().push(status);
+                })),
+                &mut batch,
+            )
+            .unwrap();
+        let write_zeroes_completions = completions.clone();
+        (device.as_ref() as &dyn BlockDevice)
+            .write_zeroes_sectors_async(
+                Sid::new(48),
+                5,
+                Some(Box::new(move |status| {
+                    write_zeroes_completions.lock().push(status);
+                })),
+                &mut batch,
+            )
+            .unwrap();
+
+        assert_eq!(batch.len(), 2);
+        assert!(completions.lock().is_empty());
+        assert_eq!(
+            *device.recorded.lock(),
+            vec![
+                RecordedBio {
+                    type_: BioType::Discard,
+                    range: Sid::new(32)..Sid::new(35),
+                    segment_count: 0,
+                },
+                RecordedBio {
+                    type_: BioType::WriteZeroes,
+                    range: Sid::new(48)..Sid::new(53),
+                    segment_count: 0,
+                },
+            ]
+        );
+
+        device.complete_next(BioStatus::Complete);
+        assert_eq!(*completions.lock(), vec![BioStatus::Complete]);
+        device.complete_next(BioStatus::Complete);
+        batch.wait_all().unwrap();
+        assert_eq!(
+            *completions.lock(),
+            vec![BioStatus::Complete, BioStatus::Complete]
+        );
+    }
+
+    #[ktest]
+    fn range_wrappers_distinguish_enqueue_and_completion_errors() {
+        let rejecting = RangeBlockDevice::new(EnqueueMode::Reject);
+        let mut rejected_batch = IoBatch::new();
+        assert_eq!(
+            (rejecting.as_ref() as &dyn BlockDevice).discard_sectors(Sid::new(1), 1),
+            Err(BioEnqueueError::Refused)
+        );
+        assert_eq!(
+            (rejecting.as_ref() as &dyn BlockDevice).write_zeroes_sectors_async(
+                Sid::new(2),
+                1,
+                None,
+                &mut rejected_batch,
+            ),
+            Err(BioEnqueueError::Refused)
+        );
+        assert!(rejected_batch.is_empty());
+        assert!(rejecting.recorded.lock().is_empty());
+
+        let completing = RangeBlockDevice::new(EnqueueMode::Complete(BioStatus::IoError));
+        assert_eq!(
+            (completing.as_ref() as &dyn BlockDevice)
+                .write_zeroes_sectors(Sid::new(4), 2)
+                .unwrap(),
+            BioStatus::IoError
+        );
+
+        let deferred = RangeBlockDevice::new(EnqueueMode::Defer);
+        let completions = Arc::new(Mutex::new(Vec::new()));
+        let callback_completions = completions.clone();
+        let mut batch = IoBatch::new();
+        (deferred.as_ref() as &dyn BlockDevice)
+            .discard_sectors_async(
+                Sid::new(6),
+                2,
+                Some(Box::new(move |status| {
+                    callback_completions.lock().push(status);
+                })),
+                &mut batch,
+            )
+            .unwrap();
+        assert!(completions.lock().is_empty());
+
+        deferred.complete_next(BioStatus::IoError);
+        assert_eq!(batch.wait_all(), Err(IoError::Failed));
+        assert_eq!(*completions.lock(), vec![BioStatus::IoError]);
+    }
+}

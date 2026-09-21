@@ -235,3 +235,79 @@ impl From<SubmittedBio> for BioRequest {
         }
     }
 }
+
+#[cfg(ktest)]
+mod tests {
+    use alloc::vec;
+
+    use ostd::prelude::ktest;
+
+    use super::*;
+    use crate::{
+        SECTOR_SIZE,
+        bio::{Bio, BioDirection, BioSegment},
+    };
+
+    fn write_bio(start: u64) -> SubmittedBio {
+        Bio::new(
+            BioType::Write,
+            Sid::new(start),
+            vec![BioSegment::alloc_exact(
+                1,
+                SECTOR_SIZE,
+                BioDirection::ToDevice,
+            )],
+            None,
+        )
+        .submit_for_test()
+    }
+
+    #[ktest]
+    fn merges_contiguous_range_bios_without_segments() {
+        let queue = BioRequestSingleQueue::with_max_nr_segments_per_bio(0);
+        queue
+            .enqueue(Bio::new_range(BioType::Discard, Sid::new(12), 4, None).submit_for_test())
+            .unwrap();
+        queue
+            .enqueue(Bio::new_range(BioType::Discard, Sid::new(16), 3, None).submit_for_test())
+            .unwrap();
+
+        assert_eq!(queue.num_requests(), 1);
+        let request = queue.dequeue();
+        assert_eq!(request.type_(), BioType::Discard);
+        assert_eq!(request.sid_range(), &(Sid::new(12)..Sid::new(19)));
+        assert_eq!(request.num_segments(), 0);
+        assert_eq!(request.bios().count(), 2);
+    }
+
+    #[ktest]
+    fn enforces_segment_limit_when_merging_data_bios() {
+        let queue = BioRequestSingleQueue::with_max_nr_segments_per_bio(2);
+        queue.enqueue(write_bio(20)).unwrap();
+        queue.enqueue(write_bio(21)).unwrap();
+        queue.enqueue(write_bio(22)).unwrap();
+
+        assert_eq!(queue.num_requests(), 2);
+        let merged = queue.dequeue();
+        assert_eq!(merged.sid_range(), &(Sid::new(20)..Sid::new(22)));
+        assert_eq!(merged.num_segments(), 2);
+        assert_eq!(merged.bios().count(), 2);
+        let unmerged = queue.dequeue();
+        assert_eq!(unmerged.sid_range(), &(Sid::new(22)..Sid::new(23)));
+        assert_eq!(unmerged.num_segments(), 1);
+
+        let too_big = Bio::new(
+            BioType::Write,
+            Sid::new(30),
+            vec![
+                BioSegment::alloc_exact(1, SECTOR_SIZE, BioDirection::ToDevice),
+                BioSegment::alloc_exact(1, SECTOR_SIZE, BioDirection::ToDevice),
+                BioSegment::alloc_exact(1, SECTOR_SIZE, BioDirection::ToDevice),
+            ],
+            None,
+        )
+        .submit_for_test();
+        assert_eq!(queue.enqueue(too_big), Err(BioEnqueueError::TooBig));
+        assert_eq!(queue.num_requests(), 0);
+    }
+}

@@ -1100,6 +1100,39 @@ mod tests {
     }
 
     #[ktest]
+    fn split_bio_keeps_first_error_until_all_children_complete() {
+        let completions = Arc::new(SpinLock::<Vec<BioStatus>, LocalIrqDisabled>::new(Vec::new()));
+        let callback_completions = completions.clone();
+        let bio = Bio::new_range(
+            BioType::WriteZeroes,
+            Sid::new(10),
+            12,
+            Some(Box::new(move |status| {
+                callback_completions.lock().push(status);
+            })),
+        )
+        .submit_for_test();
+        let (children, _completion) = bio
+            .split(vec![
+                Sid::new(10)..Sid::new(14),
+                Sid::new(14)..Sid::new(18),
+                Sid::new(18)..Sid::new(22),
+            ])
+            .unwrap();
+        let mut children = children.into_iter();
+        let first = children.next().unwrap();
+        let second = children.next().unwrap();
+        let third = children.next().unwrap();
+
+        third.complete(BioStatus::NoSpace);
+        first.complete(BioStatus::IoError);
+        assert!(completions.lock().is_empty());
+
+        second.complete(BioStatus::Complete);
+        assert_eq!(*completions.lock(), vec![BioStatus::NoSpace]);
+    }
+
+    #[ktest]
     fn write_like_includes_discard_and_write_zeroes() {
         assert!(BioType::Write.is_write_like());
         assert!(BioType::Discard.is_write_like());
