@@ -169,22 +169,105 @@ run_lvm_expect_success() {
     return 0
 }
 
-grep_expect() {
-    grep_label=$1
-    pattern=$2
-    file=$3
-    if ! timeout 3 grep -E -q -- "${pattern}" "${file}"; then
-        observe_gap "${grep_label}_grep_failed"
+run_lvm_report() {
+    report_label=$1
+    shift
+    LC_ALL=C run_lvm_expect_success "${report_label}" "$@" \
+        --reportformat basic --noheadings --separator '|' --units b --nosuffix
+}
+
+normalize_report() {
+    awk -F'|' '
+        NF {
+            for (i = 1; i <= NF; i++) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i)
+            }
+            line = $1
+            for (i = 2; i <= NF; i++) {
+                line = line "|" $i
+            }
+            print line
+        }
+    ' "$1"
+}
+
+expect_row() {
+    row_label=$1
+    file=$2
+    expected=$3
+    matches=$(normalize_report "${file}" | awk -v expected="${expected}" '$0 == expected { count++ } END { print count + 0 }')
+    if [ "${matches}" -ne 1 ]; then
+        actual=$(normalize_report "${file}" | tr '\n' ';')
+        observe_gap "${row_label}_row_matches_${matches}_expected_1 actual=${actual:-<empty>} expected=${expected}"
     fi
 }
 
-line_count_expect() {
-    count_label=$1
-    expected=$2
-    file=$3
-    count=$(awk 'NF && $1 != "LV" { count++ } END { print count + 0 }' "${file}")
-    if [ "${count}" -ne "${expected}" ]; then
-        observe_gap "${count_label}_line_count_${count}_expected_${expected}"
+expect_column_set() {
+    set_label=$1
+    file=$2
+    column=$3
+    shift 3
+    actual_file="/tmp/${set_label}.actual"
+    expected_file="/tmp/${set_label}.expected"
+    normalize_report "${file}" | awk -F'|' -v column="${column}" '$column != "" { print $column }' | sort -u >"${actual_file}"
+    printf '%s\n' "$@" | awk 'NF' | sort -u >"${expected_file}"
+    if ! diff -u "${expected_file}" "${actual_file}" >/tmp/"${set_label}".diff; then
+        actual=$(tr '\n' ',' <"${actual_file}")
+        expected=$(tr '\n' ',' <"${expected_file}")
+        observe_gap "${set_label}_set_mismatch actual=${actual:-<empty>} expected=${expected:-<empty>}"
+    fi
+}
+
+expect_empty_report() {
+    empty_label=$1
+    file=$2
+    if normalize_report "${file}" | grep -q .; then
+        actual=$(normalize_report "${file}" | tr '\n' ';')
+        observe_gap "${empty_label}_expected_empty actual=${actual}"
+    fi
+}
+
+extract_dm_deps() {
+    awk '
+        {
+            for (i = 1; i < NF; i++) {
+                if ($i ~ /^\([0-9]+,$/ && $(i + 1) ~ /^[0-9]+\)$/) {
+                    major = $i
+                    minor = $(i + 1)
+                    gsub(/[^0-9]/, "", major)
+                    gsub(/[^0-9]/, "", minor)
+                    print major ":" minor
+                }
+            }
+        }
+    ' "$1"
+}
+
+expect_dm_deps_set() {
+    deps_label=$1
+    file=$2
+    shift 2
+    actual_file="/tmp/${deps_label}.actual"
+    expected_file="/tmp/${deps_label}.expected"
+    extract_dm_deps "${file}" | sort -u >"${actual_file}"
+    printf '%s\n' "$@" | awk 'NF' | sort -u >"${expected_file}"
+    if ! diff -u "${expected_file}" "${actual_file}" >/tmp/"${deps_label}".diff; then
+        actual=$(tr '\n' ',' <"${actual_file}")
+        expected=$(tr '\n' ',' <"${expected_file}")
+        observe_gap "${deps_label}_deps_mismatch actual=${actual:-<empty>} expected=${expected:-<empty>}"
+    fi
+}
+
+expect_mapper_absent() {
+    absent_label=$1
+    lv_name=$2
+    dm_name=$(mapper_name "${lv_name}")
+    if run_capture "${absent_label}_DM_INFO" dmsetup info "${dm_name}"; then
+        observe_gap "${absent_label}_dm_info_present"
+    fi
+    mapper_path="/dev/mapper/${dm_name}"
+    if [ -e "${mapper_path}" ] || [ -L "${mapper_path}" ]; then
+        observe_gap "${absent_label}_mapper_path_present_${mapper_path}"
     fi
 }
 
@@ -253,107 +336,152 @@ fi
 echo "LVM_DEVICES_SUPPORTED=${LVM_DEVICES_SUPPORTED}"
 
 step '=== STEP 2: static LVM2 queries under test filter ==='
-run_lvm_expect_success STATIC_PVS pvs -o pv_name,vg_name,pv_size
-run_lvm_expect_success STATIC_VGS vgs -o vg_name,pv_count,lv_count,vg_size,vg_free
-run_lvm_expect_success STATIC_LVS lvs -a -o vg_name,lv_name,lv_size,seg_count,devices
+run_lvm_report STATIC_PVS pvs -o pv_name,vg_name
+run_lvm_report STATIC_VGS vgs -o vg_name,pv_count,lv_count
+run_lvm_report STATIC_LVS lvs -a -o lv_name,lv_size,seg_count
 
 step '=== STEP 3: PV and VG lifecycle ==='
 run_lvm_expect_success PV_CREATE pvcreate -ff -y "${DISK1}" "${DISK2}" "${DISK3}" "${DISK4}"
-run_lvm_expect_success PVS_AFTER_PVCREATE pvs -o pv_name,pv_size,vg_name
-grep_expect PVS_AFTER_PVCREATE_DISK1 "${DISK1}" /tmp/PVS_AFTER_PVCREATE.out
-grep_expect PVS_AFTER_PVCREATE_DISK4 "${DISK4}" /tmp/PVS_AFTER_PVCREATE.out
+run_lvm_report PVS_AFTER_PVCREATE pvs -o pv_name,vg_name
+expect_column_set PVS_AFTER_PVCREATE_NAMES /tmp/PVS_AFTER_PVCREATE.out 1 "${DISK1}" "${DISK2}" "${DISK3}" "${DISK4}"
+expect_row PVS_AFTER_PVCREATE_DISK1 /tmp/PVS_AFTER_PVCREATE.out "${DISK1}|"
+expect_row PVS_AFTER_PVCREATE_DISK2 /tmp/PVS_AFTER_PVCREATE.out "${DISK2}|"
+expect_row PVS_AFTER_PVCREATE_DISK3 /tmp/PVS_AFTER_PVCREATE.out "${DISK3}|"
+expect_row PVS_AFTER_PVCREATE_DISK4 /tmp/PVS_AFTER_PVCREATE.out "${DISK4}|"
 run_lvm_expect_success PVSCAN_AFTER_PVCREATE pvscan
 run_lvm_expect_success VG_CREATE vgcreate "${TEST_VG}" "${DISK1}" "${DISK2}"
-run_lvm_expect_success VGS_AFTER_VGCREATE vgs -o vg_name,vg_size,vg_free,pv_count,lv_count
-grep_expect VGS_AFTER_VGCREATE_NAME "${TEST_VG}" /tmp/VGS_AFTER_VGCREATE.out
+run_lvm_report VGS_AFTER_VGCREATE vgs -o vg_name,pv_count,lv_count
+expect_row VGS_AFTER_VGCREATE_COUNTS /tmp/VGS_AFTER_VGCREATE.out "${TEST_VG}|2|0"
 run_lvm_expect_success VG_EXTEND vgextend "${TEST_VG}" "${DISK3}" "${DISK4}"
-run_lvm_expect_success VGS_AFTER_VGEXTEND vgs -o vg_name,vg_size,vg_free,pv_count,lv_count
-grep_expect VGS_AFTER_VGEXTEND_NAME "${TEST_VG}" /tmp/VGS_AFTER_VGEXTEND.out
+run_lvm_report VGS_AFTER_VGEXTEND vgs -o vg_name,pv_count,lv_count
+expect_row VGS_AFTER_VGEXTEND_COUNTS /tmp/VGS_AFTER_VGEXTEND.out "${TEST_VG}|4|0"
+run_lvm_report PVS_AFTER_VGEXTEND pvs -o pv_name,vg_name
+expect_column_set PVS_AFTER_VGEXTEND_NAMES /tmp/PVS_AFTER_VGEXTEND.out 1 "${DISK1}" "${DISK2}" "${DISK3}" "${DISK4}"
+expect_row PVS_AFTER_VGEXTEND_DISK1 /tmp/PVS_AFTER_VGEXTEND.out "${DISK1}|${TEST_VG}"
+expect_row PVS_AFTER_VGEXTEND_DISK2 /tmp/PVS_AFTER_VGEXTEND.out "${DISK2}|${TEST_VG}"
+expect_row PVS_AFTER_VGEXTEND_DISK3 /tmp/PVS_AFTER_VGEXTEND.out "${DISK3}|${TEST_VG}"
+expect_row PVS_AFTER_VGEXTEND_DISK4 /tmp/PVS_AFTER_VGEXTEND.out "${DISK4}|${TEST_VG}"
 
 step '=== STEP 4: linear LV create grow shrink ==='
 run_lvm_expect_success LV_CREATE_LINEAR lvcreate --type linear -L "${LINEAR_INITIAL_MIB}M" -n "${LINEAR_LV}" "${TEST_VG}" "${DISK1}"
-run_lvm_expect_success LVS_LINEAR_INITIAL lvs -a -o vg_name,lv_name,lv_size,seg_count,devices "${TEST_VG}"
-run_lvm_expect_success LVS_SEGMENTS_LINEAR_INITIAL lvs --segments -o lv_name,seg_start,seg_size,segtype,devices "${TEST_VG}/${LINEAR_LV}"
-grep_expect LVS_SEGMENTS_LINEAR_INITIAL_TYPE 'linear' /tmp/LVS_SEGMENTS_LINEAR_INITIAL.out
-line_count_expect LVS_SEGMENTS_LINEAR_INITIAL 1 /tmp/LVS_SEGMENTS_LINEAR_INITIAL.out
+run_lvm_report LVS_LINEAR_INITIAL lvs -o lv_name,lv_size,seg_count,segtype "${TEST_VG}/${LINEAR_LV}"
+expect_row LVS_LINEAR_INITIAL_FIELDS /tmp/LVS_LINEAR_INITIAL.out "${LINEAR_LV}|$((LINEAR_INITIAL_MIB * 1024 * 1024))|1|linear"
 record_dm_state LINEAR_INITIAL "$(mapper_name "${LINEAR_LV}")"
-grep_expect LINEAR_INITIAL_TABLE_TYPE ' linear ' /tmp/LINEAR_INITIAL_DM_TABLE.out
-grep_expect LINEAR_INITIAL_DEPS '1 dependencies' /tmp/LINEAR_INITIAL_DM_DEPS.out
+expect_dm_deps_set LINEAR_INITIAL_DEPS /tmp/LINEAR_INITIAL_DM_DEPS.out "${DEV1}"
 
 run_lvm_expect_success LV_EXTEND_LINEAR_SAME_PV lvextend -L "${LINEAR_SAME_PV_EXTENDED_MIB}M" "${TEST_VG}/${LINEAR_LV}" "${DISK1}"
-run_lvm_expect_success LVS_LINEAR_SAME_PV_EXTENDED lvs -a -o vg_name,lv_name,lv_size,seg_count,devices "${TEST_VG}"
-run_lvm_expect_success LVS_SEGMENTS_LINEAR_SAME_PV_EXTENDED lvs --segments -o lv_name,seg_start,seg_size,segtype,devices "${TEST_VG}/${LINEAR_LV}"
-grep_expect LVS_SEGMENTS_LINEAR_SAME_PV_EXTENDED_TYPE 'linear' /tmp/LVS_SEGMENTS_LINEAR_SAME_PV_EXTENDED.out
+run_lvm_report LVS_LINEAR_SAME_PV_EXTENDED lvs -o lv_name,lv_size,seg_count,segtype "${TEST_VG}/${LINEAR_LV}"
+expect_row LVS_LINEAR_SAME_PV_EXTENDED_FIELDS /tmp/LVS_LINEAR_SAME_PV_EXTENDED.out "${LINEAR_LV}|$((LINEAR_SAME_PV_EXTENDED_MIB * 1024 * 1024))|1|linear"
 record_dm_state LINEAR_SAME_PV_EXTENDED "$(mapper_name "${LINEAR_LV}")"
+expect_dm_deps_set LINEAR_SAME_PV_EXTENDED_DEPS /tmp/LINEAR_SAME_PV_EXTENDED_DM_DEPS.out "${DEV1}"
 
 run_lvm_expect_success LV_EXTEND_LINEAR_CROSS_PV lvextend -L "${LINEAR_CROSS_PV_EXTENDED_MIB}M" "${TEST_VG}/${LINEAR_LV}" "${DISK2}"
-run_lvm_expect_success LVS_LINEAR_CROSS_PV_EXTENDED lvs -a -o vg_name,lv_name,lv_size,seg_count,devices "${TEST_VG}"
-run_lvm_expect_success LVS_SEGMENTS_LINEAR_CROSS_PV_EXTENDED lvs --segments -o lv_name,seg_start,seg_size,segtype,devices "${TEST_VG}/${LINEAR_LV}"
-grep_expect LVS_SEGMENTS_LINEAR_CROSS_PV_EXTENDED_TYPE 'linear' /tmp/LVS_SEGMENTS_LINEAR_CROSS_PV_EXTENDED.out
+run_lvm_report LVS_LINEAR_CROSS_PV_EXTENDED lvs -o lv_name,lv_size,seg_count,segtype "${TEST_VG}/${LINEAR_LV}"
+expect_row LVS_LINEAR_CROSS_PV_EXTENDED_FIELDS /tmp/LVS_LINEAR_CROSS_PV_EXTENDED.out "${LINEAR_LV}|$((LINEAR_CROSS_PV_EXTENDED_MIB * 1024 * 1024))|2|linear"
 record_dm_state LINEAR_CROSS_PV_EXTENDED "$(mapper_name "${LINEAR_LV}")"
-grep_expect LINEAR_CROSS_PV_EXTENDED_DEPS '2 dependencies' /tmp/LINEAR_CROSS_PV_EXTENDED_DM_DEPS.out
+expect_dm_deps_set LINEAR_CROSS_PV_EXTENDED_DEPS /tmp/LINEAR_CROSS_PV_EXTENDED_DM_DEPS.out "${DEV1}" "${DEV2}"
 
 run_lvm_expect_success LV_REDUCE_LINEAR lvreduce -y -L "${LINEAR_SHRUNK_MIB}M" "${TEST_VG}/${LINEAR_LV}"
-run_lvm_expect_success LVS_LINEAR_SHRUNK lvs -a -o vg_name,lv_name,lv_size,seg_count,devices "${TEST_VG}"
-run_lvm_expect_success LVS_SEGMENTS_LINEAR_SHRUNK lvs --segments -o lv_name,seg_start,seg_size,segtype,devices "${TEST_VG}/${LINEAR_LV}"
+run_lvm_report LVS_LINEAR_SHRUNK lvs -o lv_name,lv_size,seg_count,segtype "${TEST_VG}/${LINEAR_LV}"
+expect_row LVS_LINEAR_SHRUNK_FIELDS /tmp/LVS_LINEAR_SHRUNK.out "${LINEAR_LV}|$((LINEAR_SHRUNK_MIB * 1024 * 1024))|1|linear"
 record_dm_state LINEAR_SHRUNK "$(mapper_name "${LINEAR_LV}")"
+expect_dm_deps_set LINEAR_SHRUNK_DEPS /tmp/LINEAR_SHRUNK_DM_DEPS.out "${DEV1}"
 
 step '=== STEP 5: striped LV create grow shrink ==='
 run_lvm_expect_success LV_CREATE_STRIPED lvcreate --type striped -i "${STRIPES}" -I "${STRIPE_SIZE_KIB}K" -L "${STRIPED_INITIAL_MIB}M" -n "${STRIPED_LV}" "${TEST_VG}" "${DISK1}" "${DISK2}"
-run_lvm_expect_success LVS_STRIPED_INITIAL lvs -a -o vg_name,lv_name,lv_size,seg_count,devices "${TEST_VG}"
-run_lvm_expect_success LVS_SEGMENTS_STRIPED_INITIAL lvs --segments -o lv_name,seg_start,seg_size,segtype,stripes,stripesize,devices "${TEST_VG}/${STRIPED_LV}"
-grep_expect LVS_SEGMENTS_STRIPED_INITIAL_TYPE 'striped' /tmp/LVS_SEGMENTS_STRIPED_INITIAL.out
-grep_expect LVS_SEGMENTS_STRIPED_INITIAL_STRIPES '2' /tmp/LVS_SEGMENTS_STRIPED_INITIAL.out
+run_lvm_report LVS_STRIPED_INITIAL lvs -o lv_name,lv_size,seg_count "${TEST_VG}/${STRIPED_LV}"
+expect_row LVS_STRIPED_INITIAL_FIELDS /tmp/LVS_STRIPED_INITIAL.out "${STRIPED_LV}|$((STRIPED_INITIAL_MIB * 1024 * 1024))|1"
+run_lvm_report LVS_SEGMENTS_STRIPED_INITIAL lvs --segments -o lv_name,segtype,stripes,stripesize "${TEST_VG}/${STRIPED_LV}"
+expect_row LVS_SEGMENTS_STRIPED_INITIAL_FIELDS /tmp/LVS_SEGMENTS_STRIPED_INITIAL.out "${STRIPED_LV}|striped|${STRIPES}|$((STRIPE_SIZE_KIB * 1024))"
 record_dm_state STRIPED_INITIAL "$(mapper_name "${STRIPED_LV}")"
-grep_expect STRIPED_INITIAL_TABLE_TYPE ' striped ' /tmp/STRIPED_INITIAL_DM_TABLE.out
-grep_expect STRIPED_INITIAL_DEPS '2 dependencies' /tmp/STRIPED_INITIAL_DM_DEPS.out
+expect_dm_deps_set STRIPED_INITIAL_DEPS /tmp/STRIPED_INITIAL_DM_DEPS.out "${DEV1}" "${DEV2}"
 
 run_lvm_expect_success LV_EXTEND_STRIPED_SAME_SET lvextend -i "${STRIPES}" -I "${STRIPE_SIZE_KIB}K" -L "${STRIPED_SAME_SET_EXTENDED_MIB}M" "${TEST_VG}/${STRIPED_LV}" "${DISK1}" "${DISK2}"
-run_lvm_expect_success LVS_STRIPED_SAME_SET_EXTENDED lvs -a -o vg_name,lv_name,lv_size,seg_count,devices "${TEST_VG}"
-run_lvm_expect_success LVS_SEGMENTS_STRIPED_SAME_SET_EXTENDED lvs --segments -o lv_name,seg_start,seg_size,segtype,stripes,stripesize,devices "${TEST_VG}/${STRIPED_LV}"
-grep_expect LVS_SEGMENTS_STRIPED_SAME_SET_EXTENDED_TYPE 'striped' /tmp/LVS_SEGMENTS_STRIPED_SAME_SET_EXTENDED.out
+run_lvm_report LVS_STRIPED_SAME_SET_EXTENDED lvs -o lv_name,lv_size,seg_count "${TEST_VG}/${STRIPED_LV}"
+expect_row LVS_STRIPED_SAME_SET_EXTENDED_FIELDS /tmp/LVS_STRIPED_SAME_SET_EXTENDED.out "${STRIPED_LV}|$((STRIPED_SAME_SET_EXTENDED_MIB * 1024 * 1024))|1"
+run_lvm_report LVS_SEGMENTS_STRIPED_SAME_SET_EXTENDED lvs --segments -o lv_name,segtype,stripes,stripesize "${TEST_VG}/${STRIPED_LV}"
+expect_row LVS_SEGMENTS_STRIPED_SAME_SET_EXTENDED_FIELDS /tmp/LVS_SEGMENTS_STRIPED_SAME_SET_EXTENDED.out "${STRIPED_LV}|striped|${STRIPES}|$((STRIPE_SIZE_KIB * 1024))"
 record_dm_state STRIPED_SAME_SET_EXTENDED "$(mapper_name "${STRIPED_LV}")"
+expect_dm_deps_set STRIPED_SAME_SET_EXTENDED_DEPS /tmp/STRIPED_SAME_SET_EXTENDED_DM_DEPS.out "${DEV1}" "${DEV2}"
 
 run_lvm_expect_success LV_EXTEND_STRIPED_CROSS_SET lvextend -i "${STRIPES}" -I "${STRIPE_SIZE_KIB}K" -L "${STRIPED_CROSS_SET_EXTENDED_MIB}M" "${TEST_VG}/${STRIPED_LV}" "${DISK3}" "${DISK4}"
-run_lvm_expect_success LVS_STRIPED_CROSS_SET_EXTENDED lvs -a -o vg_name,lv_name,lv_size,seg_count,devices "${TEST_VG}"
-run_lvm_expect_success LVS_SEGMENTS_STRIPED_CROSS_SET_EXTENDED lvs --segments -o lv_name,seg_start,seg_size,segtype,stripes,stripesize,devices "${TEST_VG}/${STRIPED_LV}"
-grep_expect LVS_SEGMENTS_STRIPED_CROSS_SET_EXTENDED_TYPE 'striped' /tmp/LVS_SEGMENTS_STRIPED_CROSS_SET_EXTENDED.out
+run_lvm_report LVS_STRIPED_CROSS_SET_EXTENDED lvs -o lv_name,lv_size,seg_count "${TEST_VG}/${STRIPED_LV}"
+expect_row LVS_STRIPED_CROSS_SET_EXTENDED_FIELDS /tmp/LVS_STRIPED_CROSS_SET_EXTENDED.out "${STRIPED_LV}|$((STRIPED_CROSS_SET_EXTENDED_MIB * 1024 * 1024))|2"
+run_lvm_report LVS_SEGMENTS_STRIPED_CROSS_SET_EXTENDED lvs --segments -o lv_name,segtype,stripes,stripesize "${TEST_VG}/${STRIPED_LV}"
+expect_column_set LVS_SEGMENTS_STRIPED_CROSS_SET_TYPES /tmp/LVS_SEGMENTS_STRIPED_CROSS_SET_EXTENDED.out 2 striped
+expect_column_set LVS_SEGMENTS_STRIPED_CROSS_SET_STRIPES /tmp/LVS_SEGMENTS_STRIPED_CROSS_SET_EXTENDED.out 3 "${STRIPES}"
+expect_column_set LVS_SEGMENTS_STRIPED_CROSS_SET_STRIPE_SIZE /tmp/LVS_SEGMENTS_STRIPED_CROSS_SET_EXTENDED.out 4 "$((STRIPE_SIZE_KIB * 1024))"
 record_dm_state STRIPED_CROSS_SET_EXTENDED "$(mapper_name "${STRIPED_LV}")"
-grep_expect STRIPED_CROSS_SET_EXTENDED_DEPS '4 dependencies' /tmp/STRIPED_CROSS_SET_EXTENDED_DM_DEPS.out
+expect_dm_deps_set STRIPED_CROSS_SET_EXTENDED_DEPS /tmp/STRIPED_CROSS_SET_EXTENDED_DM_DEPS.out "${DEV1}" "${DEV2}" "${DEV3}" "${DEV4}"
 
 run_lvm_expect_success LV_REDUCE_STRIPED lvreduce -y -L "${STRIPED_SHRUNK_MIB}M" "${TEST_VG}/${STRIPED_LV}"
-run_lvm_expect_success LVS_STRIPED_SHRUNK lvs -a -o vg_name,lv_name,lv_size,seg_count,devices "${TEST_VG}"
-run_lvm_expect_success LVS_SEGMENTS_STRIPED_SHRUNK lvs --segments -o lv_name,seg_start,seg_size,segtype,stripes,stripesize,devices "${TEST_VG}/${STRIPED_LV}"
+run_lvm_report LVS_STRIPED_SHRUNK lvs -o lv_name,lv_size,seg_count "${TEST_VG}/${STRIPED_LV}"
+expect_row LVS_STRIPED_SHRUNK_FIELDS /tmp/LVS_STRIPED_SHRUNK.out "${STRIPED_LV}|$((STRIPED_SHRUNK_MIB * 1024 * 1024))|1"
+run_lvm_report LVS_SEGMENTS_STRIPED_SHRUNK lvs --segments -o lv_name,segtype,stripes,stripesize "${TEST_VG}/${STRIPED_LV}"
+expect_row LVS_SEGMENTS_STRIPED_SHRUNK_FIELDS /tmp/LVS_SEGMENTS_STRIPED_SHRUNK.out "${STRIPED_LV}|striped|${STRIPES}|$((STRIPE_SIZE_KIB * 1024))"
 record_dm_state STRIPED_SHRUNK "$(mapper_name "${STRIPED_LV}")"
+expect_dm_deps_set STRIPED_SHRUNK_DEPS /tmp/STRIPED_SHRUNK_DM_DEPS.out "${DEV1}" "${DEV2}"
 
 step '=== STEP 6: mixed linear plus striped LV ==='
 run_lvm_expect_success LV_CREATE_MIXED_LINEAR lvcreate --type linear -L "${MIXED_INITIAL_MIB}M" -n "${MIXED_LV}" "${TEST_VG}" "${DISK4}"
 run_lvm_expect_success LV_EXTEND_MIXED_STRIPED lvextend --type striped -i "${STRIPES}" -I "${STRIPE_SIZE_KIB}K" -L "${MIXED_EXTENDED_MIB}M" "${TEST_VG}/${MIXED_LV}" "${DISK1}" "${DISK2}"
-run_lvm_expect_success LVS_MIXED lvs -a -o vg_name,lv_name,lv_size,seg_count,devices "${TEST_VG}"
-run_lvm_expect_success LVS_SEGMENTS_MIXED lvs --segments -o lv_name,seg_start,seg_size,segtype,stripes,stripesize,devices "${TEST_VG}/${MIXED_LV}"
-grep_expect LVS_SEGMENTS_MIXED_LINEAR 'linear' /tmp/LVS_SEGMENTS_MIXED.out
-grep_expect LVS_SEGMENTS_MIXED_STRIPED 'striped' /tmp/LVS_SEGMENTS_MIXED.out
+run_lvm_report LVS_MIXED lvs -o lv_name,lv_size,seg_count "${TEST_VG}/${MIXED_LV}"
+expect_row LVS_MIXED_FIELDS /tmp/LVS_MIXED.out "${MIXED_LV}|$((MIXED_EXTENDED_MIB * 1024 * 1024))|2"
+run_lvm_report LVS_SEGMENTS_MIXED lvs --segments -o lv_name,segtype,stripes,stripesize "${TEST_VG}/${MIXED_LV}"
+expect_column_set LVS_SEGMENTS_MIXED_TYPES /tmp/LVS_SEGMENTS_MIXED.out 2 linear striped
+expect_row LVS_SEGMENTS_MIXED_STRIPED_FIELDS /tmp/LVS_SEGMENTS_MIXED.out "${MIXED_LV}|striped|${STRIPES}|$((STRIPE_SIZE_KIB * 1024))"
 record_dm_state MIXED "$(mapper_name "${MIXED_LV}")"
-grep_expect MIXED_DEPS '3 dependencies' /tmp/MIXED_DM_DEPS.out
+expect_dm_deps_set MIXED_DEPS /tmp/MIXED_DM_DEPS.out "${DEV1}" "${DEV2}" "${DEV4}"
+run_lvm_report VGS_WITH_LVS vgs -o vg_name,pv_count,lv_count
+expect_row VGS_WITH_LVS_COUNTS /tmp/VGS_WITH_LVS.out "${TEST_VG}|4|3"
 
 step '=== STEP 7: activation scan mknodes ==='
 run_lvm_expect_success VGCHANGE_INACTIVE vgchange -an "${TEST_VG}"
-run_expect_success DM_LS_AFTER_VGCHANGE_INACTIVE dmsetup ls
 run_lvm_expect_success PVSCAN_RECOVERY pvscan
 run_lvm_expect_success VGSCAN_MKNODES vgscan --mknodes
 run_lvm_expect_success VGCHANGE_ACTIVE vgchange -ay "${TEST_VG}"
-run_lvm_expect_success LVS_AFTER_REACTIVATE lvs -a -o vg_name,lv_name,lv_size,seg_count,devices "${TEST_VG}"
+run_lvm_report LVS_AFTER_REACTIVATE lvs -o lv_name,lv_size,seg_count,lv_active "${TEST_VG}"
+expect_row LVS_AFTER_REACTIVATE_LINEAR /tmp/LVS_AFTER_REACTIVATE.out "${LINEAR_LV}|$((LINEAR_SHRUNK_MIB * 1024 * 1024))|1|active"
+expect_row LVS_AFTER_REACTIVATE_STRIPED /tmp/LVS_AFTER_REACTIVATE.out "${STRIPED_LV}|$((STRIPED_SHRUNK_MIB * 1024 * 1024))|1|active"
+expect_row LVS_AFTER_REACTIVATE_MIXED /tmp/LVS_AFTER_REACTIVATE.out "${MIXED_LV}|$((MIXED_EXTENDED_MIB * 1024 * 1024))|2|active"
 record_dm_state LINEAR_AFTER_REACTIVATE "$(mapper_name "${LINEAR_LV}")"
+expect_dm_deps_set LINEAR_AFTER_REACTIVATE_DEPS /tmp/LINEAR_AFTER_REACTIVATE_DM_DEPS.out "${DEV1}"
+record_dm_state STRIPED_AFTER_REACTIVATE "$(mapper_name "${STRIPED_LV}")"
+expect_dm_deps_set STRIPED_AFTER_REACTIVATE_DEPS /tmp/STRIPED_AFTER_REACTIVATE_DM_DEPS.out "${DEV1}" "${DEV2}"
+record_dm_state MIXED_AFTER_REACTIVATE "$(mapper_name "${MIXED_LV}")"
+expect_dm_deps_set MIXED_AFTER_REACTIVATE_DEPS /tmp/MIXED_AFTER_REACTIVATE_DM_DEPS.out "${DEV1}" "${DEV2}" "${DEV4}"
 
 step '=== STEP 8: test-object remove lifecycle ==='
 run_lvm_expect_success LVREMOVE_MIXED lvremove -y "${TEST_VG}/${MIXED_LV}"
+expect_mapper_absent AFTER_LVREMOVE_MIXED "${MIXED_LV}"
 run_lvm_expect_success LVREMOVE_STRIPED lvremove -y "${TEST_VG}/${STRIPED_LV}"
+expect_mapper_absent AFTER_LVREMOVE_STRIPED "${STRIPED_LV}"
 run_lvm_expect_success LVREMOVE_LINEAR lvremove -y "${TEST_VG}/${LINEAR_LV}"
-run_lvm_expect_success LVS_AFTER_LVREMOVE lvs -a -o vg_name,lv_name,lv_size,seg_count,devices "${TEST_VG}"
+expect_mapper_absent AFTER_LVREMOVE_LINEAR "${LINEAR_LV}"
+run_lvm_report LVS_AFTER_LVREMOVE lvs -o lv_name,vg_name "${TEST_VG}"
+expect_empty_report LVS_AFTER_LVREMOVE_EMPTY /tmp/LVS_AFTER_LVREMOVE.out
+run_lvm_report VGS_AFTER_LVREMOVE vgs -o vg_name,pv_count,lv_count
+expect_row VGS_AFTER_LVREMOVE_COUNTS /tmp/VGS_AFTER_LVREMOVE.out "${TEST_VG}|4|0"
+run_lvm_report PVS_AFTER_LVREMOVE pvs -o pv_name,vg_name
+expect_row PVS_AFTER_LVREMOVE_DISK1 /tmp/PVS_AFTER_LVREMOVE.out "${DISK1}|${TEST_VG}"
+expect_row PVS_AFTER_LVREMOVE_DISK2 /tmp/PVS_AFTER_LVREMOVE.out "${DISK2}|${TEST_VG}"
+expect_row PVS_AFTER_LVREMOVE_DISK3 /tmp/PVS_AFTER_LVREMOVE.out "${DISK3}|${TEST_VG}"
+expect_row PVS_AFTER_LVREMOVE_DISK4 /tmp/PVS_AFTER_LVREMOVE.out "${DISK4}|${TEST_VG}"
 run_lvm_expect_success VGREMOVE_TEST vgremove -y "${TEST_VG}"
-run_lvm_expect_success VGS_AFTER_VGREMOVE vgs -o vg_name,pv_count,lv_count
+run_lvm_report VGS_AFTER_VGREMOVE vgs -o vg_name,pv_count,lv_count
+expect_column_set VGS_AFTER_VGREMOVE_NAMES /tmp/VGS_AFTER_VGREMOVE.out 1
+run_lvm_report PVS_AFTER_VGREMOVE pvs -o pv_name,vg_name
+expect_column_set PVS_AFTER_VGREMOVE_NAMES /tmp/PVS_AFTER_VGREMOVE.out 1 "${DISK1}" "${DISK2}" "${DISK3}" "${DISK4}"
+expect_row PVS_AFTER_VGREMOVE_DISK1 /tmp/PVS_AFTER_VGREMOVE.out "${DISK1}|"
+expect_row PVS_AFTER_VGREMOVE_DISK2 /tmp/PVS_AFTER_VGREMOVE.out "${DISK2}|"
+expect_row PVS_AFTER_VGREMOVE_DISK3 /tmp/PVS_AFTER_VGREMOVE.out "${DISK3}|"
+expect_row PVS_AFTER_VGREMOVE_DISK4 /tmp/PVS_AFTER_VGREMOVE.out "${DISK4}|"
 run_lvm_expect_success PVREMOVE_TEST pvremove -ff -y "${DISK1}" "${DISK2}" "${DISK3}" "${DISK4}"
-run_lvm_expect_success PVS_AFTER_PVREMOVE pvs -o pv_name,pv_size,vg_name
+run_lvm_report PVS_AFTER_PVREMOVE pvs -o pv_name,vg_name
+expect_empty_report PVS_AFTER_PVREMOVE_EMPTY /tmp/PVS_AFTER_PVREMOVE.out
+expect_mapper_absent FINAL_MIXED "${MIXED_LV}"
+expect_mapper_absent FINAL_STRIPED "${STRIPED_LV}"
+expect_mapper_absent FINAL_LINEAR "${LINEAR_LV}"
 
 cleanup_lvm
 sync
