@@ -68,7 +68,7 @@ readelf -S target/osdk/asterinas/asterinas-osdk-bin \
 
 ### 2.2 `[dm-debug]` 控制面学习日志
 
-在已构建的 `LOG_LEVEL=error` 调试镜像中，DM 控制 ioctl 会输出短小的 `[dm-debug]` 日志：`ioctl begin`、已解析 header、`ioctl done`，以及具有独立 ABI 或资源价值的控制提交与 core 状态提交。`dmsetup targets` 的 `DM_LIST_VERSIONS` 还会在每条完整 target-version record 的 `next` 最终回填后输出 `offset`、`next`、version、name 和 `record_len`，并以 `records`/`buffer_full` 收尾；`dmsetup target-version <name>` 只在成功编码时输出一条 `next=0` record 摘要。它们帮助关联 CLI 列表与可变长 record，但不替代 GDB 对原始用户 buffer 字节的独立验证。启动期不会因该通道打印 DM 日志；`DmDevice::enqueue`、target 映射、BIO split、completion 和 flush fan-out 均不记录每 I/O 日志。
+在已构建的 `LOG_LEVEL=error` 调试镜像中，DM 控制 ioctl 会输出短小的 `[dm-debug]` 日志：`ioctl begin`、已解析 header、`ioctl done`，以及具有独立 ABI 或资源价值的控制提交与 core 状态提交。日志格式区分 ABI 原始字段与领域语义：`raw_ioctl`、`encoded_dev`、`flags` 固定为十六进制；mapper identity 统一为 `dev=<major>:<minor>`；size、offset、`next` 和 record length 以十进制 `<field>_bytes` 表示。`dmsetup targets` 的 `DM_LIST_VERSIONS` 还会在每条完整 target-version record 的 `next` 最终回填后输出 `offset_bytes`、`next_bytes`、version、name 和 `record_len_bytes`，并以 `records`/`buffer_full` 收尾；`dmsetup target-version <name>` 只在成功编码时输出一条 `next_bytes=0` record 摘要。它们帮助关联 CLI 列表与可变长 record，但不替代 GDB 对原始用户 buffer 字节的独立验证。启动期不会因该通道打印 DM 日志；`DmDevice::enqueue`、target 映射、BIO split、completion 和 flush fan-out 均不记录每 I/O 日志。
 
 一条 CLI 命令不等于一条 ioctl。libdevmapper 常先发送 `DM_VERSION`，例如 `dmsetup targets` 实测为 `DM_VERSION → DM_LIST_VERSIONS`；zero mapper 的 `create → load → resume` 分别对应 create、table load 与 resume ioctl。学习时在 guest shell 使用 marker 把命令和内核日志按时间关联：
 
