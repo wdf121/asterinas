@@ -178,19 +178,22 @@ git status --short
 
 目的：确认验证后工作区状态与本轮预期一致，特别是区分代码/文档改动、测试产物日志和新脚本文件。
 
-定向 ktest 优先从仓库根目录调用 [ktest_crate.sh](../myshell/ktest_crate.sh)，由脚本进入目标 crate 目录并补齐 release、boot、KVM、initramfs 等公共参数；不要为了筛选 crate 临时修改根 [Cargo.toml](../Cargo.toml) 的 `default-members`。例如：
+定向 ktest 在目标 crate 目录执行，避免为了筛选 crate 临时修改根 [Cargo.toml](../Cargo.toml) 的 `default-members`。例如：
 
 ```bash
-myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::<test_path>
+cd kernel/core/comps/device-mapper
+CONSOLE=ttyS0 cargo osdk test aster_device_mapper::table::tests
 ```
 
 或：
 
 ```bash
-myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>
+cd kernel/core
+CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon \
+  aster_core::device::misc::device_mapper::tests
 ```
 
-`git status --short` 的作用是确认本轮留下的文件是否都在预期范围内。当前 ktest wrapper 会在目标 crate 下生成 `<crate-dir>/ktest.log` 作为测试产物；是否提交这类结果日志应由阶段要求决定，不能默认混入代码提交。
+`git status --short` 的作用是确认本轮留下的文件是否都在预期范围内。手动 ktest 虽从目标 crate 目录启动，但当前使用仓库根 OSDK manifest，因此日志应在仓库根目录查看：`ttyS0` 使用 `qemu.log`，`hvc0` 使用 `qemu-serial.log`；不要提交运行日志。
 
 ## 2. `make ktest` 背后到底在做什么
 
@@ -200,16 +203,19 @@ myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::test
 make ktest
 ```
 
-定向入口推荐从仓库根目录调用 [ktest_crate.sh](../myshell/ktest_crate.sh)，避免临时修改根 `Cargo.toml`，也避免每次手写 KVM/initramfs 参数：
+定向入口在目标 crate 目录手动执行：
 
 ```bash
-myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::<test_path>
+cd kernel/core/comps/device-mapper
+CONSOLE=ttyS0 cargo osdk test aster_device_mapper::table::tests
 ```
 
 ioctl 层测试：
 
 ```bash
-myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>
+cd kernel/core
+CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon \
+  aster_core::device::misc::device_mapper::tests
 ```
 
 先看总链路：
@@ -223,7 +229,7 @@ myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::test
 | 5. 生成 test base crate | OSDK test command | 为每个被测 crate 生成临时 test base crate，并写入测试白名单 | `target/osdk/<crate>/src/main.rs` | TESTNAME 是否正确进入 whitelist |
 | 6. 编译测试内核 | OSDK build | 用 `--cfg ktest` 编译 kernel ELF，让 `#[cfg(ktest)]` 测试代码进入内核 | `target/<arch>/<profile>/<crate>` | Rust 编译错误、profile 改变、增量缓存失效 |
 | 7. 生成启动 bundle | OSDK bundle | 复制 kernel/initramfs，按 boot method 生成 GRUB ISO 等启动产物 | `target/osdk/<crate>/bundle.toml`、ISO | bundle/cache 是否重建、GRUB ISO 是否耗时 |
-| 8. 启动 QEMU | OSDK bundle runner | 拼 QEMU 参数并启动 guest；`ktest_crate.sh` 保留终端输出并在结束后清理 QEMU 原始日志 | 终端 stdout；最终 `<crate-dir>/ktest.log` | 是否带 `-accel kvm`，是否退回 TCG，是否进入 ktest runner |
+| 8. 启动 QEMU | OSDK bundle runner | 拼 QEMU 参数并启动 guest | 终端 stdout、`qemu.log`、`qemu-serial.log` | 是否带 `-accel kvm`，是否退回 TCG，是否进入 ktest runner |
 | 9. guest 内运行 ktest runner | `osdk-test-kernel` | 枚举所有 `#[ktest]`，按 crate/test whitelist 过滤并执行 | `[ktest runner]`、`test result` | 测试是否卡住、panic、过滤条件是否过宽 |
 | 10. 返回结果 | OSDK/QEMU | guest 通过 `isa-debug-exit` 退出，OSDK 解码成功/失败 | shell exit code、`test result` | QEMU 自身失败、kernel panic、triple fault |
 
@@ -234,7 +240,7 @@ myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::test
 | `make ktest` 不是普通 `cargo test` | 它会构建一个可启动测试内核，并在 QEMU guest 里跑 kernel-mode tests。 |
 | 只跑一个测试仍显示很多 tests/crates | guest 内 runner 会先枚举完整 ktest tree，再用 whitelist 过滤。 |
 | `... filtered out` | 不是失败，只是当前 crate 中未匹配测试被跳过；如果目标是覆盖某个路径而结果为 `0 passed`，应改跑正确 crate、修正过滤路径或扩大到 crate 全量 ktest。 |
-| `myshell/ktest_crate.sh` | 推荐用于定向 crate 测试；它会进入目标 crate 并补齐 release、KVM、initramfs 等关键参数。 |
+| `CONSOLE=ttyS0 cargo osdk test` | 在目标 crate 目录运行定向测试；显式使用 serial console 并查看原始 QEMU 日志。 |
 | ktest 很慢但 QEMU 已出现 | 多半要看 guest boot 到 `[ktest runner]` 之间，例如 KVM/TCG、boot protocol、kernel init。 |
 
 定向 ktest 的过滤链路可以记成一行：
@@ -263,10 +269,11 @@ cargo osdk test → RUSTFLAGS 加 `--cfg ktest` → `#[cfg(ktest)]` 测试模块
 
 ```bash
 pgrep -af '[q]emu-system' || true
-cat <crate-dir>/ktest.log
+tail -n 100 qemu.log
+tail -n 100 qemu-serial.log
 ```
 
-本次发现的典型问题：根目录 `make ktest CARGO_OSDK_TEST_ARGS="..."` 覆盖 Make 变量后没有显式带 `--qemu-args="-accel kvm"`，实际 QEMU 走 TCG，启动时间明显变慢。后续定向测试优先从仓库根目录调用 [ktest_crate.sh](../myshell/ktest_crate.sh)，由脚本统一补齐 KVM/initramfs/release 参数，并通过 `timeout --foreground` 避免交互终端里 QEMU 被 job-control stop。
+手动定向测试时，在目标 crate 目录运行 `CONSOLE=ttyS0 cargo osdk test <crate>::<module>::tests`；core 测试还要传 `--kcmd-args=earlycon`。日志在仓库根目录查看：本轮 `ttyS0` 输出看 `qemu.log`，`hvc0` 输出看 `qemu-serial.log`，已有但本轮未使用的日志可能是旧文件。
 
 ## 3. DM system test 背后在做什么
 
@@ -363,7 +370,8 @@ git diff --check -- "kernel/core/comps/device-mapper/src"
 定向 ktest：
 
 ```bash
-myshell/ktest_crate.sh kernel/core/comps/device-mapper aster_device_mapper::<test_path>
+cd kernel/core/comps/device-mapper
+CONSOLE=ttyS0 cargo osdk test aster_device_mapper::table::tests
 ```
 
 如果改动影响真实数据面边界：
@@ -383,7 +391,9 @@ git diff --check -- "kernel/core/comps/device-mapper/src" "kernel/core/src/devic
 定向 ioctl ktest：
 
 ```bash
-myshell/ktest_crate.sh kernel/core aster_core::device::misc::device_mapper::tests::<test_name>
+cd kernel/core
+CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon \
+  aster_core::device::misc::device_mapper::tests
 ```
 
 如果改变用户可见 dmsetup 语义：
@@ -422,10 +432,10 @@ pgrep -af '[q]emu-system' || true
 
 - `cargo fmt --all --check` 通过。
 - `git diff --check` 通过。
-- 相关定向 [ktest_crate.sh](../myshell/ktest_crate.sh) 或必要的 `make ktest` 通过。
+- 在目标 crate 目录执行的相关 `CONSOLE=ttyS0 cargo osdk test` 或必要的 `make ktest` 通过。
 - 如果影响真实 `dmsetup`/LVM2/数据面语义，相关 system suite 输出 `HOST_PASS_*`。
 - 测试后无 QEMU 残留。
-- 定向 ktest 使用 `myshell/ktest_crate.sh <crate-dir> [filter]`，并在对应 `<crate-dir>/ktest.log` 中看到有效结果；`0 passed; ... filtered out` 不算目标覆盖。
+- 定向 ktest 使用模块 selector `crate::...::tests`；core 测试附加 `--kcmd-args=earlycon`，并从仓库根目录查看当前 console 对应的 QEMU 日志。
 
 判断 system test 完整通过时，要看最终 marker：
 
@@ -441,6 +451,6 @@ HOST_PASS_...
 1. 先知道命令会进入哪条链路，再解释结果。
 2. 先看阶段 marker，再判断是构建慢、QEMU 慢、boot 慢还是测试慢。
 3. 定向 ktest 的过滤发生在 guest 内 ktest runner，不是宿主 shell 层过滤。
-4. `myshell/ktest_crate.sh` 的 `<crate-dir>` 决定 OSDK 要为哪个 crate 生成测试内核；过滤参数只决定 runner 最后跑哪些测试。
+4. 当前工作目录决定 OSDK 为哪个 crate 生成测试内核；模块 selector 只决定 runner 最后运行哪些测试。
 5. QEMU 参数是性能和启动路径判断的关键证据，尤其要确认是否带 `-accel kvm`。
 6. ktest 证明 kernel 内部逻辑；system test 证明真实用户态工具和真实 block device 链路。
