@@ -70,7 +70,7 @@ Makefile
 | `BENCHMARK` | `none` | 是否在 initramfs 中启用 benchmark 入口 |
 | `BOOT_METHOD` | `grub-rescue-iso` | OSDK 默认启动方式 |
 | `BOOT_PROTOCOL` | `multiboot2` | GRUB 启动协议 |
-| `ENABLE_KVM` | `1` | x86_64 下给 QEMU 加 `-accel kvm` |
+| `ENABLE_KVM` | `1` | x86_64 下由 `tools/qemu_args.sh` 组织 QEMU acceleration 参数 |
 | `INTEL_TDX` | `0` | 是否使用 TDX scheme |
 | `MEM` | `8G` | QEMU 内存大小，主要被 `tools/qemu_args.sh` 使用 |
 | `OVMF` | `on` | 是否使用 OVMF 固件 |
@@ -142,7 +142,7 @@ CARGO_OSDK_TEST_ARGS :=
 --grub-boot-protocol=multiboot2
 ```
 
-默认 `ENABLE_KVM=1` 且 `TARGET_ARCH=x86_64`，所以追加：
+`ENABLE_KVM` 的默认值由 `tools/qemu_args.sh` 提供；QEMU acceleration 参数也由该脚本统一组织。
 
 ```text
 --qemu-args="-accel kvm"

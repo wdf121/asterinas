@@ -153,10 +153,6 @@ if [ -n "${DM_TEST_IMAGES}" ]; then
     append_dm_test_images
 fi
 
-if [ "${ENABLE_KVM}" = "1" ]; then
-    QEMU_ARGS="${QEMU_ARGS} -accel kvm"
-fi
-
 QEMU_BIN=${QEMU_BIN:-qemu-system-${TARGET_ARCH}}
 
 # The kernel uses a specific value to signal a successful shutdown via the

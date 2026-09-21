@@ -20,6 +20,7 @@
 #  - VIRTIOFS_SCRATCH_TAG: mount tag for the scratch virtio-fs device;
 #  - INITRAMFS: "on" or "off"; when "off", attach `rootfs.img` as an extra block device.
 #  - CONSOLE: "hvc0" to enable virtio console;
+#  - ENABLE_KVM: "1" to enable KVM acceleration (default), or "0" to use TCG;
 #  - SMP: number of CPUs;
 #  - MEM: amount of memory, e.g. "8G";
 #  - VNC_PORT: VNC display number, default is "42" (TCP port 5942),
@@ -36,6 +37,7 @@ VIRTIOFS_SCRATCH=${VIRTIOFS_SCRATCH:-"off"}
 NETDEV=${NETDEV:-"user"}
 QEMU_DISPLAY=${QEMU_DISPLAY:-"vnc=0.0.0.0:${VNC_PORT:-42}"}
 CONSOLE=${CONSOLE:-"hvc0"}
+ENABLE_KVM=${ENABLE_KVM:-1}
 XFSTESTS_NEEDS_BLOCK_DEVICES=${XFSTESTS_NEEDS_BLOCK_DEVICES:-false}
 
 if [ "$XFSTESTS_NEEDS_BLOCK_DEVICES" != "true" ] && \
@@ -146,45 +148,24 @@ if [ "$1" = "riscv" ]; then
     exit 0
 fi
 
-if [ "$1" = "aarch64" ]; then
-    # QEMU in KVM mode on a native aarch64 host only accepts host-compatible
-    # CPU models (e.g. `host` or `max`).
-    if [ "${ENABLE_KVM:-1}" = "1" ] && [ -e /dev/kvm ] && [ "$(uname -m)" = "aarch64" ]; then
-        CPU_MODEL=host
-    else
-        CPU_MODEL=cortex-a72
-    fi
-    QEMU_ARGS="\
-        -cpu ${CPU_MODEL} \
-        -machine virt,gic-version=3 \
-        -m ${MEM:-8G} \
-        -smp ${SMP:-1} \
-        --no-reboot \
-        -nographic \
-        -display none \
-        -monitor chardev:mux \
-        -chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log \
-        -drive if=none,format=raw,id=x0,file=./test/initramfs/build/ext2.img \
-        -drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img \
-        -drive if=none,format=raw,id=x2,file=./test/initramfs/build/ltp_dev.img \
-        -device virtio-blk-device,drive=x2 \
-        -device virtio-blk-device,drive=x1 \
-        -device virtio-blk-device,drive=x0 \
-        -device virtio-keyboard-device \
-        -device virtio-serial-device \
-        $CONSOLE_ARGS \
-    "
-    echo $QEMU_ARGS
-    exit 0
+if [ "${ENABLE_KVM}" = "1" ]; then
+    KVM_ARGS="-accel kvm"
+else
+    KVM_ARGS=""
 fi
 
 if [ "$1" = "tdx" ]; then
+    if [ "${ENABLE_KVM}" != "1" ]; then
+        echo "TDX requires ENABLE_KVM=1" 1>&2
+        exit 1
+    fi
     TDX_OBJECT='{ "qom-type": "tdx-guest", "id": "tdx0", "sept-ve-disable": true, "quote-generation-socket": { "type": "vsock", "cid": "1", "port": "4050" } }'
     if [ "$INITRAMFS" = "off" ]; then
         ROOTFS_TDX_DEVICE_ARGS="-device virtio-blk-pci,bus=pcie.0,addr=0xb,drive=rootfs,serial=vrootfs,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off"
     fi
 
     QEMU_ARGS="\
+        $KVM_ARGS \
         -m ${MEM:-8G} \
         -smp ${SMP:-1} \
         -vga none \
@@ -219,7 +200,8 @@ if [ "$1" = "tdx" ]; then
 fi
 
 COMMON_QEMU_ARGS="\
-    -cpu Icelake-Server,+x2apic,+vmx \
+    $KVM_ARGS \
+    -cpu Icelake-Server,+x2apic \
     -smp ${SMP:-1} \
     -m ${MEM:-8G} \
     --no-reboot \
