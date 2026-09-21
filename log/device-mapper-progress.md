@@ -1,108 +1,133 @@
-# Device Mapper 项目进度
+# Device Mapper 当前项目状态
 
-本文记录 `dm` 分支中变化较快的 Device Mapper 项目状态。若本文与当前代码或实际命令结果不一致，以当前代码和命令结果为准，并及时修正本文。
+> **更新日期**：2026-09-20。
+>
+> **事实来源**：当前工作区相对 `e31b265a3` 的实际 diff 与当前源码。daily log 只用于交叉核对已执行动作，不替代源码事实。
 
-## 当前状态
+## 1. 当前方向
 
-截至 2026-09-11，当前工作重点是稳固已实现的 Device Mapper 功能与验证链路，不新增 target 或扩大 Linux DM 兼容声明。已确认的实现范围包括 `error`、`zero`、`linear`、`striped`，以及同一 mapper/LV 内的 linear + striped mixed table。DM table/control-plane 已从 closed `DmTarget` enum 迁移为 `dyn DmTarget` trait object；定向 ktest 默认使用 crate-local wrapper。`create -> load -> 首次 resume` 已按本机 Linux 的可观察生命周期对齐：load 后 `/dev/dm-X` 已发布但只有 inactive table、容量为 0、read 为 EOF，resume 后 active table 生效并发布 `/dev/mapper/<name>` alias。首次 primary 在 pending block registration/wrapper 阶段先创建 `/dev/dm-X`，成功后才变为 Live 并开放 open gate；创建失败不留下 registry 或 wrapper。普通 suspend drain 已映射 BIO，`suspend --noflush` 不等待已映射 BIO；两者均 postpone 后续未映射 BIO 并在 resume 后按 active table replay。mapper 生命周期写操作以 per-device lifecycle guard 串行：某个 mapper drain 时，其他 mapper 的查询和 create 不再受全局控制锁阻塞；同 mapper 的 load/clear/remove/rename/resume 不会穿插。运行中 rename 保持旧 name 索引、预留新 name，alias 成功后才提交 manager name/UUID index 与 `DmDevice.name`；alias 失败不再依赖反向索引回滚。若 remove 的节点补偿失败，mapper 保持不可 lookup/open 的 `Removing` 隔离状态并返回 `EIO`，随后 remove 可重试继续注销，不能重新作为半发布的 Live 设备使用。
-
-当前六个 canonical NixOS system suite 均已通过，且每个实际 guest 的 shell-ready 时间均不超过 40 秒；2026-09-09 在首次 load/resume Linux 生命周期对齐后重建 NixOS 镜像并复跑 `--control-plane` 与 `--linear-integration`，均通过：
+当前方向是稳固已实现的 Device Mapper 主链，不主动扩大通用框架：
 
 ```text
-myshell/run_dm_system_tests.sh --control-plane
-myshell/run_dm_system_tests.sh --dataplane
-myshell/run_dm_system_tests.sh --lvm2-topology
-myshell/run_dm_system_tests.sh --linear-integration
-myshell/run_dm_system_tests.sh --striped-integration
-myshell/run_dm_system_tests.sh --mixed-integration
+DM control ABI
+→ runtime primary / alias
+→ linear / striped / zero / error table
+→ mapper I/O / flush
+→ LVM2 显式创建、扩缩、恢复
+→ ext2 mapper mount / remove 保护
 ```
 
-运行时统一使用：
+后续 target 路线以 [global.md](../docs/global.md) 为准：
+
+```text
+P0 主链语义收敛
+→ verity
+→ crypt
+→ snapshot
+→ mirror
+```
+
+## 2. 当前实现状态
+
+- `/dev/mapper/control` 提供当前 DM ioctl 子集；
+- `DM_DEV_WAIT` 直接进入 wait 处理，不再落入通用命令分派的不可达路径；无 `SA_RESTART` 时用户态收到 `EINTR`，带 `SA_RESTART` 时原 ioctl 自动重启并继续等待事件；
+- 首次 table load 发布 `/dev/dm-N`，首次 resume 发布 `/dev/mapper/<name>`；node/alias 创建、rename、remove 均有事务和回滚/Removing 隔离；
+- target 为 `linear`、`striped`、`zero`、`error`；支持连续 mixed table、跨 target/chunk I/O、flush fan-out；
+- mount source 和 ext2 对象持有 tracked lease；已挂载或仍打开的 mapper 不可直接 remove，释放使用者后才可 remove；
+- 当前 LVM 路径是显式创建与显式恢复：`pvscan → vgscan --mknodes → vgchange -ay`；
+- runtime nodes 由内核直接发布，不依赖 udev 创建当前 DM primary/alias。
+
+## 3. 当前测试入口
+
+### 3.1 ktest
+
+当前定向/完整 ktest 从目标 Cargo crate 目录运行，不再使用已删除的 `myshell/ktest_crate.sh`：
+
+```bash
+cd kernel/core/comps/device-mapper
+CONSOLE=ttyS0 cargo osdk test
+```
+
+按模块运行时使用完整 module `::tests` selector：
+
+```bash
+CONSOLE=ttyS0 cargo osdk test aster_device_mapper::table::tests
+```
+
+跨到 core ioctl/runtime 时：
+
+```bash
+cd kernel/core
+CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon \
+  aster_core::device::misc::device_mapper::tests
+```
+
+### 3.2 Initramfs C ABI 回归
+
+`REGRESSION_TESTS` 可选择目录或单个 C ELF。DM focused C 回归入口：
+
+```bash
+RELEASE=1 AUTO_TEST=regression INTEL_TDX=0 \
+  REGRESSION_TESTS=device/device_mapper make run_kernel
+```
+
+它覆盖 raw ioctl、runtime node/alias rollback、ext2 mount lease、zero target range ioctl，以及无 `SA_RESTART` 的 `EINTR` 对照和带 `SA_RESTART` 的 WAIT 重启；完整 regression 仍可能被无关目录中的失败提前中止，因此 focused selector 是当前 DM ABI 的最小入口。
+
+### 3.3 NixOS DM system suite
+
+当前只保留六个 canonical suite：
 
 ```bash
 GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
-  myshell/run_dm_system_tests.sh <suite>
+  myshell/run_dm_system_tests.sh --control-plane
+
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --dataplane
+
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --lvm2-topology
+
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --linear-integration
+
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --striped-integration
+
+GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
+  myshell/run_dm_system_tests.sh --mixed-integration
 ```
 
-`GUEST_READY_TIMEOUT=40` 限制 QEMU 启动到 guest shell-ready；`GUEST_QEMU_TIMEOUT=180` 限制单个 guest 的完整生命周期。系统测试必须串行执行。入口不提供无参数默认执行或历史兼容别名。
+`--control-plane-non-wait` 已删除，不再作为当前入口。系统 suite 默认 release；只有明确调试时才指定 `RELEASE=0`。
 
-## 新对话接手阅读清单
+`--dataplane` 当前使用三块测试盘；其长 guest 脚本在未显式覆盖时使用 `GUEST_INPUT_LINE_DELAY=0.05`。公共 harness 负责 FIFO 注入、ready/lifecycle 超时和 QEMU process-group 清理。
 
-新开对话或上下文压缩后，优先阅读：
+## 4. 当前边界
+
+以下不属于当前主动工作：
+
+- uevent / sysfs / udev / systemd 自动发现和自动激活；
+- DM-on-DM stacking；
+- deferred remove、完整 control ABI 扩展；
+- 完整 queue stacking、后端限制自动再拆；
+- ext4 / exfat 作为当前核心验收；
+- MlsDisk 生命周期、virtio/NVMe fault injection 等框架专项工作。
+
+只有它们造成 DM 用户可见失败、数据风险或阻塞新 target 时才重新开启。
+
+## 5. 新对话接手顺序
 
 ```text
 CLAUDE.md
-AGENTS.md
-log/device-mapper-progress.md
-log/daily/2026-9-11.md
-log/daily/2026-9-10.md
-log/daily/2026-9-9.md
-docs/test.md
-docs/production-code-validation-chain.md
-docs/device-mapper-technical-maintenance.md
-docs/non-device-mapper-change-rationale.md
+→ AGENTS.md
+→ docs/global.md
+→ docs/device-mapper-technical-design-and-implementation.md
+→ docs/test.md
+→ docs/review.md
+→ docs/non-device-mapper-change-rationale.md
+→ log/daily/2026-9-18.md
+→ log/daily/2026-9-20.md
+→ git status --short
+→ git diff e31b265a3
 ```
 
-阅读重点：
-
-- `CLAUDE.md`：协作规则，包括简体中文、精简汇报、新阶段先说明差异、默认不 push。
-- `AGENTS.md`：容器路径、测试入口、系统测试串行和定向 ktest 约束。
-- `log/daily/2026-9-11.md`：P2.1 runtime rename name reservation、P2.2 primary pending-to-Live 发布、P2.3 `Removing` 隔离重试，以及 core/ioctl/control-plane 验证记录。
-- `log/daily/2026-9-10.md`：suspend/no-flush 语义纠正、postponed BIO replay、失败完成闭环与控制面系统验证。
-- `log/daily/2026-9-9.md`：本机 Linux 生命周期基线、首次 load 后 primary 的 0-capacity/EOF、首次 resume alias 发布、定向 ktest、control-plane 与 linear LVM2 integration 验证记录。
-- `docs/test.md`：当前系统验收命令、suite 职责、marker 和超时含义。
-- `docs/production-code-validation-chain.md`：ktest 与 system test 的实际执行链路。
-- `docs/device-mapper-technical-maintenance.md`：DM 架构、target 边界、系统验证矩阵和 command alignment 附录。
-- `docs/non-device-mapper-change-rationale.md`：DM 依赖的通用内核与测试基础设施改动边界。
-
-## 当前验证入口与职责
-
-| suite | 所有者与覆盖范围 |
-|---|---|
-| `--control-plane` | `dmsetup` discovery、tableless/table 生命周期、首次 `create --notable -> load` 后 primary node、0 容量、EOF 与 alias 缺失，首次 resume 后 alias 和立即交叉读写、primary-only rename/remove、linear/striped/error/zero table/status/deps/info、events、rename/UUID、readonly、busy remove/remove_all；包含 error/zero I/O。 |
-| `--dataplane` | raw linear、striped、mixed、error、zero；nonzero backing start、跨 target/chunk split、flush、discard/write-zeroes、mapper readback 和 backing 布局。 |
-| `--lvm2-topology` | static LVM2 查询、PV/VG/LV lifecycle、linear/striped/mixed create/grow/shrink、table/status/deps、activation/scan/remove；不做 ext2 或 reboot persistence。 |
-| `--linear-integration` | linear same-PV/cross-PV second segment、ext2、grow/shrink 和三次启动恢复。 |
-| `--striped-integration` | parameterized N-way striped、same-set/cross-set second segment、ext2、grow/shrink 和三次启动恢复。 |
-| `--mixed-integration` | linear + striped mixed LV、跨段 ext2 I/O 和两次启动恢复。 |
-
-公共 harness [dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh) 提供 single、two、three guest 流程，并输出 started、shell-ready、completed 的 ISO 时间与 elapsed marker。默认 `GUEST_INPUT_LINE_DELAY=0.01`，按行节流注入 guest 脚本；设置为 `0` 才显式关闭节流。
-
-## 已完成并验证的范围
-
-### DM core 与用户可见 ABI
-
-- `/dev/mapper/control` 和 Linux DM 核心 ioctl 子集已支持：create/remove/remove_all/rename/status/list/wait、table load/clear/status/deps、active/inactive lifecycle、readonly 与主要 flags。
-- target 支持 `error`、`zero`、`linear`、`striped`，以及 linear + striped mixed table。
-- `error` 无 backing，Read/Write 返回 I/O error；`zero` Read 返回全零、Write 丢弃；二者无 backing Flush 均 direct-complete，deps 为空。
-- linear/striped 支持 Read/Write/Discard/WriteZeroes remap；table-level 与 target-level split 通过 completion 聚合保证原始 BIO 只完成一次。
-- Flush 对 backing 去重后 fan-out；无 backing table direct-complete。
-
-### 2026-09-04 数据面与系统验收收敛
-
-- 删除历史阶段性 system-test 入口，只保留六个 canonical suite；保留公共 harness、`myshell/ktest_crate.sh` 和 Linux baseline 对照脚本。
-- 公共 harness 增加独立的 40 秒 shell-ready timeout、180 秒 lifecycle timeout、guest timing marker、QEMU group cleanup 和 three-guest helper。
-- 修复长 guest shell script 一次性通过 serial 输入时可能丢失后续命令的问题：默认按行以 10ms 节流注入；这不是 DM I/O hang。
-- `--dataplane` 的非对齐 striped 场景从 mapper sector 2 单次写入 12 sectors，验证四个 child 的真实 backing 布局；Step 5 I/O 另有 20 秒诊断 timeout。
-- `aster-device-mapper` 新增精确 12-sector ktest，验证 `striped 2 4` 下 `[2,14)` Write 分成 2/4/4/2 sectors 的四个 child；前三个乱序完成后原 BIO 仍 pending，最后一个完成后原 BIO 只完成一次。
-- 六个 canonical suite 已逐个串行通过；所有实际 guest shell-ready 均在 40 秒上限内，未发现残留 QEMU。
-
-### 当前功能边界
-
-当前不声明完整 Linux Device Mapper、完整 LVM2 用户体验或完整 udev/systemd 自动激活生态。尚不纳入：snapshot、thin、cache、crypt、mirror、raid 等 target 族，完整 sysfs DM 层级，DM-on-DM backing，queue limit/alignment/topology，真实 guest backing I/O error/partial completion 注入，以及 NVMe discard/write-zeroes 后端命令。
-
-## 后续优先级
-
-1. 继续以当前六个 suite 和相关 ktest 稳固已实现功能；改动按 owner 选择窄验证，避免无关 system suite。
-2. 若审计数据面，优先评估 queue limit/alignment/topology、真实 backing error 和 partial completion；不要将这些解释为当前已支持的完整 queue stacking。
-3. 新 target 或 target registry 等扩展应另起小阶段，先说明原有行为、目标行为和最小验收路径。
-4. `patches/` 当前暂不处理；后续若更新 patch，再单独核对其与执行树和验证记录的一致性。
-
-## 相关阶段日志
-
-- `log/daily/2026-8-24.md`：mixed active/inactive ktest、striped 几何边界 ktest、mixed LVM2 系统验收、合入当前 main 并适配 `kernel/core` 目录迁移。
-- `log/daily/2026-8-31.md`：dmsetup 控制面语义对齐、LVM2 控制面 baseline/guest 同构、raw DM 数据面边界 guest 审计。
-- `log/daily/2026-9-1.md`：guest 启动慢排查修复、`zero` target 核心/控制面/数据面覆盖、discard / write zeroes 通用 range BIO 与 DM 映射接入。
-- `log/daily/2026-9-2.md`：源码注释、DM 文档事实、系统测试脚本口径、成功 marker、超时变量和 patches 同步记录。
-- `log/daily/2026-9-3.md`：`DmTarget` trait object 重构、crate-local ktest wrapper、runner 结果行拆分、`timeout --foreground` 修复和验证结果。
-- `log/daily/2026-9-4.md`：six-suite 收敛、公共 harness 输入节流、非对齐 striped 四 child ktest 和六套系统验收。
+接手时不假定工作区干净；先按当前 diff 判断生产、测试基础设施与文档的改动归属。QEMU、ktest 和 NixOS system test 必须串行执行。
