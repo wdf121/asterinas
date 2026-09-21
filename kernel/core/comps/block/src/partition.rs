@@ -289,81 +289,99 @@ impl PartitionNode {
     }
 }
 
-/// Manages the partitions of a whole-disk block device.
-///
-/// The manager owns the device's current partition list and the lock that
-/// serializes partition replacement.
-#[derive(Debug)]
-pub struct PartitionManager {
-    inner: Mutex<Option<Vec<Arc<PartitionNode>>>>,
-}
+#[cfg(ktest)]
+mod tests {
+    use ::device_id::{MajorId, MinorId};
+    use ostd::{prelude::ktest, sync::Mutex};
 
-impl Default for PartitionManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+    use super::*;
+    use crate::{
+        bio::{Bio, BioType},
+        id::Sid,
+    };
 
-impl PartitionManager {
-    /// Creates an empty partition manager.
-    pub const fn new() -> Self {
-        Self {
-            inner: Mutex::new(None),
-        }
+    #[derive(Debug)]
+    struct RecordingBlockDevice {
+        id: DeviceId,
+        enqueue_count: AtomicUsize,
+        last_range: Mutex<Option<Range<Sid>>>,
     }
 
-    /// Replaces the managed partitions with the parsed partition information.
-    pub(super) fn update(&self, device: &Arc<dyn BlockDevice>, infos: Vec<Option<PartitionInfo>>) {
-        // Lock order: partition lock -> `DEVICE_REGISTRY`
-
-        let mut partitions = self.inner.lock();
-
-        if let Some(old_partitions) = partitions.take() {
-            for partition in old_partitions {
-                let _ = unregister(partition.id());
-            }
+    impl RecordingBlockDevice {
+        fn new(minor: u32) -> Arc<Self> {
+            Arc::new(Self {
+                id: DeviceId::new(MajorId::new(510), MinorId::new(minor)),
+                enqueue_count: AtomicUsize::new(0),
+                last_range: Mutex::new(None),
+            })
         }
-
-        let mut new_partitions = Vec::new();
-        for (index, info_opt) in infos.iter().enumerate() {
-            let Some(info) = info_opt else {
-                continue;
-            };
-
-            let index = index as u32 + 1;
-            let id = if index < DEVICE_MINORS {
-                let device_id = device.id();
-                DeviceId::new(
-                    device_id.major(),
-                    MinorId::new(device_id.minor().get() + index),
-                )
-            } else {
-                EXTENDED_DEVICE_ID_ALLOCATOR.get().unwrap().allocate()
-            };
-            let name = partition_name(device.name(), index);
-            let partition = Arc::new(PartitionNode::new(id, name, device.clone(), *info));
-            new_partitions.push(partition);
-        }
-
-        for partition in new_partitions.iter() {
-            let _ = register(partition.clone());
-        }
-
-        *partitions = Some(new_partitions);
     }
-}
 
-/// Formats the name of a partition.
-///
-/// We perform the naming similar to the Linux implementation: insert "p" between
-/// the disk name and the partition number when the disk name ends with a digit
-/// (`nvme0n1p1`), and append the number otherwise (`vda1`).
-///
-/// Reference: <https://elixir.bootlin.com/linux/v7.2.2/source/block/partitions/core.c#L337>
-fn partition_name(disk_name: &str, partno: u32) -> String {
-    if disk_name.ends_with(|c: char| c.is_ascii_digit()) {
-        format!("{}p{}", disk_name, partno)
-    } else {
-        format!("{}{}", disk_name, partno)
+    impl BlockDevice for RecordingBlockDevice {
+        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            self.enqueue_count.fetch_add(1, Ordering::Relaxed);
+            *self.last_range.lock() = Some(bio.sid_range().clone());
+            Ok(())
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta::default()
+        }
+
+        fn name(&self) -> String {
+            String::from("partition-test-backing")
+        }
+
+        fn id(&self) -> DeviceId {
+            self.id
+        }
+    }
+
+    fn mbr_partition(start_sector: u32) -> PartitionInfo {
+        PartitionInfo::Mbr(MbrEntry {
+            flag: 0,
+            start_chs: ChsAddr([0, 1, 0]),
+            type_: 0x83,
+            end_chs: ChsAddr([0, 1, 0]),
+            start_sector,
+            total_sectors: 128,
+        })
+    }
+
+    #[ktest]
+    fn remaps_range_bio_to_partition_start() {
+        let backing = RecordingBlockDevice::new(1);
+        let partition = PartitionNode::new(
+            DeviceId::new(MajorId::new(510), MinorId::new(2)),
+            String::from("partition-test"),
+            backing.clone(),
+            mbr_partition(100),
+        );
+        let bio = Bio::new_range(BioType::Discard, Sid::new(7), 4, None).submit_for_test();
+
+        partition.enqueue(bio).unwrap();
+
+        assert_eq!(backing.enqueue_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *backing.last_range.lock(),
+            Some(Sid::new(107)..Sid::new(111))
+        );
+    }
+
+    #[ktest]
+    fn refuses_offset_overflow_without_forwarding_bio() {
+        let backing = RecordingBlockDevice::new(3);
+        let partition = PartitionNode::new(
+            DeviceId::new(MajorId::new(510), MinorId::new(4)),
+            String::from("partition-overflow-test"),
+            backing.clone(),
+            mbr_partition(10),
+        );
+        let bio =
+            Bio::new_range(BioType::Discard, Sid::new(u64::MAX - 5), 5, None).submit_for_test();
+
+        assert_eq!(partition.enqueue(bio), Err(BioEnqueueError::Refused));
+        assert_eq!(backing.enqueue_count.load(Ordering::Relaxed), 0);
+        assert_eq!(*backing.last_range.lock(), None);
     }
 }
