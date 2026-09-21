@@ -14,7 +14,7 @@
 2. Asterinas 通用内核框架改动；
 3. 配置、构建、启动和回归支撑改动。
 
-本文不展开系统测试脚本、patch 目录、每日日志和测试日志。系统验收入口和结果应查看 `docs/test.md` 与 `log/device-mapper-progress.md`。
+本文不展开系统测试脚本、patch 目录、每日日志和测试日志。通用测试分层和 selector 说明见 `docs/test.md`；当前 canonical DM suite、超时、release 与串行边界以 `AGENTS.md`、`log/device-mapper-progress.md` 和实际脚本为准。
 
 ## 1. Device Mapper core crate 内部改动
 
@@ -92,16 +92,15 @@
 |---|---|---|---|
 | `Cargo.toml` | workspace | 将 `aster-device-mapper` 纳入 workspace。 | DM crate 需要进入统一构建和测试图。 |
 | `Cargo.lock` | dependency lock | 锁定新增 crate/dependency graph。 | workspace 依赖变化需要可复现。 |
-| `kernel/comps/README.md` | kernel comps 说明 | 记录或同步 comps 目录下新增组件。 | DM 作为独立 kernel component，需要在组件说明中可见。 |
 | `Makefile` | 构建与清理入口 | 提供适合 DM 系统验收的构建/清理入口，包括测试盘清理。 | LVM2 会写入 PV/VG/LV 元数据，旧测试盘状态会污染下次验证。 |
 | `distro/etc_nixos/configuration.nix` | NixOS guest 环境 | 内置 `lvm2`、`e2fsprogs`、`util-linux`、`strace` 和测试盘 locator。 | DM/LVM2 验收依赖真实用户态工具，启动后临时补装不可重复。 |
 | `distro/etc_nixos/modules/systemd.nix` | NixOS/systemd 启动 | 调整系统服务和启动行为以减少 guest 启动阻塞。 | 系统验收需要在限定时间内进入 root shell，慢启动会掩盖真实测试结果。 |
 | `distro/etc_nixos/overlays/hello-asterinas/default.nix` | Nix overlay | 构建并安装 `aster-dm-disk-locator`。 | 多测试盘不能依赖 `/dev/vdX` 枚举顺序，需要按 VirtIO serial 稳定定位。 |
-| `tools/nixos/build_nixos.sh` | NixOS image 构建 | 保证 guest 工具和 locator 在 image 构建阶段进入系统。 | 系统启动后的测试环境必须可复现。 |
+| `tools/nixos/build_nixos.sh` | NixOS image 构建入口 | 调用 NixOS 镜像构建流程。 | guest 用户工具与 locator 的声明主要位于 NixOS 配置和 overlay；本脚本不应被描述为其主要实现位置。 |
 | `tools/nixos/run.sh` | NixOS/QEMU 启动 | 支持多块 `DM_TEST_IMAGES`；设置 root disk boot order；校验测试盘安全；隔离 OVMF/boot protocol 影响。 | striped、mixed、跨 PV LVM2 和 reboot recovery 都依赖多块持久测试盘；同时不能误伤 root image。 |
-| `tools/qemu_args.sh` | QEMU 参数生成 | 支持稳定 VirtIO serial、随机 host forwarding 端口、NixOS OVMF 启动约束。 | 测试盘定位、并行/残留 QEMU 端口冲突和 root image boot 都需要在启动参数层处理。 |
+| `tools/qemu_args.sh` | QEMU 参数生成 | 统一组织 acceleration、firmware 与通用 QEMU 参数。 | KVM/OVMF 等启动参数应在该层理解；多盘、root disk 保护与测试盘安全检查的主要逻辑位于 `tools/nixos/run.sh`。 |
 | `myshell/br.sh` | 本地启动辅助 | 适配当前 boot/run 参数约定。 | 手工验证路径需要跟随 NixOS/QEMU 启动链路变化。 |
-| `myshell/ktest_crate.sh` | ktest 辅助入口 | 统一从指定 crate 运行 ktest。 | DM core ktest 需要稳定、可重复的 crate-local 入口。 |
+| `docs/test.md` | 开发测试手册 | 说明在目标 crate 手动执行 `CONSOLE=ttyS0 cargo osdk test`。 | ktest 需要可重复的 crate-local 手动入口。 |
 | `.gitignore` | 仓库忽略规则 | 忽略 DM/NixOS 验收产生的本地临时产物。 | 多盘系统测试会生成 raw image、日志或中间文件，不能污染提交。 |
 | `osdk/deps/test-kernel/src/lib.rs` | test kernel 支撑 | 适配 ktest 或 test kernel dependency 变化。 | DM crate ktest 需要能在当前 test kernel 环境下链接运行。 |
 | `ostd/src/arch/x86/cpu/cpuid.rs` | x86 CPU 支撑 | 启动/虚拟化环境相关适配。 | DM 系统验收依赖稳定 guest 启动，底层 CPU feature 处理不能成为干扰项。 |
@@ -113,8 +112,9 @@
 
 | 文件 | 所在层 | 主要承载功能 | 为什么必须改 |
 |---|---|---|---|
-| `test/initramfs/src/regression/device/device_mapper.c` | initramfs regression | 覆盖最小 DM control ABI，例如 `/dev/mapper/control` 和基础 ioctl。 | 在不启动完整 NixOS/LVM2 的情况下保护 DM control 面最小兼容性。 |
-| `test/initramfs/src/regression/device/run_test.sh` | initramfs regression runner | 接入 device regression 测试。 | 新增 DM control ABI 回归需要进入现有 regression 流程。 |
+| `test/initramfs/src/regression/device/device_mapper.c` | initramfs regression | 覆盖 raw DM control ABI、linear table load、runtime node/alias rollback、ext2 mount lease、range ioctl、wait errno、`SA_RESTART` 与 rename/setuuid waiter 唤醒。 | 在不启动完整 NixOS/LVM2 的情况下保护原始 DM 用户 ABI；不替代完整 target 数据面或 LVM2 编排。 |
+| `test/initramfs/src/regression/device/run_test.sh` | initramfs regression runner | 调度 device 目录下的回归 ELF。 | 目录级 regression 仍通过该脚本按顺序运行。 |
+| `test/initramfs/src/regression/scripts/run_regression_test.sh` | initramfs regression selector | 接受目录或单个 ELF selector，并拒绝路径穿越。 | `REGRESSION_TESTS=device/device_mapper` 使 focused DM C ABI 回归不受无关目录失败阻断。 |
 | `test/initramfs/src/regression/fs/procfs/devices.c` | procfs regression | 覆盖 `/proc/devices` block major/name 输出。 | LVM2 依赖该发现路径，不能只靠系统测试发现回归。 |
 | `test/initramfs/src/regression/fs/run_test.sh` | fs regression runner | 接入 procfs devices 回归。 | 新增 procfs 兼容输出需要进入现有 regression 流程。 |
 | `test/initramfs/src/regression/io/file_io/block_device.c` | block file I/O regression | 覆盖 block device 文件打开、size/ioctl 或基础 I/O 行为。 | DM mapper 和普通 block device 都依赖 block file 用户态入口。 |
@@ -123,7 +123,7 @@
 
 | 不在本文展开的内容 | 原因 | 应查看的位置 |
 |---|---|---|
-| `myshell/` 下的 DM 系统测试脚本 | 系统测试入口变化快，且脚本本身不是生产代码改动原因说明。 | `docs/test.md`、`log/device-mapper-progress.md` |
+| `myshell/` 下的 DM 系统测试脚本 | 系统测试入口变化快，且脚本本身不是生产代码改动原因说明。 | `AGENTS.md`、`log/device-mapper-progress.md` 与实际脚本；通用分层见 `docs/test.md` |
 | patch 生成、同步和验证 | 不是本文主题，且 patch 内容应由当前 git diff/patch 文件本身作为事实来源。 | patch 目录或后续 patch 阶段记录 |
 | 每日工程日志、测试日志、docx 交付物 | 本文是文件改动说明，不是阶段日志或附件索引。 | `log/`、`docs/` 下对应文档 |
-| 完整 Linux DM 生态兼容 | 当前实现不声明完整 udev/systemd/sysfs/queue stacking 或复杂 target 族兼容。 | `docs/device-mapper-technical-maintenance.md` |
+| 完整 Linux DM 生态兼容 | 当前实现不声明完整 udev/systemd/sysfs/queue stacking 或复杂 target 族兼容。 | `docs/global.md` |
