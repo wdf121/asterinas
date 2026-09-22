@@ -42,10 +42,12 @@ GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-40}
 GUEST_INPUT_LINE_DELAY=${GUEST_INPUT_LINE_DELAY:-0.01}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
+dm_init_log "${TEST_ID}"
+
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
-echo "HOST_INFO_${TEST_ID} disks=${DM_TEST_IMAGES} serials=vdmtest,vdmtest2,vdmtest3,vdmtest4"
-echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
+dm_emit "HOST_INFO_${TEST_ID} disks=${DM_TEST_IMAGES} serials=vdmtest,vdmtest2,vdmtest3,vdmtest4"
+dm_emit "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 
 GUEST_SCRIPT_FILE=$(mktemp /tmp/lvm2-topology-guest.XXXXXX)
 cat >"${GUEST_SCRIPT_FILE}" <<'GUEST_SCRIPT'
@@ -376,8 +378,8 @@ record_dm_state LINEAR_SAME_PV_EXTENDED "$(mapper_name "${LINEAR_LV}")"
 expect_dm_deps_set LINEAR_SAME_PV_EXTENDED_DEPS /tmp/LINEAR_SAME_PV_EXTENDED_DM_DEPS.out "${DEV1}"
 
 run_lvm_expect_success LV_EXTEND_LINEAR_CROSS_PV lvextend -L "${LINEAR_CROSS_PV_EXTENDED_MIB}M" "${TEST_VG}/${LINEAR_LV}" "${DISK2}"
-run_lvm_report LVS_LINEAR_CROSS_PV_EXTENDED lvs -o lv_name,lv_size,seg_count,segtype "${TEST_VG}/${LINEAR_LV}"
-expect_row LVS_LINEAR_CROSS_PV_EXTENDED_FIELDS /tmp/LVS_LINEAR_CROSS_PV_EXTENDED.out "${LINEAR_LV}|$((LINEAR_CROSS_PV_EXTENDED_MIB * 1024 * 1024))|2|linear"
+run_lvm_report LVS_LINEAR_CROSS_PV_EXTENDED lvs -o lv_name,lv_size,seg_count "${TEST_VG}/${LINEAR_LV}"
+expect_row LVS_LINEAR_CROSS_PV_EXTENDED_FIELDS /tmp/LVS_LINEAR_CROSS_PV_EXTENDED.out "${LINEAR_LV}|$((LINEAR_CROSS_PV_EXTENDED_MIB * 1024 * 1024))|2"
 record_dm_state LINEAR_CROSS_PV_EXTENDED "$(mapper_name "${LINEAR_LV}")"
 expect_dm_deps_set LINEAR_CROSS_PV_EXTENDED_DEPS /tmp/LINEAR_CROSS_PV_EXTENDED_DM_DEPS.out "${DEV1}" "${DEV2}"
 

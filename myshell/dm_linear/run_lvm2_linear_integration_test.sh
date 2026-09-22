@@ -55,6 +55,8 @@ LINEAR_SHRUNK_LV_MIB=${LINEAR_SHRUNK_LV_MIB:-256}
 LINEAR_BASE_FILE_MIB=${LINEAR_BASE_FILE_MIB:-64}
 LINEAR_GROW_FILE_MIB=${LINEAR_GROW_FILE_MIB:-240}
 
+dm_init_log "${TEST_ID}"
+
 test "${LINEAR_INITIAL_LV_MIB}" -lt "${LINEAR_SAME_PV_LV_MIB}"
 test "${LINEAR_SAME_PV_LV_MIB}" -lt "${LINEAR_EXTENDED_LV_MIB}"
 test "${LINEAR_SHRUNK_LV_MIB}" -lt "${LINEAR_EXTENDED_LV_MIB}"
@@ -65,10 +67,10 @@ test "${LINEAR_BASE_FILE_MIB}" -lt "${LINEAR_SHRUNK_LV_MIB}"
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
-echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
-echo "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
-echo "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
-echo "HOST_INFO_${TEST_ID} initial_lv_mib=${LINEAR_INITIAL_LV_MIB} same_pv_lv_mib=${LINEAR_SAME_PV_LV_MIB} extended_lv_mib=${LINEAR_EXTENDED_LV_MIB} shrunk_lv_mib=${LINEAR_SHRUNK_LV_MIB} base_file_mib=${LINEAR_BASE_FILE_MIB} grow_file_mib=${LINEAR_GROW_FILE_MIB}"
+dm_emit "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
+dm_emit "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
+dm_emit "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
+dm_emit "HOST_INFO_${TEST_ID} initial_lv_mib=${LINEAR_INITIAL_LV_MIB} same_pv_lv_mib=${LINEAR_SAME_PV_LV_MIB} extended_lv_mib=${LINEAR_EXTENDED_LV_MIB} shrunk_lv_mib=${LINEAR_SHRUNK_LV_MIB} base_file_mib=${LINEAR_BASE_FILE_MIB} grow_file_mib=${LINEAR_GROW_FILE_MIB}"
 
 FIRST_GUEST_SCRIPT=$(mktemp /tmp/dm-linear-integration-first.XXXXXX)
 {

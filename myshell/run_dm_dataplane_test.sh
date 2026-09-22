@@ -42,23 +42,24 @@ GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-180}
 GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-40}
 GUEST_INPUT_LINE_DELAY=${GUEST_INPUT_LINE_DELAY:-0.05}
 DM_DATAPLANE_STEP5_IO_TIMEOUT=${DM_DATAPLANE_STEP5_IO_TIMEOUT:-20}
+dm_init_log "${TEST_ID}"
 case "${DM_DATAPLANE_STEP5_IO_TIMEOUT}" in
     ''|*[!0-9]*)
-        echo "DM_DATAPLANE_STEP5_IO_TIMEOUT must be a positive decimal integer" >&2
+        dm_emit "HOST_FAIL_${TEST_ID} invalid_step5_io_timeout=${DM_DATAPLANE_STEP5_IO_TIMEOUT:-<empty>}"
         exit 2
         ;;
 esac
 if ((10#${DM_DATAPLANE_STEP5_IO_TIMEOUT} <= 0)); then
-    echo "DM_DATAPLANE_STEP5_IO_TIMEOUT must be a positive decimal integer" >&2
+    dm_emit "HOST_FAIL_${TEST_ID} invalid_step5_io_timeout=${DM_DATAPLANE_STEP5_IO_TIMEOUT:-<empty>}"
     exit 2
 fi
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
-echo "HOST_INFO_${TEST_ID} disks=${DM_TEST_IMAGES} serials=vdmtest,vdmtest2,vdmtest3"
-echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
-echo "HOST_INFO_${TEST_ID} step5_io_timeout=${DM_DATAPLANE_STEP5_IO_TIMEOUT}s"
+dm_emit "HOST_INFO_${TEST_ID} disks=${DM_TEST_IMAGES} serials=vdmtest,vdmtest2,vdmtest3"
+dm_emit "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
+dm_emit "HOST_INFO_${TEST_ID} step5_io_timeout=${DM_DATAPLANE_STEP5_IO_TIMEOUT}s"
 
 GUEST_SCRIPT_FILE=$(mktemp /tmp/dm-dataplane-guest.XXXXXX)
 printf 'export DM_DATAPLANE_STEP5_IO_TIMEOUT=%s\n' \

@@ -63,5 +63,26 @@ if [ -z "${SUITE_SCRIPTS[${SUITE}]+x}" ]; then
     exit 2
 fi
 
+case "${SUITE}" in
+    --control-plane)
+        SUITE_LOG=${DM_CONTROL_PLANE_LOG:-/tmp/dm-control-plane-test.log}
+        ;;
+    --dataplane)
+        SUITE_LOG=${DM_DATAPLANE_LOG:-/tmp/dm-dataplane-test.log}
+        ;;
+    --lvm2-topology)
+        SUITE_LOG=${LVM2_TOPOLOGY_LOG:-/tmp/lvm2-topology-test.log}
+        ;;
+    --linear-integration)
+        SUITE_LOG=${DM_LINEAR_INTEGRATION_LOG:-/tmp/dm-linear-integration-test.log}
+        ;;
+    --striped-integration)
+        SUITE_LOG=${DM_STRIPED_INTEGRATION_LOG:-/tmp/dm-striped-integration-test.log}
+        ;;
+    --mixed-integration)
+        SUITE_LOG=${DM_MIXED_INTEGRATION_LOG:-/tmp/dm-mixed-integration-test.log}
+        ;;
+esac
+
 "${SCRIPT_DIR}/${SUITE_SCRIPTS[${SUITE}]}"
-echo HOST_PASS_DM_SYSTEM_TESTS "${SUITE}"
+printf 'HOST_PASS_DM_SYSTEM_TESTS %s\n' "${SUITE}" | tee -a "${SUITE_LOG}"
