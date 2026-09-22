@@ -56,6 +56,8 @@ MIXED_BASE_FILE_MIB=${MIXED_BASE_FILE_MIB:-64}
 MIXED_GROW_FILE_MIB=${MIXED_GROW_FILE_MIB:-256}
 MIXED_STRIPED_CHUNK_KIB=${MIXED_STRIPED_CHUNK_KIB:-4}
 
+dm_init_log "${TEST_ID}"
+
 test "${MIXED_INITIAL_LV_MIB}" -lt "${MIXED_EXTENDED_LV_MIB}"
 test "${MIXED_BASE_FILE_MIB}" -lt "${MIXED_INITIAL_LV_MIB}"
 test $((MIXED_BASE_FILE_MIB + MIXED_GROW_FILE_MIB)) -gt "${MIXED_INITIAL_LV_MIB}"
@@ -63,11 +65,11 @@ test $((MIXED_BASE_FILE_MIB + MIXED_GROW_FILE_MIB)) -lt "${MIXED_EXTENDED_LV_MIB
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
-echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
-echo "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
-echo "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
-echo "HOST_INFO_${TEST_ID} disk3=${DM_TEST_IMAGE_3} serial=vdmtest3"
-echo "HOST_INFO_${TEST_ID} initial_lv_mib=${MIXED_INITIAL_LV_MIB} extended_lv_mib=${MIXED_EXTENDED_LV_MIB} base_file_mib=${MIXED_BASE_FILE_MIB} grow_file_mib=${MIXED_GROW_FILE_MIB} chunk_kib=${MIXED_STRIPED_CHUNK_KIB}"
+dm_emit "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
+dm_emit "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
+dm_emit "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
+dm_emit "HOST_INFO_${TEST_ID} disk3=${DM_TEST_IMAGE_3} serial=vdmtest3"
+dm_emit "HOST_INFO_${TEST_ID} initial_lv_mib=${MIXED_INITIAL_LV_MIB} extended_lv_mib=${MIXED_EXTENDED_LV_MIB} base_file_mib=${MIXED_BASE_FILE_MIB} grow_file_mib=${MIXED_GROW_FILE_MIB} chunk_kib=${MIXED_STRIPED_CHUNK_KIB}"
 
 FIRST_GUEST_SCRIPT=$(mktemp /tmp/dm-mixed-lvm2-first.XXXXXX)
 cat >"${FIRST_GUEST_SCRIPT}" <<'GUEST_SCRIPT'

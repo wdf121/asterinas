@@ -41,11 +41,13 @@ GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-40}
 GUEST_INPUT_LINE_DELAY=${GUEST_INPUT_LINE_DELAY:-0.01}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
+dm_init_log "${TEST_ID}"
+
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
-echo "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
-echo "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
-echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
+dm_emit "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
+dm_emit "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
+dm_emit "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 
 GUEST_SCRIPT_FILE=$(mktemp /tmp/dm-control-plane-guest.XXXXXX)
 cat >"${GUEST_SCRIPT_FILE}" <<'GUEST_SCRIPT'

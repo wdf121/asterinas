@@ -56,6 +56,8 @@ GUEST_QEMU_TIMEOUT=${GUEST_QEMU_TIMEOUT:-180}
 GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-40}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
+dm_init_log "${TEST_ID}"
+
 test "${STRIPED_PV_COUNT}" -ge 2
 test $((STRIPED_INITIAL_LV_MIB % STRIPED_PV_COUNT)) -eq 0
 test $((STRIPED_SAME_SET_LV_MIB % STRIPED_PV_COUNT)) -eq 0
@@ -92,7 +94,7 @@ DM_TEST_IMAGE_2=${DM_TEST_IMAGE_2:-target/nixos/test2.img}
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
-echo "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
+dm_emit "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 index=1
 for image_path in ${DM_TEST_IMAGES}; do
     if [ "${index}" -eq 1 ]; then
@@ -100,10 +102,10 @@ for image_path in ${DM_TEST_IMAGES}; do
     else
         serial=vdmtest${index}
     fi
-    echo "HOST_INFO_${TEST_ID} disk${index}=${image_path} serial=${serial}"
+    dm_emit "HOST_INFO_${TEST_ID} disk${index}=${image_path} serial=${serial}"
     index=$((index + 1))
 done
-echo "HOST_INFO_${TEST_ID} pv_count=${STRIPED_PV_COUNT} total_pv_count=${STRIPED_TOTAL_PV_COUNT} initial_lv_mib=${STRIPED_INITIAL_LV_MIB} same_set_lv_mib=${STRIPED_SAME_SET_LV_MIB} extended_lv_mib=${STRIPED_EXTENDED_LV_MIB} shrunk_lv_mib=${STRIPED_SHRUNK_LV_MIB} base_file_mib=${STRIPED_BASE_FILE_MIB} grow_file_mib=${STRIPED_GROW_FILE_MIB} chunk_kib=${STRIPED_CHUNK_KIB}"
+dm_emit "HOST_INFO_${TEST_ID} pv_count=${STRIPED_PV_COUNT} total_pv_count=${STRIPED_TOTAL_PV_COUNT} initial_lv_mib=${STRIPED_INITIAL_LV_MIB} same_set_lv_mib=${STRIPED_SAME_SET_LV_MIB} extended_lv_mib=${STRIPED_EXTENDED_LV_MIB} shrunk_lv_mib=${STRIPED_SHRUNK_LV_MIB} base_file_mib=${STRIPED_BASE_FILE_MIB} grow_file_mib=${STRIPED_GROW_FILE_MIB} chunk_kib=${STRIPED_CHUNK_KIB}"
 
 FIRST_GUEST_SCRIPT=$(mktemp /tmp/dm-striped-integration-first.XXXXXX)
 {
