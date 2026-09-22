@@ -243,4 +243,4 @@ GET_ID 必须按完成项所在层次区分，不能写成统一的“异常后�
 | 旧记录与源码变化 | 本文行号为核对时定位；后续以符号和当前 diff 复核。main 或工作区变化后更新基线与断言映射。 |
 | 首轮未穷尽所有行为 | 实施前逐项复核，实施后回查剩余 diff；不能以本清单项数声称绝对完整。 |
 
-**当前最终状态：**文档契约与范围问题已修订；本轮授权的 tracked table/BIO 生命周期、failed table-load 状态保持、实际 DmDevice backing 拒绝、四个 block range wrapper、WAIT/`SA_RESTART` 用户 ABI 和 raw range ioctl 均已有直接断言并通过对应验证。最新本轮 Rust 结果为 DM 86/0、block 23/0、core DM ioctl 82/0；focused `device/device_mapper` C regression 为 159/0。真实 alias/VFS 深层补偿、mount source 类型仍未实施；exfat、RawDisk、VirtIO/NVMe 等保持条件性候选。原 V4.5/V4.6 已按范围决策移出，而非测试通过。
+**当前最终状态：**文档契约与范围问题已修订；本轮授权的 tracked table/BIO 生命周期、failed table-load 状态保持、实际 DmDevice backing 拒绝、四个 block range wrapper、WAIT/`SA_RESTART` 用户 ABI 和 raw range ioctl 均已有直接断言并通过对应验证。最新本轮 Rust 结果为 DM 86/0、block 23/0、core DM ioctl 82/0；focused `device/device_mapper` C regression 为 159/0。2026-09-22 的真实 NixOS 系统验收中，control-plane、dataplane、LVM2 topology、linear、striped 与 mixed 六个 canonical suite 均通过；后面三项分别覆盖完整存储流程的跨启动恢复。该系统证据不替代内部生命周期断言，也不关闭未实施的真实 alias/VFS 深层补偿和 mount source 类型边界；exfat、RawDisk、VirtIO/NVMe 等仍保持条件性候选。原 V4.5/V4.6 已按范围决策移出，而非测试通过。
