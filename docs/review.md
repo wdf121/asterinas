@@ -273,6 +273,7 @@ VirtIO 的正常数据路径已有 DM NixOS suite 证据。NVMe 对未支持 ran
 - 已删除的 maintenance Markdown、旧 DOCX、`kernel/comps/README.md` 和旧 wrapper 不再作为当前资料入口；
 - 构建/NixOS 用户工具职责以当前配置、overlay、`tools/nixos/run.sh` 与 `tools/qemu_args.sh` 的实际分工描述；
 - 当前通用分层与 selector 说明以 `docs/test.md` 为准；core ktest 从 `kernel/core` 运行并带 `--kcmd-args=earlycon`，DM component ktest 从目标 crate 目录运行。六个 canonical NixOS suite、超时、release 与串行边界以 `AGENTS.md`、`log/device-mapper-progress.md` 和实际脚本为准。
+- 2026-09-22 的系统验收已串行通过 control-plane、dataplane、LVM2 topology、linear integration、striped integration 和 mixed integration。LVM2 topology 中 `lvs` 请求 `segtype` 对跨 PV 的双 linear segment 产生重复汇总行，已将该条断言改为 LV 汇总的 `seg_count=2`；DM table 与 dependency 的两 backing 验证保留，复跑通过。
 
 后续文档同步必须先比较 `e31b265a3 → 当前工作区` 的实际 diff，不从固定日期 daily log 推导当前状态。
 
