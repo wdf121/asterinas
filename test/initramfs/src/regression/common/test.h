@@ -88,11 +88,13 @@
 		_ret;                       \
 	})
 
+static int __total_passes;
 static int __total_failures;
 
 #define __TEST_SUMMARY()                                                  \
 	fprintf(stderr, "%s summary: %d tests passed, %d tests failed\n", \
 		__func__, __tests_passed, __tests_failed);                \
+	__total_passes += __tests_passed;                                 \
 	__total_failures += __tests_failed;
 
 /** Starts the definition of a test function. */
@@ -219,6 +221,9 @@ static int __total_failures;
 
 int main(void)
 {
+	fprintf(stderr, "test result: %s. %d passed; %d failed\n",
+		__total_failures ? "FAILED" : "ok", __total_passes,
+		__total_failures);
 	return __total_failures ? 1 : 0;
 }
 
