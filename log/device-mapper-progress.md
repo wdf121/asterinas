@@ -1,6 +1,6 @@
 # Device Mapper 当前项目状态
 
-> **更新日期**：2026-09-22。
+> **更新日期**：2026-09-23。
 >
 > **事实来源**：当前工作区相对 `e31b265a3` 的实际 diff 与当前源码。daily log 只用于交叉核对已执行动作，不替代源码事实。
 
@@ -33,6 +33,7 @@ P0 主链语义收敛
 - `DM_DEV_WAIT` 直接进入 wait 处理，不再落入通用命令分派的不可达路径；无 `SA_RESTART` 时用户态收到 `EINTR`，带 `SA_RESTART` 时原 ioctl 自动重启并继续等待事件；
 - 首次 table load 发布 `/dev/dm-N`，首次 resume 发布 `/dev/mapper/<name>`；node/alias 创建、rename、remove 均有事务和回滚/Removing 隔离；
 - target 为 `linear`、`striped`、`zero`、`error`；支持连续 mixed table、跨 target/chunk I/O、flush fan-out；
+- `DM_READONLY_FLAG` 是 table mode：tableless create 不持久化 readonly，load 仅安装 inactive table mode，首次/替换 resume 后 active I/O 与 active/inactive 查询分别反映选中 table 的 mode；
 - mount source 和 ext2 对象持有 tracked lease；已挂载或仍打开的 mapper 不可直接 remove，释放使用者后才可 remove；
 - 当前 LVM 路径是显式创建与显式恢复：`pvscan → vgscan --mknodes → vgchange -ay`；
 - runtime nodes 由内核直接发布，不依赖 udev 创建当前 DM primary/alias。
@@ -71,7 +72,7 @@ RELEASE=1 AUTO_TEST=regression INTEL_TDX=0 \
   REGRESSION_TESTS=device/device_mapper make run_kernel
 ```
 
-它覆盖 raw ioctl、runtime node/alias rollback、ext2 mount lease、zero target range ioctl，以及无 `SA_RESTART` 的 `EINTR` 对照和带 `SA_RESTART` 的 WAIT 重启；完整 regression 仍可能被无关目录中的失败提前中止，因此 focused selector 是当前 DM ABI 的最小入口。
+它覆盖 raw ioctl、runtime node/alias rollback、ext2 mount lease、zero target range ioctl、table-scoped readonly mode，以及无 `SA_RESTART` 的 `EINTR` 对照和带 `SA_RESTART` 的 WAIT 重启；完整 regression 仍可能被无关目录中的失败提前中止，因此 focused selector 是当前 DM ABI 的最小入口。
 
 ### 3.3 NixOS DM system suite
 
@@ -101,7 +102,7 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
 
 `--dataplane` 当前使用三块测试盘；其长 guest 脚本在未显式覆盖时使用 `GUEST_INPUT_LINE_DELAY=0.05`。公共 harness 负责 FIFO 注入、ready/lifecycle 超时和 QEMU process-group 清理。
 
-2026-09-22 已按默认 `GUEST_READY_TIMEOUT=40`、`GUEST_QEMU_TIMEOUT=180` 串行完成六个 canonical suite：control-plane、dataplane、LVM2 topology、linear integration、striped integration 与 mixed integration 均出现 guest、host 和聚合通过标记。LVM2 topology 首次运行发现 `lvs -o ... segtype` 对双 linear segment 返回重复汇总行；测试改为单独验证 LV 汇总的 `seg_count=2`，DM table/dependencies 仍验证两个 backing，复跑通过。每个 suite 的 `/tmp/*-test.log` 是唯一验收日志；host 事件和 QEMU/guest 输出经运行期 FIFO 单写入，FIFO 退出即删，正常路径不保留 `*-qemu-running.txt`。
+2026-09-22 已按默认 `GUEST_READY_TIMEOUT=40`、`GUEST_QEMU_TIMEOUT=180` 串行完成六个 canonical suite：control-plane、dataplane、LVM2 topology、linear integration、striped integration 与 mixed integration 均出现 guest、host 和聚合通过标记。LVM2 topology 首次运行发现 `lvs -o ... segtype` 对双 linear segment 返回重复汇总行；测试改为单独验证 LV 汇总的 `seg_count=2`，DM table/dependencies 仍验证两个 backing，复跑通过。每个 suite 的 `/tmp/*-test.log` 是唯一验收日志；host 事件和 QEMU/guest 输出经运行期 FIFO 单写入，FIFO 退出即删，正常路径不保留 `*-qemu-running.txt`。2026-09-23 的 readonly P0 control-plane 验收因默认 40 秒 ready timeout 两次未进入 guest；重建 `target/nixos/asterinas.img` 后，以用户授权的 `GUEST_READY_TIMEOUT=50`、`GUEST_QEMU_TIMEOUT=180` 复跑通过，guest 63 秒完成、全程 71 秒，`SUMMARY_GAP_DM_CONTROL_PLANE: 0`。
 
 ## 4. 当前边界
 
@@ -121,6 +122,7 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
 ```text
 CLAUDE.md
 → AGENTS.md
+→ docs/device-mapper-source-evidence.md
 → docs/global.md
 → docs/device-mapper-technical-design-and-implementation.md
 → docs/test.md
