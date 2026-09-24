@@ -144,7 +144,7 @@ impl Debug for BioRequestSingleQueue {
 pub struct BioRequest {
     /// The type of the I/O
     type_: BioType,
-    /// The physical range of target sectors on the device
+    /// The mapped range of target sectors on this queue's device.
     sid_range: Range<Sid>,
     /// The number of segments
     num_segments: usize,
