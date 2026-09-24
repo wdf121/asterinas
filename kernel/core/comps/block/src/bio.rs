@@ -150,13 +150,13 @@ impl Bio {
             Ordering::Relaxed,
         );
         assert!(result.is_ok());
-        let current_sid_range = metadata.sid_range().clone();
+        let mapped_sid_range = metadata.sid_range().clone();
         SubmittedBio {
             metadata,
-            current_sid_range,
+            mapped_sid_range,
             complete_fn,
             segments,
-            complete_as_io_error_on_drop: false,
+            completes_as_io_error_on_drop: false,
         }
     }
 
@@ -191,13 +191,13 @@ impl Bio {
         assert!(result.is_ok());
 
         let waiter_metadata = metadata.clone();
-        let current_sid_range = metadata.sid_range().clone();
+        let mapped_sid_range = metadata.sid_range().clone();
         let submitted_bio = SubmittedBio {
             metadata,
-            current_sid_range,
+            mapped_sid_range,
             complete_fn,
             segments,
-            complete_as_io_error_on_drop: false,
+            completes_as_io_error_on_drop: false,
         };
         if let Err(e) = block_device.enqueue(submitted_bio) {
             // Fail to submit, revert the status.
@@ -265,13 +265,11 @@ impl From<BioEnqueueError> for Error {
 /// The request queue of a block device only accepts `SubmittedBio`s into the queue.
 pub struct SubmittedBio {
     metadata: Arc<BioMetadata>,
-    current_sid_range: Range<Sid>,
+    mapped_sid_range: Range<Sid>,
     complete_fn: Option<BioCompleteFn>,
     segments: Vec<BioSegment>,
-    // Deferred block layers have already accepted this BIO before replay. If a
-    // later mapping or backing enqueue error drops it, completion must still
-    // reach the original submitter instead of leaving it in Submit forever.
-    complete_as_io_error_on_drop: bool,
+    // An accepted BIO must not leave its submitter pending when an owning path drops it.
+    completes_as_io_error_on_drop: bool,
 }
 
 impl SubmittedBio {
@@ -280,31 +278,35 @@ impl SubmittedBio {
         self.metadata.type_()
     }
 
-    /// Returns the sector range seen by the current block device layer.
+    /// Returns the sector range mapped for the current block device layer.
     pub fn sid_range(&self) -> &Range<Sid> {
-        &self.current_sid_range
+        &self.mapped_sid_range
     }
 
-    /// Remaps the current sector range to a new start while preserving the `Bio` length.
+    /// Remaps the mapped sector range to a new start while preserving its length.
+    ///
+    /// Returns `Refused` without changing the mapping if the new end overflows.
     pub fn remap_sid_start(&mut self, new_start: Sid) -> Result<(), BioEnqueueError> {
         let length = self
-            .current_sid_range
+            .mapped_sid_range
             .end
             .to_raw()
-            .checked_sub(self.current_sid_range.start.to_raw())
+            .checked_sub(self.mapped_sid_range.start.to_raw())
             .ok_or(BioEnqueueError::Refused)?;
         let new_end = new_start
             .to_raw()
             .checked_add(length)
             .ok_or(BioEnqueueError::Refused)?;
-        self.current_sid_range = new_start..Sid::new(new_end);
+        self.mapped_sid_range = new_start..Sid::new(new_end);
         Ok(())
     }
 
-    /// Adds a sector offset to the current mapping result.
-    pub fn add_sid_offset(&mut self, offset: u64) -> Result<(), BioEnqueueError> {
+    /// Offsets the mapped sector range while preserving its length.
+    ///
+    /// Returns `Refused` without changing the mapping if the offset overflows.
+    pub fn offset_mapped_sid_range(&mut self, offset: u64) -> Result<(), BioEnqueueError> {
         let new_start = self
-            .current_sid_range
+            .mapped_sid_range
             .start
             .to_raw()
             .checked_add(offset)
@@ -313,7 +315,7 @@ impl SubmittedBio {
         self.remap_sid_start(new_start)
     }
 
-    /// Splits the current `Bio` into children that cover the same range.
+    /// Splits the mapped sector range into children that cover it exactly.
     ///
     /// Each child owns one completion responsibility. Dropping an incomplete child
     /// completes the original BIO with `IoError` after every other child terminates.
@@ -343,10 +345,10 @@ impl SubmittedBio {
                         status: AtomicU32::new(BioStatus::Submit as u32),
                         wait_queue: WaitQueue::new(),
                     }),
-                    current_sid_range: range,
+                    mapped_sid_range: range,
                     complete_fn: Some(Box::new(move |status| completion.complete_child(status))),
                     segments,
-                    complete_as_io_error_on_drop: true,
+                    completes_as_io_error_on_drop: true,
                 }
             })
             .collect();
@@ -354,18 +356,18 @@ impl SubmittedBio {
     }
 
     fn validate_split_ranges(&self, ranges: &[Range<Sid>]) -> Result<(), BioEnqueueError> {
-        if ranges.is_empty() || ranges[0].start != self.current_sid_range.start {
+        if ranges.is_empty() || ranges[0].start != self.mapped_sid_range.start {
             return Err(BioEnqueueError::Refused);
         }
 
-        let mut expected_start = self.current_sid_range.start;
+        let mut expected_start = self.mapped_sid_range.start;
         for range in ranges {
             if range.start != expected_start || range.start >= range.end {
                 return Err(BioEnqueueError::Refused);
             }
             expected_start = range.end;
         }
-        if expected_start != self.current_sid_range.end {
+        if expected_start != self.mapped_sid_range.end {
             return Err(BioEnqueueError::Refused);
         }
         Ok(())
@@ -385,12 +387,12 @@ impl SubmittedBio {
         let start_sectors = range
             .start
             .to_raw()
-            .checked_sub(self.current_sid_range.start.to_raw())
+            .checked_sub(self.mapped_sid_range.start.to_raw())
             .ok_or(BioEnqueueError::Refused)?;
         let end_sectors = range
             .end
             .to_raw()
-            .checked_sub(self.current_sid_range.start.to_raw())
+            .checked_sub(self.mapped_sid_range.start.to_raw())
             .ok_or(BioEnqueueError::Refused)?;
         let start = sectors_to_bytes(start_sectors)?;
         let end = sectors_to_bytes(end_sectors)?;
@@ -437,7 +439,7 @@ impl SubmittedBio {
     /// Normal immediate submission must not enable this: its caller still owns
     /// enqueue failure and restores the BIO from `Submit` to `Init`.
     pub fn complete_as_io_error_on_drop(&mut self) {
-        self.complete_as_io_error_on_drop = true;
+        self.completes_as_io_error_on_drop = true;
     }
 
     /// Chains an additional completion callback after the original one.
@@ -467,7 +469,7 @@ impl SubmittedBio {
     pub fn complete(mut self, status: BioStatus) {
         assert!(status != BioStatus::Init && status != BioStatus::Submit);
 
-        self.complete_as_io_error_on_drop = false;
+        self.completes_as_io_error_on_drop = false;
         let complete_fn = self.complete_fn.take();
 
         // Complete the `complete_fn` before publishing the status change,
@@ -487,11 +489,11 @@ impl SubmittedBio {
 
 impl Drop for SubmittedBio {
     fn drop(&mut self) {
-        if !self.complete_as_io_error_on_drop || self.status() != BioStatus::Submit {
+        if !self.completes_as_io_error_on_drop || self.status() != BioStatus::Submit {
             return;
         }
 
-        self.complete_as_io_error_on_drop = false;
+        self.completes_as_io_error_on_drop = false;
         let complete_fn = self.complete_fn.take();
         general_complete_fn(self.metadata.type_(), BioStatus::IoError, complete_fn);
         let result = self.metadata.status.compare_exchange(
@@ -509,12 +511,13 @@ impl Debug for SubmittedBio {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         f.debug_struct("SubmittedBio")
             .field("metadata", &self.metadata)
-            .field("current_sid_range", &self.current_sid_range)
+            .field("mapped_sid_range", &self.mapped_sid_range)
             .field("segments", &self.segments)
             .finish()
     }
 }
 
+/// Aggregates one terminal result from each split child and completes the parent once.
 struct SplitBioCompletion {
     remaining: AtomicUsize,
     status: AtomicU32,
@@ -781,6 +784,7 @@ impl BioSegment {
         self.inner.dma_slice()
     }
 
+    /// Creates a sector-aligned subsegment sharing the underlying DMA allocation.
     fn slice(&self, range: Range<usize>) -> Self {
         assert!(is_sector_aligned(range.start) && is_sector_aligned(range.end - range.start));
         if range.start == 0 && range.end == self.nbytes() {
@@ -920,10 +924,10 @@ mod tests {
                 status: AtomicU32::new(BioStatus::Submit as u32),
                 wait_queue: WaitQueue::new(),
             }),
-            current_sid_range: sid_range,
+            mapped_sid_range: sid_range,
             complete_fn: None,
             segments: Vec::new(),
-            complete_as_io_error_on_drop: false,
+            completes_as_io_error_on_drop: false,
         }
     }
 
@@ -938,11 +942,11 @@ mod tests {
     }
 
     #[ktest]
-    fn add_sid_offset_composes_multiple_block_layers() {
+    fn offset_mapped_sid_range_composes_multiple_block_layers() {
         let mut bio = submitted_bio(10, 18);
 
-        bio.add_sid_offset(100).unwrap();
-        bio.add_sid_offset(1_000).unwrap();
+        bio.offset_mapped_sid_range(100).unwrap();
+        bio.offset_mapped_sid_range(1_000).unwrap();
 
         assert_eq!(bio.sid_range(), &(Sid::new(1_110)..Sid::new(1_118)));
     }
@@ -1105,11 +1109,14 @@ mod tests {
     }
 
     #[ktest]
-    fn add_sid_offset_rejects_overflow_without_changing_range() {
+    fn offset_mapped_sid_range_rejects_overflow_without_changing_range() {
         let mut bio = submitted_bio(u64::MAX - 8, u64::MAX);
         let original = bio.sid_range().clone();
 
-        assert_eq!(bio.add_sid_offset(9), Err(BioEnqueueError::Refused));
+        assert_eq!(
+            bio.offset_mapped_sid_range(9),
+            Err(BioEnqueueError::Refused)
+        );
         assert_eq!(bio.sid_range(), &original);
     }
 }
