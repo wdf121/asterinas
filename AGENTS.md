@@ -44,7 +44,7 @@ Set `TARGET_ARCH` to `x86_64` (default), `riscv64`, or `loongarch64`.
 ## dm Branch Local Workflow
 
 This branch keeps Device Mapper project progress in `log/device-mapper-progress.md`.
-Stage-by-stage engineering changes are recorded in `log/YYYY-M-D.md`.
+Daily engineering, learning, analysis/review, validation, failures, and conclusions are recorded in `log/daily/YYYY-M-D.md`; unexecuted plans must not be presented as completed work.
 
 Local environment:
 
@@ -186,12 +186,12 @@ same nodes at a different, but otherwise safe, command stage is medium priority.
 
 Project logging rules:
 
-- Before writing a dated log, run `date +%F` and write to `log/YYYY-M-D.md`.
+- Before writing a dated log, run `date +%F` and write to `log/daily/YYYY-M-D.md`.
 - Restart stage numbering from 1 each day.
 - Log by small stage in this order: background, changes, tests.
 - Do not split logs by “production code / ktest”.
-- Record only actual engineering changes and validation; do not log discussion,
-  review-only work, or planning-only work.
+- Record actual engineering, learning, analysis/review, validation, failures, and
+  conclusions. Do not present discussion or unexecuted plans as completed work.
 
 ## Toolchain
 
