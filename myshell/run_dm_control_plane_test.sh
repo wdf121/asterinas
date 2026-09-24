@@ -680,8 +680,19 @@ step '=== STEP 11: read-only and busy device lifecycle ==='
 readonly_name=$(name readonly)
 run_shell_expect_success READONLY_CREATE "printf '0 8 linear ${DEV} 0\\n' | dmsetup --readonly create ${readonly_name}"
 record_nodes READONLY_CREATE "${readonly_name}"
+capture_info_columns READONLY_ACTIVE "${readonly_name}"
+expect_info_column READONLY_ACTIVE 10 Read-only
 run_shell_expect_success READONLY_READ "dd if=/dev/mapper/${readonly_name} of=/tmp/readonly-read.bin bs=512 count=1 status=none"
 run_shell_expect_failure READONLY_WRITE "dd if=/dev/zero of=/dev/mapper/${readonly_name} bs=512 count=1 conv=fsync status=none"
+run_shell_expect_success READONLY_RELOAD_WRITABLE "printf '0 8 linear ${DEV} 0\\n' | dmsetup reload ${readonly_name}"
+capture_info_columns READONLY_ACTIVE_WITH_INACTIVE "${readonly_name}"
+expect_info_column READONLY_ACTIVE_WITH_INACTIVE 10 Read-only
+capture_info_columns READONLY_INACTIVE --inactive "${readonly_name}"
+expect_info_column READONLY_INACTIVE 10 Writeable
+run_expect_success READONLY_RESUME_WRITABLE dmsetup resume "${readonly_name}"
+capture_info_columns READONLY_ACTIVE_WRITABLE "${readonly_name}"
+expect_info_column READONLY_ACTIVE_WRITABLE 10 Writeable
+run_shell_expect_success READONLY_WRITE_AFTER_RELOAD "dd if=/dev/zero of=/dev/mapper/${readonly_name} bs=512 count=1 conv=fsync status=none"
 run_expect_success READONLY_REMOVE dmsetup remove "${readonly_name}"
 
 deferred_name=$(name deferred_busy)
