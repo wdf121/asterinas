@@ -1,6 +1,6 @@
 # Device Mapper 当前项目状态
 
-> **更新日期**：2026-09-23。
+> **更新日期**：2026-09-24。
 >
 > **事实来源**：当前工作区相对 `e31b265a3` 的实际 diff 与当前源码。daily log 只用于交叉核对已执行动作，不替代源码事实。
 
@@ -103,6 +103,8 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
 `--dataplane` 当前使用三块测试盘；其长 guest 脚本在未显式覆盖时使用 `GUEST_INPUT_LINE_DELAY=0.05`。公共 harness 负责 FIFO 注入、ready/lifecycle 超时和 QEMU process-group 清理。
 
 2026-09-22 已按默认 `GUEST_READY_TIMEOUT=40`、`GUEST_QEMU_TIMEOUT=180` 串行完成六个 canonical suite：control-plane、dataplane、LVM2 topology、linear integration、striped integration 与 mixed integration 均出现 guest、host 和聚合通过标记。LVM2 topology 首次运行发现 `lvs -o ... segtype` 对双 linear segment 返回重复汇总行；测试改为单独验证 LV 汇总的 `seg_count=2`，DM table/dependencies 仍验证两个 backing，复跑通过。每个 suite 的 `/tmp/*-test.log` 是唯一验收日志；host 事件和 QEMU/guest 输出经运行期 FIFO 单写入，FIFO 退出即删，正常路径不保留 `*-qemu-running.txt`。2026-09-23 的 readonly P0 control-plane 验收因默认 40 秒 ready timeout 两次未进入 guest；重建 `target/nixos/asterinas.img` 后，以用户授权的 `GUEST_READY_TIMEOUT=50`、`GUEST_QEMU_TIMEOUT=180` 复跑通过，guest 63 秒完成、全程 71 秒，`SUMMARY_GAP_DM_CONTROL_PLANE: 0`。
+
+2026-09-24：权威 `dm` 完成 latest `upstream/main` 的冲突解析和 DM 专项验证，尚未创建同步 merge commit。源码同版本 OSDK core check 通过；devtmpfs 6/0、runtime registry 7/0、block 23/0、DM crate 86/0、core DM ioctl 81/0、focused C ABI 182/0；使用同步专属测试盘的六项 canonical NixOS suite 全部通过。同步过程发现 kernel `DM_VERSION` 4.48 与 Linux UAPI 4.50 不一致，已收敛为 4.50 并由 focused C 回归验证。完整非 DM C regression、全仓 CI、AArch64 和非 QEMU TSC 验证不属于本轮 DM 同步矩阵；详见 [upstream sync](../docs/upstream-sync.md)。
 
 ## 4. 当前边界
 

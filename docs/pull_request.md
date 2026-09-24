@@ -1,8 +1,8 @@
 # Device Mapper 上游 PR 提交计划
 
-> **状态**：计划，尚未开始制备上游提交。
+> **状态**：权威 `dm` 已完成 latest `upstream/main` 的冲突解析与 DM 专项验证；同步 merge commit 尚未创建，尚未开始制备 upstream PR。
 >
-> **更新日期**：2026-09-23。
+> **更新日期**：2026-09-24。
 >
 > **目标**：将 `dm` 分支的 Device Mapper 实现拆成可独立审阅、测试和回退的 upstream patch series；不把本地研发、验收和过程资料混入生产代码 PR。
 
@@ -11,6 +11,8 @@
 当前 `dm` 分支相对 `main` 混合了 Device Mapper 生产代码、通用内核基础设施、本地 NixOS/LVM2 验收脚本、patch 快照和大量项目过程文档。它不能直接作为一个 upstream PR，也不应机械按现有 commit 边界 cherry-pick。
 
 上游同步是 PR 制备的前置阶段：必须先在权威 `dm` 工作区完成与最新 `upstream/main` 的同步、处理语义冲突、运行相关验证并形成清晰的同步 commit。同步 worktree 只能用于冲突预演和审核，不能替代权威工作区的正式同步。只有同步后的 `dm` 成为唯一实现来源，才创建独立 PR worktree 重新摘取或重做最小 patch；该 PR worktree 的 base 仍为 `upstream/main` 或已合入的 stacked PR，而不是把整个 `dm` 分支直接提交。
+
+2026-09-24：权威 `dm` 已完成 latest `upstream/main` 的冲突解析及 DM 专项验证；DM crate、core ioctl、focused C ABI 和六项 canonical NixOS suite 均通过。同步 merge commit 仍待用户审阅与决定，因此 PR 制备仍被冻结。
 
 ## 2. 提交原则
 
