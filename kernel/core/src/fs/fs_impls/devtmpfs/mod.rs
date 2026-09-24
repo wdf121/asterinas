@@ -36,6 +36,11 @@ pub(super) fn init_in_first_kthread() {
 }
 
 #[cfg(ktest)]
+pub(crate) fn init_for_ktest() {
+    worker::init_for_ktest();
+}
+
+#[cfg(ktest)]
 mod tests {
     use device_id::{DeviceId, MajorId, MinorId};
     use ostd::prelude::ktest;
@@ -172,5 +177,62 @@ mod tests {
             Some(device_id(240, 6))
         );
         delete_node(char_node(path, 240, 6)).unwrap();
+    }
+
+    #[ktest]
+    fn handle_delete_rejects_same_rdev_replacement() {
+        worker::init_for_ktest();
+
+        let path = "__devtmpfs_ktest_handle_replacement";
+        let node = char_node(path, 240, 8);
+        let handle = create_node(node).unwrap();
+        let root = singleton().root_inode();
+        let root_dentry = crate::fs::vfs::path::Dentry::new_root(root.clone());
+        let original = root_dentry
+            .as_dir_dentry_or_err()
+            .unwrap()
+            .lookup_child(path)
+            .unwrap();
+        root.unlink(&original).unwrap();
+        root.mknod(
+            &root_dentry,
+            path,
+            mkmod!(a+rw),
+            MknodType::CharDevice(device_id(240, 8).as_encoded_u64()),
+        )
+        .unwrap();
+
+        assert_eq!(delete(&handle).unwrap_err().error(), Errno::ESTALE);
+        assert_eq!(
+            root.lookup(path).unwrap().metadata().unwrap().self_dev_id,
+            Some(device_id(240, 8))
+        );
+        let replacement = root_dentry
+            .as_dir_dentry_or_err()
+            .unwrap()
+            .lookup_child(path)
+            .unwrap();
+        root.unlink(&replacement).unwrap();
+    }
+
+    #[ktest]
+    fn handle_rename_no_replace_keeps_source() {
+        worker::init_for_ktest();
+
+        let source = "__devtmpfs_ktest_rename_source";
+        let destination = "__devtmpfs_ktest_rename_destination";
+        let source_handle = create_node(char_node(source, 240, 9)).unwrap();
+        let source_for_validation = source_handle.clone();
+        let destination_handle = create_node(char_node(destination, 240, 10)).unwrap();
+
+        assert_eq!(
+            rename_no_replace(source_handle, destination.to_string())
+                .unwrap_err()
+                .error(),
+            Errno::EEXIST
+        );
+        validate(&source_for_validation).unwrap();
+        delete(&source_for_validation).unwrap();
+        delete(&destination_handle).unwrap();
     }
 }

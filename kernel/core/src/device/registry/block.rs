@@ -195,8 +195,28 @@ impl BlockFile {
         *owned_node = Some(node);
     }
 
-    fn node(&self) -> Option<Path> {
-        self.node.lock().clone()
+    fn delete_node<F>(&self, delete: F) -> Result<()>
+    where
+        F: FnOnce(&DevtmpfsHandle) -> Result<()>,
+    {
+        let mut node = self.node.lock();
+        if let Some(handle) = node.as_ref() {
+            delete(handle)?;
+            node.take();
+        }
+        Ok(())
+    }
+
+    fn delete_mapper_alias<F>(&self, delete: F) -> Result<()>
+    where
+        F: FnOnce(&DevtmpfsHandle) -> Result<()>,
+    {
+        let mut alias = self.mapper_alias.lock();
+        if let Some((_, handle)) = alias.as_ref() {
+            delete(handle)?;
+            alias.take();
+        }
+        Ok(())
     }
 
     fn clear_node(&self) {
@@ -219,16 +239,8 @@ impl BlockFile {
         *owned_alias = Some((path, alias));
     }
 
-    fn mapper_alias(&self) -> Option<(String, Path)> {
-        self.mapper_alias.lock().clone()
-    }
-
-    fn replace_mapper_alias(&self, path: String, alias: Path) {
-        *self.mapper_alias.lock() = Some((path, alias));
-    }
-
-    fn clear_mapper_alias(&self) {
-        *self.mapper_alias.lock() = None;
+    fn has_mapper_alias(&self) -> bool {
+        self.mapper_alias.lock().is_some()
     }
 
     fn try_start_accepting_opens(&self) -> bool {
@@ -600,37 +612,45 @@ pub(crate) fn rename_mapper(id: DeviceId, old_name: &str, new_name: &str) -> Res
 }
 
 pub(crate) fn unregister_mapper(id: DeviceId, mapper_name: &str) -> Result<Arc<dyn BlockDevice>> {
+    unregister_mapper_with_node_remover(id, mapper_name, remove_owned_node_or_accept_stale)
+}
+
+fn unregister_mapper_with_node_remover<F>(
+    id: DeviceId,
+    mapper_name: &str,
+    remove_node: F,
+) -> Result<Arc<dyn BlockDevice>>
+where
+    F: Fn(&DevtmpfsHandle) -> Result<()> + Copy,
+{
     validate_mapper_name(mapper_name)?;
     let block_file = lookup_runtime_block_file(id)?;
     let _lifecycle = block_file.lifecycle.lock();
     let expected_alias_path = format!("mapper/{mapper_name}");
-    let alias = block_file.mapper_alias();
-    if let Some((alias_path, _)) = &alias
-        && alias_path != &expected_alias_path
-    {
-        return_errno_with_message!(Errno::ENODEV, "the mapper name does not match the device");
-    }
+    let alias_path = {
+        let alias = block_file.mapper_alias.lock();
+        if let Some((current_path, _)) = alias.as_ref()
+            && current_path != &expected_alias_path
+        {
+            return_errno_with_message!(Errno::ENODEV, "the mapper name does not match the device");
+        }
+        alias.as_ref().map(|(path, _)| path.clone())
+    };
 
     let unregistration = begin_runtime_unregistration(&block_file)?;
-    if let Some((alias_path, alias_node)) = &alias {
-        if let Err(error) = remove_owned_node_or_accept_stale(alias_path, alias_node) {
-            abort_runtime_unregistration(unregistration, &block_file);
-            return Err(error);
-        }
-        block_file.clear_mapper_alias();
+    if let Err(error) = block_file.delete_mapper_alias(remove_node) {
+        abort_runtime_unregistration(unregistration, &block_file);
+        return Err(error);
     }
 
-    if let Some(node) = block_file.node() {
-        if let Err(error) = remove_owned_node_or_accept_stale(block_file.path.as_str(), &node) {
-            return recover_primary_removal_failure(
-                unregistration,
-                &block_file,
-                alias.map(|(alias_path, _)| alias_path),
-                error,
-                restore_mapper_alias,
-            );
-        }
-        block_file.clear_node();
+    if let Err(error) = block_file.delete_node(remove_node) {
+        return recover_primary_removal_failure(
+            unregistration,
+            &block_file,
+            alias_path,
+            error,
+            restore_mapper_alias,
+        );
     }
 
     match aster_block::commit_unregister(unregistration) {
@@ -704,7 +724,7 @@ where
     };
 
     if let Err(error) = aster_block::commit_registration(&registration) {
-        let _ = remove_owned_node_or_accept_stale(path.as_str(), &node);
+        let _ = remove_owned_node_or_accept_stale(&node);
         remove_wrapper_if_matches(&block_file);
         let _ = aster_block::abort_registration(registration);
         return Err(map_block_registry_error(error));
@@ -716,9 +736,9 @@ where
 }
 
 /// Removes nodes that still belong to this registration; missing or replaced
-/// nodes are already clean.
-fn remove_owned_node_or_accept_stale(path: &str, expected: &Path) -> Result<()> {
-    match remove_owned_runtime_node(path, expected) {
+/// nodes are already externally cleaned up and are left untouched.
+fn remove_owned_node_or_accept_stale(handle: &DevtmpfsHandle) -> Result<()> {
+    match devtmpfs::delete(handle) {
         Ok(()) => Ok(()),
         Err(error) if matches!(error.error(), Errno::ENOENT | Errno::ESTALE) => Ok(()),
         Err(error) => Err(error),
@@ -1093,6 +1113,29 @@ mod tests {
         assert!(aster_block::lookup(id).is_none());
         let retry = aster_block::register_pending(device).unwrap();
         drop(retry);
+    }
+
+    #[ktest]
+    fn failed_mapper_alias_removal_keeps_handle_for_retry() {
+        let device = TestBlockDevice::new(91_337);
+        let id = device.id();
+        let mapper_name = "runtime-block-alias-delete-failure";
+        devtmpfs::init_for_ktest();
+        register_mapper_primary(device).unwrap();
+        publish_mapper_alias(id, mapper_name).unwrap();
+
+        let error = unregister_mapper_with_node_remover(id, mapper_name, |_| {
+            Err(Error::with_message(
+                Errno::EIO,
+                "injected mapper alias delete failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.error(), Errno::EIO);
+        assert!(has_mapper_alias(id).unwrap());
+
+        unregister_mapper(id, mapper_name).unwrap();
+        assert!(lookup(id).is_none());
     }
 
     #[ktest]

@@ -40,9 +40,8 @@ pub fn unregister(id: DeviceId) -> Result<Arc<dyn Device>> {
         .remove(&id.to_raw())
         .ok_or_else(|| Error::with_message(Errno::ENOENT, "the char device does not exist"))?;
 
-    if let Some(meta) = device.devtmpfs_meta()
-        && let Err(error) =
-            devtmpfs::delete_node(DevtmpfsNode::new(device.type_(), device.id(), meta))
+    if let Some(node) = registered.node
+        && let Err(error) = devtmpfs::delete(&node)
     {
         warn!(
             "failed to delete devtmpfs node for char device {:?}: {:?}",

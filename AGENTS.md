@@ -192,6 +192,9 @@ Project logging rules:
 - Do not split logs by “production code / ktest”.
 - Record actual engineering, learning, analysis/review, validation, failures, and
   conclusions. Do not present discussion or unexecuted plans as completed work.
+- After every verified bug fix, append one factual row to the `修复日志` table
+  at the end of `docs/global.md`. Record the issue and impact, root cause, fix,
+  validation, and commit status; do not record unverified hypotheses.
 
 ## Toolchain
 

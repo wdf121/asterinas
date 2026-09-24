@@ -106,3 +106,11 @@
 3. 新 target 或重新开启框架专项工作前，先说明原来行为、目标行为、示例差异、依赖和验收；未经确认不开始实现。
 4. 任何无法由源码或已确认项目决策支撑的内容，先询问项目负责人。
 5. 不默认提交或 push；通过小阶段验证后由项目负责人决定是否提交。
+
+## 10. 修复日志
+
+> 仅记录已完成并验证的修复；完整命令、失败输出和排障过程见 [daily log](../log/daily/)。
+
+| 日期 | 问题与影响 | 根因 | 修复 | 验证 | 提交状态 |
+|---|---|---|---|---|---|
+| 2026-09-24 | mapper alias 删除返回非 `ENOENT`/`ESTALE` 错误后恢复 `Live` 时丢失 `DevtmpfsHandle`；后续 rename 失败，重试 remove 可能遗留 `/dev/mapper/<name>`。 | `unregister_mapper` 在删除成功前从 runtime registry 取走 alias handle；按值 `delete` 失败不返还该 handle。 | `devtmpfs::delete` 改为借用 handle；registry 只在 identity 删除成功后清除 primary/alias 记录，并为定向测试提供删除故障注入。 | `cargo fmt --check --all`、`git diff --check` 通过；标准 runtime registry ktest 8/0、devtmpfs ktest 6/0。 | 未提交 |

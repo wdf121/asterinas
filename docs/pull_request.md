@@ -1,6 +1,6 @@
 # Device Mapper 上游 PR 提交计划
 
-> **状态**：权威 `dm` 已完成 latest `upstream/main` 的冲突解析与 DM 专项验证；同步 merge commit 尚未创建，尚未开始制备 upstream PR。
+> **状态**：`a4603e369` 已完成 latest `upstream/main` 的正式同步 merge，`cdefc74dc` 已记录 DM 专项验证；同步后 alias 删除失败修复通过定向 ktest，尚未创建修复 commit。尚未开始制备 upstream PR。
 >
 > **更新日期**：2026-09-24。
 >
@@ -12,7 +12,7 @@
 
 上游同步是 PR 制备的前置阶段：必须先在权威 `dm` 工作区完成与最新 `upstream/main` 的同步、处理语义冲突、运行相关验证并形成清晰的同步 commit。同步 worktree 只能用于冲突预演和审核，不能替代权威工作区的正式同步。只有同步后的 `dm` 成为唯一实现来源，才创建独立 PR worktree 重新摘取或重做最小 patch；该 PR worktree 的 base 仍为 `upstream/main` 或已合入的 stacked PR，而不是把整个 `dm` 分支直接提交。
 
-2026-09-24：权威 `dm` 已完成 latest `upstream/main` 的冲突解析及 DM 专项验证；DM crate、core ioctl、focused C ABI 和六项 canonical NixOS suite 均通过。同步 merge commit 仍待用户审阅与决定，因此 PR 制备仍被冻结。
+2026-09-24：权威 `dm` 已通过 `a4603e369` 完成 latest `upstream/main` 同步，DM crate、core ioctl、focused C ABI 和六项 canonical NixOS suite 均通过。同步后审阅修复 alias 删除失败时的 runtime handle 丢失，标准 registry ktest 为 8/0；修复 commit 仍待用户决定。PR 制备可在该修复收口后开始。
 
 ## 2. 提交原则
 

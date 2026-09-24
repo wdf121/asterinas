@@ -8,7 +8,42 @@ use spin::Once;
 use super::{DevtmpfsNode, tree};
 use crate::{prelude::*, thread::kernel_thread::ThreadOptions};
 
-/// Creates a device node through `devtmpfsd`.
+/// Creates a device node through `devtmpfsd` and returns its ownership handle.
+pub(crate) fn create_node(node: DevtmpfsNode) -> Result<DevtmpfsHandle> {
+    match submit(Request::CreateNode(node))? {
+        Response::Handle(handle) => Ok(handle),
+        Response::Unit => unreachable!(),
+    }
+}
+
+/// Creates a symbolic link through `devtmpfsd` and returns its ownership handle.
+pub(crate) fn create_symlink(path: String, target: String) -> Result<DevtmpfsHandle> {
+    match submit(Request::CreateSymlink { path, target })? {
+        Response::Handle(handle) => Ok(handle),
+        Response::Unit => unreachable!(),
+    }
+}
+
+/// Validates that a handle still names its original devtmpfs inode.
+pub(crate) fn validate(handle: &DevtmpfsHandle) -> Result<()> {
+    match submit(Request::Validate(handle.clone()))? {
+        Response::Unit => Ok(()),
+        Response::Handle(_) => unreachable!(),
+    }
+}
+
+/// Deletes a handle's node through `devtmpfsd` using inode identity.
+///
+/// The caller retains the handle if deletion fails, so it can preserve its
+/// registration state and retry or recover the operation.
+pub(crate) fn delete(handle: &DevtmpfsHandle) -> Result<()> {
+    match submit(Request::Delete(handle.clone()))? {
+        Response::Unit => Ok(()),
+        Response::Handle(_) => unreachable!(),
+    }
+}
+
+/// Renames a handle's node through `devtmpfsd` with no-replace semantics.
 ///
 /// The request is queued to the dedicated devtmpfs kernel thread and this
 /// function waits until the node has been created or the creation fails.
