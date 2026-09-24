@@ -3,7 +3,7 @@
 use alloc::{collections::VecDeque, string::String, sync::Arc};
 use core::{
     fmt::{Debug, Display, Formatter},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use aster_block::{
@@ -136,25 +136,18 @@ pub struct DmDevice {
     name: Mutex<String>,
     uuid: Mutex<Option<String>>,
     lifecycle: Mutex<()>,
-    readonly: AtomicBool,
     state: Mutex<DmDeviceState>,
     io: Arc<DmIoState>,
     events: WaitQueue,
 }
 
 impl DmDevice {
-    pub(crate) fn new(
-        id_owner: DmDeviceIdOwner,
-        name: String,
-        uuid: Option<String>,
-        readonly: bool,
-    ) -> Self {
+    pub(crate) fn new(id_owner: DmDeviceIdOwner, name: String, uuid: Option<String>) -> Self {
         Self {
             id_owner,
             name: Mutex::new(name),
             uuid: Mutex::new(uuid),
             lifecycle: Mutex::new(()),
-            readonly: AtomicBool::new(readonly),
             state: Mutex::new(DmDeviceState::default()),
             io: Arc::new(DmIoState::new()),
             events: WaitQueue::new(),
@@ -229,6 +222,11 @@ impl DmDevice {
             return;
         };
         for bio in postponed {
+            if table.is_readonly() && bio.type_().is_write_like() {
+                bio.complete(BioStatus::IoError);
+                self.io.finish();
+                continue;
+            }
             self.dispatch_assigned_bio(table.clone(), bio, true)
                 .expect("deferred replay must complete enqueue failures internally");
         }
@@ -277,14 +275,30 @@ impl DmDevice {
         *uuid = Some(new_uuid);
     }
 
-    /// Returns whether the device is a read-only mapper.
+    /// Returns whether the current active table is read-only.
     pub fn is_readonly(&self) -> bool {
-        self.readonly.load(Ordering::Acquire)
+        self.status().readonly
     }
 
-    /// Switches the device to a read-only mapper.
-    pub fn set_readonly(&self) {
-        self.readonly.store(true, Ordering::Release);
+    /// Captures one selected table generation together with its Linux-visible status.
+    ///
+    /// The table and its read-only mode must come from the same state-lock snapshot,
+    /// so table replacement cannot expose one generation with another generation's mode.
+    pub fn table_snapshot(&self, inactive: bool) -> (DmDeviceStatus, Option<Arc<DmTable>>) {
+        let state = self.state.lock();
+        let table = if inactive {
+            state.inactive.clone()
+        } else {
+            state.active.clone()
+        };
+        let status = DmDeviceStatus {
+            suspended: state.phase != DmDevicePhase::Running,
+            readonly: table.as_ref().is_some_and(|table| table.is_readonly()),
+            has_active_table: state.active.is_some(),
+            has_inactive_table: state.inactive.is_some(),
+            event_nr: state.event_nr,
+        };
+        (status, table)
     }
 
     /// Installs a fully validated mapping table as the inactive table.
@@ -488,36 +502,35 @@ impl DmDevice {
         self.events.wake_all();
     }
 
-    /// Returns the current status snapshot.
+    /// Returns the Linux-visible status for the active table.
     pub fn status(&self) -> DmDeviceStatus {
-        let state = self.state.lock();
-        DmDeviceStatus {
-            suspended: state.phase != DmDevicePhase::Running,
-            readonly: self.is_readonly(),
-            has_active_table: state.active.is_some(),
-            has_inactive_table: state.inactive.is_some(),
-            event_nr: state.event_nr,
-        }
+        self.table_snapshot(false).0
     }
 }
 
 impl BlockDevice for DmDevice {
     fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
-        if self.is_readonly() && bio.type_().is_write_like() {
-            // Discard and write-zeroes are write-like because they can change
-            // persistent contents even though they carry no data segments.
-            return Err(BioEnqueueError::Refused);
-        }
-
         let table = {
             let mut state = self.state.lock();
             match state.phase {
                 DmDevicePhase::Running => {
                     let table = state.active.clone().ok_or(BioEnqueueError::Refused)?;
+                    if table.is_readonly() && bio.type_().is_write_like() {
+                        // Discard and write-zeroes can change persistent contents without data segments.
+                        return Err(BioEnqueueError::Refused);
+                    }
                     self.io.in_flight.fetch_add(1, Ordering::AcqRel);
                     table
                 }
                 DmDevicePhase::Suspending | DmDevicePhase::Suspended => {
+                    if state
+                        .active
+                        .as_ref()
+                        .is_some_and(|table| table.is_readonly())
+                        && bio.type_().is_write_like()
+                    {
+                        return Err(BioEnqueueError::Refused);
+                    }
                     state.postponed.push_back(bio);
                     return Ok(());
                 }
@@ -1295,15 +1308,21 @@ mod tests {
     fn readonly_device_refuses_write_like_bios_but_allows_read_and_flush() {
         let manager = DmManager::new().unwrap();
         let device = manager
-            .create_with_readonly("dm-readonly-test".to_string(), None, None, true)
+            .create("dm-readonly-test".to_string(), None, None)
             .unwrap();
         let backing = Arc::new(TestBlockDevice) as Arc<dyn BlockDevice>;
         let table = Arc::new(
-            DmTable::new_single_linear(
-                Sid::new(0),
-                128,
-                Sid::new(16),
-                BlockDeviceLease::new_untracked(backing),
+            DmTable::new_targets_with_readonly(
+                vec![Box::new(
+                    crate::target::linear::LinearTarget::new(
+                        Sid::new(0),
+                        128,
+                        Sid::new(16),
+                        BlockDeviceLease::new_untracked(backing.clone()),
+                    )
+                    .unwrap(),
+                ) as crate::target::DmTargetBox],
+                true,
             )
             .unwrap(),
         );
@@ -1346,6 +1365,44 @@ mod tests {
             Bio::new_range(BioType::WriteZeroes, Sid::new(0), 8, None)
                 .submit_and_wait(device.as_ref()),
             Err(BioEnqueueError::Refused)
+        );
+
+        device.suspend_no_flush().unwrap();
+        assert_eq!(
+            Bio::new(
+                BioType::Write,
+                Sid::new(0),
+                vec![BioSegment::alloc(1, BioDirection::ToDevice)],
+                None,
+            )
+            .submit_and_wait(device.as_ref()),
+            Err(BioEnqueueError::Refused)
+        );
+        device.resume().unwrap();
+
+        let writable_table = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(16),
+                BlockDeviceLease::new_untracked(backing),
+            )
+            .unwrap(),
+        );
+        device.load_table(writable_table);
+        device.resume().unwrap();
+
+        assert!(!device.status().readonly);
+        assert_eq!(
+            Bio::new(
+                BioType::Write,
+                Sid::new(0),
+                vec![BioSegment::alloc(1, BioDirection::ToDevice)],
+                None,
+            )
+            .submit_and_wait(device.as_ref())
+            .unwrap(),
+            BioStatus::Complete
         );
     }
 }

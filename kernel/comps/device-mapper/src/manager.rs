@@ -121,23 +121,15 @@ impl DmManager {
         self.major.get().get()
     }
 
-    /// Creates a device without a loaded mapping table.
+    /// Creates a tableless device without assigning a read/write mode.
+    ///
+    /// Linux Device Mapper associates `DM_READONLY_FLAG` with a loaded table rather
+    /// than with a mapper identity.
     pub fn create(
         &self,
         name: String,
         uuid: Option<String>,
         requested_minor: Option<u32>,
-    ) -> Result<Arc<DmDevice>, DmError> {
-        self.create_with_readonly(name, uuid, requested_minor, false)
-    }
-
-    /// Creates a device without a loaded mapping table and sets its read-only mode.
-    pub fn create_with_readonly(
-        &self,
-        name: String,
-        uuid: Option<String>,
-        requested_minor: Option<u32>,
-        readonly: bool,
     ) -> Result<Arc<DmDevice>, DmError> {
         let mut inner = self.inner.lock();
         if inner.by_name.contains_key(&name) || inner.reserved_runtime_names.contains(&name) {
@@ -165,12 +157,7 @@ impl DmManager {
         };
         let id = DeviceId::new(self.major.get(), MinorId::new(minor as u32));
         let id_owner = DmDeviceIdOwner::new(id, self.major.clone(), self.minors.clone());
-        let device = Arc::new(DmDevice::new(
-            id_owner,
-            name.clone(),
-            uuid.clone(),
-            readonly,
-        ));
+        let device = Arc::new(DmDevice::new(id_owner, name.clone(), uuid.clone()));
         inner.by_name.insert(name.clone(), device.clone());
         if let Some(uuid) = uuid {
             inner.name_by_uuid.insert(uuid, name);
@@ -361,14 +348,14 @@ mod tests {
     }
 
     #[ktest]
-    fn creates_readonly_device_when_requested() {
+    fn creates_tableless_device_without_readonly_mode() {
         let manager = DmManager::new().unwrap();
         let device = manager
-            .create_with_readonly("dm-readonly".to_string(), None, None, true)
+            .create("dm-readonly".to_string(), None, None)
             .unwrap();
 
-        assert!(device.is_readonly());
-        assert!(device.status().readonly);
+        assert!(!device.is_readonly());
+        assert!(!device.status().readonly);
         assert_eq!(
             manager.lookup_name("dm-readonly").unwrap().id(),
             device.id()

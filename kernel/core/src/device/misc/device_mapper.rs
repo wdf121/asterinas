@@ -443,19 +443,16 @@ fn create_device(buffer: &mut [u8]) -> Result<()> {
         None
     };
 
-    let readonly = flags & DM_READONLY_FLAG != 0;
     let request = CreateRequest {
         name,
         uuid,
         requested_minor,
-        readonly,
     };
     let device = ControlWorkflow::new(manager()).create(request)?;
     ostd::error!(
-        "[dm-debug] control create committed name={} dev={} readonly={} requested_minor={:?}",
+        "[dm-debug] control create committed name={} dev={} requested_minor={:?}",
         device.name(),
         DeviceIdLogLabel(device.id()),
-        readonly,
         requested_minor
     );
     fill_device_header(buffer, &device)
@@ -643,8 +640,10 @@ fn parse_table_load_request(buffer: &[u8]) -> Result<TableLoadRequest> {
         cursor = next_spec;
     }
 
-    let table = Arc::new(DmTable::new_targets(targets).map_err(map_table_error)?);
-    Ok(TableLoadRequest::new(table, flags & DM_READONLY_FLAG != 0))
+    let readonly = flags & DM_READONLY_FLAG != 0;
+    let table =
+        Arc::new(DmTable::new_targets_with_readonly(targets, readonly).map_err(map_table_error)?);
+    Ok(TableLoadRequest::new(table))
 }
 
 fn device_suspend(buffer: &mut [u8]) -> Result<()> {
@@ -2112,23 +2111,7 @@ mod tests {
     }
 
     #[ktest]
-    fn fills_readonly_flag_for_readonly_device() {
-        let manager = DmManager::new().unwrap();
-        let device = manager
-            .create_with_readonly("dm-readonly-header-test".to_string(), None, None, true)
-            .unwrap();
-        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
-
-        fill_device_header(&mut buffer, &device).unwrap();
-
-        assert_eq!(
-            read_u32(&buffer, OFF_FLAGS).unwrap(),
-            DM_EXISTS_FLAG | DM_READONLY_FLAG
-        );
-    }
-
-    #[ktest]
-    fn create_device_honors_readonly_flag() {
+    fn create_device_does_not_persist_readonly_flag_without_a_table() {
         DM_MANAGER.call_once(|| DmManager::new().unwrap());
         let name = "dm-readonly-create-test";
         let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
@@ -2138,12 +2121,9 @@ mod tests {
         create_device(&mut buffer).unwrap();
         let device = manager().lookup_name(name).unwrap();
 
-        assert!(device.is_readonly());
-        assert!(device.status().readonly);
-        assert_eq!(
-            read_u32(&buffer, OFF_FLAGS).unwrap(),
-            DM_EXISTS_FLAG | DM_READONLY_FLAG
-        );
+        assert!(!device.is_readonly());
+        assert!(!device.status().readonly);
+        assert_eq!(read_u32(&buffer, OFF_FLAGS).unwrap(), DM_EXISTS_FLAG);
 
         assert_eq!(block_open_count(device.id()), None);
 
@@ -3655,7 +3635,7 @@ mod tests {
     }
 
     #[ktest]
-    fn table_load_with_readonly_flag_marks_device_readonly() {
+    fn readonly_table_mode_remains_inactive_until_resume() {
         let backing = StatusBacking::new_with_major(510, 201);
         let backing_id = backing.id();
         register(backing as Arc<dyn BlockDevice>).unwrap();
@@ -3672,15 +3652,38 @@ mod tests {
 
         table_load_for_test(&mut buffer, &device).unwrap();
 
-        assert!(device.is_readonly());
-        assert!(device.status().readonly);
-        assert!(device.inactive_table().is_some());
+        assert!(!device.is_readonly());
+        assert!(!device.status().readonly);
+        assert!(device.inactive_table().unwrap().is_readonly());
         assert_eq!(
             read_u32(&buffer, OFF_FLAGS).unwrap(),
+            DM_EXISTS_FLAG | DM_INACTIVE_PRESENT_FLAG
+        );
+
+        let mut inactive_status = test_buffer(DM_IOCTL_HEADER_SIZE);
+        write_u32(
+            &mut inactive_status,
+            OFF_FLAGS,
+            DM_QUERY_INACTIVE_TABLE_FLAG,
+        )
+        .unwrap();
+        device_status_for_device(&mut inactive_status, &device).unwrap();
+        assert_eq!(
+            read_u32(&inactive_status, OFF_FLAGS).unwrap(),
             DM_EXISTS_FLAG | DM_READONLY_FLAG | DM_INACTIVE_PRESENT_FLAG
         );
 
-        device.clear_inactive_table().unwrap();
+        device.resume().unwrap();
+        let mut active_status = test_buffer(DM_IOCTL_HEADER_SIZE);
+        device_status_for_device(&mut active_status, &device).unwrap();
+        assert!(device.is_readonly());
+        assert_eq!(
+            read_u32(&active_status, OFF_FLAGS).unwrap(),
+            DM_EXISTS_FLAG | DM_READONLY_FLAG | DM_ACTIVE_PRESENT_FLAG
+        );
+
+        manager.remove("dm-readonly-table-load-test").unwrap();
+        drop(device);
         unregister(backing_id).unwrap();
     }
 
@@ -3755,6 +3758,7 @@ mod tests {
             let mut active_load = test_buffer(
                 DM_IOCTL_HEADER_SIZE + table_status_record_len(active_params.len()).unwrap(),
             );
+            write_u32(&mut active_load, OFF_FLAGS, DM_READONLY_FLAG).unwrap();
             write_u32(&mut active_load, OFF_TARGET_COUNT, 1).unwrap();
             write_linear_target_spec(
                 &mut active_load,
@@ -3781,7 +3785,6 @@ mod tests {
                 inactive_params,
             );
             table_load_for_test(&mut inactive_load, &device).unwrap();
-            device.set_readonly();
             device.suspend().unwrap();
 
             assert!(device.status().has_active_table);
