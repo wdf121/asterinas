@@ -219,7 +219,7 @@ impl DmTable {
         // Each child covers exactly one already-mapped part. Completion is
         // aggregated back into the original `Bio` so stacked-device callers see
         // a single Linux-style result even when the table crosses targets.
-        let (children, completion) = bio.split(ranges)?;
+        let children = bio.split(ranges)?;
         for (mut child, part) in children.into_iter().zip(parts) {
             match part {
                 TargetIoAction::Remap {
@@ -227,12 +227,8 @@ impl DmTable {
                     backing,
                     ..
                 } => {
-                    if child.remap_sid_start(backing_start).is_err() {
-                        completion.complete_child(BioStatus::IoError);
-                        continue;
-                    }
-                    if backing.enqueue(child).is_err() {
-                        completion.complete_child(BioStatus::IoError);
+                    if child.remap_sid_start(backing_start).is_ok() {
+                        let _ = backing.enqueue(child);
                     }
                 }
                 TargetIoAction::Error { .. } => child.complete(BioStatus::IoError),

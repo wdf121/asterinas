@@ -104,7 +104,7 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
 
 2026-09-22 已按默认 `GUEST_READY_TIMEOUT=40`、`GUEST_QEMU_TIMEOUT=180` 串行完成六个 canonical suite：control-plane、dataplane、LVM2 topology、linear integration、striped integration 与 mixed integration 均出现 guest、host 和聚合通过标记。LVM2 topology 首次运行发现 `lvs -o ... segtype` 对双 linear segment 返回重复汇总行；测试改为单独验证 LV 汇总的 `seg_count=2`，DM table/dependencies 仍验证两个 backing，复跑通过。每个 suite 的 `/tmp/*-test.log` 是唯一验收日志；host 事件和 QEMU/guest 输出经运行期 FIFO 单写入，FIFO 退出即删，正常路径不保留 `*-qemu-running.txt`。2026-09-23 的 readonly P0 control-plane 验收因默认 40 秒 ready timeout 两次未进入 guest；重建 `target/nixos/asterinas.img` 后，以用户授权的 `GUEST_READY_TIMEOUT=50`、`GUEST_QEMU_TIMEOUT=180` 复跑通过，guest 63 秒完成、全程 71 秒，`SUMMARY_GAP_DM_CONTROL_PLANE: 0`。
 
-2026-09-24：`a4603e369` 已创建 latest `upstream/main` 的同步 merge，`cdefc74dc` 记录专项验证；源码同版本 OSDK core check 通过，devtmpfs 6/0、block 23/0、DM crate 86/0、core DM ioctl 81/0、focused C ABI 182/0，以及六项 canonical NixOS suite 全部通过。同步后审阅发现 alias 删除发生非 `ENOENT`/`ESTALE` 错误时会丢失 `DevtmpfsHandle`，恢复 `Live` 后无法可靠 rename/retry remove；现改为删除成功后才清除 handle，并以标准 runtime registry ktest 验证 8/0。完整非 DM C regression、全仓 CI、AArch64 和非 QEMU TSC 验证仍不属于本轮覆盖；修复尚未提交，详见 [upstream sync](../docs/upstream-sync.md)。
+2026-09-24：`a4603e369` 已创建 latest `upstream/main` 的同步 merge，`cdefc74dc` 记录专项验证，`0423431d5` 已修复 alias 删除失败时的 `DevtmpfsHandle` 丢失。源码同版本 OSDK core check 通过，devtmpfs 6/0、core registry 8/0、core DM ioctl 81/0、focused C ABI 182/0，以及六项 canonical NixOS suite 全部通过。后续 PR 1 审计发现 deferred replay 的 split child 在 drop guard 自动报错后仍由 table 手动补偿，可能双重递减聚合计数；现移除 completion handle 并由 child 自治完成，block/DM 完整 ktest 为 25/0、87/0。该 split 修复随本提交收口，完整非 DM C regression、全仓 CI、AArch64 和非 QEMU TSC 验证仍不属于本轮覆盖；详见 [upstream sync](../docs/upstream-sync.md)。
 
 ## 4. 当前边界
 

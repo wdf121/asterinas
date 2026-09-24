@@ -22,11 +22,11 @@
 
 ## 当前停点
 
-### 已完成的 upstream 同步；同步后修复待提交
+### 已完成的 upstream 同步；alias 与 split 修复均随本提交收口
 
 权威 `dm` 已在 `a4603e369` 创建 latest `upstream/main` 的同步 merge commit，`cdefc74dc` 记录其专项验证。同步覆盖构建入口、block/driver、VFS/devtmpfs/runtime registry 与 DM primary/alias 适配，不应误判为仅 Device Mapper crate 的局部改动。
 
-同步后审阅发现并修复了 alias 删除非 `ENOENT`/`ESTALE` 错误时丢失 `DevtmpfsHandle` 的生命周期漏洞；恢复 `Live` 后现可保留 alias 身份并重试 remove。标准 runtime registry ktest 为 8/0；其余同步矩阵为 core check、devtmpfs 6/0、block 23/0、DM crate 86/0、core DM ioctl 81/0、focused C ABI 182/0 与六项 canonical NixOS suite。全仓 CI、完整非 DM C regression、AArch64 与非 QEMU TSC 仍未覆盖。当前修复尚未创建 commit，详见 [上游同步记录](upstream-sync.md)。
+同步后审阅修复 alias 删除非 `ENOENT`/`ESTALE` 错误时丢失 `DevtmpfsHandle` 的生命周期漏洞，已提交为 `0423431d5`。PR 1 审计又发现 deferred replay 的 split child 会由 drop guard 和 table 手动补偿双重递减聚合计数；现已改为 child 自治完成，待提交。标准 runtime registry ktest 为 8/0；本次 block/DM ktest 分别为 25/0、87/0；其余同步矩阵为 core check、devtmpfs 6/0、core DM ioctl 81/0、focused C ABI 182/0 与六项 canonical NixOS suite。全仓 CI、完整非 DM C regression、AArch64 与非 QEMU TSC 仍未覆盖。详见 [上游同步记录](upstream-sync.md)。
 
 ### 已完成并提交的 V4 测试阶段
 
@@ -79,13 +79,13 @@ e6f00b9fa test(regression): report aggregate C assertion totals
 
 ## 下一步
 
-当前优先级是审阅并决定是否提交已验证的 alias 删除失败修复；同步 merge commit 已存在，后续 PR 制备无需再等待同步历史收口。用户可选择：
+当前优先级是审阅并决定是否提交已验证的 split child 完成责任修复；alias 删除失败修复已由 `0423431d5` 收口。用户可选择：
 
 1. 审阅当前修复 diff 后创建修复 commit；
-2. 在创建修复 commit 前补充更广泛的 runtime/devtmpfs 验证；
+2. 在创建修复 commit 前补充更广泛的 split/BIO 验证；
 3. 在修复收口后开始 PR 1 的独立制备，或单独审阅来源待确认的协作规则、学习资料和 DOCX。
 
-PR worktree 仍须从已同步的权威 `dm` 实现重新提取最小 patch，不复制文档、日志或本地系统 harness。
+PR worktree 必须从包含该修复的已验证权威 `dm` 实现重新提取最小 patch，不复制文档、日志或本地系统 harness。
 
 ## 安全规则
 

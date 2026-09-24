@@ -113,4 +113,5 @@
 
 | 日期 | 问题与影响 | 根因 | 修复 | 验证 | 提交状态 |
 |---|---|---|---|---|---|
-| 2026-09-24 | mapper alias 删除返回非 `ENOENT`/`ESTALE` 错误后恢复 `Live` 时丢失 `DevtmpfsHandle`；后续 rename 失败，重试 remove 可能遗留 `/dev/mapper/<name>`。 | `unregister_mapper` 在删除成功前从 runtime registry 取走 alias handle；按值 `delete` 失败不返还该 handle。 | `devtmpfs::delete` 改为借用 handle；registry 只在 identity 删除成功后清除 primary/alias 记录，并为定向测试提供删除故障注入。 | `cargo fmt --check --all`、`git diff --check` 通过；标准 runtime registry ktest 8/0、devtmpfs ktest 6/0。 | 未提交 |
+| 2026-09-24 | mapper alias 删除返回非 `ENOENT`/`ESTALE` 错误后恢复 `Live` 时丢失 `DevtmpfsHandle`；后续 rename 失败，重试 remove 可能遗留 `/dev/mapper/<name>`。 | `unregister_mapper` 在删除成功前从 runtime registry 取走 alias handle；按值 `delete` 失败不返还该 handle。 | `devtmpfs::delete` 改为借用 handle；registry 只在 identity 删除成功后清除 primary/alias 记录，并为定向测试提供删除故障注入。 | `cargo fmt --check --all`、`git diff --check` 通过；标准 runtime registry ktest 8/0、devtmpfs ktest 6/0。 | `0423431d5` |
+| 2026-09-24 | deferred replay 的 split child 在失败后可能双重递减聚合计数，导致父 BIO 提前完成；后续 child 结束时 release 下可下溢并破坏完成生命周期。 | child 继承 drop-to-`IoError` 后，`DmTable` 仍通过未绑定 child 的 completion handle 手动补完成。 | 移除 completion handle；每个 split child 无条件承担未完成即 `IoError` 的完成责任，table 不再手动递减。 | `cargo fmt --check --all`、`git diff --check` 通过；block crate ktest 25/0、DM crate ktest 87/0，含 deferred replay 跨 target 失败回归。 | 本提交 |
