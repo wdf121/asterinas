@@ -18,6 +18,7 @@ use crate::{
     fs::{
         file::{
             CreationFlags, InodeHandle, InodeMode, InodeType, OpenArgs, Permission, StatusFlags,
+            SyncMode,
         },
         pseudofs::NsInode,
         vfs::{
@@ -44,7 +45,7 @@ mod resolver;
 /// Each `Path` corresponds to a node in the VFS tree, and a single node
 /// may have multiple `Path` instances referencing it due to mount operations.
 #[derive(Clone, Debug)]
-pub(crate) struct Path {
+pub struct Path {
     mount: Arc<Mount>,
     dentry: Arc<Dentry>,
 }
@@ -59,21 +60,44 @@ impl Eq for Path {}
 
 impl Path {
     /// Creates a new `Path` to represent the root directory of a file system.
-    pub(crate) fn new_fs_root(mount: Arc<Mount>) -> Self {
+    pub(crate) fn new_root(mount: Arc<Mount>) -> Self {
         let inner = mount.root_dentry().clone();
         Self::new(mount, inner)
     }
 
-    /// Creates a new `Path` to represent the child directory of a file system.
-    pub(crate) fn new_fs_child(
+    /// Creates a new child `Path` in a file system.
+    ///
+    /// This API is for non-symbolic-link children.
+    /// Use [`Self::new_symlink_child`] to create a symbolic link, because a
+    /// symbolic link should be created atomically with its target.
+    pub(crate) fn new_child(&self, name: &str, type_: InodeType, mode: InodeMode) -> Result<Self> {
+        debug_assert_ne!(type_, InodeType::SymLink);
+
+        let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
+        self.check_dir_entry_mutation()?;
+        let new_child_dentry = dir_dentry.create_child(name, || {
+            dir_dentry.inode().create(&dir_dentry, name, type_, mode)
+        })?;
+        Ok(Self::new(self.mount.clone(), new_child_dentry))
+    }
+
+    /// Creates a new symbolic-link child `Path` in a file system.
+    ///
+    /// Use this API instead of [`Self::new_child`] when creating symbolic
+    /// links so the link target is supplied at creation time.
+    pub(crate) fn new_symlink_child(
         &self,
         name: &str,
-        type_: InodeType,
+        target: &str,
         mode: InodeMode,
     ) -> Result<Self> {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         self.check_dir_entry_mutation()?;
-        let new_child_dentry = dir_dentry.create(name, type_, mode)?;
+        let new_child_dentry = dir_dentry.create_child(name, || {
+            dir_dentry
+                .inode()
+                .create_symlink(&dir_dentry, name, target, mode)
+        })?;
         Ok(Self::new(self.mount.clone(), new_child_dentry))
     }
 
@@ -98,7 +122,9 @@ impl Path {
     ) -> Result<Self> {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         self.check_dir_entry_mutation()?;
-        let tmp_inode = self.inode().create_tmpfile(mode, hard_linkability)?;
+        let tmp_inode = self
+            .inode()
+            .create_tmpfile(&self.dentry, mode, hard_linkability)?;
         let tmp_dentry = Dentry::new_anonymous(tmp_inode, &dir_dentry);
         Ok(Self::new(self.mount.clone(), tmp_dentry))
     }
@@ -679,7 +705,7 @@ impl Path {
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         old.check_hardlink_source()?;
         self.check_dir_entry_mutation()?;
-        dir_dentry.link(old.inode(), name)
+        dir_dentry.link(&old.dentry, name)
     }
 
     /// Unlinks a name from the `Path`.
@@ -689,24 +715,24 @@ impl Path {
         dir_dentry.unlink(name)
     }
 
-    /// 仅当名称仍指向预期路径的 inode 时删除目录项。
+    /// Deletes a name only if it still names the expected dentry.
     pub(crate) fn unlink_if_matches(&self, name: &str, expected: &Self) -> Result<()> {
         if !Arc::ptr_eq(&self.mount, &expected.mount) {
             return_errno_with_message!(Errno::EXDEV, "the operation cannot cross mounts");
         }
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         self.check_dir_entry_mutation()?;
-        dir_dentry.unlink_if_matches(name, expected.inode())
+        dir_dentry.unlink_if_matches(name, &expected.dentry)
     }
 
-    /// 仅当名称仍指向预期路径的 inode 时删除空目录。
+    /// Removes a directory only if it still names the expected dentry.
     pub(crate) fn rmdir_if_matches(&self, name: &str, expected: &Self) -> Result<()> {
         if !Arc::ptr_eq(&self.mount, &expected.mount) {
             return_errno_with_message!(Errno::EXDEV, "the operation cannot cross mounts");
         }
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         self.check_dir_entry_mutation()?;
-        dir_dentry.rmdir_if_matches(name, expected.inode())
+        dir_dentry.rmdir_if_matches(name, &expected.dentry)
     }
 
     /// Removes a directory by `rmdir()` the inner inode.
@@ -738,33 +764,79 @@ impl Path {
 
         old_dir_dentry.rename(old_name, &new_dir_dentry, new_name, mode)
     }
+
+    /// Renames a name with no-replace or replacement semantics only if the
+    /// source directory entry is still `expected`.
+    pub(crate) fn rename_if_matches(
+        &self,
+        old_name: &str,
+        expected: &Self,
+        new_dir: &Self,
+        new_name: &str,
+        mode: RenameMode,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(&self.mount, &expected.mount) || !Arc::ptr_eq(&self.mount, &new_dir.mount) {
+            return_errno_with_message!(Errno::EXDEV, "the operation cannot cross mounts");
+        }
+
+        let old_dir_dentry = self.dentry.as_dir_dentry_or_err()?;
+        let new_dir_dentry = new_dir.dentry.as_dir_dentry_or_err()?;
+        self.check_dir_entry_mutation()?;
+        if !Arc::ptr_eq(&self.dentry, &new_dir.dentry) {
+            new_dir.check_dir_entry_mutation()?;
+        }
+        old_dir_dentry.rename_if_matches(
+            old_name,
+            Some(&expected.dentry),
+            &new_dir_dentry,
+            new_name,
+            mode,
+        )
+    }
 }
 
 // Methods inherited from `Inode`.
 #[inherit_methods(from = "self.inode()")]
 impl Path {
     pub(crate) fn fs(&self) -> Arc<dyn FileSystem>;
-    pub(crate) fn sync_all(&self) -> Result<()>;
-    pub(crate) fn sync_data(&self) -> Result<()>;
+    pub(crate) fn sync(&self, mode: SyncMode) -> Result<()>;
     pub(crate) fn metadata(&self) -> Result<Metadata>;
     pub(crate) fn mode(&self) -> Result<InodeMode>;
-    pub(crate) fn set_mode(&self, mode: InodeMode) -> Result<()>;
     pub(crate) fn size(&self) -> usize;
     pub(crate) fn owner(&self) -> Result<Uid>;
-    pub(crate) fn set_owner(&self, uid: Uid) -> Result<()>;
     pub(crate) fn group(&self) -> Result<Gid>;
-    pub(crate) fn set_group(&self, gid: Gid) -> Result<()>;
     pub(crate) fn atime(&self) -> Duration;
-    pub(crate) fn set_atime(&self, time: Duration);
     pub(crate) fn mtime(&self) -> Duration;
-    pub(crate) fn set_mtime(&self, time: Duration);
     pub(crate) fn ctime(&self) -> Duration;
-    pub(crate) fn set_ctime(&self, time: Duration);
     pub(crate) fn list_xattr(
         &self,
         namespace: XattrNamespace,
         list_writer: &mut VmWriter,
     ) -> Result<usize>;
+
+    pub(crate) fn set_mode(&self, mode: InodeMode) -> Result<()> {
+        self.inode().set_mode(&self.dentry, mode)
+    }
+
+    pub(crate) fn set_owner(&self, uid: Uid) -> Result<()> {
+        self.inode().set_owner(&self.dentry, uid)
+    }
+
+    pub(crate) fn set_group(&self, gid: Gid) -> Result<()> {
+        self.inode().set_group(&self.dentry, gid)
+    }
+
+    pub(crate) fn set_atime(&self, time: Duration) {
+        self.inode().set_atime(&self.dentry, time)
+    }
+
+    pub(crate) fn set_mtime(&self, time: Duration) {
+        self.inode().set_mtime(&self.dentry, time)
+    }
+
+    pub(crate) fn set_ctime(&self, time: Duration) {
+        self.inode().set_ctime(&self.dentry, time)
+    }
 
     /// Resizes the file.
     pub(crate) fn resize(&self, size: usize) -> Result<()> {
@@ -775,8 +847,8 @@ impl Path {
     /// Resizes the file without permission checks.
     pub(in crate::fs) fn resize_unchecked_access(&self, size: usize) -> Result<()> {
         let inode = self.inode();
-        xattr::clear_file_priv(inode.as_ref())?;
-        inode.resize(size)
+        xattr::clear_file_priv(&self.dentry)?;
+        inode.resize(&self.dentry, size)
     }
 
     /// Sets an xattr of the file.
@@ -793,7 +865,7 @@ impl Path {
         } else {
             inode.check_permission(Permission::MAY_WRITE)?;
         }
-        inode.set_xattr(name, value_reader, flags)
+        inode.set_xattr(&self.dentry, name, value_reader, flags)
     }
 
     /// Gets an xattr of the file.
@@ -811,7 +883,7 @@ impl Path {
         } else {
             inode.check_permission(Permission::MAY_WRITE)?;
         }
-        inode.remove_xattr(name)
+        inode.remove_xattr(&self.dentry, name)
     }
 }
 

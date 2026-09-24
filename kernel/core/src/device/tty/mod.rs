@@ -5,15 +5,19 @@ use ostd::sync::LocalIrqDisabled;
 
 use self::{line_discipline::LineDiscipline, termio::CFontOp};
 use crate::{
-    device::{Device, DeviceType, DevtmpfsInodeMeta},
+    device::{Device, DeviceType},
+    dispatch_ioctl,
     events::IoEvents,
-    fs::file::{PerOpenFileOps, StatusFlags},
+    fs::{
+        devtmpfs::DevtmpfsNodeMeta,
+        file::{PerOpenFileOps, StatusFlags},
+    },
     prelude::*,
     process::{
         JobControl, Terminal, broadcast_signal_async,
         signal::{PollHandle, Pollable, Pollee},
     },
-    util::ioctl::{RawIoctl, dispatch_ioctl},
+    util::ioctl::RawIoctl,
 };
 
 mod device;
@@ -27,6 +31,7 @@ mod serial;
 pub(super) mod termio;
 mod vt;
 
+pub(crate) use device::CONSOLE_DEVICE_ID;
 pub(super) use driver::TtyDriver;
 pub(super) use flags::TtyFlags;
 
@@ -356,7 +361,7 @@ impl<D: TtyDriver> Device for Tty<D> {
         )
     }
 
-    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
         self.driver.devtmpfs_meta(self.index)
     }
 

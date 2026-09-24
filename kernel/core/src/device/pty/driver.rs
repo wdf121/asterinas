@@ -3,21 +3,18 @@
 use super::file::PtySlaveFile;
 use crate::{
     device::{
-        DevtmpfsInodeMeta,
         pty::packet::{PacketCtrl, PacketStatus},
         tty::{
             Tty, TtyDriver, TtyFlags,
             termio::{CCtrlCharId, CInputFlags, CLocalFlags, CTermios},
         },
     },
+    dispatch_ioctl,
     events::IoEvents,
-    fs::file::PerOpenFileOps,
+    fs::{devtmpfs::DevtmpfsNodeMeta, file::PerOpenFileOps},
     prelude::*,
     process::signal::Pollee,
-    util::{
-        ioctl::{RawIoctl, dispatch_ioctl},
-        ring_buffer::RingBuffer,
-    },
+    util::{ioctl::RawIoctl, ring_buffer::RingBuffer},
 };
 
 const BUFFER_CAPACITY: usize = 8192;
@@ -115,7 +112,7 @@ impl TtyDriver for PtyDriver {
     // Reference: <https://elixir.bootlin.com/linux/v6.17/source/include/uapi/linux/major.h#L147>.
     const DEVICE_MAJOR_ID: u32 = 136;
 
-    fn devtmpfs_meta(&self, _index: u32) -> Option<DevtmpfsInodeMeta<'_>> {
+    fn devtmpfs_meta(&self, _index: u32) -> Option<DevtmpfsNodeMeta> {
         None
     }
 

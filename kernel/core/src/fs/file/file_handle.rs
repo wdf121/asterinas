@@ -6,8 +6,6 @@
 
 use core::fmt::Display;
 
-use ostd::io::IoMem;
-
 use super::{
     AccessMode, FileCommon, InodeHandle, SettableStatusFlags, StatusFlags, file_table::FdFlags,
     inode_handle::SeekFrom,
@@ -18,7 +16,7 @@ use crate::{
     prelude::*,
     process::{Process, signal::Pollable},
     util::ioctl::RawIoctl,
-    vm::page_cache::Vmo,
+    vm::{page_cache::Vmo, vmar::MapHandle},
 };
 
 /// The basic operations defined on a file
@@ -92,10 +90,7 @@ pub(crate) trait FileLike: Pollable + Send + Sync + Any {
     }
 
     /// Obtains the mappable object to map this file into the user address space.
-    ///
-    /// If this file has a corresponding mappable object of [`Mappable`],
-    /// then it can be either an inode or an MMIO region.
-    fn mappable(&self) -> Result<Mappable> {
+    fn mappable(&self) -> Result<MappableObject<'_>> {
         // `ENODEV` means that "The underlying filesystem of the specified file does not support
         // memory mapping".
         // Reference: <https://man7.org/linux/man-pages/man2/mmap.2.html>.
@@ -143,6 +138,15 @@ pub(crate) trait FileLike: Pollable + Send + Sync + Any {
     ///    collected later in its `Display::display()` method, after dropping the file table's spin
     ///    lock.
     fn dump_proc_fdinfo(self: Arc<Self>, fd_flags: FdFlags) -> Box<dyn Display>;
+
+    /// Synchronizes the file according to `mode`.
+    ///
+    /// File-like objects do not support synchronization by default. Linux returns `EINVAL`
+    /// when a file's operations do not provide an `fsync` method.
+    /// Reference: <https://github.com/torvalds/linux/blob/v6.16/fs/sync.c#L179-L188>
+    fn sync(&self, _mode: SyncMode) -> Result<()> {
+        return_errno_with_message!(Errno::EINVAL, "the file does not support synchronization")
+    }
 }
 
 impl dyn FileLike {
@@ -333,10 +337,53 @@ impl StatusFlagsUpdate {
 }
 
 /// An object that may be memory mapped into the user address space.
-#[derive(Clone, Debug)]
-pub(crate) enum Mappable {
+pub(crate) enum MappableObject<'a> {
     /// A VMO (i.e., page cache).
     Vmo(Arc<Vmo>),
-    /// An MMIO region.
-    IoMem(IoMem),
+    /// A device mapping.
+    Device(&'a dyn Mappable),
+}
+
+/// A trait that describes memory mapping behavior for special files (in `mmap`).
+pub trait Mappable {
+    /// Fills the memory region to map with `handle`.
+    ///
+    /// `offset` specifies the file offset, which must be page-aligned.
+    fn map(&self, offset: usize, handle: MapHandle) -> Box<dyn MappedObject>;
+}
+
+/// A trait that describes memory mapping behavior for special files (after `mmap`).
+pub trait MappedObject: Send + Sync + Debug {
+    /// Duplicates the memory mapping at the specific offset.
+    ///
+    /// `offset` specifies the memory address offset within the mapping, which must be smaller than
+    /// the mapping size and page-aligned.
+    fn dup_at_offset(&self, offset: usize) -> Box<dyn MappedObject>;
+
+    /// Handles the page fault.
+    ///
+    /// `offset` specifies the memory address offset within the mapping, which must be smaller than
+    /// the mapping size and page-aligned.
+    fn handle_page_fault(&self, _offset: usize, _handle: MapHandle) -> Result<()> {
+        return_errno_with_message!(
+            Errno::EFAULT,
+            "device memory page faults cannot be resolved"
+        );
+    }
+}
+
+impl dyn MappedObject {
+    /// Duplicates the memory mapping.
+    pub(crate) fn dup(&self) -> Box<dyn MappedObject> {
+        self.dup_at_offset(0)
+    }
+}
+
+/// Specifies the extent of a file synchronization operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncMode {
+    /// Synchronizes file data and the metadata required to retrieve it.
+    Data,
+    /// Synchronizes file data and all associated metadata.
+    Full,
 }

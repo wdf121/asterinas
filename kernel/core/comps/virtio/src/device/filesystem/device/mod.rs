@@ -34,7 +34,10 @@ use waiter::{FuseWaiter, ReplyBufs};
 
 pub use self::session::{AttrVersion, FuseSession};
 use crate::{
-    device::filesystem::pool::{FuseDataBuf, FuseReplyBuf, FuseRequestBuf, SizeClassedDmaPool},
+    device::filesystem::{
+        pool,
+        pool::{FuseDataBuf, FuseReplyBuf, FuseRequestBuf, VirtiofsDmaPool},
+    },
     transport::DeviceTransport,
 };
 
@@ -52,8 +55,8 @@ pub struct FileSystemDevice {
     transport: SpinLock<DeviceTransport, LocalIrqDisabled>,
     hiprio_queue: Arc<FsRequestQueue>,
     request_queues: Vec<Arc<FsRequestQueue>>,
-    to_device_pool: Arc<SizeClassedDmaPool<ToDevice>>,
-    from_device_pool: Arc<SizeClassedDmaPool<FromDevice>>,
+    to_device_pool: VirtiofsDmaPool<ToDevice>,
+    from_device_pool: VirtiofsDmaPool<FromDevice>,
     next_unique: AtomicU64,
     tag: String,
     notify_supported: bool,
@@ -67,12 +70,14 @@ impl FileSystemDevice {
         tag: String,
         notify_supported: bool,
     ) -> Self {
+        let (to_device_arena_pool, from_device_arena_pool) = pool::dma_arena_pools_singleton();
+
         Self {
             transport: SpinLock::new(transport),
             hiprio_queue,
             request_queues,
-            to_device_pool: SizeClassedDmaPool::new(),
-            from_device_pool: SizeClassedDmaPool::new(),
+            to_device_pool: VirtiofsDmaPool::new(to_device_arena_pool),
+            from_device_pool: VirtiofsDmaPool::new(from_device_arena_pool),
             // Start request IDs at 1 and keep 0 unused. In FUSE,
             // `unique == 0` is reserved for unsolicited notification messages
             // rather than ordinary request/reply matching.
@@ -121,6 +126,7 @@ impl FileSystemDevice {
         complete_fn: Option<FuseCompleteFn>,
     ) -> Result<FuseRequest, FuseError> {
         let unique = self.alloc_unique();
+        let reply_expectation = operation.reply_expectation();
 
         let data_buf_len = match data_buf.as_ref() {
             Some(FuseDataBuf::Write(data_buf)) => data_buf.len(),
@@ -133,12 +139,12 @@ impl FileSystemDevice {
         let (request_bufs, reply_bufs) = match data_buf {
             Some(FuseDataBuf::Read(data_buf)) => (
                 smallvec![request_buf],
-                self.alloc_reply_bufs(operation.reply_expectation(), Some(data_buf))?,
+                self.alloc_reply_bufs(reply_expectation, Some(data_buf))?,
             ),
             Some(FuseDataBuf::Write(data_buf)) => {
                 data_buf.sync_to_device().unwrap();
 
-                let reply_bufs = self.alloc_reply_bufs(operation.reply_expectation(), None)?;
+                let reply_bufs = self.alloc_reply_bufs(reply_expectation, None)?;
                 if reply_bufs.header().is_none() {
                     return Err(FuseError::MalformedResponse);
                 }
@@ -146,7 +152,7 @@ impl FileSystemDevice {
                 (smallvec![request_buf, data_buf], reply_bufs)
             }
             None => {
-                let reply_bufs = self.alloc_reply_bufs(operation.reply_expectation(), None)?;
+                let reply_bufs = self.alloc_reply_bufs(reply_expectation, None)?;
 
                 (smallvec![request_buf], reply_bufs)
             }
@@ -155,6 +161,7 @@ impl FileSystemDevice {
         Ok(FuseRequest::new(
             unique,
             nodeid,
+            reply_expectation,
             request_bufs,
             reply_bufs,
             complete_fn,
@@ -226,11 +233,19 @@ impl FileSystemDevice {
             (ReplyExpectation::HeaderOnly, None) => {
                 Ok(ReplyBufs::new_header_only(self.alloc_reply_header_buf()?))
             }
-            (ReplyExpectation::Payload(payload_size), None) => Ok(ReplyBufs::new_with_payload(
+            (
+                ReplyExpectation::FixedPayload(payload_size)
+                | ReplyExpectation::VariablePayload(payload_size),
+                None,
+            ) => Ok(ReplyBufs::new_with_payload(
                 self.alloc_reply_header_buf()?,
                 self.alloc_reply_payload_buf(payload_size.get())?,
             )),
-            (ReplyExpectation::Payload(payload_size), Some(data_buf)) => {
+            (
+                ReplyExpectation::FixedPayload(payload_size)
+                | ReplyExpectation::VariablePayload(payload_size),
+                Some(data_buf),
+            ) => {
                 if payload_size.get() > data_buf.len() {
                     return Err(FuseError::BufferTooSmall);
                 }

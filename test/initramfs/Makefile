@@ -6,6 +6,7 @@ VERBOSE ?= 1
 ENABLE_CONFORMANCE_TEST ?= false
 CONFORMANCE_TEST_SUITE ?= ltp
 CONFORMANCE_TEST_WORKDIR ?= /tmp
+CONFORMANCE_TEST_SELECTOR ?=
 ENABLE_REGRESSION_TEST ?= false
 # Specify platform macros when building regression tests (supported: asterinas, linux).
 # - asterinas: Define both `__asterinas__` and `__linux__`. Tests may fail in Linux.
@@ -63,8 +64,10 @@ BOOT_IMAGE_NIX_ARGS := \
 	--arg enableConformanceTest $(ENABLE_CONFORMANCE_TEST) \
 	--arg enableRegressionTest $(ENABLE_REGRESSION_TEST) \
 	--arg enableTdxAttest $(ENABLE_TDX_ATTEST) \
+	--argstr benchmarkName $(BENCHMARK) \
 	--argstr conformanceTestSuite $(CONFORMANCE_TEST_SUITE) \
 	--argstr conformanceTestWorkDir $(CONFORMANCE_TEST_WORKDIR) \
+	--argstr conformanceTestSelector "$(CONFORMANCE_TEST_SELECTOR)" \
 	--argstr regressionTestPlatform $(REGRESSION_TEST_PLATFORM) \
 	--argstr dnsServer ${DNS_SERVER} \
 	--arg smp $(SMP)
@@ -219,12 +222,12 @@ $(XFSTESTS_SCRATCH_IMAGE):
 .PHONY: format
 format:
 	@$(MAKE) --no-print-directory -C src/regression format
-	@nixfmt nix
+	@../../tools/nixfmt.sh nix
 
 .PHONY: check
 check:
 	@$(MAKE) --no-print-directory -C src/regression check
-	@nixfmt --check nix
+	@../../tools/nixfmt.sh --check nix
 
 .PHONY: clean
 clean:

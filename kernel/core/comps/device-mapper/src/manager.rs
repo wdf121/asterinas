@@ -79,7 +79,7 @@ impl RuntimeRenameReservation<'_> {
         if let Some(uuid) = device.uuid() {
             inner.name_by_uuid.insert(uuid, self.new_name.clone());
         }
-        device.rename(self.new_name.clone());
+        device.rename_mapper(self.new_name.clone());
         inner.by_name.insert(self.new_name.clone(), device);
         self.committed = true;
     }
@@ -263,7 +263,7 @@ impl DmManager {
         if let Some(uuid) = device.uuid() {
             inner.name_by_uuid.insert(uuid, String::from(new_name));
         }
-        device.rename(String::from(new_name));
+        device.rename_mapper(String::from(new_name));
         inner.by_name.insert(String::from(new_name), device);
         Ok(())
     }
@@ -374,7 +374,8 @@ mod tests {
         assert!(manager.lookup_name("dm-old").is_none());
         assert_eq!(manager.lookup_name("dm-new").unwrap().id(), device.id());
         assert_eq!(manager.lookup_uuid("dm-uuid").unwrap().id(), device.id());
-        assert_eq!(device.name(), "dm-new");
+        assert_eq!(device.mapper_name(), "dm-new");
+        assert_eq!(BlockDevice::name(device.as_ref()), "dm-0");
     }
 
     #[ktest]
@@ -408,7 +409,7 @@ mod tests {
             manager.lookup_uuid("dm-reservation-uuid").unwrap().id(),
             device.id()
         );
-        assert_eq!(device.name(), "dm-reservation-new");
+        assert_eq!(device.mapper_name(), "dm-reservation-new");
     }
 
     #[ktest]
@@ -428,7 +429,7 @@ mod tests {
             device.id()
         );
         assert!(manager.lookup_name("dm-reservation-new").is_none());
-        assert_eq!(device.name(), "dm-reservation-old");
+        assert_eq!(device.mapper_name(), "dm-reservation-old");
         assert!(
             manager
                 .create("dm-reservation-new".to_string(), None, None)
@@ -455,7 +456,7 @@ mod tests {
         assert!(manager.lookup_uuid("old-uuid").is_none());
         assert_eq!(manager.lookup_uuid("new-uuid").unwrap().id(), id);
         assert_eq!(manager.lookup_name("dm-uuid-device").unwrap().id(), id);
-        assert_eq!(device.name(), "dm-uuid-device");
+        assert_eq!(device.mapper_name(), "dm-uuid-device");
         assert_eq!(device.uuid().unwrap(), "new-uuid");
     }
 

@@ -70,7 +70,7 @@ impl<'a> MapperRuntimeCoordinator<'a> {
     where
         F: FnOnce(DeviceId, &str) -> Result<()>,
     {
-        let name = device.name();
+        let name = device.mapper_name();
         let activation = device.begin_initial_resume().map_err(map_dm_error)?;
         publish_alias(device.id(), &name)?;
         activation.commit();
@@ -96,7 +96,7 @@ impl<'a> MapperRuntimeCoordinator<'a> {
     where
         F: FnOnce(DeviceId, &str, &str) -> Result<()>,
     {
-        let old_name = device.name();
+        let old_name = device.mapper_name();
         if new_name == old_name {
             return Err(Error::with_message(
                 Errno::EBUSY,
@@ -119,7 +119,7 @@ impl<'a> MapperRuntimeCoordinator<'a> {
     /// state; this method must not remove the mapper from `DmManager` itself.
     pub(super) fn unregister_if_registered(&self, device: &DmDevice) -> Result<()> {
         if self.is_registered(device) {
-            let name = device.name();
+            let name = device.mapper_name();
             unregister_block_mapper(device.id(), &name)?;
         }
         Ok(())

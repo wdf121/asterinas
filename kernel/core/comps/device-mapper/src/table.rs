@@ -334,7 +334,7 @@ fn complete_zero_bio(bio: SubmittedBio) {
     // because the target's visible contents are permanently zero.
     if bio.type_() == BioType::Read {
         for segment in bio.segments() {
-            let mut writer = segment.inner_dma_slice().writer().unwrap();
+            let mut writer = segment.dma_slice().writer().unwrap();
             let written = writer.fill_zeros(segment.nbytes());
             debug_assert_eq!(written, segment.nbytes());
         }
@@ -531,8 +531,8 @@ mod tests {
             }
         }
 
-        fn name(&self) -> String {
-            String::from("dm-table-test")
+        fn name(&self) -> &str {
+            "dm-table-test"
         }
 
         fn id(&self) -> DeviceId {
@@ -586,8 +586,8 @@ mod tests {
             }
         }
 
-        fn name(&self) -> String {
-            String::from("dm-table-deferred-test")
+        fn name(&self) -> &str {
+            "dm-table-deferred-test"
         }
 
         fn id(&self) -> DeviceId {
@@ -1246,10 +1246,7 @@ mod tests {
             BioStatus::Complete
         );
         let mut buffer = [0xffu8; 512];
-        read_segment
-            .inner_dma_slice()
-            .read_bytes(0, &mut buffer)
-            .unwrap();
+        read_segment.dma_slice().read_bytes(0, &mut buffer).unwrap();
         assert!(buffer.iter().all(|byte| *byte == 0));
         assert_eq!(
             write.submit_and_wait(&TableDevice(table)).unwrap(),
@@ -1806,8 +1803,8 @@ mod tests {
             self.0.metadata()
         }
 
-        fn name(&self) -> String {
-            String::from("dm-table-wrapper")
+        fn name(&self) -> &str {
+            "dm-table-wrapper"
         }
 
         fn id(&self) -> DeviceId {

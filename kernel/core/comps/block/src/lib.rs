@@ -49,12 +49,7 @@ pub mod request_queue;
 
 use ::device_id::DeviceId;
 use component::{ComponentInitError, init_component};
-pub use device_id::{
-    EXTENDED_DEVICE_ID_ALLOCATOR, MajorIdOwner, acquire_major, acquire_major_with_name,
-    allocate_major, allocate_major_with_name, major_devices,
-};
 use ostd::sync::Mutex;
-pub use partition::{PartitionInfo, PartitionNode};
 
 #[derive(Debug)]
 struct RegisteredBlockDevice {
@@ -213,9 +208,23 @@ use self::{
     bio::{BioEnqueueError, SubmittedBio},
     prelude::*,
 };
+pub use self::{
+    device_id::{
+        MAX_MAJOR, MajorIdOwner, acquire_major, acquire_major_with_name, allocate_major,
+        allocate_major_with_name, major_devices,
+    },
+    partition::PartitionManager,
+};
 
 pub const BLOCK_SIZE: usize = ostd::mm::PAGE_SIZE;
 pub const SECTOR_SIZE: usize = 512;
+
+/// The number of minor device numbers allocated for each whole-disk device,
+/// including the whole disk and its partitions.
+///
+/// If a disk has more than 16 partitions, we will allocate device IDs for
+/// remaining partitions via `EXTENDED_DEVICE_ID_ALLOCATOR`.
+pub const DEVICE_MINORS: u32 = 16;
 
 pub trait BlockDevice: Send + Sync + Any + Debug {
     /// Enqueues a new `SubmittedBio` to the block device.
@@ -225,7 +234,7 @@ pub trait BlockDevice: Send + Sync + Any + Debug {
     fn metadata(&self) -> BlockDeviceMeta;
 
     /// Returns the name of the block device.
-    fn name(&self) -> String;
+    fn name(&self) -> &str;
 
     /// Returns the device ID of the block device.
     fn id(&self) -> DeviceId;
@@ -235,11 +244,12 @@ pub trait BlockDevice: Send + Sync + Any + Debug {
         false
     }
 
-    /// Sets the partitions of the block device.
-    fn set_partitions(&self, _infos: Vec<Option<PartitionInfo>>) {}
-
-    /// Returns the partitions of the block device.
-    fn partitions(&self) -> Option<Vec<Arc<dyn BlockDevice>>> {
+    /// Returns the partition manager of the block device.
+    ///
+    /// Whole-disk devices return their manager, which owns the device's
+    /// partitions. Partition devices and devices without partition support
+    /// return `None`.
+    fn partition_manager(&self) -> Option<&PartitionManager> {
         None
     }
 }
@@ -269,9 +279,9 @@ pub enum Error {
     NotFound,
     /// Invalid arguments
     InvalidArgs,
-    /// Id Acquired
+    /// ID acquired
     IdAcquired,
-    /// Id Exhausted
+    /// ID exhausted
     IdExhausted,
     /// The device is in use or transitioning between lifecycle states.
     Busy,
@@ -465,11 +475,15 @@ pub fn scan_partitions() {
             continue;
         }
 
-        let Some(partition_info) = partition::parse(&device) else {
+        let Some(partition_manager) = device.partition_manager() else {
             continue;
         };
 
-        device.set_partitions(partition_info);
+        let Some(partition_infos) = partition::parse(&device) else {
+            continue;
+        };
+
+        partition_manager.update(&device, partition_infos);
     }
 }
 
@@ -526,8 +540,8 @@ mod tests {
             BlockDeviceMeta::default()
         }
 
-        fn name(&self) -> String {
-            String::from("block-registry-test")
+        fn name(&self) -> &str {
+            "block-registry-test"
         }
 
         fn id(&self) -> DeviceId {
@@ -559,8 +573,8 @@ mod tests {
             BlockDeviceMeta::default()
         }
 
-        fn name(&self) -> String {
-            String::from("block-registry-reentrant-id-test")
+        fn name(&self) -> &str {
+            "block-registry-reentrant-id-test"
         }
 
         fn id(&self) -> DeviceId {

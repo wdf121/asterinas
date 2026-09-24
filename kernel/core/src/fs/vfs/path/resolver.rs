@@ -267,14 +267,18 @@ impl PathResolver {
                 return current.name();
             }
 
-            let Some(parent) = current.mount_node().parent() else {
+            let Some(parent) = current
+                .mount_node()
+                .parent()
+                .and_then(|parent| parent.upgrade())
+            else {
                 return current.name();
             };
             let Some(mountpoint) = current.mount_node().mountpoint() else {
                 return current.name();
             };
 
-            owned = Path::new(parent.upgrade().unwrap(), mountpoint);
+            owned = Path::new(parent, mountpoint);
             current = &owned;
         }
     }
@@ -314,7 +318,7 @@ impl PathResolver {
             let parent = current.mount.parent()?;
             let mountpoint = current.mount.mountpoint()?;
 
-            owned = Path::new(parent.upgrade().unwrap(), mountpoint);
+            owned = Path::new(parent.upgrade()?, mountpoint);
             current = &owned;
         }
     }
@@ -381,7 +385,7 @@ impl PathResolver {
         new_root_mount.graft_mount_tree(&parent_path, &mut topology_guard);
         drop(topology_guard);
 
-        let new_root = Path::new_fs_root(new_root_mount);
+        let new_root = Path::new_root(new_root_mount);
         self.root = new_root.clone();
         self.cwd = new_root;
     }

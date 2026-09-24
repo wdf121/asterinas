@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 
 use align_ext::AlignExt;
 use aster_util::mem_obj_slice::Slice;
-use bitvec::array::BitArray;
+use dma_pool::{DmaArenaPool, DmaBuffer};
 use int_to_c_enum::TryFromInt;
 use io_util::{
     IoError,
@@ -14,7 +14,7 @@ use ostd::{
     Error,
     mm::{
         HasSize, Infallible, USegment, VmReader, VmWriter,
-        dma::DmaStream,
+        dma::{DmaStream, FromAndToDevice},
         io::util::{HasVmReaderWriter, VmReaderWriterResult},
     },
     sync::{LocalIrqDisabled, SpinLock, WaitQueue},
@@ -49,7 +49,7 @@ impl Bio {
     /// Constructs a new `Bio`.
     ///
     /// The `type_` describes the type of the I/O.
-    /// The `start_sid` is the starting sector id on the device.
+    /// The `start_sid` is the starting sector ID on the device.
     /// The `segments` describes the memory segments.
     /// The `complete_fn` is the optional callback function that will be invoked
     /// when the I/O is completed, receiving the final `BioStatus`.
@@ -262,7 +262,7 @@ impl From<BioEnqueueError> for Error {
 
 /// A submitted `Bio` object.
 ///
-/// The request queue of block device only accepts a `SubmittedBio` into the queue.
+/// The request queue of a block device only accepts `SubmittedBio`s into the queue.
 pub struct SubmittedBio {
     metadata: Arc<BioMetadata>,
     current_sid_range: Range<Sid>,
@@ -568,7 +568,7 @@ fn sectors_to_bytes(sectors: u64) -> Result<usize, BioEnqueueError> {
 struct BioMetadata {
     /// The type of the I/O
     type_: BioType,
-    /// The logical range of target sectors on device
+    /// The logical range of target sectors on the device
     sid_range: Range<Sid>,
     /// The I/O status
     status: AtomicU32,
@@ -577,15 +577,15 @@ struct BioMetadata {
 }
 
 impl BioMetadata {
-    pub fn type_(&self) -> BioType {
+    fn type_(&self) -> BioType {
         self.type_
     }
 
-    pub fn sid_range(&self) -> &Range<Sid> {
+    fn sid_range(&self) -> &Range<Sid> {
         &self.sid_range
     }
 
-    pub fn status(&self) -> BioStatus {
+    fn status(&self) -> BioStatus {
         BioStatus::try_from(self.status.load(Ordering::Acquire)).unwrap()
     }
 }
@@ -677,10 +677,8 @@ pub struct BioSegment {
 struct BioSegmentInner {
     /// Internal DMA slice.
     // TODO: The direction is currently `FromAndToDevice`. Implement compile-time checking.
-    dma_slice: Slice<Arc<DmaStream>>,
+    storage: Slice<Arc<DmaBuffer<FromAndToDevice>>>,
     direction: BioDirection,
-    /// Whether the segment is allocated from the pool.
-    from_pool: bool,
 }
 
 /// The direction of a bio request.
@@ -739,9 +737,11 @@ impl BioSegment {
             .unwrap_or_else(|| {
                 let dma_stream = DmaStream::alloc_uninit(nblocks, false).unwrap();
                 BioSegmentInner {
-                    dma_slice: Slice::new(Arc::new(dma_stream), offset..offset + len),
+                    storage: Slice::new(
+                        Arc::new(DmaBuffer::Direct(dma_stream)),
+                        offset..offset + len,
+                    ),
                     direction,
-                    from_pool: false,
                 }
             });
 
@@ -761,16 +761,15 @@ impl BioSegment {
         let dma_stream = DmaStream::map(segment, false).unwrap();
         Self {
             inner: Arc::new(BioSegmentInner {
-                dma_slice: Slice::new(Arc::new(dma_stream), 0..len),
+                storage: Slice::new(Arc::new(DmaBuffer::Direct(dma_stream)), 0..len),
                 direction,
-                from_pool: false,
             }),
         }
     }
 
     /// Returns the number of bytes.
     pub fn nbytes(&self) -> usize {
-        self.inner.dma_slice.size()
+        self.inner.dma_slice().size()
     }
 
     /// Returns the number of sectors.
@@ -785,12 +784,12 @@ impl BioSegment {
 
     /// Returns the offset (in bytes) within the first block.
     pub fn offset_within_first_block(&self) -> usize {
-        self.inner.dma_slice.offset().start % BLOCK_SIZE
+        self.inner.dma_slice().offset().start % BLOCK_SIZE
     }
 
-    /// Returns the inner DMA slice.
-    pub fn inner_dma_slice(&self) -> &Slice<Arc<DmaStream>> {
-        &self.inner.dma_slice
+    /// Returns the DMA slice.
+    pub fn dma_slice(&self) -> &Slice<Arc<DmaBuffer<FromAndToDevice>>> {
+        self.inner.dma_slice()
     }
 
     fn slice(&self, range: Range<usize>) -> Self {
@@ -800,19 +799,10 @@ impl BioSegment {
         }
         Self {
             inner: Arc::new(BioSegmentInner {
-                dma_slice: self.inner.dma_slice.slice(range),
+                storage: self.inner.dma_slice().slice(range),
                 direction: self.inner.direction,
-                from_pool: false,
             }),
         }
-    }
-
-    /// Returns the inner DMA object.
-    ///
-    /// Note that the slicing will be ignored. This is only for testing.
-    #[cfg(ktest)]
-    pub fn inner_dma(&self) -> &Arc<DmaStream> {
-        self.inner.dma_slice.mem_obj()
     }
 }
 
@@ -823,57 +813,30 @@ impl HasVmReaderWriter for BioSegment {
         if self.inner.direction != BioDirection::FromDevice {
             return Err(Error::AccessDenied);
         }
-        self.inner.dma_slice.reader()
+        self.inner.dma_slice().reader()
     }
 
     fn writer(&self) -> Result<VmWriter<'_, Infallible>, Error> {
         if self.inner.direction != BioDirection::ToDevice {
             return Err(Error::AccessDenied);
         }
-        self.inner.dma_slice.writer()
-    }
-}
-
-// The timing for free the segment to the pool.
-impl Drop for BioSegmentInner {
-    fn drop(&mut self) {
-        if !self.from_pool {
-            return;
-        }
-        if let Some(pool) = target_pool(self.direction()) {
-            pool.free(self);
-        }
+        self.inner.dma_slice().writer()
     }
 }
 
 impl BioSegmentInner {
-    /// Returns the bio direction.
-    fn direction(&self) -> BioDirection {
-        self.direction
+    fn dma_slice(&self) -> &Slice<Arc<DmaBuffer<FromAndToDevice>>> {
+        &self.storage
     }
 }
 
-/// A pool of managing segments for block I/O requests.
-///
-/// Inside the pool, it's a large chunk of `DmaStream` which
-/// contains the mapped segment. The allocation/free is done by slicing
-/// the `DmaStream`.
-// TODO: Use a more advanced allocation algorithm to replace the naive one to improve efficiency.
+/// A BIO-specific wrapper around a shared DMA arena.
+//
+// TODO: Replace this wrapper with `DmaArenaPool` directly once the BIO
+// direction and block-oriented allocation API can be represented there.
 struct BioSegmentPool {
-    pool: Arc<DmaStream>,
-    total_blocks: usize,
+    arena_pool: Arc<DmaArenaPool<FromAndToDevice>>,
     direction: BioDirection,
-    manager: SpinLock<PoolSlotManager, LocalIrqDisabled>,
-}
-
-/// Manages the free slots in the pool.
-struct PoolSlotManager {
-    /// A bit array to manage the occupied slots in the pool (Bit
-    /// value 1 represents "occupied"; 0 represents "free").
-    /// The total size is currently determined by `POOL_DEFAULT_NBLOCKS`.
-    occupied: BitArray<[u8; POOL_DEFAULT_NBLOCKS.div_ceil(8)]>,
-    /// The first index of all free slots in the pool.
-    min_free: usize,
 }
 
 impl BioSegmentPool {
@@ -881,19 +844,10 @@ impl BioSegmentPool {
     /// managed blocks is currently set to `POOL_DEFAULT_NBLOCKS`.
     ///
     /// The new pool will be allocated and mapped for later allocation.
-    pub fn new(direction: BioDirection) -> Self {
-        let total_blocks = POOL_DEFAULT_NBLOCKS;
-        let pool = DmaStream::alloc_uninit(total_blocks, false).unwrap();
-        let manager = SpinLock::new(PoolSlotManager {
-            occupied: BitArray::ZERO,
-            min_free: 0,
-        });
-
+    fn new(direction: BioDirection) -> Self {
         Self {
-            pool: Arc::new(pool),
-            total_blocks,
+            arena_pool: DmaArenaPool::new(POOL_DEFAULT_NBLOCKS).unwrap(),
             direction,
-            manager,
         }
     }
 
@@ -912,7 +866,7 @@ impl BioSegmentPool {
     ///
     /// If the `offset_within_first_block` exceeds the block size, or the `len`
     /// exceeds the total length, this method will panic.
-    pub fn alloc(
+    fn alloc(
         &self,
         nblocks: usize,
         offset_within_first_block: usize,
@@ -922,75 +876,15 @@ impl BioSegmentPool {
             offset_within_first_block < BLOCK_SIZE
                 && offset_within_first_block + len <= nblocks * BLOCK_SIZE
         );
-        let mut manager = self.manager.lock();
-        if nblocks > self.total_blocks - manager.min_free {
-            return None;
-        }
 
-        // Find the free range
-        let (start, end) = {
-            let mut start = manager.min_free;
-            let mut end = start;
-            while end < self.total_blocks && end - start < nblocks {
-                if manager.occupied[end] {
-                    start = end + 1;
-                    end = start;
-                } else {
-                    end += 1;
-                }
-            }
-            if end - start < nblocks {
-                return None;
-            }
-            (start, end)
-        };
-
-        manager.occupied[start..end].fill(true);
-        manager.min_free = manager.occupied[end..]
-            .iter()
-            .position(|i| !i)
-            .map(|pos| end + pos)
-            .unwrap_or(self.total_blocks);
-
-        let dma_slice = {
-            let offset = start * BLOCK_SIZE + offset_within_first_block;
-            Slice::new(self.pool.clone(), offset..offset + len)
-        };
-        let bio_segment = BioSegmentInner {
-            dma_slice,
+        let arena = self.arena_pool.alloc(nblocks)?;
+        Some(BioSegmentInner {
+            storage: Slice::new(
+                Arc::new(DmaBuffer::Arena(arena)),
+                offset_within_first_block..offset_within_first_block + len,
+            ),
             direction: self.direction,
-            from_pool: true,
-        };
-        Some(bio_segment)
-    }
-
-    /// Returns an allocated bio segment to the pool,
-    /// free the space. This method is not public and should only
-    /// be called automatically by `BioSegmentInner::drop()`.
-    ///
-    /// # Panics
-    ///
-    /// If the target bio segment is not allocated from the pool
-    /// or not the same direction, this method will panic.
-    fn free(&self, bio_segment: &BioSegmentInner) {
-        assert!(bio_segment.from_pool && bio_segment.direction() == self.direction);
-        let (start, end) = {
-            let dma_slice = &bio_segment.dma_slice;
-            let start = dma_slice.offset().start.align_down(BLOCK_SIZE) / BLOCK_SIZE;
-            let end = dma_slice.offset().end.align_up(BLOCK_SIZE) / BLOCK_SIZE;
-
-            if end <= start || end > self.total_blocks {
-                return;
-            }
-            (start, end)
-        };
-
-        let mut manager = self.manager.lock();
-        debug_assert!(manager.occupied[start..end].iter().all(|i| *i));
-        manager.occupied[start..end].fill(false);
-        if start < manager.min_free {
-            manager.min_free = start;
-        }
+        })
     }
 }
 
@@ -1016,7 +910,7 @@ fn target_pool(direction: BioDirection) -> Option<&'static Arc<BioSegmentPool>> 
 }
 
 /// Checks if the given offset is aligned to sector.
-pub fn is_sector_aligned(offset: usize) -> bool {
+pub(crate) fn is_sector_aligned(offset: usize) -> bool {
     offset.is_multiple_of(SECTOR_SIZE)
 }
 

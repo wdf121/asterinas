@@ -63,14 +63,9 @@ impl Inode {
     }
 
     /// Removes an empty sub-directory.
-    pub(in ext2) fn rmdir(&self, name: &str) -> Result<()> {
-        let entry_info = {
-            let parent_inner = self.inner.read();
-            parent_inner.find_entry_info(name)?
-        };
+    pub(in ext2) fn rmdir(&self, name: &str, child: &Inode) -> Result<()> {
         let fs = self.fs()?;
-        let child = fs.read_inode(entry_info.ino)?;
-        let lock_targets = [self, child.as_ref()];
+        let lock_targets = [self, child];
 
         // The `DirDentry.children` lock in the VFS layer keeps the parent
         // directory entry stable during this operation, so we only need to
@@ -89,11 +84,14 @@ impl Inode {
         child_inner.dec_link_count(2);
 
         if child_inner.link_count() == 0 {
-            child_inner.write_back_inode_desc(&fs, entry_info.ino)?;
-            let _ = fs.remove_inode(entry_info.ino);
+            child_inner.write_back_inode_desc(&fs, child.ino())?;
+            let _ = fs.remove_inode(child.ino());
         }
 
         let parent_inner = guards.inner_mut(self.ino());
+
+        let entry_info = parent_inner.find_entry_info(name)?;
+        debug_assert_eq!(entry_info.ino, child.ino);
 
         parent_inner.delete_entry(&entry_info)?;
         parent_inner.dec_link_count(1);
@@ -103,26 +101,36 @@ impl Inode {
     }
 
     /// Creates a child inode and directory entry under this directory.
+    ///
+    /// To create a symbolic link, use [`Inode::create_symlink`] instead.
     pub(in ext2) fn create(
         &self,
         name: &str,
         type_: InodeType,
         perm: FilePerm,
     ) -> Result<Arc<Inode>> {
-        if !matches!(
-            type_,
-            InodeType::File
-                | InodeType::Dir
-                | InodeType::SymLink
-                | InodeType::CharDevice
-                | InodeType::BlockDevice
-                | InodeType::NamedPipe
-                | InodeType::Socket
-        ) {
+        if matches!(type_, InodeType::Unknown | InodeType::SymLink) {
             return_errno!(Errno::EINVAL);
         }
 
-        let is_dir = type_ == InodeType::Dir;
+        self.create_initialized_child(name, type_, perm, |fs, child| {
+            if type_ == InodeType::Dir {
+                let child_ino = child.ino();
+                let mut child_inner = child.inner.write();
+                child_inner.make_empty(fs, child_ino, self.ino)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Creates a child inode, initializes it, and publishes its directory entry.
+    pub(super) fn create_initialized_child(
+        &self,
+        name: &str,
+        type_: InodeType,
+        perm: FilePerm,
+        init_child_fn: impl FnOnce(&Arc<Ext2>, &Inode) -> Result<()>,
+    ) -> Result<Arc<Inode>> {
         let dir_entry_file_type = DirEntryFileType::from(type_);
 
         // Find a slot before creating the child inode to avoid wasting
@@ -143,16 +151,8 @@ impl Inode {
         // from Inode desc and then insert it into inode cache.
         let child = fs.create_inode(self.ino, type_, perm)?;
         let child_ino = child.ino();
-
-        let result = if is_dir {
-            child
-                .inner
-                .write()
-                .make_empty(&fs, child_ino, self.ino)
-                .and_then(|_| parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type))
-        } else {
-            parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type)
-        };
+        let result = init_child_fn(&fs, &child)
+            .and_then(|_| parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type));
 
         if let Err(err) = result {
             // Clear the link count so other resources are reclaimed by `Drop`.
@@ -162,7 +162,7 @@ impl Inode {
         }
 
         // Link the child dir's `..` to parent dir.
-        if is_dir {
+        if type_ == InodeType::Dir {
             parent_inner.inc_link_count(1);
         }
         parent_inner.set_mtime_ctime(utils::now());
@@ -196,19 +196,14 @@ impl Inode {
     }
 
     /// Removes a non-directory entry from this directory.
-    pub(in ext2) fn unlink(&self, name: &str) -> Result<()> {
-        let entry_info = {
-            let parent_inner = self.inner.read();
-            parent_inner.find_entry_info(name)?
-        };
+    pub(in ext2) fn unlink(&self, name: &str, child: &Inode) -> Result<()> {
         let fs = self.fs()?;
-        let child = fs.read_inode(entry_info.ino)?;
 
         // The `DirDentry.children` lock in the VFS layer keeps the parent
         // directory entry stable during this operation, so we only need to
         // lock all related inodes in order, without rechecking the lookup
         // result.
-        let lock_targets = [self, child.as_ref()];
+        let lock_targets = [self, child];
         let mut guards = MultiInodeInnerGuards::lock(&lock_targets);
 
         let child_inner = guards.inner_mut(child.ino());
@@ -217,6 +212,10 @@ impl Inode {
         }
 
         let parent_inner = guards.inner_mut(self.ino());
+
+        let entry_info = parent_inner.find_entry_info(name)?;
+        debug_assert_eq!(entry_info.ino, child.ino);
+
         parent_inner.delete_entry(&entry_info)?;
         parent_inner.set_mtime_ctime(utils::now());
 
@@ -225,8 +224,8 @@ impl Inode {
         child_inner.set_ctime(utils::now());
         child_inner.dec_link_count(1);
         if child_inner.link_count() == 0 {
-            child_inner.write_back_inode_desc(&fs, entry_info.ino)?;
-            let _ = fs.remove_inode(entry_info.ino);
+            child_inner.write_back_inode_desc(&fs, child.ino())?;
+            let _ = fs.remove_inode(child.ino());
         }
         Ok(())
     }
@@ -797,7 +796,7 @@ mod test {
         old.write_direct_at(0, &mut payload_reader).unwrap();
 
         let free_blocks_before = f.ext2.super_block().free_blocks_count();
-        root.unlink("old").unwrap();
+        root.unlink("old", old.as_ref()).unwrap();
         assert_errno!(f.ext2.read_inode(old_ino), Errno::ESTALE);
         assert!(
             f.ext2

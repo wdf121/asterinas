@@ -658,8 +658,8 @@ mod tests {
             }
         }
 
-        fn name(&self) -> String {
-            String::from("striped-test")
+        fn name(&self) -> &str {
+            "striped-test"
         }
 
         fn id(&self) -> DeviceId {

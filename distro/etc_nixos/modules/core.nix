@@ -1,4 +1,10 @@
-{ config, lib, pkgs, options, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  options,
+  ...
+}:
 let
   kernel = builtins.path {
     name = "asterinas-osdk-bin";
@@ -40,7 +46,13 @@ let
       exit 1
     fi
 
-    mkdir /sysroot
+    mkdir -p /dev
+    mount -t devtmpfs devtmpfs /dev
+    mkdir -p /dev/pts
+    mount -t devpts devpts /dev/pts
+    chmod 0666 /dev/pts/ptmx
+    ln -s pts/ptmx /dev/ptmx
+    mkdir -p /sysroot
     mount -t ext2 "$NEW_ROOT" /sysroot
     mount -t proc none /sysroot/proc
     mount --move /dev /sysroot/dev
@@ -60,7 +72,8 @@ let
       }
     ];
   };
-in {
+in
+{
   boot.loader.grub.enable = true;
   boot.loader.grub.configurationLimit = 1;
   boot.loader.grub.efiSupport = true;
@@ -77,9 +90,11 @@ in {
   '';
   # Suppress error and warning messages of systemd.
   # TODO: Fix errors and warnings from systemd and remove this setting.
-  environment.sessionVariables = { SYSTEMD_LOG_LEVEL = "crit"; };
+  environment.sessionVariables = {
+    SYSTEMD_LOG_LEVEL = "crit";
+  };
   system.systemBuilderCommands = ''
-    echo "PATH=/bin:/nix/var/nix/profiles/system/sw/bin earlycon loglevel=${config.aster_nixos.log-level} console=${config.aster_nixos.console} -- root=/dev/vda2 init=/nix/var/nix/profiles/system/init rd.break=${
+    echo "PATH=/bin:/nix/var/nix/profiles/system/sw/bin earlycon loglevel=${config.aster_nixos.log-level} console=${config.aster_nixos.console} systemd.getty_auto=no -- root=/dev/vda2 init=/nix/var/nix/profiles/system/init rd.break=${
       if config.aster_nixos.break-into-stage-1-shell then "1" else "0"
     }"  > $out/kernel-params
     sed -i 's_^\([[:space:]]*\)\(exec > >(tee -i /run/log/stage-2-init.log) 2>&1\)$_\1# \2_' $out/init
@@ -92,8 +107,12 @@ in {
   '';
   system.activationScripts.modprobe = lib.mkForce "";
 
-  nix.nixPath = options.nix.nixPath.default
-    ++ [ "nixpkgs-overlays=/etc/nixos/overlays" ];
+  nix.nixPath = [
+    "nixpkgs=${pkgs.path}"
+  ]
+  ++ builtins.filter (entry: !(lib.hasPrefix "nixpkgs=" entry)) options.nix.nixPath.default
+  ++ [ "nixpkgs-overlays=/etc/nixos/overlays" ];
+  system.extraDependencies = [ (builtins.storePath pkgs.path) ];
   nix.settings = {
     filter-syscalls = false;
     require-sigs = false;

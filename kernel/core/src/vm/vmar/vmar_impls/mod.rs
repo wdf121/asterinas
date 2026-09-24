@@ -130,7 +130,7 @@ impl Vmar {
 ///
 /// Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/include/linux/mm_types_task.h#L26-L32>
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, TryFromInt)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromInt)]
 pub(crate) enum RssType {
     File = 0,
     Anon = 1,
@@ -380,8 +380,9 @@ impl VmarInner {
         offset: Vaddr,
         size: usize,
         rss_delta: &mut RssDelta,
-    ) -> Result<Range<Vaddr>> {
+    ) -> Range<Vaddr> {
         let range = offset..offset + size;
+
         let mut mappings_to_remove = Vec::new();
         for vm_mapping in self.vm_mappings.find(&range) {
             mappings_to_remove.push(vm_mapping.map_to_addr());
@@ -410,7 +411,7 @@ impl VmarInner {
             rss_delta.add(taken.rss_type(), -(taken.unmap(&vmar.vm_space) as isize));
         }
 
-        Ok(offset..(offset + size))
+        range
     }
 
     /// Allocates a free region for mapping, searching from high address to low address.
@@ -526,7 +527,7 @@ impl VmarInner {
                 map_addr + new_size,
                 old_size - new_size,
                 rss_delta,
-            )?;
+            );
             return Ok(());
         }
 

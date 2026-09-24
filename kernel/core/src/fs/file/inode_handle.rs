@@ -5,8 +5,8 @@
 use core::fmt::Display;
 
 use super::{
-    AccessMode, CreationFlags, FileCommon, FileLike, InodeType, Mappable, SettableStatusFlags,
-    StatusFlags, file_table::FdFlags, flock::FlockItem,
+    AccessMode, CreationFlags, FileCommon, FileLike, InodeType, Mappable, MappableObject,
+    SettableStatusFlags, StatusFlags, SyncMode, file_table::FdFlags, flock::FlockItem,
 };
 use crate::{
     events::IoEvents,
@@ -26,12 +26,19 @@ use crate::{
 };
 
 pub(crate) struct InodeHandle {
-    common: FileCommon,
     /// `open_file` is similar to the `file_private` field in Linux's `file` structure. If
     /// `open_file` is `Some(_)`, typical file operations including `read`, `write`, `poll`,
     /// and `ioctl` will be provided by the per-open file object instead of `path`.
     open_file: Option<Box<dyn PerOpenFileOps>>,
     offset: Mutex<usize>,
+    /// Path and common states of the handle.
+    //
+    // This field is placed last so that its `Path` keeps the corresponding filesystem alive
+    // while `open_file` is dropped, because releasing `open_file` may access that filesystem.
+    //
+    // Struct fields are dropped in declaration order.
+    // Reference: <https://doc.rust-lang.org/reference/destructors.html>.
+    common: FileCommon,
 }
 
 impl InodeHandle {
@@ -65,13 +72,15 @@ impl InodeHandle {
         } else if inode.type_() == InodeType::Dir && access_mode.is_writable() {
             return_errno_with_message!(Errno::EISDIR, "a directory cannot be opened writable");
         } else {
-            inode.open(access_mode, status_flags).transpose()?
+            inode
+                .open(path.dentry(), access_mode, status_flags)
+                .transpose()?
         };
 
         Ok(Self {
-            common: FileCommon::new(path, access_mode, status_flags),
             open_file,
             offset: Mutex::new(0),
+            common: FileCommon::new(path, access_mode, status_flags),
         })
     }
 
@@ -295,7 +304,7 @@ impl FileLike for InodeHandle {
             return_errno_with_message!(Errno::EBADF, "the file is not opened writable");
         }
         if reader.remain() > 0 {
-            clear_file_priv(self.path().inode().as_ref())?;
+            clear_file_priv(self.path().dentry())?;
         }
 
         let (file_ops, is_offset_aware) = self.file_ops_and_is_offset_aware();
@@ -337,7 +346,7 @@ impl FileLike for InodeHandle {
             return_errno_with_message!(Errno::EBADF, "the file is not opened writable");
         }
         if reader.remain() > 0 {
-            clear_file_priv(self.path().inode().as_ref())?;
+            clear_file_priv(self.path().dentry())?;
         }
 
         let status_flags = self.status_flags();
@@ -365,7 +374,7 @@ impl FileLike for InodeHandle {
         return_errno_with_message!(Errno::ENOTTY, "ioctl is not supported");
     }
 
-    fn mappable(&self) -> Result<Mappable> {
+    fn mappable(&self) -> Result<MappableObject<'_>> {
         if self.status_flags().contains(StatusFlags::O_PATH) {
             return_errno_with_message!(Errno::EBADF, "the file is opened as a path");
         }
@@ -374,11 +383,11 @@ impl FileLike for InodeHandle {
         if let Some(page_cache) = inode.page_cache() {
             // If the inode has a page cache, it is a file-backed mapping and
             // we return the VMO as the mappable object.
-            Ok(Mappable::Vmo(page_cache))
+            Ok(MappableObject::Vmo(page_cache))
         } else if let Some(ref open_file) = self.open_file {
             // Otherwise, it is a special file (e.g. device file) and we should
             // return the file-specific mappable object.
-            open_file.mappable()
+            open_file.mappable().map(MappableObject::Device)
         } else {
             return_errno_with_message!(Errno::ENODEV, "the file is not mappable");
         }
@@ -440,7 +449,8 @@ impl FileLike for InodeHandle {
             return_errno_with_message!(Errno::EBADF, "the file is not opened writable");
         }
 
-        let inode = self.path().inode().as_ref();
+        let dentry = self.path().dentry();
+        let inode = dentry.inode().as_ref();
         let inode_type = inode.type_();
 
         // TODO: `fallocate` on pipe files also fails with `ESPIPE`.
@@ -474,7 +484,7 @@ impl FileLike for InodeHandle {
             );
         }
 
-        clear_file_priv(inode)?;
+        clear_file_priv(dentry)?;
         inode.fallocate(mode, offset, len)
     }
 
@@ -507,6 +517,18 @@ impl FileLike for InodeHandle {
             fd_flags,
         })
     }
+
+    fn sync(&self, mode: SyncMode) -> Result<()> {
+        if self.status_flags().contains(StatusFlags::O_PATH) {
+            return_errno_with_message!(Errno::EBADF, "the file is opened as a path");
+        }
+
+        if let Some(ref open_file) = self.open_file {
+            return open_file.sync(mode);
+        }
+
+        self.path().sync(mode)
+    }
 }
 
 impl Drop for InodeHandle {
@@ -538,7 +560,7 @@ pub(crate) enum SeekFrom {
 /// A per-open file object can hold file-description-specific state and override
 /// operations that are not purely inode-backed, such as state and operations for
 /// devices, pipes, namespace files, and procfs files.
-pub(crate) trait PerOpenFileOps: Pollable + FileOps + Any + Send + Sync + 'static {
+pub trait PerOpenFileOps: Pollable + FileOps + Any + Send + Sync + 'static {
     /// Checks whether the `seek()` operation should fail.
     fn check_seekable(&self) -> Result<()>;
 
@@ -571,7 +593,7 @@ pub(crate) trait PerOpenFileOps: Pollable + FileOps + Any + Send + Sync + 'stati
     }
 
     // See `FileLike::mappable`.
-    fn mappable(&self) -> Result<Mappable> {
+    fn mappable(&self) -> Result<&dyn Mappable> {
         return_errno_with_message!(Errno::EINVAL, "the file is not mappable");
     }
 
@@ -584,6 +606,14 @@ pub(crate) trait PerOpenFileOps: Pollable + FileOps + Any + Send + Sync + 'stati
         // `O_ASYNC` and `O_DIRECT` can only be set on file descriptions that explicitly
         // support them.
         SettableStatusFlags::minimal()
+    }
+
+    /// Synchronizes the file according to `mode`.
+    ///
+    /// Per-open file operations do not support synchronization by default.
+    /// Implementations that support synchronization must override this method.
+    fn sync(&self, _mode: SyncMode) -> Result<()> {
+        return_errno_with_message!(Errno::EINVAL, "the file does not support synchronization")
     }
 }
 

@@ -10,22 +10,18 @@ use ostd::mm::VmIo;
 
 use crate::{
     context::current_userspace,
-    device::{
-        Device, DeviceType, DevtmpfsInodeMeta, add_node, add_runtime_node,
-        remove_owned_runtime_node,
-    },
+    device::{Device, DeviceType},
+    dispatch_ioctl,
     events::IoEvents,
     fs::{
-        file::{PerOpenFileOps, SettableStatusFlags, StatusFlags},
-        vfs::{
-            inode::FileOps,
-            path::{Path, PathResolver},
-        },
+        devtmpfs::{self, DevtmpfsHandle, DevtmpfsNode, DevtmpfsNodeMeta},
+        file::{PerOpenFileOps, SettableStatusFlags, StatusFlags, SyncMode},
+        vfs::{inode::FileOps, path::Path},
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
     thread::kernel_thread::ThreadOptions,
-    util::ioctl::{RawIoctl, dispatch_ioctl},
+    util::ioctl::RawIoctl,
 };
 
 pub(super) fn init_in_first_kthread() {
@@ -65,18 +61,22 @@ pub(super) fn init_in_first_kthread() {
     aster_block::scan_partitions();
 }
 
-pub(super) fn init_in_first_process(path_resolver: &PathResolver) -> Result<()> {
+pub(super) fn init_in_first_process() -> Result<()> {
     for device in aster_block::collect_all() {
         let block_file = register_wrapper(device)?;
-        if let Some(devtmpfs_meta) = block_file.devtmpfs_meta() {
-            let dev_id = block_file.id().as_encoded_u64();
-            match add_node(DeviceType::Block, dev_id, &devtmpfs_meta, path_resolver) {
-                Ok(node) => block_file.set_node(node),
+        if let Some(meta) = block_file.devtmpfs_meta() {
+            let node = match devtmpfs::create_node(DevtmpfsNode::new(
+                block_file.type_(),
+                block_file.id(),
+                meta,
+            )) {
+                Ok(node) => node,
                 Err(error) => {
                     remove_wrapper_if_matches(&block_file);
                     return Err(error);
                 }
-            }
+            };
+            block_file.set_node(node);
         }
     }
 
@@ -84,9 +84,10 @@ pub(super) fn init_in_first_process(path_resolver: &PathResolver) -> Result<()> 
 }
 
 mod ioctl_defs {
-    use aster_virtio::device::block::VIRTIO_BLOCK_ID_BYTES;
-
-    use crate::util::ioctl::{NoData, OutData, ioc};
+    use crate::{
+        ioc,
+        util::ioctl::{NoData, OutData},
+    };
 
     // Reference: <https://elixir.bootlin.com/linux/v6.18/source/include/uapi/linux/fs.h>
 
@@ -130,13 +131,6 @@ mod ioctl_defs {
     /// Writes zeroes to a byte range described by two u64 values: start and length.
     /// Linux: _IO(0x12, 127).
     pub(super) type BlkZeroout = ioc!(BLKZEROOUT, 0x127F, NoData);
-
-    /// Returns the raw 20-byte device identifier provided by the VirtIO host.
-    ///
-    /// This is a narrow Asterinas-internal test interface, not part of the Linux
-    /// block ioctl ABI.
-    pub(super) type AsterVirtioBlkGetId =
-        ioc!(ASTER_VIRTIO_BLK_GET_ID, b'A', 0x01, OutData<[u8; VIRTIO_BLOCK_ID_BYTES]>);
 }
 
 /// Represents a block device inode in the filesystem.
@@ -150,8 +144,8 @@ struct BlockFile {
     path: String,
     state: Arc<Mutex<BlockFileState>>,
     lifecycle: Mutex<()>,
-    node: Mutex<Option<Path>>,
-    mapper_alias: Mutex<Option<(String, Path)>>,
+    node: Mutex<Option<DevtmpfsHandle>>,
+    mapper_alias: Mutex<Option<(String, DevtmpfsHandle)>>,
     removing: Mutex<Option<aster_block::PendingBlockDeviceUnregistration>>,
 }
 
@@ -191,18 +185,25 @@ impl BlockFile {
         }
     }
 
-    fn set_node(&self, node: Path) {
+    fn set_node(&self, node: DevtmpfsHandle) {
         let mut owned_node = self.node.lock();
         assert!(owned_node.is_none());
         *owned_node = Some(node);
     }
 
-    fn node(&self) -> Option<Path> {
-        self.node.lock().clone()
+    fn take_node(&self) -> Option<DevtmpfsHandle> {
+        self.node.lock().take()
     }
 
-    fn clear_node(&self) {
-        *self.node.lock() = None;
+    fn has_node(&self) -> bool {
+        self.node.lock().is_some()
+    }
+
+    fn validate_node(&self) -> Result<()> {
+        let node = self.node.lock();
+        devtmpfs::validate(node.as_ref().ok_or_else(|| {
+            Error::with_message(Errno::ESTALE, "the mapper primary node is missing")
+        })?)
     }
 
     fn take_removing(&self) -> Option<aster_block::PendingBlockDeviceUnregistration> {
@@ -215,22 +216,18 @@ impl BlockFile {
         *removing = Some(unregistration.retain_removing());
     }
 
-    fn set_mapper_alias(&self, path: String, alias: Path) {
+    fn set_mapper_alias(&self, path: String, alias: DevtmpfsHandle) {
         let mut owned_alias = self.mapper_alias.lock();
         assert!(owned_alias.is_none());
         *owned_alias = Some((path, alias));
     }
 
-    fn mapper_alias(&self) -> Option<(String, Path)> {
-        self.mapper_alias.lock().clone()
+    fn take_mapper_alias(&self) -> Option<(String, DevtmpfsHandle)> {
+        self.mapper_alias.lock().take()
     }
 
-    fn replace_mapper_alias(&self, path: String, alias: Path) {
-        *self.mapper_alias.lock() = Some((path, alias));
-    }
-
-    fn clear_mapper_alias(&self) {
-        *self.mapper_alias.lock() = None;
+    fn has_mapper_alias(&self) -> bool {
+        self.mapper_alias.lock().is_some()
     }
 
     fn try_start_accepting_opens(&self) -> bool {
@@ -268,8 +265,8 @@ impl Device for BlockFile {
         self.id
     }
 
-    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
-        Some(DevtmpfsInodeMeta::new(self.path.as_str()))
+    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
+        Some(DevtmpfsNodeMeta::new(self.path.clone()).unwrap())
     }
 
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
@@ -474,22 +471,6 @@ impl PerOpenFileOps for OpenBlockFile {
                 }
                 Ok(0)
             }
-            cmd @ AsterVirtioBlkGetId => {
-                let virtio_device =
-                    self.device
-                        .downcast_ref::<VirtIoBlockDevice>()
-                        .ok_or_else(|| {
-                            Error::with_message(
-                                Errno::ENOTTY,
-                                "the block device does not expose a VirtIO host ID",
-                            )
-                        })?;
-                let host_id = virtio_device.host_id().ok_or_else(|| {
-                    Error::with_message(Errno::ENODATA, "the VirtIO block device has no host ID")
-                })?;
-                cmd.write(host_id.as_bytes())?;
-                Ok(0)
-            }
             _ => return_errno_with_message!(
                 Errno::ENOTTY,
                 "the ioctl command is not supported by block devices"
@@ -499,6 +480,18 @@ impl PerOpenFileOps for OpenBlockFile {
 
     fn settable_status_flags(&self) -> SettableStatusFlags {
         SettableStatusFlags::minimal().with_o_direct()
+    }
+
+    fn sync(&self, _mode: SyncMode) -> Result<()> {
+        match self.device.sync()? {
+            // Linux treats an unsupported block-device flush as success.
+            // Reference: <https://github.com/torvalds/linux/blob/v6.16/block/fops.c#L609-L611>
+            BioStatus::Complete | BioStatus::NotSupported => Ok(()),
+            status @ (BioStatus::NoSpace | BioStatus::IoError) => Err(status.into()),
+            BioStatus::Init | BioStatus::Submit | BioStatus::Zeros => {
+                return_errno_with_message!(Errno::EIO, "invalid block device flush status")
+            }
+        }
     }
 }
 
@@ -523,7 +516,7 @@ pub(crate) fn register_mapper_primary_with_node_creator<F>(
     create_node: F,
 ) -> Result<()>
 where
-    F: FnOnce(&DevtmpfsInodeMeta<'_>) -> Result<Path>,
+    F: FnOnce(DevtmpfsNode) -> Result<DevtmpfsHandle>,
 {
     let primary_path = format!("dm-{}", device.id().minor().get());
     register_runtime_primary_with_node_creator(device, primary_path, create_node)
@@ -538,28 +531,21 @@ pub(crate) fn publish_mapper_alias(id: DeviceId, mapper_name: &str) -> Result<()
 
     let block_file = lookup_runtime_block_file(id)?;
     let _lifecycle = block_file.lifecycle.lock();
-    if block_file.mapper_alias().is_some() {
+    if block_file.has_mapper_alias() {
         return_errno_with_message!(Errno::EEXIST, "the mapper alias already exists");
     }
-
-    let primary = block_file
-        .node()
-        .ok_or_else(|| Error::with_message(Errno::ESTALE, "the mapper primary node is missing"))?;
-    let current_primary = crate::device::runtime_node(block_file.path.as_str())?;
-    if current_primary != primary {
-        return_errno_with_message!(Errno::ESTALE, "the mapper primary node is no longer owned");
-    }
+    block_file.validate_node()?;
 
     let alias_path = format!("mapper/{mapper_name}");
     let alias_target = format!("../{}", block_file.path);
-    let alias = crate::device::add_runtime_symlink(&alias_path, &alias_target)?;
+    let alias = devtmpfs::create_symlink(alias_path.clone(), alias_target)?;
     block_file.set_mapper_alias(alias_path, alias);
     Ok(())
 }
 
 /// Reports whether this mapper runtime registration has published its alias.
 pub(crate) fn has_mapper_alias(id: DeviceId) -> Result<bool> {
-    Ok(lookup_runtime_block_file(id)?.mapper_alias().is_some())
+    Ok(lookup_runtime_block_file(id)?.has_mapper_alias())
 }
 
 pub(crate) fn rename_mapper(id: DeviceId, old_name: &str, new_name: &str) -> Result<()> {
@@ -573,20 +559,26 @@ pub(crate) fn rename_mapper(id: DeviceId, old_name: &str, new_name: &str) -> Res
     let _lifecycle = block_file.lifecycle.lock();
     let old_path = format!("mapper/{old_name}");
     let new_path = format!("mapper/{new_name}");
-    let (alias_path, alias) = block_file.mapper_alias().ok_or_else(|| {
+    let mut alias = block_file.mapper_alias.lock();
+    let (alias_path, handle) = alias.take().ok_or_else(|| {
         Error::with_message(Errno::ESTALE, "the mapper alias registration is missing")
     })?;
     if alias_path != old_path {
+        *alias = Some((alias_path, handle));
         return_errno_with_message!(Errno::ENODEV, "the mapper name does not match the device");
     }
 
-    let source = crate::device::runtime_node(&old_path)?;
-    if source != alias {
-        return_errno_with_message!(Errno::ESTALE, "the mapper alias is no longer owned");
+    let retained = handle.clone();
+    match devtmpfs::rename_no_replace(handle, new_path.clone()) {
+        Ok(handle) => {
+            *alias = Some((new_path, handle));
+            Ok(())
+        }
+        Err(error) => {
+            *alias = Some((alias_path, retained));
+            Err(error)
+        }
     }
-    crate::device::rename_runtime_node(&old_path, &alias, &new_path)?;
-    block_file.replace_mapper_alias(new_path, source);
-    Ok(())
 }
 
 pub(crate) fn unregister_mapper(id: DeviceId, mapper_name: &str) -> Result<Arc<dyn BlockDevice>> {
@@ -594,33 +586,34 @@ pub(crate) fn unregister_mapper(id: DeviceId, mapper_name: &str) -> Result<Arc<d
     let block_file = lookup_runtime_block_file(id)?;
     let _lifecycle = block_file.lifecycle.lock();
     let expected_alias_path = format!("mapper/{mapper_name}");
-    let alias = block_file.mapper_alias();
-    if let Some((alias_path, _)) = &alias
-        && alias_path != &expected_alias_path
-    {
-        return_errno_with_message!(Errno::ENODEV, "the mapper name does not match the device");
-    }
+    let alias_path = {
+        let alias = block_file.mapper_alias.lock();
+        if let Some((current_path, _)) = alias.as_ref()
+            && current_path != &expected_alias_path
+        {
+            return_errno_with_message!(Errno::ENODEV, "the mapper name does not match the device");
+        }
+        alias.as_ref().map(|(path, _)| path.clone())
+    };
 
     let unregistration = begin_runtime_unregistration(&block_file)?;
-    if let Some((alias_path, alias_node)) = &alias {
-        if let Err(error) = remove_owned_node_or_accept_stale(alias_path, alias_node) {
-            abort_runtime_unregistration(unregistration, &block_file);
-            return Err(error);
-        }
-        block_file.clear_mapper_alias();
+    if let Some((_, alias_handle)) = block_file.take_mapper_alias()
+        && let Err(error) = remove_owned_node_or_accept_stale(alias_handle)
+    {
+        abort_runtime_unregistration(unregistration, &block_file);
+        return Err(error);
     }
 
-    if let Some(node) = block_file.node() {
-        if let Err(error) = remove_owned_node_or_accept_stale(block_file.path.as_str(), &node) {
-            return recover_primary_removal_failure(
-                unregistration,
-                &block_file,
-                alias.map(|(alias_path, _)| alias_path),
-                error,
-                restore_mapper_alias,
-            );
-        }
-        block_file.clear_node();
+    if let Some(node) = block_file.take_node()
+        && let Err(error) = remove_owned_node_or_accept_stale(node)
+    {
+        return recover_primary_removal_failure(
+            unregistration,
+            &block_file,
+            alias_path,
+            error,
+            restore_mapper_alias,
+        );
     }
 
     match aster_block::commit_unregister(unregistration) {
@@ -629,13 +622,13 @@ pub(crate) fn unregister_mapper(id: DeviceId, mapper_name: &str) -> Result<Arc<d
             Ok(device)
         }
         Err((unregistration, error)) => {
-            let primary_recovery = if block_file.node().is_none() {
+            let primary_recovery = if !block_file.has_node() {
                 restore_runtime_node(&block_file)
             } else {
                 Ok(())
             };
-            let alias_recovery = if let Some((alias_path, _)) = alias {
-                if block_file.mapper_alias().is_none() {
+            let alias_recovery = if let Some(alias_path) = alias_path {
+                if !block_file.has_mapper_alias() {
                     restore_mapper_alias(&block_file, alias_path)
                 } else {
                     Ok(())
@@ -658,10 +651,7 @@ pub(crate) fn unregister_mapper(id: DeviceId, mapper_name: &str) -> Result<Arc<d
 }
 
 fn register_runtime_primary(device: Arc<dyn BlockDevice>, path: String) -> Result<()> {
-    let dev_id = device.id().as_encoded_u64();
-    register_runtime_primary_with_node_creator(device, path, move |meta| {
-        add_runtime_node(DeviceType::Block, dev_id, meta)
-    })
+    register_runtime_primary_with_node_creator(device, path, devtmpfs::create_node)
 }
 
 fn register_runtime_primary_with_node_creator<F>(
@@ -670,7 +660,7 @@ fn register_runtime_primary_with_node_creator<F>(
     create_node: F,
 ) -> Result<()>
 where
-    F: FnOnce(&DevtmpfsInodeMeta<'_>) -> Result<Path>,
+    F: FnOnce(DevtmpfsNode) -> Result<DevtmpfsHandle>,
 {
     let registration =
         aster_block::register_pending(device.clone()).map_err(map_block_registry_error)?;
@@ -683,8 +673,11 @@ where
         }
     };
 
-    let meta = DevtmpfsInodeMeta::new(path.as_str());
-    let node = match create_node(&meta) {
+    let node = match create_node(DevtmpfsNode::new(
+        DeviceType::Block,
+        block_file.id(),
+        DevtmpfsNodeMeta::new(path.clone()).unwrap(),
+    )) {
         Ok(node) => node,
         Err(error) => {
             remove_wrapper_if_matches(&block_file);
@@ -694,7 +687,7 @@ where
     };
 
     if let Err(error) = aster_block::commit_registration(&registration) {
-        let _ = remove_owned_node_or_accept_stale(path.as_str(), &node);
+        let _ = remove_owned_node_or_accept_stale(node);
         remove_wrapper_if_matches(&block_file);
         let _ = aster_block::abort_registration(registration);
         return Err(map_block_registry_error(error));
@@ -706,9 +699,9 @@ where
 }
 
 /// Removes nodes that still belong to this registration; missing or replaced
-/// nodes are already clean.
-fn remove_owned_node_or_accept_stale(path: &str, expected: &Path) -> Result<()> {
-    match remove_owned_runtime_node(path, expected) {
+/// nodes are already externally cleaned up and are left untouched.
+fn remove_owned_node_or_accept_stale(handle: DevtmpfsHandle) -> Result<()> {
+    match devtmpfs::delete(handle) {
         Ok(()) => Ok(()),
         Err(error) if matches!(error.error(), Errno::ENOENT | Errno::ESTALE) => Ok(()),
         Err(error) => Err(error),
@@ -791,15 +784,18 @@ fn isolate_runtime_unregistration(
 }
 
 fn restore_runtime_node(block_file: &BlockFile) -> Result<()> {
-    let meta = DevtmpfsInodeMeta::new(block_file.path.as_str());
-    let restored = add_runtime_node(DeviceType::Block, block_file.id().as_encoded_u64(), &meta)?;
-    *block_file.node.lock() = Some(restored);
+    let restored = devtmpfs::create_node(DevtmpfsNode::new(
+        DeviceType::Block,
+        block_file.id(),
+        DevtmpfsNodeMeta::new(block_file.path.clone()).unwrap(),
+    ))?;
+    block_file.set_node(restored);
     Ok(())
 }
 
 fn restore_mapper_alias(block_file: &BlockFile, alias_path: String) -> Result<()> {
     let alias_target = format!("../{}", block_file.path);
-    let restored = crate::device::add_runtime_symlink(&alias_path, &alias_target)?;
+    let restored = devtmpfs::create_symlink(alias_path.clone(), alias_target)?;
     block_file.set_mapper_alias(alias_path, restored);
     Ok(())
 }
@@ -910,8 +906,8 @@ mod tests {
             BlockDeviceMeta::default()
         }
 
-        fn name(&self) -> String {
-            String::from("runtime-block-test")
+        fn name(&self) -> &str {
+            "runtime-block-test"
         }
 
         fn id(&self) -> DeviceId {

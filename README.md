@@ -14,6 +14,7 @@ https://github.com/user-attachments/assets/eabf8674-8503-44f7-abcc-52395d2ca4a3
 
 <p align="center">
     <a href="https://github.com/asterinas/asterinas/actions/workflows/test_x86.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_x86.yml/badge.svg?event=push" alt="Test x86-64" style="max-width: 100%;"></a>
+    <a href="https://github.com/asterinas/asterinas/actions/workflows/test_aarch64.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_aarch64.yml/badge.svg?event=push" alt="Test aarch64" style="max-width: 100%;"></a>
     <a href="https://github.com/asterinas/asterinas/actions/workflows/test_riscv.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_riscv.yml/badge.svg?event=push" alt="Test riscv64" style="max-width: 100%;"></a>
     <a href="https://github.com/asterinas/asterinas/actions/workflows/test_loongarch.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_loongarch.yml/badge.svg?event=push" alt="Test loongarch64" style="max-width: 100%;"></a>
     <a href="https://github.com/asterinas/asterinas/actions/workflows/test_x86_tdx.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_x86_tdx.yml/badge.svg" alt="Test Intel TDX" style="max-width: 100%;"></a>
@@ -117,6 +118,7 @@ that Asterinas can run on as an OS kernel.
 | x86-64              | Tier 1 |
 | x86-64 (Intel TDX)  | Tier 2 |
 | RISC-V 64           | Tier 2 |
+| ARM 64              | Tier 3 |
 | LoongArch 64        | Tier 3 |
 
 Tier definitions:
@@ -154,12 +156,14 @@ Follow the steps below to get Asterinas up and running.
 2. Run a Docker container as the development environment:
 
     ```bash
-    docker run -it --privileged --network=host -v /dev:/dev -v $(pwd)/asterinas:/root/asterinas asterinas/dev:0.18.1-20260805
+    docker run -it --privileged --network=host -v /dev:/dev -v $(pwd)/asterinas:/root/asterinas asterinas/dev:0.18.1-20260918
     ```
 
     Alternatively, if you use VS Code with the
     [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers)
     extension, open the cloned folder and select "Reopen in Container".
+    If you prefer Nix to Docker, enter the Nix development shell instead,
+    as described in [Using Nix for Development](book/src/kernel/nix-development.md).
 
 3. Inside the container,
 go to the project folder (`/root/asterinas`) and run:

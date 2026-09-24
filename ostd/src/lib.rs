@@ -30,6 +30,7 @@ macro_rules! __log_prefix {
 #[cfg_attr(target_arch = "x86_64", path = "arch/x86/mod.rs")]
 #[cfg_attr(target_arch = "riscv64", path = "arch/riscv/mod.rs")]
 #[cfg_attr(target_arch = "loongarch64", path = "arch/loongarch/mod.rs")]
+#[cfg_attr(target_arch = "aarch64", path = "arch/arm/mod.rs")]
 pub mod arch;
 
 pub mod boot;
@@ -87,7 +88,8 @@ unsafe fn init() {
     #[cfg(target_arch = "x86_64")]
     arch::if_tdx_enabled!({
     } else {
-        arch::serial::init(&early_cmdline);
+        // SAFETY: This function is called only once on the BSP.
+        unsafe { arch::serial::init(&early_cmdline) };
     });
     #[cfg(not(target_arch = "x86_64"))]
     arch::serial::init(&early_cmdline);
@@ -121,7 +123,8 @@ unsafe fn init() {
 
     #[cfg(target_arch = "x86_64")]
     arch::if_tdx_enabled!({
-        arch::serial::init(&early_cmdline);
+        // SAFETY: This function is called only once on the BSP.
+        unsafe { arch::serial::init(&early_cmdline) };
     });
 
     smp::init();

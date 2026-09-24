@@ -30,12 +30,12 @@ use crate::{
             bitmap::ExfatBitmap, dentry::ExfatDentryIterator, fat::ExfatChain, fs::ExfatFs,
             upcase_table::ExfatUpcaseTable,
         },
-        file::{InodeMode, InodeType, StatusFlags, mkmod},
+        file::{InodeMode, InodeType, StatusFlags, SyncMode, mkmod},
         utils::DirentVisitor,
         vfs::{
             file_system::FileSystem,
             inode::{Extension, FileOps, Inode, Metadata, MknodType, RenameMode, SymbolicLink},
-            path::{is_dot, is_dot_or_dotdot, is_dotdot},
+            path::Dentry,
         },
     },
     prelude::*,
@@ -160,7 +160,7 @@ impl BlockAsPageCacheBackend for ExfatInode {
         let sector_id = inner.get_sector_id(idx * PAGE_SIZE / fs.sector_size())?;
         fs.block_device().read_blocks_async(
             BlockId::from_offset(sector_id * inner.fs().sector_size()),
-            bio_segment,
+            vec![bio_segment],
             Some(complete_fn),
             io_batch,
         )?;
@@ -182,7 +182,7 @@ impl BlockAsPageCacheBackend for ExfatInode {
         let sector_id = inner.get_sector_id(idx * PAGE_SIZE / fs.sector_size())?;
         fs.block_device().write_blocks_async(
             BlockId::from_offset(sector_id * inner.fs().sector_size()),
-            bio_segment,
+            vec![bio_segment],
             Some(complete_fn),
             io_batch,
         )?;
@@ -694,7 +694,7 @@ impl ExfatInode {
             inner
                 .fs()
                 .block_device()
-                .read_blocks(physical_bid, bio_segment.clone())?;
+                .read_blocks(physical_bid, vec![bio_segment.clone()])?;
             bio_segment.reader().unwrap().read_fallible(writer)?;
 
             cur_offset += BLOCK_SIZE;
@@ -808,7 +808,7 @@ impl ExfatInode {
                 Bid::from_offset(cur_cluster.cluster_id() as usize * cluster_size + cur_offset);
             let fs = inner.fs();
             fs.block_device()
-                .write_blocks(physical_bid, bio_segment.clone())?;
+                .write_blocks(physical_bid, vec![bio_segment.clone()])?;
 
             cur_offset += BLOCK_SIZE;
             if cur_offset >= cluster_size {
@@ -1286,7 +1286,7 @@ impl ExfatInode {
     /// Delete the file contents if delete_content is set.
     fn delete_inode(
         &self,
-        inode: Arc<ExfatInode>,
+        inode: &ExfatInode,
         delete_contents: bool,
         fs_guard: &MutexGuard<()>,
     ) -> Result<()> {
@@ -1433,7 +1433,7 @@ impl Inode for ExfatInode {
         self.inner.read().size
     }
 
-    fn resize(&self, new_size: usize) -> Result<()> {
+    fn resize(&self, _self_dentry: &Dentry, new_size: usize) -> Result<()> {
         let inner = self.inner.upread();
 
         if inner.inode_type.is_directory() {
@@ -1500,7 +1500,7 @@ impl Inode for ExfatInode {
         Ok(self.inner.read().make_mode())
     }
 
-    fn set_mode(&self, mode: InodeMode) -> Result<()> {
+    fn set_mode(&self, _self_dentry: &Dentry, mode: InodeMode) -> Result<()> {
         //Pass through
         Ok(())
     }
@@ -1509,7 +1509,7 @@ impl Inode for ExfatInode {
         self.inner.read().atime.as_duration().unwrap_or_default()
     }
 
-    fn set_atime(&self, time: Duration) {
+    fn set_atime(&self, _self_dentry: &Dentry, time: Duration) {
         self.inner.write().atime = DosTimestamp::from_duration(time).unwrap_or_default();
     }
 
@@ -1517,7 +1517,7 @@ impl Inode for ExfatInode {
         self.inner.read().mtime.as_duration().unwrap_or_default()
     }
 
-    fn set_mtime(&self, time: Duration) {
+    fn set_mtime(&self, _self_dentry: &Dentry, time: Duration) {
         self.inner.write().mtime = DosTimestamp::from_duration(time).unwrap_or_default();
     }
 
@@ -1525,7 +1525,7 @@ impl Inode for ExfatInode {
         self.inner.read().ctime.as_duration().unwrap_or_default()
     }
 
-    fn set_ctime(&self, time: Duration) {
+    fn set_ctime(&self, _self_dentry: &Dentry, time: Duration) {
         self.inner.write().ctime = DosTimestamp::from_duration(time).unwrap_or_default();
     }
 
@@ -1535,7 +1535,7 @@ impl Inode for ExfatInode {
         ))
     }
 
-    fn set_owner(&self, uid: Uid) -> Result<()> {
+    fn set_owner(&self, _self_dentry: &Dentry, uid: Uid) -> Result<()> {
         // Pass through.
         Ok(())
     }
@@ -1546,7 +1546,7 @@ impl Inode for ExfatInode {
         ))
     }
 
-    fn set_group(&self, gid: Gid) -> Result<()> {
+    fn set_group(&self, _self_dentry: &Dentry, gid: Gid) -> Result<()> {
         // Pass through.
         Ok(())
     }
@@ -1559,7 +1559,13 @@ impl Inode for ExfatInode {
         Some(self.inner.read().page_cache.as_vmo().clone())
     }
 
-    fn create(&self, name: &str, type_: InodeType, mode: InodeMode) -> Result<Arc<dyn Inode>> {
+    fn create(
+        &self,
+        _self_dentry: &Dentry,
+        name: &str,
+        type_: InodeType,
+        mode: InodeMode,
+    ) -> Result<Arc<dyn Inode>> {
         let fs = self.inner.read().fs();
         let fs_guard = fs.lock();
         {
@@ -1590,29 +1596,35 @@ impl Inode for ExfatInode {
         Ok(result)
     }
 
-    fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Arc<dyn Inode>> {
+    fn create_symlink(
+        &self,
+        _self_dentry: &Dentry,
+        _name: &str,
+        _target: &str,
+        _mode: InodeMode,
+    ) -> Result<Arc<dyn Inode>> {
         return_errno_with_message!(Errno::EINVAL, "unsupported operation")
     }
 
-    fn link(&self, old: &Arc<dyn Inode>, name: &str) -> Result<()> {
+    fn mknod(
+        &self,
+        _self_dentry: &Dentry,
+        name: &str,
+        mode: InodeMode,
+        type_: MknodType,
+    ) -> Result<Arc<dyn Inode>> {
         return_errno_with_message!(Errno::EINVAL, "unsupported operation")
     }
 
-    fn unlink(&self, name: &str) -> Result<()> {
-        if !self.inner.read().inode_type.is_directory() {
-            return_errno!(Errno::ENOTDIR)
-        }
-        if name.len() > MAX_NAME_LENGTH {
-            return_errno!(Errno::ENAMETOOLONG)
-        }
-        if is_dot_or_dotdot(name) {
-            return_errno!(Errno::EISDIR)
-        }
+    fn link(&self, _self_dentry: &Dentry, _old_dentry: &Dentry, _name: &str) -> Result<()> {
+        return_errno_with_message!(Errno::EINVAL, "unsupported operation")
+    }
 
+    fn unlink(&self, child_dentry: &Dentry) -> Result<()> {
         let fs = self.inner.read().fs();
         let fs_guard = fs.lock();
 
-        let inode = self.inner.read().lookup_by_name(name, true, &fs_guard)?;
+        let inode = child_dentry.inode().downcast_ref::<ExfatInode>().unwrap();
 
         // FIXME: we need to step by following line to avoid deadlock.
         if inode.type_() != InodeType::File {
@@ -1629,24 +1641,11 @@ impl Inode for ExfatInode {
         Ok(())
     }
 
-    fn rmdir(&self, name: &str) -> Result<()> {
-        if !self.inner.read().inode_type.is_directory() {
-            return_errno!(Errno::ENOTDIR)
-        }
-        if is_dot(name) {
-            return_errno_with_message!(Errno::EINVAL, "rmdir on .")
-        }
-        if is_dotdot(name) {
-            return_errno_with_message!(Errno::ENOTEMPTY, "rmdir on ..")
-        }
-        if name.len() > MAX_NAME_LENGTH {
-            return_errno!(Errno::ENAMETOOLONG)
-        }
-
+    fn rmdir(&self, child_dentry: &Dentry) -> Result<()> {
         let fs = self.inner.read().fs();
         let fs_guard = fs.lock();
 
-        let inode = self.inner.read().lookup_by_name(name, true, &fs_guard)?;
+        let inode = child_dentry.inode().downcast_ref::<ExfatInode>().unwrap();
 
         if inode.inner.read().inode_type != InodeType::Dir {
             return_errno!(Errno::ENOTDIR)
@@ -1690,9 +1689,8 @@ impl Inode for ExfatInode {
 
     fn rename(
         &self,
-        old_name: &str,
-        old_inode: &Arc<dyn Inode>,
-        new_dir_inode: &Arc<dyn Inode>,
+        old_child_dentry: &Dentry,
+        new_dir_dentry: &Dentry,
         new_name: &str,
         replaced_inode: Option<&Arc<dyn Inode>>,
         mode: RenameMode,
@@ -1701,22 +1699,23 @@ impl Inode for ExfatInode {
             return_errno_with_message!(Errno::EINVAL, "RENAME_EXCHANGE is not supported on exfat");
         }
 
-        let new_dir_inode = Arc::downcast::<ExfatInode>(new_dir_inode.clone()).unwrap();
-        let old_inode = Arc::downcast::<ExfatInode>(old_inode.clone()).unwrap();
+        let new_dir_inode = Arc::downcast::<ExfatInode>(new_dir_dentry.inode().clone()).unwrap();
+        let old_inode = Arc::downcast::<ExfatInode>(old_child_dentry.inode().clone()).unwrap();
+        let old_name = old_child_dentry.name();
 
         let fs = self.inner.read().fs();
         let fs_guard = fs.lock();
 
         // FIXME: Case-only renames are not handled correctly by exFAT. Keep the existing
         // no-op behavior until the VFS dentry invalidation is applied.
-        let up_old_name = fs.upcase_table().lock().str_to_upcase(old_name)?;
+        let up_old_name = fs.upcase_table().lock().str_to_upcase(&old_name)?;
         let up_new_name = fs.upcase_table().lock().str_to_upcase(new_name)?;
         if self.inner.read().ino == new_dir_inode.inner.read().ino && up_old_name.eq(&up_new_name) {
             return Ok(());
         }
 
         let replaced_inode = match replaced_inode {
-            Some(inode) => Some(Arc::downcast::<ExfatInode>(inode.clone()).unwrap()),
+            Some(inode) => Some(Arc::downcast::<ExfatInode>((*inode).clone()).unwrap()),
             None => {
                 // FIXME: The dentry lookup may miss an existing entry whose name differs only in case,
                 // so perform an additional case-insensitive lookup for the replacement.
@@ -1736,7 +1735,7 @@ impl Inode for ExfatInode {
         }
 
         // All checks are done here. This is a valid rename and it needs to modify the metadata.
-        self.delete_inode(old_inode.clone(), false, &fs_guard)?;
+        self.delete_inode(&old_inode, false, &fs_guard)?;
         // Create the new dentries.
         let new_inode =
             new_dir_inode.add_entry(new_name, old_inode.type_(), old_inode.mode()?, &fs_guard)?;
@@ -1748,7 +1747,7 @@ impl Inode for ExfatInode {
         let _ = fs.insert_inode(old_inode.clone());
         // Remove the exist 'new_name' file.
         if let Some(exist_inode) = replaced_inode {
-            new_dir_inode.delete_inode(exist_inode, true, &fs_guard)?;
+            new_dir_inode.delete_inode(&exist_inode, true, &fs_guard)?;
         }
         // Update the times.
         self.inner.write().update_atime_mtime_and_ctime()?;
@@ -1767,26 +1766,14 @@ impl Inode for ExfatInode {
         return_errno_with_message!(Errno::EINVAL, "unsupported operation")
     }
 
-    fn write_link(&self, target: &str) -> Result<()> {
-        return_errno_with_message!(Errno::EINVAL, "unsupported operation")
-    }
-
-    fn sync_all(&self) -> Result<()> {
+    fn sync(&self, mode: SyncMode) -> Result<()> {
         let inner = self.inner.read();
         let fs = inner.fs();
         let fs_guard = fs.lock();
-        inner.sync_all(&fs_guard)?;
-
-        fs.block_device().sync()?;
-
-        Ok(())
-    }
-
-    fn sync_data(&self) -> Result<()> {
-        let inner = self.inner.read();
-        let fs = inner.fs();
-        let fs_guard = fs.lock();
-        inner.sync_data(&fs_guard)?;
+        match mode {
+            SyncMode::Data => inner.sync_data(&fs_guard)?,
+            SyncMode::Full => inner.sync_all(&fs_guard)?,
+        }
 
         fs.block_device().sync()?;
 

@@ -7,41 +7,69 @@ use core::ops::Range;
 use device_id::{DeviceId, MajorId};
 
 use crate::{
-    device::{Device, DeviceType, add_node},
-    fs::vfs::path::PathResolver,
+    device::Device,
+    fs::devtmpfs::{self, DevtmpfsHandle, DevtmpfsNode},
     prelude::*,
 };
 
-static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<dyn Device>>> = Mutex::new(BTreeMap::new());
+struct RegisteredCharDevice {
+    device: Arc<dyn Device>,
+    node: Option<DevtmpfsHandle>,
+}
 
-/// Registers a new char device.
-pub(crate) fn register(device: Arc<dyn Device>) -> Result<()> {
-    let mut registry = DEVICE_REGISTRY.lock();
+static DEVICE_REGISTRY: Mutex<BTreeMap<u32, RegisteredCharDevice>> = Mutex::new(BTreeMap::new());
+
+/// Registers a new char device and immediately materializes its devtmpfs node.
+pub fn register(device: Arc<dyn Device>) -> Result<()> {
     let id = device.id().to_raw();
+    let mut registry = DEVICE_REGISTRY.lock();
     if registry.contains_key(&id) {
         return_errno_with_message!(Errno::EEXIST, "the char device already exists");
     }
-    registry.insert(id, device);
 
+    let node = if let Some(meta) = device.devtmpfs_meta() {
+        Some(devtmpfs::create_node(DevtmpfsNode::new(
+            device.type_(),
+            device.id(),
+            meta,
+        ))?)
+    } else {
+        None
+    };
+    registry.insert(id, RegisteredCharDevice { device, node });
     Ok(())
 }
 
 /// Unregisters an existing char device, returning the device if found.
-pub(crate) fn unregister(id: DeviceId) -> Result<Arc<dyn Device>> {
-    DEVICE_REGISTRY
+pub fn unregister(id: DeviceId) -> Result<Arc<dyn Device>> {
+    let registered = DEVICE_REGISTRY
         .lock()
         .remove(&id.to_raw())
-        .ok_or_else(|| Error::with_message(Errno::ENOENT, "the char device does not exist"))
-}
+        .ok_or_else(|| Error::with_message(Errno::ENOENT, "the char device does not exist"))?;
 
-/// Collects all char devices.
-pub(crate) fn collect_all() -> Vec<Arc<dyn Device>> {
-    DEVICE_REGISTRY.lock().values().cloned().collect()
+    if let Some(node) = registered.node
+        && let Err(error) = devtmpfs::delete(node)
+    {
+        match error.error() {
+            Errno::ENOENT | Errno::ESTALE => warn!(
+                "devtmpfs node for char device {:?} was already removed or replaced: {:?}",
+                id, error
+            ),
+            _ => warn!(
+                "failed to delete devtmpfs node for char device {:?}: {:?}",
+                id, error
+            ),
+        }
+    }
+    Ok(registered.device)
 }
 
 /// Looks up a char device of a given device ID.
 pub(super) fn lookup(id: DeviceId) -> Option<Arc<dyn Device>> {
-    DEVICE_REGISTRY.lock().get(&id.to_raw()).cloned()
+    DEVICE_REGISTRY
+        .lock()
+        .get(&id.to_raw())
+        .map(|entry| entry.device.clone())
 }
 
 /// The maximum value of the major device ID of a char device.
@@ -95,8 +123,6 @@ pub(crate) fn allocate_major() -> Result<MajorIdOwner> {
 }
 
 /// An owned major ID.
-///
-/// Each instances of this type will unregister the major ID when dropped.
 pub(crate) struct MajorIdOwner(MajorId);
 
 impl MajorIdOwner {
@@ -110,17 +136,4 @@ impl Drop for MajorIdOwner {
     fn drop(&mut self) {
         MAJORS.lock().remove(&self.0.get());
     }
-}
-
-// The first userspace process materializes pre-registered devices under `/dev`
-// according to their devtmpfs metadata.
-pub(super) fn init_in_first_process(path_resolver: &PathResolver) -> Result<()> {
-    for device in collect_all() {
-        if let Some(devtmpfs_meta) = device.devtmpfs_meta() {
-            let dev_id = device.id().as_encoded_u64();
-            add_node(DeviceType::Char, dev_id, &devtmpfs_meta, path_resolver)?;
-        }
-    }
-
-    Ok(())
 }

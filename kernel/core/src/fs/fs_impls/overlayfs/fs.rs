@@ -19,7 +19,7 @@ use ostd::{
 
 use crate::{
     fs::{
-        file::{AccessMode, InodeMode, InodeType, PerOpenFileOps, StatusFlags, mkmod},
+        file::{AccessMode, InodeMode, InodeType, PerOpenFileOps, StatusFlags, SyncMode, mkmod},
         pseudofs::AnonDeviceId,
         utils::{DirentCounter, DirentVisitor, NAME_MAX},
         vfs::{
@@ -28,7 +28,7 @@ use crate::{
                 Extension, FallocMode, FileOps, Inode, Metadata, MknodType, RenameMode,
                 SymbolicLink,
             },
-            path::{FsPath, Path},
+            path::{Dentry, FsPath, Path},
             registry::{FsCreationCtx, FsProperties, FsType},
             xattr::{XATTR_VALUE_MAX_LEN, XattrName, XattrNamespace, XattrSetFlags},
         },
@@ -247,6 +247,33 @@ impl OverlayInode {
         type_: InodeType,
         mode: InodeMode,
     ) -> Result<Arc<dyn Inode>> {
+        let (new_upper, upper_is_opaque) =
+            self.create_upper_child(name, type_, |upper, upper_dentry| {
+                upper.create(upper_dentry, name, type_, mode)
+            })?;
+        Ok(self.new_child_from_upper(name, type_, new_upper, upper_is_opaque))
+    }
+
+    /// Creates a new symbolic-link child `OverlayInode` in the upper layer.
+    pub(crate) fn create_symlink(
+        &self,
+        name: &str,
+        target: &str,
+        mode: InodeMode,
+    ) -> Result<Arc<dyn Inode>> {
+        let (new_upper, upper_is_opaque) =
+            self.create_upper_child(name, InodeType::SymLink, |upper, upper_dentry| {
+                upper.create_symlink(upper_dentry, name, target, mode)
+            })?;
+        Ok(self.new_child_from_upper(name, InodeType::SymLink, new_upper, upper_is_opaque))
+    }
+
+    fn create_upper_child(
+        &self,
+        name: &str,
+        type_: InodeType,
+        create_fn: impl FnOnce(&Arc<dyn Inode>, &Dentry) -> Result<Arc<dyn Inode>>,
+    ) -> Result<(Arc<dyn Inode>, bool)> {
         if self.type_ != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -271,28 +298,44 @@ impl OverlayInode {
         // Protect the whole create operation
         let upper_guard = self.upper.lock();
         let upper = upper_guard.as_ref().unwrap();
+        let upper_dentry = Dentry::new_root(upper.clone());
+        let upper_dir_dentry = upper_dentry.as_dir_dentry_or_err()?;
 
         let mut upper_is_opaque = false;
         if is_whiteout {
             // Delete the whiteout file first then create the new file
             // or the new opaque directory.
-            upper.unlink(&whiteout_name(name))?;
+            let whiteout_name = whiteout_name(name);
+            let whiteout_dentry = upper_dir_dentry.lookup_child(&whiteout_name)?;
+            upper.unlink(&whiteout_dentry)?;
 
             if type_ == InodeType::Dir {
                 upper_is_opaque = true;
             }
         }
 
-        let new_upper = upper.create(name, type_, mode)?;
+        let new_upper = create_fn(upper, &upper_dentry)?;
         if upper_is_opaque {
+            let new_upper_dentry = upper_dir_dentry.lookup_child(name)?;
             new_upper.set_xattr(
+                &new_upper_dentry,
                 XattrName::try_from_full_name(OPAQUE_DIR_XATTR_NAME).unwrap(),
                 &mut VmReader::from(WHITEOUT_AND_OPAQUE_XATTR_VALUE.as_slice()).to_fallible(),
                 XattrSetFlags::CREATE_ONLY,
             )?;
         }
 
-        let new_child = Arc::new_cyclic(|weak| OverlayInode {
+        Ok((new_upper, upper_is_opaque))
+    }
+
+    fn new_child_from_upper(
+        &self,
+        name: &str,
+        type_: InodeType,
+        new_upper: Arc<dyn Inode>,
+        upper_is_opaque: bool,
+    ) -> Arc<dyn Inode> {
+        let new_child: Arc<OverlayInode> = Arc::new_cyclic(|weak| OverlayInode {
             ino: new_upper.ino(),
             type_,
             name_upon_creation: SpinLock::new(String::from(name)),
@@ -304,7 +347,7 @@ impl OverlayInode {
             fs: self.fs.clone(),
             self_: weak.clone(),
         });
-        Ok(new_child)
+        new_child
     }
 
     /// Writes data to the target inode, if it resides in the lower layer,
@@ -379,10 +422,9 @@ impl OverlayInode {
 
     /// Deletes the target file by creating a "whiteout" file from the upper layer.
     /// The corresponding parent directories will be created also if they do not exist.
-    pub(crate) fn unlink(&self, name: &str) -> Result<()> {
+    pub(crate) fn unlink(&self, name: &str, child: &Arc<dyn Inode>) -> Result<()> {
         // TODO: Hold the upper lock from here to avoid race condition
-        let inode = self.lookup(name)?;
-        let target = inode.downcast_ref::<OverlayInode>().unwrap();
+        let target = child.downcast_ref::<OverlayInode>().unwrap();
         if target.type_() == InodeType::Dir {
             return_errno!(Errno::EISDIR);
         }
@@ -395,17 +437,30 @@ impl OverlayInode {
         }
 
         let upper = upper_guard.as_ref().unwrap();
+        let upper_dentry = Dentry::new_root(upper.clone());
+        let upper_dir_dentry = upper_dentry.as_dir_dentry_or_err()?;
+
         let target_has_valid_lower = target.has_valid_lower();
         if target.has_valid_upper() {
-            upper.unlink(name)?;
+            let upper_child_dentry = upper_dir_dentry.lookup_child(name)?;
+            upper.unlink(&upper_child_dentry)?;
         } else {
             assert!(target_has_valid_lower);
         }
 
         if target_has_valid_lower {
-            let whiteout = upper.create(&whiteout_name(name), InodeType::File, mkmod!(a+r, u+w))?;
+            let whiteout_name = whiteout_name(name);
+            let _ = upper.create(
+                &upper_dentry,
+                &whiteout_name,
+                InodeType::File,
+                mkmod!(a+r, u+w),
+            )?;
+            let whiteout_dentry = upper_dir_dentry.lookup_child(&whiteout_name)?;
+            let whiteout = whiteout_dentry.inode();
             // FIXME: Align the whiteout xattr behavior with Linux
             whiteout.set_xattr(
+                &whiteout_dentry,
                 XattrName::try_from_full_name(WHITEOUT_XATTR_NAME).unwrap(),
                 &mut VmReader::from(WHITEOUT_AND_OPAQUE_XATTR_VALUE.as_slice()).to_fallible(),
                 XattrSetFlags::CREATE_ONLY,
@@ -417,10 +472,9 @@ impl OverlayInode {
 
     /// Deletes the target directory by creating an "opaque" directory from the upper layer.
     /// The corresponding parent directories will be created also if they do not exist.
-    pub(crate) fn rmdir(&self, name: &str) -> Result<()> {
+    pub(crate) fn rmdir(&self, name: &str, child: &Arc<dyn Inode>) -> Result<()> {
         // TODO: Hold the upper lock from here to avoid race condition
-        let inode = self.lookup(name)?;
-        let target = inode.downcast_ref::<OverlayInode>().unwrap();
+        let target = child.downcast_ref::<OverlayInode>().unwrap();
         if target.type_() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -437,21 +491,40 @@ impl OverlayInode {
         // Delete all the whiteout files if necessary
         if visitor.contains_whiteout() {
             let target_upper = target.upper().unwrap();
+            let target_upper_dentry = Dentry::new_root(target_upper.clone());
 
             let mut target_visitor = Vec::<String>::new();
             target_upper.readdir_at(0, &mut target_visitor)?;
 
             for whiteout in target_visitor.iter().skip(2) {
                 assert!(whiteout.starts_with(WHITEOUT_PREFIX));
-                target_upper.unlink(whiteout)?;
+                let whiteout_dentry = target_upper_dentry
+                    .as_dir_dentry_or_err()?
+                    .lookup_child(whiteout)?;
+                target_upper.unlink(&whiteout_dentry)?;
             }
         }
 
-        upper.rmdir(name)?;
+        let upper_dentry = Dentry::new_root(upper.clone());
+        let upper_dir_dentry = upper_dentry.as_dir_dentry_or_err()?;
 
-        let whiteout = upper.create(&whiteout_name(name), InodeType::File, mkmod!(a+r, u+w))?;
+        if target.has_valid_upper() {
+            let upper_child_dentry = upper_dir_dentry.lookup_child(name)?;
+            upper.rmdir(&upper_child_dentry)?;
+        }
+
+        let whiteout_name = whiteout_name(name);
+        let _ = upper.create(
+            &upper_dentry,
+            &whiteout_name,
+            InodeType::File,
+            mkmod!(a+r, u+w),
+        )?;
+        let whiteout_dentry = upper_dir_dentry.lookup_child(&whiteout_name)?;
+        let whiteout = whiteout_dentry.inode();
         // FIXME: Align the whiteout xattr behavior with Linux
         whiteout.set_xattr(
+            &whiteout_dentry,
             XattrName::try_from_full_name(WHITEOUT_XATTR_NAME).unwrap(),
             &mut VmReader::from(WHITEOUT_AND_OPAQUE_XATTR_VALUE.as_slice()).to_fallible(),
             XattrSetFlags::CREATE_ONLY,
@@ -477,7 +550,7 @@ impl OverlayInode {
         }
 
         let upper = self.build_upper_recursively_if_needed()?;
-        upper.resize(new_size)
+        upper.resize(&Dentry::new_root(upper.clone()), new_size)
     }
 
     pub(crate) fn metadata(&self) -> Result<Metadata> {
@@ -515,15 +588,25 @@ impl OverlayInode {
             return_errno_with_message!(Errno::ENOTDIR, "not mknod on a dir");
         }
         let upper = self.build_upper_recursively_if_needed()?;
-        upper.mknod(name, mode, type_)
+        let upper_dentry = Dentry::new_root(upper.clone());
+        upper.mknod(&upper_dentry, name, mode, type_)
     }
 
-    pub(crate) fn link(&self, old: &Arc<dyn Inode>, name: &str) -> Result<()> {
+    pub(crate) fn link(&self, old_dentry: &Dentry, name: &str) -> Result<()> {
         if self.type_ != InodeType::Dir {
             return_errno_with_message!(Errno::ENOTDIR, "self is not dir");
         }
         let upper = self.build_upper_recursively_if_needed()?;
-        upper.link(old, name)
+        let old = old_dentry
+            .inode()
+            .downcast_ref::<OverlayInode>()
+            .unwrap()
+            .build_upper_recursively_if_needed()?;
+        upper.link(
+            &Dentry::new_root(upper.clone()),
+            &Dentry::new_root(old),
+            name,
+        )
     }
 
     pub(crate) fn read_link(&self) -> Result<SymbolicLink> {
@@ -531,14 +614,6 @@ impl OverlayInode {
             return_errno_with_message!(Errno::EINVAL, "self is not symlink");
         }
         self.get_top_valid_inode().read_link()
-    }
-
-    pub(crate) fn write_link(&self, target: &str) -> Result<()> {
-        if self.type_ != InodeType::SymLink {
-            return_errno_with_message!(Errno::EINVAL, "self is not symlink");
-        }
-        let upper = self.build_upper_recursively_if_needed()?;
-        upper.write_link(target)
     }
 
     pub(crate) fn rename(
@@ -558,12 +633,8 @@ impl OverlayInode {
         );
     }
 
-    pub(crate) fn sync_all(&self) -> Result<()> {
-        self.upper().map_or(Ok(()), |upper| upper.sync_all())
-    }
-
-    pub(crate) fn sync_data(&self) -> Result<()> {
-        self.upper().map_or(Ok(()), |upper| upper.sync_data())
+    pub(crate) fn sync(&self, mode: SyncMode) -> Result<()> {
+        self.upper().map_or(Ok(()), |upper| upper.sync(mode))
     }
 }
 
@@ -576,11 +647,6 @@ impl OverlayInode {
     pub(crate) fn atime(&self) -> Duration;
     pub(crate) fn mtime(&self) -> Duration;
     pub(crate) fn ctime(&self) -> Duration;
-    pub(crate) fn open(
-        &self,
-        access_mode: AccessMode,
-        status_flags: StatusFlags,
-    ) -> Option<Result<Box<dyn PerOpenFileOps>>>;
     pub(crate) fn get_xattr(&self, name: XattrName, value_writer: &mut VmWriter) -> Result<usize>;
     pub(crate) fn list_xattr(
         &self,
@@ -589,20 +655,51 @@ impl OverlayInode {
     ) -> Result<usize>;
 }
 
-#[inherit_methods(from = "self.build_upper_recursively_if_needed()?")]
 impl OverlayInode {
-    // TODO: Support the `metacopy` feature for efficiency
-    pub(crate) fn set_mode(&self, mode: InodeMode) -> Result<()>;
-    pub(crate) fn set_owner(&self, uid: Uid) -> Result<()>;
-    pub(crate) fn set_group(&self, gid: Gid) -> Result<()>;
-    pub(crate) fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()>;
-}
+    pub(crate) fn open(
+        &self,
+        access_mode: AccessMode,
+        status_flags: StatusFlags,
+    ) -> Option<Result<Box<dyn PerOpenFileOps>>> {
+        let inode = self.get_top_valid_inode();
+        inode.open(&Dentry::new_root(inode.clone()), access_mode, status_flags)
+    }
 
-#[inherit_methods(from = "self.build_upper_recursively_if_needed().unwrap()")]
-impl OverlayInode {
-    pub(crate) fn set_atime(&self, time: Duration);
-    pub(crate) fn set_mtime(&self, time: Duration);
-    pub(crate) fn set_ctime(&self, time: Duration);
+    // TODO: Support the `metacopy` feature for efficiency
+    pub(crate) fn set_mode(&self, mode: InodeMode) -> Result<()> {
+        let upper = self.build_upper_recursively_if_needed()?;
+        upper.set_mode(&Dentry::new_root(upper.clone()), mode)
+    }
+
+    pub(crate) fn set_owner(&self, uid: Uid) -> Result<()> {
+        let upper = self.build_upper_recursively_if_needed()?;
+        upper.set_owner(&Dentry::new_root(upper.clone()), uid)
+    }
+
+    pub(crate) fn set_group(&self, gid: Gid) -> Result<()> {
+        let upper = self.build_upper_recursively_if_needed()?;
+        upper.set_group(&Dentry::new_root(upper.clone()), gid)
+    }
+
+    pub(crate) fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
+        let upper = self.build_upper_recursively_if_needed()?;
+        upper.fallocate(mode, offset, len)
+    }
+
+    pub(crate) fn set_atime(&self, time: Duration) {
+        let upper = self.build_upper_recursively_if_needed().unwrap();
+        upper.set_atime(&Dentry::new_root(upper.clone()), time);
+    }
+
+    pub(crate) fn set_mtime(&self, time: Duration) {
+        let upper = self.build_upper_recursively_if_needed().unwrap();
+        upper.set_mtime(&Dentry::new_root(upper.clone()), time);
+    }
+
+    pub(crate) fn set_ctime(&self, time: Duration) {
+        let upper = self.build_upper_recursively_if_needed().unwrap();
+        upper.set_ctime(&Dentry::new_root(upper.clone()), time);
+    }
 }
 
 impl OverlayInode {
@@ -831,7 +928,13 @@ impl OverlayInode {
             .build_upper_recursively_if_needed()?;
 
         let mode = self.get_top_valid_lower_inode().unwrap().mode()?;
-        let new_upper = parent_upper.create(&self.name_upon_creation(), self.type_, mode)?;
+        let parent_upper_dentry = Dentry::new_root(parent_upper.clone());
+        let new_upper = parent_upper.create(
+            &parent_upper_dentry,
+            &self.name_upon_creation(),
+            self.type_,
+            mode,
+        )?;
 
         // There must exist a valid lower inode if the upper is missing
         assert!(!self.lowers.is_empty());
@@ -870,11 +973,12 @@ impl OverlayInode {
         // TODO: We lack an efficient whole metadata copy API.
 
         // The mode is copied up upon creation.
-        upper.set_owner(lower.owner()?)?;
-        upper.set_group(lower.group()?)?;
-        upper.set_atime(lower.atime());
-        upper.set_mtime(lower.mtime());
-        upper.set_ctime(lower.ctime());
+        let upper_dentry = Dentry::new_root(upper.clone());
+        upper.set_owner(&upper_dentry, lower.owner()?)?;
+        upper.set_group(&upper_dentry, lower.group()?)?;
+        upper.set_atime(&upper_dentry, lower.atime());
+        upper.set_mtime(&upper_dentry, lower.mtime());
+        upper.set_ctime(&upper_dentry, lower.ctime());
         Ok(())
     }
 
@@ -917,6 +1021,7 @@ impl OverlayInode {
         let value_buf = FrameAllocOptions::new()
             .zeroed(false)
             .alloc_segment(XATTR_VALUE_MAX_LEN / PAGE_SIZE)?;
+        let upper_dentry = Dentry::new_root(upper.clone());
         for name in list
             .split(|&byte| byte == 0)
             .map(|slice| String::from_utf8_lossy(slice))
@@ -930,6 +1035,7 @@ impl OverlayInode {
             )?;
             let mut value_reader = value_buf.reader().to_fallible();
             upper.set_xattr(
+                &upper_dentry,
                 XattrName::try_from_full_name(name.as_ref()).unwrap(),
                 value_reader.limit(value_len),
                 XattrSetFlags::CREATE_ONLY,
@@ -989,60 +1095,121 @@ impl FileOps for OverlayInode {
 #[inherit_methods(from = "self")]
 impl Inode for OverlayInode {
     fn size(&self) -> usize;
-    fn resize(&self, new_size: usize) -> Result<()>;
+    fn resize(&self, _self_dentry: &Dentry, new_size: usize) -> Result<()> {
+        self.resize(new_size)
+    }
     fn metadata(&self) -> Result<Metadata>;
     fn extension(&self) -> &Extension;
     fn ino(&self) -> u64;
     fn type_(&self) -> InodeType;
     fn mode(&self) -> Result<InodeMode>;
-    fn set_mode(&self, mode: InodeMode) -> Result<()>;
+    fn set_mode(&self, _self_dentry: &Dentry, mode: InodeMode) -> Result<()> {
+        self.set_mode(mode)
+    }
     fn owner(&self) -> Result<Uid>;
-    fn set_owner(&self, uid: Uid) -> Result<()>;
+    fn set_owner(&self, _self_dentry: &Dentry, uid: Uid) -> Result<()> {
+        self.set_owner(uid)
+    }
     fn group(&self) -> Result<Gid>;
-    fn set_group(&self, gid: Gid) -> Result<()>;
+    fn set_group(&self, _self_dentry: &Dentry, gid: Gid) -> Result<()> {
+        self.set_group(gid)
+    }
     fn atime(&self) -> Duration;
-    fn set_atime(&self, time: Duration);
+    fn set_atime(&self, _self_dentry: &Dentry, time: Duration) {
+        self.set_atime(time)
+    }
     fn mtime(&self) -> Duration;
-    fn set_mtime(&self, time: Duration);
+    fn set_mtime(&self, _self_dentry: &Dentry, time: Duration) {
+        self.set_mtime(time)
+    }
     fn ctime(&self) -> Duration;
-    fn set_ctime(&self, time: Duration);
+    fn set_ctime(&self, _self_dentry: &Dentry, time: Duration) {
+        self.set_ctime(time)
+    }
     fn page_cache(&self) -> Option<Arc<Vmo>>;
-    fn create(&self, name: &str, type_: InodeType, mode: InodeMode) -> Result<Arc<dyn Inode>>;
-    fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Arc<dyn Inode>>;
+    fn create(
+        &self,
+        _self_dentry: &Dentry,
+        name: &str,
+        type_: InodeType,
+        mode: InodeMode,
+    ) -> Result<Arc<dyn Inode>> {
+        self.create(name, type_, mode)
+    }
+    fn create_symlink(
+        &self,
+        _self_dentry: &Dentry,
+        name: &str,
+        target: &str,
+        mode: InodeMode,
+    ) -> Result<Arc<dyn Inode>> {
+        self.create_symlink(name, target, mode)
+    }
+    fn mknod(
+        &self,
+        _self_dentry: &Dentry,
+        name: &str,
+        mode: InodeMode,
+        type_: MknodType,
+    ) -> Result<Arc<dyn Inode>> {
+        self.mknod(name, mode, type_)
+    }
     fn open(
         &self,
+        _self_dentry: &Dentry,
         access_mode: AccessMode,
         status_flags: StatusFlags,
-    ) -> Option<Result<Box<dyn PerOpenFileOps>>>;
-    fn link(&self, old: &Arc<dyn Inode>, name: &str) -> Result<()>;
-    fn unlink(&self, name: &str) -> Result<()>;
-    fn rmdir(&self, name: &str) -> Result<()>;
+    ) -> Option<Result<Box<dyn PerOpenFileOps>>> {
+        self.open(access_mode, status_flags)
+    }
+    fn link(&self, _self_dentry: &Dentry, old_dentry: &Dentry, name: &str) -> Result<()> {
+        self.link(old_dentry, name)
+    }
+    fn unlink(&self, child_dentry: &Dentry) -> Result<()> {
+        self.unlink(&child_dentry.name(), child_dentry.inode())
+    }
+    fn rmdir(&self, child_dentry: &Dentry) -> Result<()> {
+        self.rmdir(&child_dentry.name(), child_dentry.inode())
+    }
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>>;
     fn rename(
         &self,
-        old_name: &str,
-        old_inode: &Arc<dyn Inode>,
-        new_dir_inode: &Arc<dyn Inode>,
+        old_child_dentry: &Dentry,
+        new_dir_dentry: &Dentry,
         new_name: &str,
         replaced_inode: Option<&Arc<dyn Inode>>,
         mode: RenameMode,
-    ) -> Result<()>;
+    ) -> Result<()> {
+        self.rename(
+            &old_child_dentry.name(),
+            old_child_dentry.inode(),
+            new_dir_dentry.inode(),
+            new_name,
+            replaced_inode,
+            mode,
+        )
+    }
     fn read_link(&self) -> Result<SymbolicLink>;
-    fn write_link(&self, target: &str) -> Result<()>;
-    fn sync_all(&self) -> Result<()>;
-    fn sync_data(&self) -> Result<()>;
-    fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()>;
+    fn sync(&self, mode: SyncMode) -> Result<()>;
+    fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
+        self.fallocate(mode, offset, len)
+    }
     fn fs(&self) -> Arc<dyn FileSystem>;
     fn set_xattr(
         &self,
+        _self_dentry: &Dentry,
         name: XattrName,
         value_reader: &mut VmReader,
         flags: XattrSetFlags,
-    ) -> Result<()>;
+    ) -> Result<()> {
+        let upper = self.build_upper_recursively_if_needed()?;
+        upper.set_xattr(&Dentry::new_root(upper.clone()), name, value_reader, flags)
+    }
     fn get_xattr(&self, name: XattrName, value_writer: &mut VmWriter) -> Result<usize>;
     fn list_xattr(&self, namespace: XattrNamespace, list_writer: &mut VmWriter) -> Result<usize>;
-    fn remove_xattr(&self, name: XattrName) -> Result<()> {
-        self.build_upper_recursively_if_needed()?.remove_xattr(name)
+    fn remove_xattr(&self, _self_dentry: &Dentry, name: XattrName) -> Result<()> {
+        let upper = self.build_upper_recursively_if_needed()?;
+        upper.remove_xattr(&Dentry::new_root(upper.clone()), name)
     }
 }
 
@@ -1282,6 +1449,18 @@ mod tests {
         .unwrap()
     }
 
+    fn test_dentry(inode: &Arc<dyn Inode>) -> Arc<Dentry> {
+        Dentry::new_root(inode.clone())
+    }
+
+    fn test_child_dentry(parent: &Dentry, name: &str) -> Arc<Dentry> {
+        parent
+            .as_dir_dentry_or_err()
+            .unwrap()
+            .lookup_child(name)
+            .unwrap()
+    }
+
     fn create_overlay_fs() -> Arc<dyn FileSystem> {
         crate::time::clocks::init_for_ktest();
         crate::fs::vfs::init();
@@ -1289,19 +1468,19 @@ mod tests {
         let mode = InodeMode::all();
         let upper = {
             let root_mount = new_dummy_mount();
-            Path::new_fs_root(root_mount)
+            Path::new_root(root_mount)
         };
         let lower = {
             let r1 = new_dummy_mount();
             let r2 = new_dummy_mount();
 
-            let l1 = Path::new_fs_root(r1);
-            l1.new_fs_child("f1", InodeType::File, mode).unwrap();
-            let d1 = l1.new_fs_child("d1", InodeType::Dir, mode).unwrap();
-            d1.new_fs_child("f11", InodeType::File, mode).unwrap();
+            let l1 = Path::new_root(r1);
+            l1.new_child("f1", InodeType::File, mode).unwrap();
+            let d1 = l1.new_child("d1", InodeType::Dir, mode).unwrap();
+            d1.new_child("f11", InodeType::File, mode).unwrap();
 
-            let l2 = Path::new_fs_root(r2);
-            let f2 = l2.new_fs_child("f2", InodeType::File, mode).unwrap();
+            let l2 = Path::new_root(r2);
+            let f2 = l2.new_child("f2", InodeType::File, mode).unwrap();
             let f2_inode = f2.inode();
             f2_inode
                 .write_at(
@@ -1310,17 +1489,18 @@ mod tests {
                     StatusFlags::empty(),
                 )
                 .unwrap();
-            f2_inode.set_group(Gid::new(77)).unwrap();
+            f2_inode.set_group(f2.dentry(), Gid::new(77)).unwrap();
             f2_inode
                 .set_xattr(
+                    f2.dentry(),
                     XattrName::try_from_full_name("trusted.f2_xattr_name").unwrap(),
                     &mut VmReader::from("f2_xattr_value".as_bytes()).to_fallible(),
                     XattrSetFlags::CREATE_ONLY,
                 )
                 .unwrap();
-            let d1 = l2.new_fs_child("d1", InodeType::Dir, mode).unwrap();
-            d1.new_fs_child("f11", InodeType::File, mode).unwrap();
-            d1.new_fs_child("f12", InodeType::File, mode).unwrap();
+            let d1 = l2.new_child("d1", InodeType::Dir, mode).unwrap();
+            d1.new_child("f11", InodeType::File, mode).unwrap();
+            d1.new_child("f12", InodeType::File, mode).unwrap();
 
             vec![l1, l2]
         };
@@ -1336,9 +1516,9 @@ mod tests {
         crate::time::clocks::init_for_ktest();
         crate::fs::vfs::init();
 
-        let upper = Path::new_fs_root(new_dummy_mount());
-        let lower = vec![Path::new_fs_root(new_dummy_mount())];
-        let work = Path::new_fs_root(new_dummy_mount());
+        let upper = Path::new_root(new_dummy_mount());
+        let lower = vec![Path::new_root(new_dummy_mount())];
+        let work = Path::new_root(new_dummy_mount());
 
         let Err(e) = OverlayFs::new(upper, lower, work) else {
             panic!("OverlayFs::new should fail when work and upper are not in the same mount");
@@ -1353,11 +1533,11 @@ mod tests {
 
         let mode = InodeMode::all();
         let upper = {
-            let root = Path::new_fs_root(new_dummy_mount());
-            root.new_fs_child("file", InodeType::File, mode).unwrap();
+            let root = Path::new_root(new_dummy_mount());
+            root.new_child("file", InodeType::File, mode).unwrap();
             root
         };
-        let lower = vec![Path::new_fs_root(new_dummy_mount())];
+        let lower = vec![Path::new_root(new_dummy_mount())];
         let work = upper.clone();
 
         let Err(e) = OverlayFs::new(upper, lower, work) else {
@@ -1372,46 +1552,47 @@ mod tests {
         crate::fs::vfs::init();
 
         let mode = InodeMode::all();
-        let root = Path::new_fs_root(new_dummy_mount());
+        let root = Path::new_root(new_dummy_mount());
         let upper = {
-            let dir = root.new_fs_child("upper", InodeType::Dir, mode).unwrap();
-            dir.new_fs_child("f1", InodeType::File, mode).unwrap();
-            dir.new_fs_child(".wh.f2", InodeType::File, mode).unwrap();
-            dir.new_fs_child("d1", InodeType::Dir, mode).unwrap();
-            dir.new_fs_child("d2", InodeType::Dir, mode).unwrap();
-            dir.new_fs_child(".wh.d3", InodeType::Dir, mode).unwrap();
+            let dir = root.new_child("upper", InodeType::Dir, mode).unwrap();
+            dir.new_child("f1", InodeType::File, mode).unwrap();
+            dir.new_child(".wh.f2", InodeType::File, mode).unwrap();
+            dir.new_child("d1", InodeType::Dir, mode).unwrap();
+            dir.new_child("d2", InodeType::Dir, mode).unwrap();
+            dir.new_child(".wh.d3", InodeType::Dir, mode).unwrap();
             dir
         };
         let lower = {
             let l1 = {
-                let r1 = Path::new_fs_root(new_dummy_mount());
-                r1.new_fs_child("f1", InodeType::Dir, mode).unwrap();
-                r1.new_fs_child("f2", InodeType::File, mode).unwrap();
-                let d1 = r1.new_fs_child("d1", InodeType::Dir, mode).unwrap();
+                let r1 = Path::new_root(new_dummy_mount());
+                r1.new_child("f1", InodeType::Dir, mode).unwrap();
+                r1.new_child("f2", InodeType::File, mode).unwrap();
+                let d1 = r1.new_child("d1", InodeType::Dir, mode).unwrap();
                 // Set internal OverlayFS metadata while constructing the synthetic lower layer.
                 d1.inode()
                     .set_xattr(
+                        d1.dentry(),
                         XattrName::try_from_full_name(OPAQUE_DIR_XATTR_NAME).unwrap(),
                         &mut VmReader::from(WHITEOUT_AND_OPAQUE_XATTR_VALUE.as_slice())
                             .to_fallible(),
                         XattrSetFlags::CREATE_ONLY,
                     )
                     .unwrap();
-                r1.new_fs_child("d2", InodeType::File, mode).unwrap();
-                r1.new_fs_child("d3", InodeType::Dir, mode).unwrap();
+                r1.new_child("d2", InodeType::File, mode).unwrap();
+                r1.new_child("d3", InodeType::Dir, mode).unwrap();
                 r1
             };
             let l2 = {
-                let r2 = Path::new_fs_root(new_dummy_mount());
-                r2.new_fs_child("f1", InodeType::File, mode).unwrap();
-                r2.new_fs_child("d1", InodeType::Dir, mode).unwrap();
-                r2.new_fs_child("d2", InodeType::Dir, mode).unwrap();
-                r2.new_fs_child("d4", InodeType::Dir, mode).unwrap();
+                let r2 = Path::new_root(new_dummy_mount());
+                r2.new_child("f1", InodeType::File, mode).unwrap();
+                r2.new_child("d1", InodeType::Dir, mode).unwrap();
+                r2.new_child("d2", InodeType::Dir, mode).unwrap();
+                r2.new_child("d4", InodeType::Dir, mode).unwrap();
                 r2
             };
             vec![l1, l2]
         };
-        let work = root.new_fs_child("work", InodeType::Dir, mode).unwrap();
+        let work = root.new_child("work", InodeType::Dir, mode).unwrap();
 
         let fs = OverlayFs::new(upper, lower, work).unwrap();
         let root = fs.root_inode();
@@ -1474,14 +1655,17 @@ mod tests {
         let fs = create_overlay_fs();
         let root = fs.root_inode();
         let mode = InodeMode::all();
+        let root_dentry = test_dentry(&root);
 
-        let Err(e) = root.create("f1", InodeType::File, mode) else {
+        let Err(e) = root.create(&root_dentry, "f1", InodeType::File, mode) else {
             panic!();
         };
         assert_eq!(e.error(), Errno::EEXIST);
-        root.unlink("f1").unwrap();
+        let f1_dentry = test_child_dentry(&root_dentry, "f1");
+        root.unlink(&f1_dentry).unwrap();
 
-        root.create("f1", InodeType::File, mode).unwrap();
+        root.create(&root_dentry, "f1", InodeType::File, mode)
+            .unwrap();
     }
 
     #[ktest]
@@ -1489,19 +1673,26 @@ mod tests {
         let fs = create_overlay_fs();
         let root = fs.root_inode();
         let mode = InodeMode::all();
+        let root_dentry = test_dentry(&root);
 
-        let Err(e) = root.create("d1", InodeType::Dir, mode) else {
+        let Err(e) = root.create(&root_dentry, "d1", InodeType::Dir, mode) else {
             panic!();
         };
         assert_eq!(e.error(), Errno::EEXIST);
 
-        let d1 = root.lookup("d1").unwrap();
-        d1.unlink("f11").unwrap();
-        d1.unlink("f12").unwrap();
+        let d1_dentry = test_child_dentry(&root_dentry, "d1");
+        let d1 = d1_dentry.inode().clone();
+        let f11_dentry = test_child_dentry(&d1_dentry, "f11");
+        d1.unlink(&f11_dentry).unwrap();
+        let f12_dentry = test_child_dentry(&d1_dentry, "f12");
+        d1.unlink(&f12_dentry).unwrap();
 
-        root.rmdir("d1").unwrap();
-        let d1 = root.create("d1", InodeType::Dir, mode).unwrap();
-        d1.create("f11", InodeType::File, mode).unwrap();
+        root.rmdir(&d1_dentry).unwrap();
+        let d1 = root
+            .create(&root_dentry, "d1", InodeType::Dir, mode)
+            .unwrap();
+        d1.create(&test_dentry(&d1), "f11", InodeType::File, mode)
+            .unwrap();
     }
 
     #[ktest]
@@ -1533,33 +1724,31 @@ mod tests {
         crate::fs::vfs::init();
 
         let mode = InodeMode::all();
-        let root = Path::new_fs_root(new_dummy_mount());
+        let root = Path::new_root(new_dummy_mount());
 
         let upper = {
-            let dir = root.new_fs_child("upper", InodeType::Dir, mode).unwrap();
+            let dir = root.new_child("upper", InodeType::Dir, mode).unwrap();
             // whiteout for "deleted"
-            dir.new_fs_child(".wh.deleted", InodeType::File, mode)
-                .unwrap();
+            dir.new_child(".wh.deleted", InodeType::File, mode).unwrap();
             // a normal file that should appear exactly once
-            dir.new_fs_child("normal_file", InodeType::File, mode)
-                .unwrap();
+            dir.new_child("normal_file", InodeType::File, mode).unwrap();
             dir
         };
 
         let lower = {
-            let lower_root = Path::new_fs_root(new_dummy_mount());
+            let lower_root = Path::new_root(new_dummy_mount());
             // this file is whited-out by upper, should NOT appear
             lower_root
-                .new_fs_child("deleted", InodeType::File, mode)
+                .new_child("deleted", InodeType::File, mode)
                 .unwrap();
             // this file only lives in lower, should appear once
             lower_root
-                .new_fs_child("another_file", InodeType::File, mode)
+                .new_child("another_file", InodeType::File, mode)
                 .unwrap();
             lower_root
         };
 
-        let work = root.new_fs_child("work", InodeType::Dir, mode).unwrap();
+        let work = root.new_child("work", InodeType::Dir, mode).unwrap();
         let fs = OverlayFs::new(upper, vec![lower], work).unwrap();
         let root_inode = fs.root_inode();
 
@@ -1601,16 +1790,18 @@ mod tests {
         let fs = create_overlay_fs();
         let root = fs.root_inode();
         let mode = InodeMode::all();
+        let root_dentry = test_dentry(&root);
 
-        let f1 = root.lookup("f1").unwrap();
+        let f1_dentry = test_child_dentry(&root_dentry, "f1");
+        let f1 = f1_dentry.inode().clone();
         assert_eq!(f1.size(), 0);
-        f1.resize(PAGE_SIZE).unwrap();
+        f1.resize(&f1_dentry, PAGE_SIZE).unwrap();
         f1.page_cache()
             .unwrap()
             .write(0, &mut VmReader::from([3].as_slice()).to_fallible())
             .unwrap();
-        f1.set_atime(Duration::default());
-        f1.sync_data().unwrap();
+        f1.set_atime(&f1_dentry, Duration::default());
+        f1.sync(SyncMode::Data).unwrap();
         let mut data = [0u8; 1];
         f1.read_at(
             0,
@@ -1620,14 +1811,17 @@ mod tests {
         .unwrap();
         assert_eq!(data, [3u8; 1]);
 
-        let d1 = root.lookup("d1").unwrap();
-        d1.set_mode(mode).unwrap();
+        let d1_dentry = test_child_dentry(&root_dentry, "d1");
+        let d1 = d1_dentry.inode().clone();
+        d1.set_mode(&d1_dentry, mode).unwrap();
         assert_ne!(f1.ino(), d1.ino());
-        d1.mknod("dev", mode, MknodType::NamedPipe).unwrap();
+        d1.mknod(&d1_dentry, "dev", mode, MknodType::NamedPipe)
+            .unwrap();
 
-        let link = d1.create("link", InodeType::SymLink, mode).unwrap();
         let link_str = "link_to_somewhere";
-        link.write_link(link_str).unwrap();
+        let link = d1
+            .create_symlink(&d1_dentry, "link", link_str, mode)
+            .unwrap();
         assert!(matches!(
             link.read_link().unwrap(),
             SymbolicLink::Plain(s) if s == link_str

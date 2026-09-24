@@ -1,4 +1,9 @@
-{ config, lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 {
   systemd.package = pkgs.aster_systemd;
@@ -12,12 +17,11 @@
   systemd.services.network-setup.enable = false;
   systemd.services.resolvconf.enable = false;
   systemd.services.systemd-random-seed.enable = false;
-  systemd.services.systemd-tmpfiles-clean.enable = false;
-  systemd.services.systemd-tmpfiles-setup.enable = false;
   services.timesyncd.enable = false;
   services.udev.enable = false;
 
   services.getty.autologinUser = "root";
+  services.getty.loginProgram = "${pkgs.util-linux.bin}/bin/login";
   systemd.services."serial-getty@hvc0".enable = false;
   users.users.root = {
     shell = "${pkgs.bash}/bin/bash";
@@ -26,8 +30,8 @@
 
   systemd.targets.getty.wants = lib.mkForce [ "autovt@hvc0.service" ];
 
-  systemd.extraConfig = ''
-    LogLevel=crit
-    ShowStatus=no
-  '';
+  systemd.settings.Manager = {
+    LogLevel = "crit";
+    ShowStatus = "no";
+  };
 }
