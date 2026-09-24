@@ -22,7 +22,6 @@ pub(super) struct CreateRequest {
     pub(super) name: String,
     pub(super) uuid: Option<String>,
     pub(super) requested_minor: Option<u32>,
-    pub(super) readonly: bool,
 }
 
 /// Decoded mutation requested by `DM_DEV_RENAME`.
@@ -59,20 +58,19 @@ pub(super) enum LifecycleOutcome {
     Resumed { initial: bool },
 }
 
-/// Fully validated state to install through `DM_TABLE_LOAD`.
+/// Fully validated table state to install through `DM_TABLE_LOAD`.
 ///
 /// The ioctl façade owns target-spec decoding and builds the immutable table before
 /// constructing this request. The workflow publishes a first primary node before
-/// changing readonly or inactive-table state, so a runtime failure remains retryable.
+/// committing the inactive table, so a runtime failure remains retryable.
 pub(super) struct TableLoadRequest {
     table: Arc<DmTable>,
-    readonly: bool,
 }
 
 impl TableLoadRequest {
     /// Creates a request from a table that already passed all target validation.
-    pub(super) fn new(table: Arc<DmTable>, readonly: bool) -> Self {
-        Self { table, readonly }
+    pub(super) fn new(table: Arc<DmTable>) -> Self {
+        Self { table }
     }
 }
 
@@ -173,30 +171,25 @@ pub(super) struct TargetVersionSnapshot {
 pub(super) struct QueryWorkflow;
 
 impl QueryWorkflow {
-    /// Captures the current identity and lifecycle state of one mapper.
+    /// Captures the current identity and active-table lifecycle state of one mapper.
     pub(super) fn device(device: &DmDevice) -> DeviceSnapshot {
-        DeviceSnapshot {
-            id: device.id(),
-            name: device.name(),
-            uuid: device.uuid(),
-            status: device.status(),
-        }
+        Self::selected_table_snapshot(device, false).0
     }
 
     /// Captures count-only state for the requested active or inactive table slot.
     pub(super) fn table_metadata(device: &DmDevice, inactive: bool) -> TableMetadataSnapshot {
-        let table = Self::selected_table(device, inactive);
+        let (device, table) = Self::selected_table_snapshot(device, inactive);
         TableMetadataSnapshot {
-            device: Self::device(device),
+            device,
             target_count: table.as_ref().map_or(0, |table| table.target_count()),
         }
     }
 
     /// Captures dependency IDs for the requested active or inactive table slot.
     pub(super) fn table_deps(device: &DmDevice, inactive: bool) -> TableDepsSnapshot {
-        let table = Self::selected_table(device, inactive);
+        let (device, table) = Self::selected_table_snapshot(device, inactive);
         TableDepsSnapshot {
-            device: Self::device(device),
+            device,
             backing_ids: table.map_or_else(Vec::new, |table| table.backing_ids()),
         }
     }
@@ -207,21 +200,30 @@ impl QueryWorkflow {
         inactive: bool,
         mode: TargetStatusMode,
     ) -> TableRecordCursor {
+        let (device, table) = Self::selected_table_snapshot(device, inactive);
         TableRecordCursor {
-            device: Self::device(device),
-            table: Self::selected_table(device, inactive),
+            device,
+            table,
             mode,
             next_index: 0,
         }
     }
 
-    /// Selects one table generation without formatting or allocating target records.
-    fn selected_table(device: &DmDevice, inactive: bool) -> Option<Arc<DmTable>> {
-        if inactive {
-            device.inactive_table()
-        } else {
-            device.active_table()
-        }
+    /// Captures one selected table generation and its matching header status.
+    fn selected_table_snapshot(
+        device: &DmDevice,
+        inactive: bool,
+    ) -> (DeviceSnapshot, Option<Arc<DmTable>>) {
+        let (status, table) = device.table_snapshot(inactive);
+        (
+            DeviceSnapshot {
+                id: device.id(),
+                name: device.name(),
+                uuid: device.uuid(),
+                status,
+            },
+            table,
+        )
     }
 
     /// Captures a manager-selected sequence of visible mapper identities.
@@ -273,12 +275,7 @@ impl<'a> ControlWorkflow<'a> {
     /// Creates a tableless mapper from validated `DM_DEV_CREATE` parameters.
     pub(super) fn create(&self, request: CreateRequest) -> Result<Arc<DmDevice>> {
         self.manager
-            .create_with_readonly(
-                request.name,
-                request.uuid,
-                request.requested_minor,
-                request.readonly,
-            )
+            .create(request.name, request.uuid, request.requested_minor)
             .map_err(map_dm_error)
     }
 
@@ -294,9 +291,9 @@ impl<'a> ControlWorkflow<'a> {
 
     /// Installs a table after an injectable primary publication step.
     ///
-    /// The publication completes before the irreversible readonly flag or inactive
-    /// slot mutation. Tests use the callback to verify that a publication failure
-    /// preserves every device-state field.
+    /// Publication completes before the inactive slot changes. Because the table
+    /// captures `DM_READONLY_FLAG`, a publication failure also preserves the current
+    /// active I/O mode and leaves the request retryable.
     pub(super) fn load_table_with_primary<F>(
         device: &Arc<DmDevice>,
         request: TableLoadRequest,
@@ -306,9 +303,6 @@ impl<'a> ControlWorkflow<'a> {
         F: FnOnce(&Arc<DmDevice>) -> Result<()>,
     {
         publish_primary(device)?;
-        if request.readonly {
-            device.set_readonly();
-        }
         device.load_table(request.table);
         Ok(())
     }

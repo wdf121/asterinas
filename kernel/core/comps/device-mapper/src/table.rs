@@ -33,6 +33,8 @@ pub struct DmTable {
     targets: Vec<DmTargetBox>,
     /// Total table capacity in 512-byte sectors, equal to the last target end.
     length: u64,
+    /// Linux `DM_READONLY_FLAG` mode captured when this table was loaded.
+    readonly: bool,
 }
 
 impl DmTable {
@@ -46,8 +48,16 @@ impl DmTable {
         )
     }
 
-    /// Creates a table after enforcing Linux-visible table invariants not owned by targets.
+    /// Creates a writable table after enforcing Linux-visible table invariants not owned by targets.
     pub fn new_targets(targets: Vec<DmTargetBox>) -> Result<Self, TableError> {
+        Self::new_targets_with_readonly(targets, false)
+    }
+
+    /// Creates a table with the mode captured from `DM_TABLE_LOAD`.
+    pub fn new_targets_with_readonly(
+        targets: Vec<DmTargetBox>,
+        readonly: bool,
+    ) -> Result<Self, TableError> {
         if targets.is_empty() {
             return Err(TableError::UnsupportedTargetCount);
         }
@@ -73,6 +83,7 @@ impl DmTable {
         Ok(Self {
             targets,
             length: expected_start,
+            readonly,
         })
     }
 
@@ -94,6 +105,11 @@ impl DmTable {
     /// Returns the mapped device capacity in 512-byte sectors.
     pub fn length(&self) -> u64 {
         self.length
+    }
+
+    /// Returns whether this table rejects write-like BIOs after activation.
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
     }
 
     /// Returns block-layer metadata derived from table length and backing queue limits.
