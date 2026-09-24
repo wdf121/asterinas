@@ -1,6 +1,6 @@
 # Device Mapper 上游同步记录
 
-> **状态**：进行中；本文仅记录本地 `dm` 分支跟进 upstream 的同步决策和实际状态，不属于 upstream PR 内容。
+> **状态**：2026-09-24 的正式同步已提交；本文继续记录后续同步相关修复与验证，不属于 upstream PR 内容。
 >
 > **最后更新**：2026-09-24。
 
@@ -48,7 +48,7 @@ log/daily/YYYY-M-D.md
 
 ## 2.2 2026-09-23 权威 `dm` 正式同步：决策与合并结果
 
-在 WIP `604942896` 之后，权威 `dm` 执行了 `merge --no-commit --no-ff upstream/main`。下表记录各冲突组在实施时作出的决策及其文本合并结果；表中“尚未编译”或“留待编译”仅描述该组完成合并时的阶段状态。所有列出的 Git 冲突现已在权威 `dm` 解决，最终 DM 专项验证结果以第 2.3 节为准；同步 merge commit 尚未创建。
+在 WIP `604942896` 之后，权威 `dm` 执行了 `merge --no-commit --no-ff upstream/main`。下表记录各冲突组在实施时作出的决策及其文本合并结果；表中“尚未编译”或“留待编译”仅描述该组完成合并时的阶段状态。所有列出的 Git 冲突已在权威 `dm` 解决，并于 `a4603e369` 创建同步 merge commit；最终 DM 专项验证结果以第 2.3 节为准。
 
 | 优先级与范围 | upstream 与 `dm` 差异 | 决策与验证 |
 |---|---|---|
@@ -60,7 +60,7 @@ log/daily/YYYY-M-D.md
 | 通用基础设施：BIO/lease/partition | `kernel/core/comps/block/{bio.rs,lib.rs,partition.rs}` | 已在权威 `dm` 完成文本合并、固定 nightly 格式和限定 diff 检查；尚未编译。 | 保留 DM 不可变逻辑 metadata + 可变 current range、absolute remap、可组合 offset、跨 target split 和完成聚合；吸收 upstream `DmaBuffer`、`PartitionManager`、stable `BlockDevice::name() -> &str` 和可见性收敛；lease Pending/Live/Removing 不变。 |
 | 通用基础设施：driver | `kernel/core/comps/{nvme,virtio}` 的 block device 与 VirtIO `DmaBuf`。 | 已在权威 `dm` 完成文本合并、固定 nightly 格式和限定 diff 检查；尚未编译。 | 采用 upstream partition manager、设备初始化和 stable `name() -> &str`；保留 discard/zeroout，移除 VirtIO GET_ID 无界循环，并增加 `DmaBuf for Slice<Arc<DmaBuffer<_>>>`。 |
 | 其余 block consumers | MlsDisk、DM crate、block/registry 测试 fixture 的 `name() -> &str` 适配。 | **待决策：**需要逐类适配稳定 primary 与可变 alias，不能把 DM alias 借用为 `&str`。 |
-| 通用基础设施：VFS/devtmpfs/registry | `device/mod.rs`、`registry/{block,char}.rs`、devtmpfs、RamFS、`vfs/path`。 | 已在权威 `dm` 完成文本合并、固定 nightly 格式和限定 diff 检查；devtmpfs ktest 为 6/0，runtime registry ktest 为 7/0。 | 使用 `DevtmpfsHandle` 绑定 inode identity 与路径；delete/rename 在目录锁内校验，`ESTALE` 保留外来替代对象。DM 保持 alias → primary → commit、失败恢复与 `Removing` 隔离；Dentry 条件操作按 dentry identity 并保留 `ESTALE`/`EXDEV`。 |
+| 通用基础设施：VFS/devtmpfs/registry | `device/mod.rs`、`registry/{block,char}.rs`、devtmpfs、RamFS、`vfs/path`。 | 已在权威 `dm` 完成文本合并、固定 nightly 格式和限定 diff 检查；devtmpfs ktest 为 6/0，runtime registry ktest 初始为 7/0。 | 使用 `DevtmpfsHandle` 绑定 inode identity 与路径；delete/rename 在目录锁内校验，`ESTALE` 保留外来替代对象。同步后审阅补充 alias 删除非 `ENOENT`/`ESTALE` 错误的 handle 保留与重试回归，当前 registry ktest 为 8/0。DM 保持 alias → primary → commit、失败恢复与 `Removing` 隔离；Dentry 条件操作按 dentry identity 并保留 `ESTALE`/`EXDEV`。 |
 | 其余 block/runtime consumers | MlsDisk、DM crate、block/registry 测试 fixture、DM control-device 的 `name() -> &str` / `DevtmpfsNodeMeta` 适配。 | **决策：**普通固定名称返回 `&str`；`DmDevice` 分离 immutable `dm-N` primary 和 locked mapper alias，manager/control/runtime 使用 `mapper_name()` 快照；control-device 改用 `DevtmpfsNodeMeta`。 | 完成后首次运行同步后的 core 编译检查；QEMU/ktest 留待编译通过。 |
 
 ## 2.3 2026-09-24 正式同步验证结果
@@ -71,7 +71,7 @@ log/daily/YYYY-M-D.md
 |---|---|---|
 | kernel-aware 编译 | 源码同版本 OSDK：`kernel/core` 的 `osdk check --ktests` 通过。 | 同步后的 core/ktest 编译图。普通 host `cargo check` 不具备内核 target 配置，不作为结论。 |
 | devtmpfs ktest | `aster_core::fs::fs_impls::devtmpfs::tests`：6 passed，0 failed。 | node/symlink、同 rdev 外来替换、identity handle delete/rename。 |
-| runtime registry ktest | `aster_core::device::registry::block::tests`：7 passed，0 failed。 | primary 创建失败、alias recovery、open gate、`Removing` 隔离与重试。 |
+| runtime registry ktest | `aster_core::device::registry::block::tests`：8 passed，0 failed。 | primary 创建失败、alias recovery、alias 删除失败后的 handle 保留与重试、open gate、`Removing` 隔离。 |
 | block ktest | `aster-block`：23 passed，0 failed。 | BIO、partition、request queue、lease。 |
 | DM crate ktest | `aster-device-mapper`：86 passed，0 failed。 | table、target、manager、BIO 生命周期。 |
 | core DM ioctl ktest | `aster_core::device::misc::device_mapper::tests`：81 passed，0 failed，134 filtered。 | control ioctl、WAIT、rename、table lifecycle、readonly。 |
@@ -80,11 +80,20 @@ log/daily/YYYY-M-D.md
 
 构建和运行中仍有 upstream/现有 warning：devtmpfs 的冗余限定、未使用 identity helper、procfs visibility，以及宿主 CPU feature warning；它们未阻断本次 DM 专项矩阵，不在本同步阶段顺带重构。
 
+## 2.4 同步后审阅修复：alias 删除失败的 handle 保留
+
+同步 merge commit 后的审阅发现：`unregister_mapper` 在 identity 删除 alias 成功前取走 `DevtmpfsHandle`。当删除返回非 `ENOENT`/`ESTALE` 错误时，设备会恢复 `Live`，但丢失 alias 的身份记录；后续 rename 会返回 `ESTALE`，重试 remove 可能遗留 `/dev/mapper/<name>`。
+
+**修复**：`devtmpfs::delete` 改为借用 handle，registry 仅在删除成功后清除 primary/alias 记录；测试通过内部删除回调注入 `EIO`，验证恢复 `Live` 后 alias 仍可由下一次 remove 清理。
+
+**实际验证**：重装源码同版本 OSDK 后，使用标准命令运行 `aster_core::device::registry::block::tests`（8 passed、0 failed）与 `aster_core::fs::fs_impls::devtmpfs::tests`（6 passed、0 failed）。首次 host 尝试因缺少 `cargo-osdk` 未启动；首次容器构建暴露 devtmpfs 既有测试的按值调用，修正后新用例因 selector 未初始化 `devtmpfsd` 挂起，显式初始化测试 worker 并清理遗留 QEMU 后复跑通过。
+
+
 ## 3. 当前同步基线
 
 | 项目 | 当前值 | 说明 |
 |---|---|---|
-| 权威 `dm` HEAD | `604942896` | 本地 `wip(dm): preserve pre-sync workspace`，用于冻结同步前研发现场；尚未包含正式 upstream 同步 commit。 |
+| 权威 `dm` HEAD | `cdefc74dc` | `a4603e369` 为正式 upstream 同步 merge commit；当前 HEAD 记录该同步的专项验证。 |
 | `upstream/main` | `ac790aa89` | 已通过 `git fetch upstream` 更新。 |
 | merge-base | `604948581512d83734377974d4c34adb4530f2d7` | 预演开始时 `dm` 与当前 upstream 的共同基线。 |
 | PR 1 worktree | `.claude/worktrees/dm-pr1-bio` | 基于 `upstream/main` 的干净 `dm-pr1-bio` 分支，未应用 PR patch、未作为同步来源。 |
@@ -141,6 +150,6 @@ runtime registry 已独立创建 `/dev/dm-N` primary，并独立发布/记录/�
 
 ## 6. 当前停点
 
-权威 `dm` 已按记录完成 Git 冲突解析与 DM 专项验证矩阵，仍未创建同步 merge commit。同步预演/容器验证 worktree 保留为审计现场，不再作为实现来源；PR 仍冻结。
+正式 upstream 同步已由 `a4603e369` 提交，`cdefc74dc` 记录专项验证；同步预演/容器验证 worktree 保留为审计现场，不再作为实现来源。同步后 alias 删除失败修复已通过定向 ktest，但尚未创建后续修复 commit。
 
-下一步由用户决定：审阅 staged 同步 diff 并创建正式同步 merge commit，或在提交前要求补充非 DM/AArch64/特定 driver 验证。同步 commit 创建后，权威 `dm` 才满足 [pull_request.md](pull_request.md) 的 PR 制备前置条件。
+下一步由用户决定：审阅当前修复 diff 并创建修复 commit，或在提交前要求补充更广泛验证。该修复收口后，权威 `dm` 可作为 [pull_request.md](pull_request.md) 的 PR 制备实现来源。

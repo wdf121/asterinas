@@ -33,8 +33,11 @@ pub(crate) fn validate(handle: &DevtmpfsHandle) -> Result<()> {
 }
 
 /// Deletes a handle's node through `devtmpfsd` using inode identity.
-pub(crate) fn delete(handle: DevtmpfsHandle) -> Result<()> {
-    match submit(Request::Delete(handle))? {
+///
+/// The caller retains the handle if deletion fails, so it can preserve its
+/// registration state and retry or recover the operation.
+pub(crate) fn delete(handle: &DevtmpfsHandle) -> Result<()> {
+    match submit(Request::Delete(handle.clone()))? {
         Response::Unit => Ok(()),
         Response::Handle(_) => unreachable!(),
     }

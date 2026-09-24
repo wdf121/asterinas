@@ -48,7 +48,7 @@ pub fn unregister(id: DeviceId) -> Result<Arc<dyn Device>> {
         .ok_or_else(|| Error::with_message(Errno::ENOENT, "the char device does not exist"))?;
 
     if let Some(node) = registered.node
-        && let Err(error) = devtmpfs::delete(node)
+        && let Err(error) = devtmpfs::delete(&node)
     {
         match error.error() {
             Errno::ENOENT | Errno::ESTALE => warn!(

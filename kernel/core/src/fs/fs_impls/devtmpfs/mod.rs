@@ -38,6 +38,11 @@ pub(super) fn init_in_first_kthread() {
 }
 
 #[cfg(ktest)]
+pub(crate) fn init_for_ktest() {
+    worker::init_for_ktest();
+}
+
+#[cfg(ktest)]
 mod tests {
     use device_id::{DeviceId, MajorId, MinorId};
     use ostd::prelude::ktest;
@@ -199,7 +204,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(delete(handle).unwrap_err().error(), Errno::ESTALE);
+        assert_eq!(delete(&handle).unwrap_err().error(), Errno::ESTALE);
         assert_eq!(
             root.lookup(path).unwrap().metadata().unwrap().self_dev_id,
             Some(device_id(240, 8))
@@ -229,7 +234,7 @@ mod tests {
             Errno::EEXIST
         );
         validate(&source_for_validation).unwrap();
-        delete(source_for_validation).unwrap();
-        delete(destination_handle).unwrap();
+        delete(&source_for_validation).unwrap();
+        delete(&destination_handle).unwrap();
     }
 }

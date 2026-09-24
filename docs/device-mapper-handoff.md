@@ -22,11 +22,11 @@
 
 ## 当前停点
 
-### 已完成、待提交的 upstream 同步
+### 已完成的 upstream 同步；同步后修复待提交
 
-权威 `dm` 已在 WIP `604942896` 之上完成与 `upstream/main` `ac790aa89` 的 `merge --no-commit --no-ff`；所有冲突均已解决并暂存，但 Git 仍处于 merge 中，尚未创建同步 commit。此次同步同时覆盖构建入口、block/driver、VFS/devtmpfs/runtime registry 与 DM primary/alias 适配，不应误判为仅 Device Mapper crate 的局部改动。
+权威 `dm` 已在 `a4603e369` 创建 latest `upstream/main` 的同步 merge commit，`cdefc74dc` 记录其专项验证。同步覆盖构建入口、block/driver、VFS/devtmpfs/runtime registry 与 DM primary/alias 适配，不应误判为仅 Device Mapper crate 的局部改动。
 
-同步专项矩阵已完成：源码同版本 OSDK 的 core check 通过；devtmpfs 6/0、runtime registry 7/0、block 23/0、DM crate 86/0、core DM ioctl 81/0、focused C ABI 182/0，以及六项 canonical NixOS suite 均通过。它不等同于全仓 CI、完整非 DM C regression、AArch64 或非 QEMU TSC 验证；详见 [上游同步记录](upstream-sync.md)。PR 制备继续冻结，直至用户决定创建同步 merge commit。
+同步后审阅发现并修复了 alias 删除非 `ENOENT`/`ESTALE` 错误时丢失 `DevtmpfsHandle` 的生命周期漏洞；恢复 `Live` 后现可保留 alias 身份并重试 remove。标准 runtime registry ktest 为 8/0；其余同步矩阵为 core check、devtmpfs 6/0、block 23/0、DM crate 86/0、core DM ioctl 81/0、focused C ABI 182/0 与六项 canonical NixOS suite。全仓 CI、完整非 DM C regression、AArch64 与非 QEMU TSC 仍未覆盖。当前修复尚未创建 commit，详见 [上游同步记录](upstream-sync.md)。
 
 ### 已完成并提交的 V4 测试阶段
 
@@ -43,7 +43,7 @@ e6f00b9fa test(regression): report aggregate C assertion totals
 
 - DM crate ktest：在线 86/0；
 - core crate 全量 ktest：在线 205/0，runner 为 16 crates、621 tests；
-- focused `device/device_mapper` C 回归：在线 159/0；
+- focused `device/device_mapper` C 回归：在线 182/0；
 - control-plane、dataplane、LVM2 topology、linear、striped、mixed 六个 canonical NixOS suite 均通过；
 - harness 每个 suite 使用一个权威日志，正常路径不残留 QEMU 状态文件或日志 FIFO；
 - LVM2 topology 的跨 PV linear 验证以汇总 `seg_count=2` 加 DM table/dependencies 两 backing 断言为准。
@@ -79,13 +79,13 @@ e6f00b9fa test(regression): report aggregate C assertion totals
 
 ## 下一步
 
-当前优先级是完成已验证同步的 Git 历史收口，而非制备 PR 或扩展新的 DM 功能。用户可选择：
+当前优先级是审阅并决定是否提交已验证的 alias 删除失败修复；同步 merge commit 已存在，后续 PR 制备无需再等待同步历史收口。用户可选择：
 
-1. 审阅当前 staged 同步 diff 后创建正式同步 merge commit；
-2. 在创建 merge commit 前，补充非 DM、AArch64 或指定 driver 的验证；
-3. 单独审阅来源待确认的协作规则、学习资料和 DOCX。
+1. 审阅当前修复 diff 后创建修复 commit；
+2. 在创建修复 commit 前补充更广泛的 runtime/devtmpfs 验证；
+3. 在修复收口后开始 PR 1 的独立制备，或单独审阅来源待确认的协作规则、学习资料和 DOCX。
 
-同步 commit 创建前，不在 PR worktree 制备、应用或测试上游补丁。
+PR worktree 仍须从已同步的权威 `dm` 实现重新提取最小 patch，不复制文档、日志或本地系统 harness。
 
 ## 安全规则
 
