@@ -694,3 +694,60 @@ FN_TEST(device_mapper_wait_wakes_after_rename_and_setuuid)
 	TEST_SUCC(close(fd));
 }
 END_TEST()
+
+FN_TEST(device_mapper_readonly_table_mode_transitions)
+{
+	char name[DM_NAME_LEN];
+	struct dm_ioctl io;
+	union dm_table_buffer table;
+	uint64_t dev;
+	int fd;
+
+	snprintf(name, sizeof(name), "dm-readonly-mode-%ld", (long)getpid());
+	fd = TEST_SUCC(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+	init_named_ioctl(&io, name);
+	TEST_SUCC(ioctl(fd, DM_DEV_CREATE, &io));
+	dev = io.dev;
+
+	init_zero_table(table.bytes, sizeof(table.bytes), name, 8);
+	table.align.flags = DM_READONLY_FLAG;
+	TEST_SUCC(ioctl(fd, DM_TABLE_LOAD, table.bytes));
+	init_named_ioctl(&io, name);
+	TEST_SUCC(ioctl(fd, DM_DEV_STATUS, &io));
+	TEST_RES(io.flags & DM_INACTIVE_PRESENT_FLAG, _ret != 0);
+	TEST_RES(!(io.flags & DM_ACTIVE_PRESENT_FLAG), _ret == 1);
+	TEST_RES(!(io.flags & DM_READONLY_FLAG), _ret == 1);
+
+	init_named_ioctl(&io, name);
+	io.flags = DM_QUERY_INACTIVE_TABLE_FLAG;
+	TEST_SUCC(ioctl(fd, DM_DEV_STATUS, &io));
+	TEST_RES(io.flags & DM_READONLY_FLAG, _ret != 0);
+
+	init_named_ioctl(&io, name);
+	TEST_SUCC(ioctl(fd, DM_DEV_SUSPEND, &io));
+	TEST_RES(io.flags & DM_ACTIVE_PRESENT_FLAG, _ret != 0);
+	TEST_RES(io.flags & DM_READONLY_FLAG, _ret != 0);
+
+	init_zero_table(table.bytes, sizeof(table.bytes), name, 8);
+	TEST_SUCC(ioctl(fd, DM_TABLE_LOAD, table.bytes));
+	init_named_ioctl(&io, name);
+	TEST_SUCC(ioctl(fd, DM_DEV_STATUS, &io));
+	TEST_RES(io.flags & DM_READONLY_FLAG, _ret != 0);
+	TEST_RES(io.flags & DM_INACTIVE_PRESENT_FLAG, _ret != 0);
+
+	init_named_ioctl(&io, name);
+	io.flags = DM_QUERY_INACTIVE_TABLE_FLAG;
+	TEST_SUCC(ioctl(fd, DM_DEV_STATUS, &io));
+	TEST_RES(!(io.flags & DM_READONLY_FLAG), _ret == 1);
+
+	init_named_ioctl(&io, name);
+	TEST_SUCC(ioctl(fd, DM_DEV_SUSPEND, &io));
+	TEST_RES(io.flags & DM_ACTIVE_PRESENT_FLAG, _ret != 0);
+	TEST_RES(!(io.flags & DM_READONLY_FLAG), _ret == 1);
+
+	init_named_ioctl(&io, name);
+	io.dev = dev;
+	TEST_SUCC(ioctl(fd, DM_DEV_REMOVE, &io));
+	TEST_SUCC(close(fd));
+}
+END_TEST()
