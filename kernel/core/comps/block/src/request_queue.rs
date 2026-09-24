@@ -281,6 +281,23 @@ mod tests {
     }
 
     #[ktest]
+    fn merges_contiguous_remapped_data_bios() {
+        let queue = BioRequestSingleQueue::new();
+        let mut first = write_bio(10);
+        let mut second = write_bio(20);
+        first.remap_sid_start(Sid::new(100)).unwrap();
+        second.remap_sid_start(Sid::new(101)).unwrap();
+
+        queue.enqueue(first).unwrap();
+        queue.enqueue(second).unwrap();
+
+        assert_eq!(queue.num_requests(), 1);
+        let request = queue.dequeue();
+        assert_eq!(request.sid_range(), &(Sid::new(100)..Sid::new(102)));
+        assert_eq!(request.bios().count(), 2);
+    }
+
+    #[ktest]
     fn enforces_segment_limit_when_merging_data_bios() {
         let queue = BioRequestSingleQueue::with_max_nr_segments_per_bio(2);
         queue.enqueue(write_bio(20)).unwrap();

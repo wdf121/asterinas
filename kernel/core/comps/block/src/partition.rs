@@ -296,7 +296,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        bio::{Bio, BioType},
+        bio::{Bio, BioDirection, BioSegment, BioType},
         id::Sid,
     };
 
@@ -358,6 +358,36 @@ mod tests {
             mbr_partition(100),
         );
         let bio = Bio::new_range(BioType::Discard, Sid::new(7), 4, None).submit_for_test();
+
+        partition.enqueue(bio).unwrap();
+
+        assert_eq!(backing.enqueue_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *backing.last_range.lock(),
+            Some(Sid::new(107)..Sid::new(111))
+        );
+    }
+
+    #[ktest]
+    fn remaps_data_bio_to_partition_start() {
+        let backing = RecordingBlockDevice::new(5);
+        let partition = PartitionNode::new(
+            DeviceId::new(MajorId::new(510), MinorId::new(6)),
+            String::from("partition-data-test"),
+            backing.clone(),
+            mbr_partition(100),
+        );
+        let bio = Bio::new(
+            BioType::Read,
+            Sid::new(7),
+            vec![BioSegment::alloc_exact(
+                1,
+                4 * SECTOR_SIZE,
+                BioDirection::FromDevice,
+            )],
+            None,
+        )
+        .submit_for_test();
 
         partition.enqueue(bio).unwrap();
 
