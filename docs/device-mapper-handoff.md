@@ -1,6 +1,6 @@
 # Device Mapper 对话交接
 
-> **最后更新**：2026-09-23
+> **最后更新**：2026-09-24
 >
 > **定位**：本文是一页式启动说明，只记录当前停点、阅读顺序、工作区边界和下一步决策。源码事实、测试命令和运行证据不在本文重复。
 
@@ -21,6 +21,12 @@
 需要具体设计、测试命令或审核结论时，再按任务读取 [test.md](test.md)、[review.md](review.md)、[global.md](global.md) 或对应源码；不要把“交接”变回全局检索。
 
 ## 当前停点
+
+### 已完成、待提交的 upstream 同步
+
+权威 `dm` 已在 WIP `604942896` 之上完成与 `upstream/main` `ac790aa89` 的 `merge --no-commit --no-ff`；所有冲突均已解决并暂存，但 Git 仍处于 merge 中，尚未创建同步 commit。此次同步同时覆盖构建入口、block/driver、VFS/devtmpfs/runtime registry 与 DM primary/alias 适配，不应误判为仅 Device Mapper crate 的局部改动。
+
+同步专项矩阵已完成：源码同版本 OSDK 的 core check 通过；devtmpfs 6/0、runtime registry 7/0、block 23/0、DM crate 86/0、core DM ioctl 81/0、focused C ABI 182/0，以及六项 canonical NixOS suite 均通过。它不等同于全仓 CI、完整非 DM C regression、AArch64 或非 QEMU TSC 验证；详见 [上游同步记录](upstream-sync.md)。PR 制备继续冻结，直至用户决定创建同步 merge commit。
 
 ### 已完成并提交的 V4 测试阶段
 
@@ -73,14 +79,13 @@ e6f00b9fa test(regression): report aggregate C assertion totals
 
 ## 下一步
 
-当前 V4 与工程 P0 第一项均已收口。下一步必须由用户选择：
+当前优先级是完成已验证同步的 Git 历史收口，而非制备 PR 或扩展新的 DM 功能。用户可选择：
 
-1. 进入 P0 的下一项具体 DM 用户可见行为；
-2. 进入 verity 的设计确认；
-3. 单独处理完整 C regression 的非 DM 网络失败；
-4. 单独审阅并提交或清理上述来源待确认文档。
+1. 审阅当前 staged 同步 diff 后创建正式同步 merge commit；
+2. 在创建 merge commit 前，补充非 DM、AArch64 或指定 driver 的验证；
+3. 单独审阅来源待确认的协作规则、学习资料和 DOCX。
 
-新功能或新阶段开始前，先说明原行为、目标行为、示例差异、涉及文件和最小验证；获得确认后再修改。
+同步 commit 创建前，不在 PR worktree 制备、应用或测试上游补丁。
 
 ## 安全规则
 
