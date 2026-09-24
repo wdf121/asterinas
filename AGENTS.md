@@ -133,6 +133,20 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --s
 GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --mixed-integration
 ```
 
+## Upstream PR Preparation and Review
+
+- Treat the authoritative `dm` worktree as the sole implementation source. Fix and
+  validate every production-code issue there before preparing an upstream patch.
+  A PR worktree may reorganize history and exclude unrelated features, but its
+  production behavior must be a tested subset of the latest authoritative local
+  implementation; it must never introduce a fix or semantic change that is absent
+  from `dm`.
+- Evaluate candidate designs and reviews for system-wide architectural fitness:
+  API ownership, dependency direction, resource lifetime, concurrency, failure
+  recovery, non-DM consumers, and expected future extensions. Do not choose a
+  patch-local optimum that weakens correctness, cohesion, or long-term evolution
+  merely to shrink or simplify one PR.
+
 ## Linux Device Mapper Semantic Alignment
 
 For existing target coverage, prioritize closing semantic and lifecycle gaps with

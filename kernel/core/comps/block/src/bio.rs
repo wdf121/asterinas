@@ -314,14 +314,13 @@ impl SubmittedBio {
     }
 
     /// Splits the current `Bio` into children that cover the same range.
-    pub fn split(
-        self,
-        ranges: Vec<Range<Sid>>,
-    ) -> Result<(Vec<Self>, SplitBioCompletionHandle), BioEnqueueError> {
+    ///
+    /// Each child owns one completion responsibility. Dropping an incomplete child
+    /// completes the original BIO with `IoError` after every other child terminates.
+    pub fn split(self, ranges: Vec<Range<Sid>>) -> Result<Vec<Self>, BioEnqueueError> {
         self.validate_split_ranges(&ranges)?;
 
         let type_ = self.type_();
-        let complete_as_io_error_on_drop = self.complete_as_io_error_on_drop;
         let child_segments = ranges
             .iter()
             .map(|range| self.segments_for_child_range(range))
@@ -347,11 +346,11 @@ impl SubmittedBio {
                     current_sid_range: range,
                     complete_fn: Some(Box::new(move |status| completion.complete_child(status))),
                     segments,
-                    complete_as_io_error_on_drop,
+                    complete_as_io_error_on_drop: true,
                 }
             })
             .collect();
-        Ok((children, SplitBioCompletionHandle { inner: completion }))
+        Ok(children)
     }
 
     fn validate_split_ranges(&self, ranges: &[Range<Sid>]) -> Result<(), BioEnqueueError> {
@@ -513,16 +512,6 @@ impl Debug for SubmittedBio {
             .field("current_sid_range", &self.current_sid_range)
             .field("segments", &self.segments)
             .finish()
-    }
-}
-
-pub struct SplitBioCompletionHandle {
-    inner: Arc<SplitBioCompletion>,
-}
-
-impl SplitBioCompletionHandle {
-    pub fn complete_child(&self, status: BioStatus) {
-        self.inner.complete_child(status);
     }
 }
 
@@ -982,7 +971,7 @@ mod tests {
     #[ktest]
     fn splits_range_only_bio_without_segments() {
         let bio = Bio::new_range(BioType::WriteZeroes, Sid::new(10), 8, None).submit_for_test();
-        let (children, _completion) = bio
+        let children = bio
             .split(vec![Sid::new(10)..Sid::new(14), Sid::new(14)..Sid::new(18)])
             .unwrap();
 
@@ -991,22 +980,71 @@ mod tests {
         assert!(children[0].segments().is_empty());
         assert_eq!(children[1].sid_range(), &(Sid::new(14)..Sid::new(18)));
         assert!(children[1].segments().is_empty());
+
+        for child in children {
+            child.complete(BioStatus::Complete);
+        }
+    }
+
+    #[ktest]
+    fn split_data_bio_slices_segments_at_child_boundaries() {
+        let bio = Bio::new(
+            BioType::Read,
+            Sid::new(10),
+            vec![
+                BioSegment::alloc_exact(1, 2 * SECTOR_SIZE, BioDirection::FromDevice),
+                BioSegment::alloc_exact(1, 4 * SECTOR_SIZE, BioDirection::FromDevice),
+                BioSegment::alloc_exact(1, 2 * SECTOR_SIZE, BioDirection::FromDevice),
+            ],
+            None,
+        )
+        .submit_for_test();
+        let children = bio
+            .split(vec![
+                Sid::new(10)..Sid::new(13),
+                Sid::new(13)..Sid::new(15),
+                Sid::new(15)..Sid::new(18),
+            ])
+            .unwrap();
+
+        assert_eq!(children[0].sid_range(), &(Sid::new(10)..Sid::new(13)));
+        assert_eq!(children[1].sid_range(), &(Sid::new(13)..Sid::new(15)));
+        assert_eq!(children[2].sid_range(), &(Sid::new(15)..Sid::new(18)));
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child
+                    .segments()
+                    .iter()
+                    .map(BioSegment::nbytes)
+                    .sum::<usize>())
+                .collect::<Vec<_>>(),
+            vec![3 * SECTOR_SIZE, 2 * SECTOR_SIZE, 3 * SECTOR_SIZE]
+        );
+
+        for child in children {
+            child.complete(BioStatus::Complete);
+        }
     }
 
     #[ktest]
     fn split_bio_keeps_first_error_until_all_children_complete() {
         let completions = Arc::new(SpinLock::<Vec<BioStatus>, LocalIrqDisabled>::new(Vec::new()));
         let callback_completions = completions.clone();
-        let bio = Bio::new_range(
-            BioType::WriteZeroes,
+        let bio = Bio::new(
+            BioType::Write,
             Sid::new(10),
-            12,
+            vec![BioSegment::alloc_exact(
+                2,
+                12 * SECTOR_SIZE,
+                BioDirection::ToDevice,
+            )],
             Some(Box::new(move |status| {
                 callback_completions.lock().push(status);
             })),
         )
         .submit_for_test();
-        let (children, _completion) = bio
+        let children = bio
             .split(vec![
                 Sid::new(10)..Sid::new(14),
                 Sid::new(14)..Sid::new(18),
@@ -1024,6 +1062,37 @@ mod tests {
 
         second.complete(BioStatus::Complete);
         assert_eq!(*completions.lock(), vec![BioStatus::NoSpace]);
+    }
+
+    #[ktest]
+    fn dropping_split_child_reports_error_after_remaining_children_complete() {
+        let completions = Arc::new(SpinLock::<Vec<BioStatus>, LocalIrqDisabled>::new(Vec::new()));
+        let callback_completions = completions.clone();
+        let bio = Bio::new(
+            BioType::Read,
+            Sid::new(10),
+            vec![BioSegment::alloc_exact(
+                1,
+                8 * SECTOR_SIZE,
+                BioDirection::FromDevice,
+            )],
+            Some(Box::new(move |status| {
+                callback_completions.lock().push(status);
+            })),
+        )
+        .submit_for_test();
+        let children = bio
+            .split(vec![Sid::new(10)..Sid::new(14), Sid::new(14)..Sid::new(18)])
+            .unwrap();
+        let mut children = children.into_iter();
+        let first = children.next().unwrap();
+        let second = children.next().unwrap();
+
+        drop(first);
+        assert!(completions.lock().is_empty());
+
+        second.complete(BioStatus::Complete);
+        assert_eq!(*completions.lock(), vec![BioStatus::IoError]);
     }
 
     #[ktest]

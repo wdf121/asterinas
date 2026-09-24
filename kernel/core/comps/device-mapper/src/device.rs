@@ -593,7 +593,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::DmManager;
+    use crate::{DmManager, target::linear::LinearTarget};
 
     #[derive(Debug)]
     struct TestBlockDevice;
@@ -1286,6 +1286,67 @@ mod tests {
         device.resume().unwrap();
 
         assert!(batch.wait_all().is_err());
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[ktest]
+    fn split_replay_failure_waits_for_remaining_child_before_finishing() {
+        let (device, first) = create_device_and_table();
+        let rejecting = Arc::new(RejectingBlockDevice) as Arc<dyn BlockDevice>;
+        let deferred = DeferredBlockDevice::new();
+        let replacement = Arc::new(
+            DmTable::new_linear(vec![
+                LinearTarget::new(
+                    Sid::new(0),
+                    4,
+                    Sid::new(32),
+                    BlockDeviceLease::new_untracked(rejecting),
+                )
+                .unwrap(),
+                LinearTarget::new(
+                    Sid::new(4),
+                    4,
+                    Sid::new(64),
+                    BlockDeviceLease::new_untracked(deferred.clone() as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        device.load_table(first);
+        device.resume().unwrap();
+        device.suspend().unwrap();
+
+        let completions = Arc::new(AtomicUsize::new(0));
+        let callback_completions = completions.clone();
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(
+            BioType::Read,
+            Sid::new(0),
+            vec![BioSegment::alloc_exact(
+                1,
+                8 * aster_block::SECTOR_SIZE,
+                BioDirection::FromDevice,
+            )],
+            Some(Box::new(move |status| {
+                assert_eq!(status, BioStatus::IoError);
+                callback_completions.fetch_add(1, Ordering::AcqRel);
+            })),
+        )
+        .submit(device.as_ref(), &mut batch)
+        .unwrap();
+        assert_eq!(device.state.lock().postponed.len(), 1);
+
+        device.load_table(replacement);
+        device.resume().unwrap();
+
+        assert!(deferred.has_submitted_bio());
+        assert_eq!(completions.load(Ordering::Acquire), 0);
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 1);
+
+        deferred.complete();
+        assert!(batch.wait_all().is_err());
+        assert_eq!(completions.load(Ordering::Acquire), 1);
         assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
     }
 

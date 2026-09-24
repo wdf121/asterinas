@@ -1,6 +1,6 @@
 # Device Mapper 上游 PR 提交计划
 
-> **状态**：`a4603e369` 已完成 latest `upstream/main` 的正式同步 merge，`cdefc74dc` 已记录 DM 专项验证；同步后 alias 删除失败修复通过定向 ktest，尚未创建修复 commit。尚未开始制备 upstream PR。
+> **状态**：`a4603e369` 已完成 latest `upstream/main` 的正式同步 merge，`cdefc74dc` 已记录 DM 专项验证，`0423431d5` 已修复 alias 删除失败后的 handle 丢失。本提交收口权威 `dm` 中已验证的 split child 完成责任修复（block ktest 25/0、DM ktest 87/0）。尚未创建 upstream PR worktree 或 patch。
 >
 > **更新日期**：2026-09-24。
 >
@@ -12,7 +12,7 @@
 
 上游同步是 PR 制备的前置阶段：必须先在权威 `dm` 工作区完成与最新 `upstream/main` 的同步、处理语义冲突、运行相关验证并形成清晰的同步 commit。同步 worktree 只能用于冲突预演和审核，不能替代权威工作区的正式同步。只有同步后的 `dm` 成为唯一实现来源，才创建独立 PR worktree 重新摘取或重做最小 patch；该 PR worktree 的 base 仍为 `upstream/main` 或已合入的 stacked PR，而不是把整个 `dm` 分支直接提交。
 
-2026-09-24：权威 `dm` 已通过 `a4603e369` 完成 latest `upstream/main` 同步，DM crate、core ioctl、focused C ABI 和六项 canonical NixOS suite 均通过。同步后审阅修复 alias 删除失败时的 runtime handle 丢失，标准 registry ktest 为 8/0；修复 commit 仍待用户决定。PR 制备可在该修复收口后开始。
+2026-09-24：权威 `dm` 已通过 `a4603e369` 完成 latest `upstream/main` 同步，DM crate、core ioctl、focused C ABI 和六项 canonical NixOS suite 均通过。同步后 alias handle 修复已提交为 `0423431d5`。PR 1 审计又发现 split child 的双重聚合问题；该本地修复已通过 block 25/0 与 DM 87/0，并随本提交收口。之后 PR worktree 才能从这份最新实现裁剪。
 
 ## 2. 提交原则
 
@@ -143,6 +143,6 @@ lease_count = 0：才允许 begin/commit unregister
 
 ## 9. 当前停点
 
-PR 1 的只读拆分已经完成：它只保留与 Device Mapper 无关仍可独立成立的 BIO 映射底座，且确认 `aster-block` 没有对 `device-mapper` 的直接依赖。
+PR 1 的只读范围与上游化审计已经完成：它只保留与 Device Mapper 无关仍可独立成立的 BIO 映射底座，且确认 `aster-block` 没有对 `device-mapper` 的直接依赖。审计同时发现 split completion 是权威 `dm` 的生产生命周期漏洞；本地修复与 block 25/0、DM 87/0 已完成并随本提交收口。下一步可在其后的最新 `dm` commit 上创建 PR worktree。
 
 PR 2 审核结论已记录但处于待定状态。当前不继续制备 PR 2 或自动进入后续 PR 审计，等待用户决定下一步。
