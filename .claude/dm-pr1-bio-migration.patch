@@ -1,0 +1,903 @@
+diff --git a/kernel/core/comps/block/src/bio.rs b/kernel/core/comps/block/src/bio.rs
+index 3fe640041..feaf0ad6b 100644
+--- a/kernel/core/comps/block/src/bio.rs
++++ b/kernel/core/comps/block/src/bio.rs
+@@ -17,7 +17,7 @@ use ostd::{
+         dma::{DmaStream, FromAndToDevice},
+         io::util::{HasVmReaderWriter, VmReaderWriterResult},
+     },
+-    sync::WaitQueue,
++    sync::{LocalIrqDisabled, SpinLock, WaitQueue},
+ };
+ use spin::Once;
+ 
+@@ -62,11 +62,15 @@ impl Bio {
+         let nsectors = segments
+             .iter()
+             .map(|segment| segment.nsectors().to_raw())
+-            .sum();
+-
++            .try_fold(0_u64, u64::checked_add)
++            .expect("BIO sector count overflow");
++        let end = start_sid
++            .to_raw()
++            .checked_add(nsectors)
++            .expect("BIO sector range overflow");
+         let metadata = Arc::new(BioMetadata {
+             type_,
+-            sid_range: start_sid..start_sid + nsectors,
++            sid_range: start_sid..Sid::new(end),
+             status: AtomicU32::new(BioStatus::Init as u32),
+             wait_queue: WaitQueue::new(),
+         });
+@@ -97,6 +101,30 @@ impl Bio {
+         self.metadata.status()
+     }
+ 
++    #[cfg(ktest)]
++    pub fn submit_for_test(self) -> SubmittedBio {
++        let Self {
++            metadata,
++            complete_fn,
++            segments,
++        } = self;
++        let result = metadata.status.compare_exchange(
++            BioStatus::Init as u32,
++            BioStatus::Submit as u32,
++            Ordering::Release,
++            Ordering::Relaxed,
++        );
++        assert!(result.is_ok());
++        let current_sid_range = metadata.sid_range().clone();
++        SubmittedBio {
++            metadata,
++            current_sid_range,
++            complete_fn,
++            segments,
++            complete_as_io_error_on_drop: false,
++        }
++    }
++
+     /// Submits self to the `block_device` asynchronously.
+     ///
+     /// This method consumes `self` and transfers its segments and completion
+@@ -128,11 +156,13 @@ impl Bio {
+         assert!(result.is_ok());
+ 
+         let waiter_metadata = metadata.clone();
++        let current_sid_range = metadata.sid_range().clone();
+         let submitted_bio = SubmittedBio {
+             metadata,
+-            sid_offset: 0,
++            current_sid_range,
+             complete_fn,
+             segments,
++            complete_as_io_error_on_drop: false,
+         };
+         if let Err(e) = block_device.enqueue(submitted_bio) {
+             // Fail to submit, revert the status.
+@@ -200,9 +230,10 @@ impl From<BioEnqueueError> for Error {
+ /// The request queue of a block device only accepts `SubmittedBio`s into the queue.
+ pub struct SubmittedBio {
+     metadata: Arc<BioMetadata>,
+-    sid_offset: u64,
++    current_sid_range: Range<Sid>,
+     complete_fn: Option<BioCompleteFn>,
+     segments: Vec<BioSegment>,
++    complete_as_io_error_on_drop: bool,
+ }
+ 
+ impl SubmittedBio {
+@@ -211,19 +242,139 @@ impl SubmittedBio {
+         self.metadata.type_()
+     }
+ 
+-    /// Returns the range of target sectors on the device.
++    /// Returns the sector range seen by the current block device layer.
+     pub fn sid_range(&self) -> &Range<Sid> {
+-        self.metadata.sid_range()
++        &self.current_sid_range
++    }
++
++    /// Remaps the current sector range to a new start while preserving the `Bio` length.
++    pub fn remap_sid_start(&mut self, new_start: Sid) -> Result<(), BioEnqueueError> {
++        let length = self
++            .current_sid_range
++            .end
++            .to_raw()
++            .checked_sub(self.current_sid_range.start.to_raw())
++            .ok_or(BioEnqueueError::Refused)?;
++        let new_end = new_start
++            .to_raw()
++            .checked_add(length)
++            .ok_or(BioEnqueueError::Refused)?;
++        self.current_sid_range = new_start..Sid::new(new_end);
++        Ok(())
++    }
++
++    /// Adds a sector offset to the current mapping result.
++    pub fn add_sid_offset(&mut self, offset: u64) -> Result<(), BioEnqueueError> {
++        let new_start = self
++            .current_sid_range
++            .start
++            .to_raw()
++            .checked_add(offset)
++            .map(Sid::new)
++            .ok_or(BioEnqueueError::Refused)?;
++        self.remap_sid_start(new_start)
++    }
++
++    /// Splits the current `Bio` into children that cover the same range.
++    ///
++    /// Each child owns one completion responsibility. Dropping an incomplete child
++    /// completes the original BIO with `IoError` after every other child terminates.
++    pub fn split(self, ranges: Vec<Range<Sid>>) -> Result<Vec<Self>, BioEnqueueError> {
++        self.validate_split_ranges(&ranges)?;
++
++        let type_ = self.type_();
++        let child_segments = ranges
++            .iter()
++            .map(|range| self.segments_for_child_range(range))
++            .collect::<Result<Vec<_>, _>>()?;
++        let completion = Arc::new(SplitBioCompletion {
++            remaining: AtomicUsize::new(ranges.len()),
++            status: AtomicU32::new(BioStatus::Complete as u32),
++            original: SpinLock::new(Some(self)),
++        });
++
++        let children = ranges
++            .into_iter()
++            .zip(child_segments)
++            .map(|(range, segments)| {
++                let completion = completion.clone();
++                Self {
++                    metadata: Arc::new(BioMetadata {
++                        type_,
++                        sid_range: range.clone(),
++                        status: AtomicU32::new(BioStatus::Submit as u32),
++                        wait_queue: WaitQueue::new(),
++                    }),
++                    current_sid_range: range,
++                    complete_fn: Some(Box::new(move |status| completion.complete_child(status))),
++                    segments,
++                    complete_as_io_error_on_drop: true,
++                }
++            })
++            .collect();
++        Ok(children)
+     }
+ 
+-    /// Returns the offset of the first sector ID.
+-    pub fn sid_offset(&self) -> u64 {
+-        self.sid_offset
++    fn validate_split_ranges(&self, ranges: &[Range<Sid>]) -> Result<(), BioEnqueueError> {
++        if ranges.is_empty() || ranges[0].start != self.current_sid_range.start {
++            return Err(BioEnqueueError::Refused);
++        }
++
++        let mut expected_start = self.current_sid_range.start;
++        for range in ranges {
++            if range.start != expected_start || range.start >= range.end {
++                return Err(BioEnqueueError::Refused);
++            }
++            expected_start = range.end;
++        }
++        if expected_start != self.current_sid_range.end {
++            return Err(BioEnqueueError::Refused);
++        }
++        Ok(())
+     }
+ 
+-    /// Sets the offset of the first sector ID.
+-    pub fn set_sid_offset(&mut self, offset: u64) {
+-        self.sid_offset = offset;
++    fn segments_for_child_range(
++        &self,
++        range: &Range<Sid>,
++    ) -> Result<Vec<BioSegment>, BioEnqueueError> {
++        let start_sectors = range
++            .start
++            .to_raw()
++            .checked_sub(self.current_sid_range.start.to_raw())
++            .ok_or(BioEnqueueError::Refused)?;
++        let end_sectors = range
++            .end
++            .to_raw()
++            .checked_sub(self.current_sid_range.start.to_raw())
++            .ok_or(BioEnqueueError::Refused)?;
++        let start = sectors_to_bytes(start_sectors)?;
++        let end = sectors_to_bytes(end_sectors)?;
++
++        let mut segments = Vec::new();
++        let mut cursor = 0usize;
++        for segment in &self.segments {
++            let segment_start = cursor;
++            let segment_end = cursor
++                .checked_add(segment.nbytes())
++                .ok_or(BioEnqueueError::Refused)?;
++            cursor = segment_end;
++
++            let overlap_start = core::cmp::max(start, segment_start);
++            let overlap_end = core::cmp::min(end, segment_end);
++            if overlap_start >= overlap_end {
++                continue;
++            }
++
++            let relative_start = overlap_start - segment_start;
++            let relative_end = overlap_end - segment_start;
++            segments.push(segment.slice(relative_start..relative_end));
++        }
++
++        let total_len = segments.iter().map(BioSegment::nbytes).sum::<usize>();
++        if total_len != end - start {
++            return Err(BioEnqueueError::Refused);
++        }
++        Ok(segments)
+     }
+ 
+     /// Returns the slice to the memory segments.
+@@ -242,23 +393,14 @@ impl SubmittedBio {
+     /// The final status becomes visible only after the callback returns.
+     ///
+     /// When the driver finishes the request for this `Bio`, it will call this method.
+-    pub fn complete(self, status: BioStatus) {
++    pub fn complete(mut self, status: BioStatus) {
+         assert!(status != BioStatus::Init && status != BioStatus::Submit);
+ 
+-        let Self {
+-            metadata,
+-            complete_fn,
+-            segments,
+-            ..
+-        } = self;
+-
+-        drop(segments);
+-
+-        // Complete the `complete_fn` before publishing the status change,
+-        // so that the effects of the callback function are visible to users.
+-        general_complete_fn(metadata.type_(), status, complete_fn);
++        self.complete_as_io_error_on_drop = false;
++        let complete_fn = self.complete_fn.take();
+ 
+-        let result = metadata.status.compare_exchange(
++        general_complete_fn(self.metadata.type_(), status, complete_fn);
++        let result = self.metadata.status.compare_exchange(
+             BioStatus::Submit as u32,
+             status as u32,
+             Ordering::Release,
+@@ -266,7 +408,27 @@ impl SubmittedBio {
+         );
+         assert!(result.is_ok());
+ 
+-        metadata.wait_queue.wake_all();
++        self.metadata.wait_queue.wake_all();
++    }
++}
++
++impl Drop for SubmittedBio {
++    fn drop(&mut self) {
++        if !self.complete_as_io_error_on_drop || self.status() != BioStatus::Submit {
++            return;
++        }
++
++        self.complete_as_io_error_on_drop = false;
++        let complete_fn = self.complete_fn.take();
++        general_complete_fn(self.metadata.type_(), BioStatus::IoError, complete_fn);
++        let result = self.metadata.status.compare_exchange(
++            BioStatus::Submit as u32,
++            BioStatus::IoError as u32,
++            Ordering::Release,
++            Ordering::Relaxed,
++        );
++        debug_assert!(result.is_ok());
++        self.metadata.wait_queue.wake_all();
+     }
+ }
+ 
+@@ -274,12 +436,50 @@ impl Debug for SubmittedBio {
+     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+         f.debug_struct("SubmittedBio")
+             .field("metadata", &self.metadata)
+-            .field("sid_offset", &self.sid_offset)
++            .field("current_sid_range", &self.current_sid_range)
+             .field("segments", &self.segments)
+             .finish()
+     }
+ }
+ 
++struct SplitBioCompletion {
++    remaining: AtomicUsize,
++    status: AtomicU32,
++    original: SpinLock<Option<SubmittedBio>, LocalIrqDisabled>,
++}
++
++impl SplitBioCompletion {
++    fn complete_child(&self, status: BioStatus) {
++        if status != BioStatus::Complete {
++            let _ = self.status.compare_exchange(
++                BioStatus::Complete as u32,
++                status as u32,
++                Ordering::AcqRel,
++                Ordering::Relaxed,
++            );
++        }
++
++        let previous = self.remaining.fetch_sub(1, Ordering::AcqRel);
++        debug_assert!(previous > 0);
++        if previous == 1 {
++            let status = BioStatus::try_from(self.status.load(Ordering::Acquire)).unwrap();
++            let original = self
++                .original
++                .lock()
++                .take()
++                .expect("split BIO original must complete exactly once");
++            original.complete(status);
++        }
++    }
++}
++
++fn sectors_to_bytes(sectors: u64) -> Result<usize, BioEnqueueError> {
++    usize::try_from(sectors)
++        .ok()
++        .and_then(|sectors| sectors.checked_mul(SECTOR_SIZE))
++        .ok_or(BioEnqueueError::Refused)
++}
++
+ /// The metadata and waitable state shared by submitted `Bio`s and their waiter handles.
+ struct BioMetadata {
+     /// The type of the I/O
+@@ -378,7 +578,7 @@ pub struct BioSegment {
+ struct BioSegmentInner {
+     /// Internal DMA slice.
+     // TODO: The direction is currently `FromAndToDevice`. Implement compile-time checking.
+-    storage: Slice<DmaBuffer<FromAndToDevice>>,
++    storage: Slice<Arc<DmaBuffer<FromAndToDevice>>>,
+     direction: BioDirection,
+ }
+ 
+@@ -398,6 +598,12 @@ impl BioSegment {
+         Self::alloc_inner(nblocks, 0, nblocks * BLOCK_SIZE, direction)
+     }
+ 
++    /// Allocates a sector-aligned test segment with an exact byte length.
++    #[cfg(ktest)]
++    pub fn alloc_exact(nblocks: usize, len: usize, direction: BioDirection) -> Self {
++        Self::alloc_inner(nblocks, 0, len, direction)
++    }
++
+     /// The inner function that do the real segment allocation.
+     ///
+     /// Support two extended parameters:
+@@ -429,7 +635,10 @@ impl BioSegment {
+             .unwrap_or_else(|| {
+                 let dma_stream = DmaStream::alloc_uninit(nblocks, false).unwrap();
+                 BioSegmentInner {
+-                    storage: Slice::new(DmaBuffer::Direct(dma_stream), offset..offset + len),
++                    storage: Slice::new(
++                        Arc::new(DmaBuffer::Direct(dma_stream)),
++                        offset..offset + len,
++                    ),
+                     direction,
+                 }
+             });
+@@ -440,12 +649,17 @@ impl BioSegment {
+     }
+ 
+     /// Constructs a new `BioSegment` with a given `USegment` and the bio direction.
++    ///
++    /// # Panics
++    ///
++    /// If the segment length is not sector aligned, this method will panic.
+     pub fn new_from_segment(segment: USegment, direction: BioDirection) -> Self {
+         let len = segment.size();
++        assert!(is_sector_aligned(len));
+         let dma_stream = DmaStream::map(segment, false).unwrap();
+         Self {
+             inner: Arc::new(BioSegmentInner {
+-                storage: Slice::new(DmaBuffer::Direct(dma_stream), 0..len),
++                storage: Slice::new(Arc::new(DmaBuffer::Direct(dma_stream)), 0..len),
+                 direction,
+             }),
+         }
+@@ -472,9 +686,22 @@ impl BioSegment {
+     }
+ 
+     /// Returns the DMA slice.
+-    pub fn dma_slice(&self) -> &Slice<DmaBuffer<FromAndToDevice>> {
++    pub fn dma_slice(&self) -> &Slice<Arc<DmaBuffer<FromAndToDevice>>> {
+         self.inner.dma_slice()
+     }
++
++    fn slice(&self, range: Range<usize>) -> Self {
++        assert!(is_sector_aligned(range.start) && is_sector_aligned(range.end - range.start));
++        if range.start == 0 && range.end == self.nbytes() {
++            return self.clone();
++        }
++        Self {
++            inner: Arc::new(BioSegmentInner {
++                storage: self.inner.dma_slice().slice(range),
++                direction: self.inner.direction,
++            }),
++        }
++    }
+ }
+ 
+ impl HasVmReaderWriter for BioSegment {
+@@ -496,7 +723,7 @@ impl HasVmReaderWriter for BioSegment {
+ }
+ 
+ impl BioSegmentInner {
+-    fn dma_slice(&self) -> &Slice<DmaBuffer<FromAndToDevice>> {
++    fn dma_slice(&self) -> &Slice<Arc<DmaBuffer<FromAndToDevice>>> {
+         &self.storage
+     }
+ }
+@@ -551,7 +778,7 @@ impl BioSegmentPool {
+         let arena = self.arena_pool.alloc(nblocks)?;
+         Some(BioSegmentInner {
+             storage: Slice::new(
+-                DmaBuffer::Arena(arena),
++                Arc::new(DmaBuffer::Arena(arena)),
+                 offset_within_first_block..offset_within_first_block + len,
+             ),
+             direction: self.direction,
+@@ -584,3 +811,169 @@ fn target_pool(direction: BioDirection) -> Option<&'static Arc<BioSegmentPool>>
+ pub(crate) fn is_sector_aligned(offset: usize) -> bool {
+     offset.is_multiple_of(SECTOR_SIZE)
+ }
++
++#[cfg(ktest)]
++mod tests {
++    use alloc::vec;
++
++    use ostd::prelude::ktest;
++
++    use super::*;
++
++    fn submitted_bio(start: u64, end: u64) -> SubmittedBio {
++        let sid_range = Sid::new(start)..Sid::new(end);
++        SubmittedBio {
++            metadata: Arc::new(BioMetadata {
++                type_: BioType::Read,
++                sid_range: sid_range.clone(),
++                status: AtomicU32::new(BioStatus::Submit as u32),
++                wait_queue: WaitQueue::new(),
++            }),
++            current_sid_range: sid_range,
++            complete_fn: None,
++            segments: Vec::new(),
++            complete_as_io_error_on_drop: false,
++        }
++    }
++
++    #[ktest]
++    fn remap_sid_start_preserves_length_and_original_range() {
++        let mut bio = submitted_bio(10, 18);
++
++        bio.remap_sid_start(Sid::new(100)).unwrap();
++
++        assert_eq!(bio.sid_range(), &(Sid::new(100)..Sid::new(108)));
++        assert_eq!(bio.metadata.sid_range(), &(Sid::new(10)..Sid::new(18)));
++    }
++
++    #[ktest]
++    fn add_sid_offset_composes_multiple_block_layers() {
++        let mut bio = submitted_bio(10, 18);
++
++        bio.add_sid_offset(100).unwrap();
++        bio.add_sid_offset(1_000).unwrap();
++
++        assert_eq!(bio.sid_range(), &(Sid::new(1_110)..Sid::new(1_118)));
++    }
++
++    #[ktest]
++    fn remap_sid_start_rejects_overflow_without_changing_range() {
++        let mut bio = submitted_bio(10, 18);
++        let original = bio.sid_range().clone();
++
++        assert_eq!(
++            bio.remap_sid_start(Sid::new(u64::MAX - 3)),
++            Err(BioEnqueueError::Refused)
++        );
++        assert_eq!(bio.sid_range(), &original);
++    }
++
++    #[ktest]
++    fn split_data_bio_slices_segments_at_child_boundaries() {
++        let bio = Bio::new(
++            BioType::Read,
++            Sid::new(10),
++            vec![
++                BioSegment::alloc_exact(1, 2 * SECTOR_SIZE, BioDirection::FromDevice),
++                BioSegment::alloc_exact(1, 4 * SECTOR_SIZE, BioDirection::FromDevice),
++                BioSegment::alloc_exact(1, 2 * SECTOR_SIZE, BioDirection::FromDevice),
++            ],
++            None,
++        )
++        .submit_for_test();
++        let children = bio
++            .split(vec![
++                Sid::new(10)..Sid::new(13),
++                Sid::new(13)..Sid::new(15),
++                Sid::new(15)..Sid::new(18),
++            ])
++            .unwrap();
++
++        assert_eq!(children[0].sid_range(), &(Sid::new(10)..Sid::new(13)));
++        assert_eq!(children[1].sid_range(), &(Sid::new(13)..Sid::new(15)));
++        assert_eq!(children[2].sid_range(), &(Sid::new(15)..Sid::new(18)));
++        assert_eq!(
++            children
++                .iter()
++                .map(|child| child
++                    .segments()
++                    .iter()
++                    .map(BioSegment::nbytes)
++                    .sum::<usize>())
++                .collect::<Vec<_>>(),
++            vec![3 * SECTOR_SIZE, 2 * SECTOR_SIZE, 3 * SECTOR_SIZE]
++        );
++
++        for child in children {
++            child.complete(BioStatus::Complete);
++        }
++    }
++
++    #[ktest]
++    fn split_bio_keeps_first_error_until_all_children_complete() {
++        let completions = Arc::new(SpinLock::<Vec<BioStatus>, LocalIrqDisabled>::new(Vec::new()));
++        let callback_completions = completions.clone();
++        let bio = Bio::new(
++            BioType::Write,
++            Sid::new(10),
++            vec![BioSegment::alloc_exact(
++                2,
++                12 * SECTOR_SIZE,
++                BioDirection::ToDevice,
++            )],
++            Some(Box::new(move |status| {
++                callback_completions.lock().push(status);
++            })),
++        )
++        .submit_for_test();
++        let children = bio
++            .split(vec![
++                Sid::new(10)..Sid::new(14),
++                Sid::new(14)..Sid::new(18),
++                Sid::new(18)..Sid::new(22),
++            ])
++            .unwrap();
++        let mut children = children.into_iter();
++        let first = children.next().unwrap();
++        let second = children.next().unwrap();
++        let third = children.next().unwrap();
++
++        third.complete(BioStatus::NoSpace);
++        first.complete(BioStatus::IoError);
++        assert!(completions.lock().is_empty());
++
++        second.complete(BioStatus::Complete);
++        assert_eq!(*completions.lock(), vec![BioStatus::NoSpace]);
++    }
++
++    #[ktest]
++    fn dropping_split_child_reports_error_after_remaining_children_complete() {
++        let completions = Arc::new(SpinLock::<Vec<BioStatus>, LocalIrqDisabled>::new(Vec::new()));
++        let callback_completions = completions.clone();
++        let bio = Bio::new(
++            BioType::Read,
++            Sid::new(10),
++            vec![BioSegment::alloc_exact(
++                1,
++                8 * SECTOR_SIZE,
++                BioDirection::FromDevice,
++            )],
++            Some(Box::new(move |status| {
++                callback_completions.lock().push(status);
++            })),
++        )
++        .submit_for_test();
++        let children = bio
++            .split(vec![Sid::new(10)..Sid::new(14), Sid::new(14)..Sid::new(18)])
++            .unwrap();
++        let mut children = children.into_iter();
++        let first = children.next().unwrap();
++        let second = children.next().unwrap();
++
++        drop(first);
++        assert!(completions.lock().is_empty());
++
++        second.complete(BioStatus::Complete);
++        assert_eq!(*completions.lock(), vec![BioStatus::IoError]);
++    }
++}
+diff --git a/kernel/core/comps/block/src/partition.rs b/kernel/core/comps/block/src/partition.rs
+index 98428c051..c774e65a5 100644
+--- a/kernel/core/comps/block/src/partition.rs
++++ b/kernel/core/comps/block/src/partition.rs
+@@ -255,7 +255,7 @@ struct PartitionNode {
+ 
+ impl BlockDevice for PartitionNode {
+     fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+-        bio.set_sid_offset(self.info.start_sector());
++        bio.add_sid_offset(self.info.start_sector())?;
+         self.device.enqueue(bio)
+     }
+ 
+@@ -289,6 +289,122 @@ impl PartitionNode {
+     }
+ }
+ 
++#[cfg(ktest)]
++mod tests {
++    use ::device_id::MajorId;
++    use ostd::prelude::ktest;
++
++    use super::*;
++    use crate::{
++        bio::{Bio, BioDirection, BioSegment, BioType},
++        id::Sid,
++    };
++
++    #[derive(Debug)]
++    struct RecordingBlockDevice {
++        id: DeviceId,
++        enqueue_count: AtomicUsize,
++        last_range: Mutex<Option<Range<Sid>>>,
++    }
++
++    impl RecordingBlockDevice {
++        fn new(minor: u32) -> Arc<Self> {
++            Arc::new(Self {
++                id: DeviceId::new(MajorId::new(510), MinorId::new(minor)),
++                enqueue_count: AtomicUsize::new(0),
++                last_range: Mutex::new(None),
++            })
++        }
++    }
++
++    impl BlockDevice for RecordingBlockDevice {
++        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
++            self.enqueue_count.fetch_add(1, Ordering::Relaxed);
++            *self.last_range.lock() = Some(bio.sid_range().clone());
++            Ok(())
++        }
++
++        fn metadata(&self) -> BlockDeviceMeta {
++            BlockDeviceMeta::default()
++        }
++
++        fn name(&self) -> &str {
++            "partition-test-backing"
++        }
++
++        fn id(&self) -> DeviceId {
++            self.id
++        }
++    }
++
++    fn mbr_partition(start_sector: u32) -> PartitionInfo {
++        PartitionInfo::Mbr(MbrEntry {
++            flag: 0,
++            start_chs: ChsAddr([0, 1, 0]),
++            type_: 0x83,
++            end_chs: ChsAddr([0, 1, 0]),
++            start_sector,
++            total_sectors: 128,
++        })
++    }
++
++    #[ktest]
++    fn remaps_data_bio_to_partition_start() {
++        let backing = RecordingBlockDevice::new(1);
++        let partition = PartitionNode::new(
++            DeviceId::new(MajorId::new(510), MinorId::new(2)),
++            String::from("partition-test"),
++            backing.clone(),
++            mbr_partition(100),
++        );
++        let bio = Bio::new(
++            BioType::Read,
++            Sid::new(7),
++            vec![BioSegment::alloc_exact(
++                1,
++                4 * SECTOR_SIZE,
++                BioDirection::FromDevice,
++            )],
++            None,
++        )
++        .submit_for_test();
++
++        partition.enqueue(bio).unwrap();
++
++        assert_eq!(backing.enqueue_count.load(Ordering::Relaxed), 1);
++        assert_eq!(
++            *backing.last_range.lock(),
++            Some(Sid::new(107)..Sid::new(111))
++        );
++    }
++
++    #[ktest]
++    fn refuses_offset_overflow_without_forwarding_bio() {
++        let backing = RecordingBlockDevice::new(3);
++        let partition = PartitionNode::new(
++            DeviceId::new(MajorId::new(510), MinorId::new(4)),
++            String::from("partition-overflow-test"),
++            backing.clone(),
++            mbr_partition(10),
++        );
++        let bio = Bio::new(
++            BioType::Read,
++            Sid::new(u64::MAX - 5),
++            vec![BioSegment::alloc_exact(
++                1,
++                5 * SECTOR_SIZE,
++                BioDirection::FromDevice,
++            )],
++            None,
++        )
++        .submit_for_test();
++
++        assert_eq!(partition.enqueue(bio), Err(BioEnqueueError::Refused));
++        assert_eq!(backing.enqueue_count.load(Ordering::Relaxed), 0);
++        assert_eq!(*backing.last_range.lock(), None);
++    }
++}
++
+ /// Manages the partitions of a whole-disk block device.
+ ///
+ /// The manager owns the device's current partition list and the lock that
+diff --git a/kernel/core/comps/block/src/request_queue.rs b/kernel/core/comps/block/src/request_queue.rs
+index dd8fbfe85..4ada699ce 100644
+--- a/kernel/core/comps/block/src/request_queue.rs
++++ b/kernel/core/comps/block/src/request_queue.rs
+@@ -137,11 +137,9 @@ impl Debug for BioRequestSingleQueue {
+ /// that (1) are of the same request type and (2) are contiguous in terms of target sectors.
+ /// This helps reduce the number of I/O requests submitted to the underlying storage medium.
+ ///
+-/// Second, a `BioRequest` provides the physical sector addresses suitable for storage medium.
+-/// The sector addresses returned from `SubmittedBio::sid_range()` are logical ones:
+-/// they need to be adjusted with `SubmittedBio::sid_offset()` to calculate the physical ones.
+-/// This calculation is handled internally by `BioRequest`.
+-/// One can simply call `BioRequest::sid_range()` to obtain the physical sector addresses.
++/// Second, a `BioRequest` provides the sector addresses suitable for storage medium.
++/// Block layers may have remapped the submitted BIO. One can simply call
++/// `BioRequest::sid_range()` to obtain the addresses seen by the current device.
+ #[derive(Debug)]
+ pub struct BioRequest {
+     /// The type of the I/O
+@@ -193,10 +191,8 @@ impl BioRequest {
+             return false;
+         }
+ 
+-        let sid_offset = rq_bio.sid_offset();
+-
+-        rq_bio.sid_range().start + sid_offset == self.sid_range.end
+-            || rq_bio.sid_range().end + sid_offset == self.sid_range.start
++        rq_bio.sid_range().start == self.sid_range.end
++            || rq_bio.sid_range().end == self.sid_range.start
+     }
+ 
+     /// Merges the `SubmittedBio` into this request.
+@@ -210,13 +206,12 @@ impl BioRequest {
+         assert!(self.can_merge(&rq_bio));
+ 
+         let rq_bio_nr_segments = rq_bio.segments().len();
+-        let sid_offset = rq_bio.sid_offset();
+ 
+-        if rq_bio.sid_range().start + sid_offset == self.sid_range.end {
+-            self.sid_range.end = rq_bio.sid_range().end + sid_offset;
++        if rq_bio.sid_range().start == self.sid_range.end {
++            self.sid_range.end = rq_bio.sid_range().end;
+             self.bios.push_back(rq_bio);
+         } else {
+-            self.sid_range.start = rq_bio.sid_range().start + sid_offset;
++            self.sid_range.start = rq_bio.sid_range().start;
+             self.bios.push_front(rq_bio);
+         }
+ 
+@@ -226,9 +221,7 @@ impl BioRequest {
+ 
+ impl From<SubmittedBio> for BioRequest {
+     fn from(bio: SubmittedBio) -> Self {
+-        let mut sid_range = bio.sid_range().clone();
+-        sid_range.start = sid_range.start + bio.sid_offset();
+-        sid_range.end = sid_range.end + bio.sid_offset();
++        let sid_range = bio.sid_range().clone();
+ 
+         Self {
+             type_: bio.type_(),
+@@ -242,3 +235,76 @@ impl From<SubmittedBio> for BioRequest {
+         }
+     }
+ }
++
++#[cfg(ktest)]
++mod tests {
++    use ostd::prelude::ktest;
++
++    use super::*;
++    use crate::{
++        SECTOR_SIZE,
++        bio::{Bio, BioDirection, BioSegment},
++    };
++
++    fn write_bio(start: u64) -> SubmittedBio {
++        Bio::new(
++            BioType::Write,
++            Sid::new(start),
++            vec![BioSegment::alloc_exact(
++                1,
++                SECTOR_SIZE,
++                BioDirection::ToDevice,
++            )],
++            None,
++        )
++        .submit_for_test()
++    }
++
++    #[ktest]
++    fn merges_contiguous_remapped_data_bios() {
++        let queue = BioRequestSingleQueue::new();
++        let mut first = write_bio(10);
++        let mut second = write_bio(20);
++        first.remap_sid_start(Sid::new(100)).unwrap();
++        second.remap_sid_start(Sid::new(101)).unwrap();
++
++        queue.enqueue(first).unwrap();
++        queue.enqueue(second).unwrap();
++
++        assert_eq!(queue.num_requests(), 1);
++        let request = queue.dequeue();
++        assert_eq!(request.sid_range(), &(Sid::new(100)..Sid::new(102)));
++        assert_eq!(request.bios().count(), 2);
++    }
++
++    #[ktest]
++    fn enforces_segment_limit_when_merging_data_bios() {
++        let queue = BioRequestSingleQueue::with_max_nr_segments_per_bio(2);
++        queue.enqueue(write_bio(20)).unwrap();
++        queue.enqueue(write_bio(21)).unwrap();
++        queue.enqueue(write_bio(22)).unwrap();
++
++        assert_eq!(queue.num_requests(), 2);
++        let merged = queue.dequeue();
++        assert_eq!(merged.sid_range(), &(Sid::new(20)..Sid::new(22)));
++        assert_eq!(merged.num_segments(), 2);
++        assert_eq!(merged.bios().count(), 2);
++        let unmerged = queue.dequeue();
++        assert_eq!(unmerged.sid_range(), &(Sid::new(22)..Sid::new(23)));
++        assert_eq!(unmerged.num_segments(), 1);
++
++        let too_big = Bio::new(
++            BioType::Write,
++            Sid::new(30),
++            vec![
++                BioSegment::alloc_exact(1, SECTOR_SIZE, BioDirection::ToDevice),
++                BioSegment::alloc_exact(1, SECTOR_SIZE, BioDirection::ToDevice),
++                BioSegment::alloc_exact(1, SECTOR_SIZE, BioDirection::ToDevice),
++            ],
++            None,
++        )
++        .submit_for_test();
++        assert_eq!(queue.enqueue(too_big), Err(BioEnqueueError::TooBig));
++        assert_eq!(queue.num_requests(), 0);
++    }
++}
+diff --git a/kernel/core/comps/virtio/src/dma_buf.rs b/kernel/core/comps/virtio/src/dma_buf.rs
+index c3960e3b0..fc64979ec 100644
+--- a/kernel/core/comps/virtio/src/dma_buf.rs
++++ b/kernel/core/comps/virtio/src/dma_buf.rs
+@@ -69,6 +69,12 @@ impl<D: DmaDirection> DmaBuf for Slice<DmaBuffer<D>> {
+     }
+ }
+ 
++impl<D: DmaDirection> DmaBuf for Slice<Arc<DmaBuffer<D>>> {
++    fn len(&self) -> usize {
++        self.size()
++    }
++}
++
+ impl DmaBuf for TxBuffer {
+     fn len(&self) -> usize {
+         self.size()
