@@ -55,19 +55,21 @@ git hash-object <表中列出的文件路径>
 
 ## 4. 当前运行证据
 
-以下命令均在 `myAsterinas` 容器的 `/root/asterinas` 中串行执行；结果记录的是实际命令，不是预期命令。
+2026-09-28 在 `fork_Asterinas` 容器的 `/root/asterinas`、`dm` SHA `78f4eb24a` 上重新运行下表 DM/block/core ktest、focused C ABI 和六项 DM NixOS suite。表中的参数是当日实际执行证据，不是当前默认命令；默认验证不设置 `CARGO_NET_OFFLINE=true` 或 `CONSOLE=ttyS0`。更早的细节仅作为历史背景，不替代该 SHA 的当前证据。
 
 | 层次 | 命令或 selector | 实际结果 | 结论边界 |
 |---|---|---|---|
-| DM crate ktest | `kernel/core/comps/device-mapper`：`CONSOLE=ttyS0 cargo osdk test` | 在线 87/0。 | DM component 内部语义；不替代 core/C/system 层。 |
-| block crate ktest | `kernel/core/comps/block`：`CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test` | 25/0。 | BIO/block wrapper。 |
-| core DM ioctl | `kernel/core`：`CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon aster_core::device::misc::device_mapper::tests` | 81/0。 | DM ioctl/runtime 内部断言。 |
-| focused C ABI | `RELEASE=1 AUTO_TEST=regression INTEL_TDX=0 REGRESSION_TESTS=device/device_mapper make run_kernel` | 在线 182/0。 | 原始用户 ABI；不替代真实 CLI/LVM2。 |
-| core crate 全量 ktest | `kernel/core`：`CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon` | 在线 205/0；runner 为 16 crates、621 tests。 | 当前 core crate 全量证据；默认在线 Cargo/libgit2 已可拉取 `smoltcp`。 |
-| 基础 NixOS suite | `--control-plane`、`--dataplane`、`--lvm2-topology` | 全部通过。 | 分别证明控制面、裸块数据面与 LVM2 拓扑；三项合并仍不等于完整文件系统闭环。 |
-| 完整存储 suite | `--linear-integration`、`--striped-integration`、`--mixed-integration` | 全部通过；共 8 次 guest 启动。 | LVM2、ext2、文件 MD5、扩缩容与有序关机后的跨启动恢复；不是断电/崩溃一致性。 |
+| DM crate ktest | `kernel/core/comps/device-mapper`：`CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test` | `fork_Asterinas`：87/0。 | DM component 内部语义；不替代 core/C/system 层。 |
+| block crate ktest | `kernel/core/comps/block`：`CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test` | `fork_Asterinas`：27/0。 | BIO/block wrapper。 |
+| core DM ioctl | `kernel/core`：`CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon aster_core::device::misc::device_mapper::tests` | `fork_Asterinas`：81/0。 | DM ioctl/runtime 内部断言。 |
+| core block registry | `kernel/core`：`CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon aster_core::device::registry::block::tests` | `fork_Asterinas`：8/0。 | runtime block registry 生命周期。 |
+| core devtmpfs | `kernel/core`：`CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon aster_core::fs::fs_impls::devtmpfs::tests` | `fork_Asterinas`：6/0。 | 运行期节点与 identity 路径。 |
+| focused C ABI | `CARGO_NET_OFFLINE=true RELEASE=1 AUTO_TEST=regression INTEL_TDX=0 REGRESSION_TESTS=device/device_mapper make run_kernel` | `fork_Asterinas`：182/0。 | 原始用户 ABI；不替代真实 CLI/LVM2。 |
+| core crate 全量 ktest | `kernel/core`：`CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon` | `fork_Asterinas`：232/0。 | 当前 core crate 全量证据。 |
+| 基础 NixOS suite | `--control-plane`、`--dataplane`、`--lvm2-topology` | 2026-09-28 在 `fork_Asterinas` 重建镜像后全部重跑通过。 | 分别证明控制面、裸块数据面与 LVM2 拓扑；三项合并仍不等于完整文件系统闭环。 |
+| 完整存储 suite | `--linear-integration`、`--striped-integration`、`--mixed-integration` | 2026-09-28 在 `fork_Asterinas` 重建镜像后全部重跑通过。 | LVM2、ext2、文件 MD5、扩缩容与有序关机后的跨启动恢复；不是断电/崩溃一致性。 |
 
-完整非 TDX initramfs regression 已在线完成构建与 guest 启动，证明此前 DCAP/502 不再阻断 `INTEL_TDX=0` 构建图；但 `/test/network` 的 `test_tcp_append_after_peek_full_read` 为 137/1 失败。该失败不是 DM、代理或构建失败，不能把完整 regression 记为通过。
+完整非 TDX initramfs regression 已在 `fork_Asterinas` 的当前 `dm` SHA 上完成构建与 guest 启动，但 `test/initramfs/src/regression/process/cgroup.sh` 的 `cpu.stat` busy-loop 记账只得到 467ms，低于 1.9s 阈值，因此以失败退出。该失败在 Cgroup CPU accounting 路径，不是 DM、代理或构建失败；完整 regression 不能记为通过。
 
 ## 5. 未关闭的边界
 

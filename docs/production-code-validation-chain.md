@@ -182,18 +182,18 @@ git status --short
 
 ```bash
 cd kernel/core/comps/device-mapper
-CONSOLE=ttyS0 cargo osdk test aster_device_mapper::table::tests
+cargo osdk test aster_device_mapper::table::tests
 ```
 
 或：
 
 ```bash
 cd kernel/core
-CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon \
+cargo osdk test --kcmd-args=earlycon \
   aster_core::device::misc::device_mapper::tests
 ```
 
-`git status --short` 的作用是确认本轮留下的文件是否都在预期范围内。手动 ktest 虽从目标 crate 目录启动，但当前使用仓库根 OSDK manifest，因此日志应在仓库根目录查看：`ttyS0` 使用 `qemu.log`，`hvc0` 使用 `qemu-serial.log`；不要提交运行日志。
+`git status --short` 的作用是确认本轮留下的文件是否都在预期范围内。手动 ktest 虽从目标 crate 目录启动，但当前使用仓库根 OSDK manifest，因此日志应在仓库根目录查看：默认 `hvc0` 的 ktest UART 输出在 `qemu-serial.log`。仅在交互式排障时显式设置 `CONSOLE=ttyS0`，并查看 `qemu.log`；不要提交运行日志。
 
 ## 2. `make ktest` 背后到底在做什么
 
@@ -207,14 +207,14 @@ make ktest
 
 ```bash
 cd kernel/core/comps/device-mapper
-CONSOLE=ttyS0 cargo osdk test aster_device_mapper::table::tests
+cargo osdk test aster_device_mapper::table::tests
 ```
 
 ioctl 层测试：
 
 ```bash
 cd kernel/core
-CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon \
+cargo osdk test --kcmd-args=earlycon \
   aster_core::device::misc::device_mapper::tests
 ```
 
@@ -222,7 +222,7 @@ CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon \
 
 | 阶段 | 谁在做 | 主要动作 | 关键产物/日志 | 慢或失败时优先看 |
 |---|---|---|---|---|
-| 1. Makefile 入口 | `make ktest` | 设置 `CONSOLE=ttyS0`，准备前置依赖，然后调用 `cargo osdk test` | 终端 stdout | Makefile 参数是否被命令行覆盖 |
+| 1. Makefile 入口 | `make ktest` | 准备前置依赖，然后调用 `cargo osdk test` | 默认日志与 shell 退出码 | 当前目录或命令行参数是否改变测试范围 |
 | 2. initramfs 前置依赖 | `make initramfs` | 构建测试用 initramfs | `test/initramfs/build/initramfs.cpio.gz` | initramfs 是否在重建、VDSO 环境是否缺失 |
 | 3. cargo-osdk 前置依赖 | `$(CARGO_OSDK)` | 确认 `~/.cargo/bin/cargo-osdk` 可用；必要时重新安装 OSDK | `~/.cargo/bin/cargo-osdk` | 是否触发 `cargo install cargo-osdk --path osdk` |
 | 4. 选择测试 crate | `cargo osdk test` | 根据当前目录识别 current crate；在根目录时才受 workspace/default-members 影响 | 当前 crate 或 root `Cargo.toml` | 是否站在正确 crate 目录、是否误从根目录扩大测试范围 |
@@ -240,7 +240,7 @@ CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon \
 | `make ktest` 不是普通 `cargo test` | 它会构建一个可启动测试内核，并在 QEMU guest 里跑 kernel-mode tests。 |
 | 只跑一个测试仍显示很多 tests/crates | guest 内 runner 会先枚举完整 ktest tree，再用 whitelist 过滤。 |
 | `... filtered out` | 不是失败，只是当前 crate 中未匹配测试被跳过；如果目标是覆盖某个路径而结果为 `0 passed`，应改跑正确 crate、修正过滤路径或扩大到 crate 全量 ktest。 |
-| `CONSOLE=ttyS0 cargo osdk test` | 在目标 crate 目录运行定向测试；显式使用 serial console 并查看原始 QEMU 日志。 |
+| `cargo osdk test` | 在目标 crate 目录运行定向测试；使用默认 console，并从对应 QEMU 日志读取原始输出。 |
 | ktest 很慢但 QEMU 已出现 | 多半要看 guest boot 到 `[ktest runner]` 之间，例如 KVM/TCG、boot protocol、kernel init。 |
 
 定向 ktest 的过滤链路可以记成一行：
@@ -273,7 +273,7 @@ tail -n 100 qemu.log
 tail -n 100 qemu-serial.log
 ```
 
-手动定向测试时，在目标 crate 目录运行 `CONSOLE=ttyS0 cargo osdk test <crate>::<module>::tests`；core 测试还要传 `--kcmd-args=earlycon`。日志在仓库根目录查看：本轮 `ttyS0` 输出看 `qemu.log`，`hvc0` 输出看 `qemu-serial.log`，已有但本轮未使用的日志可能是旧文件。
+手动定向测试时，在目标 crate 目录运行 `cargo osdk test <crate>::<module>::tests`；core 测试还要传 `--kcmd-args=earlycon`。默认 `hvc0` 的 UART 输出查看根目录 `qemu-serial.log`；仅在排障时设置 `CONSOLE=ttyS0` 并查看 `qemu.log`，已有日志可能是旧文件。
 
 ## 3. DM system test 背后在做什么
 
@@ -371,7 +371,7 @@ git diff --check -- "kernel/core/comps/device-mapper/src"
 
 ```bash
 cd kernel/core/comps/device-mapper
-CONSOLE=ttyS0 cargo osdk test aster_device_mapper::table::tests
+cargo osdk test aster_device_mapper::table::tests
 ```
 
 如果改动影响真实数据面边界：
@@ -392,7 +392,7 @@ git diff --check -- "kernel/core/comps/device-mapper/src" "kernel/core/src/devic
 
 ```bash
 cd kernel/core
-CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon \
+cargo osdk test --kcmd-args=earlycon \
   aster_core::device::misc::device_mapper::tests
 ```
 
@@ -432,10 +432,10 @@ pgrep -af '[q]emu-system' || true
 
 - `cargo fmt --all --check` 通过。
 - `git diff --check` 通过。
-- 在目标 crate 目录执行的相关 `CONSOLE=ttyS0 cargo osdk test` 或必要的 `make ktest` 通过。
+- 在目标 crate 目录执行的相关 `cargo osdk test` 或必要的 `make ktest` 通过。
 - 如果影响真实 `dmsetup`/LVM2/数据面语义，相关 system suite 输出 `HOST_PASS_*`。
 - 测试后无 QEMU 残留。
-- 定向 ktest 使用模块 selector `crate::...::tests`；core 测试附加 `--kcmd-args=earlycon`，并从仓库根目录查看当前 console 对应的 QEMU 日志。
+- 定向 ktest 使用模块 selector `crate::...::tests`；core 测试附加 `--kcmd-args=earlycon`，默认从仓库根目录的 `qemu-serial.log` 查看 UART 输出。`CONSOLE=ttyS0` 仅用于交互式排障。
 
 判断 system test 完整通过时，要看最终 marker：
 

@@ -142,77 +142,77 @@ flowchart TB
 | 功能/场景 | 对应文件完整路径 |
 |---|---|
 | **workspace 接入** |  |
-| workspace 成员与默认 ktest 集合 | [/root/atom/asterinas/Cargo.toml](../Cargo.toml) |
-| `aster-core` 引入 `aster-device-mapper` 依赖 | [/root/atom/asterinas/kernel/core/Cargo.toml](../kernel/core/Cargo.toml) |
-| **DM crate：/root/atom/asterinas/kernel/core/comps/device-mapper** |  |
-| DM crate manifest | [/root/atom/asterinas/kernel/core/comps/device-mapper/Cargo.toml](../kernel/core/comps/device-mapper/Cargo.toml) |
-| DM crate 对外导出 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/lib.rs](../kernel/core/comps/device-mapper/src/lib.rs) |
-| DM device 生命周期、readonly、suspend/load/resume、event、BIO 入口 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/device.rs](../kernel/core/comps/device-mapper/src/device.rs) |
-| DM manager、name/uuid/id/minor 索引、create/remove/rename | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/manager.rs](../kernel/core/comps/device-mapper/src/manager.rs) |
-| DM table 构造、target 顺序、容量、deps、BIO remap/split、flush | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/table.rs](../kernel/core/comps/device-mapper/src/table.rs) |
-| target trait object、解析 factory 与 target 通用转发接口 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/target/mod.rs](../kernel/core/comps/device-mapper/src/target/mod.rs) |
-| linear target 构造、范围校验、sector 映射 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/target/linear.rs](../kernel/core/comps/device-mapper/src/target/linear.rs) |
-| striped target 参数解析、容量校验、sector/range 映射 | [/root/atom/asterinas/kernel/core/comps/device-mapper/src/target/striped.rs](../kernel/core/comps/device-mapper/src/target/striped.rs) |
-| **原有 block 框架：/root/atom/asterinas/kernel/core/comps/block/src** |  |
-| BIO 当前映射 range、remap、split、completion chain | [/root/atom/asterinas/kernel/core/comps/block/src/bio.rs](../kernel/core/comps/block/src/bio.rs) |
-| `DeviceId`/major/minor 支撑与测试 | [/root/atom/asterinas/kernel/core/comps/block/src/device_id.rs](../kernel/core/comps/block/src/device_id.rs) |
-| block device registry、lease、pending register/unregister、lookup/list | [/root/atom/asterinas/kernel/core/comps/block/src/lib.rs](../kernel/core/comps/block/src/lib.rs) |
-| 分区设备适配 `BlockDeviceLease`/新 block 接口 | [/root/atom/asterinas/kernel/core/comps/block/src/partition.rs](../kernel/core/comps/block/src/partition.rs) |
-| request queue 适配 BIO range/split 语义 | [/root/atom/asterinas/kernel/core/comps/block/src/request_queue.rs](../kernel/core/comps/block/src/request_queue.rs) |
+| workspace 成员与默认 ktest 集合 | [/root/github/asterinas/Cargo.toml](../Cargo.toml) |
+| `aster-core` 引入 `aster-device-mapper` 依赖 | [/root/github/asterinas/kernel/core/Cargo.toml](../kernel/core/Cargo.toml) |
+| **DM crate：/root/github/asterinas/kernel/core/comps/device-mapper** |  |
+| DM crate manifest | [/root/github/asterinas/kernel/core/comps/device-mapper/Cargo.toml](../kernel/core/comps/device-mapper/Cargo.toml) |
+| DM crate 对外导出 | [/root/github/asterinas/kernel/core/comps/device-mapper/src/lib.rs](../kernel/core/comps/device-mapper/src/lib.rs) |
+| DM device 生命周期、readonly、suspend/load/resume、event、BIO 入口 | [/root/github/asterinas/kernel/core/comps/device-mapper/src/device.rs](../kernel/core/comps/device-mapper/src/device.rs) |
+| DM manager、name/uuid/id/minor 索引、create/remove/rename | [/root/github/asterinas/kernel/core/comps/device-mapper/src/manager.rs](../kernel/core/comps/device-mapper/src/manager.rs) |
+| DM table 构造、target 顺序、容量、deps、BIO remap/split、flush | [/root/github/asterinas/kernel/core/comps/device-mapper/src/table.rs](../kernel/core/comps/device-mapper/src/table.rs) |
+| target trait object、解析 factory 与 target 通用转发接口 | [/root/github/asterinas/kernel/core/comps/device-mapper/src/target/mod.rs](../kernel/core/comps/device-mapper/src/target/mod.rs) |
+| linear target 构造、范围校验、sector 映射 | [/root/github/asterinas/kernel/core/comps/device-mapper/src/target/linear.rs](../kernel/core/comps/device-mapper/src/target/linear.rs) |
+| striped target 参数解析、容量校验、sector/range 映射 | [/root/github/asterinas/kernel/core/comps/device-mapper/src/target/striped.rs](../kernel/core/comps/device-mapper/src/target/striped.rs) |
+| **原有 block 框架：/root/github/asterinas/kernel/core/comps/block/src** |  |
+| BIO 当前映射 range、remap、split、completion chain | [/root/github/asterinas/kernel/core/comps/block/src/bio.rs](../kernel/core/comps/block/src/bio.rs) |
+| `DeviceId`/major/minor 支撑与测试 | [/root/github/asterinas/kernel/core/comps/block/src/device_id.rs](../kernel/core/comps/block/src/device_id.rs) |
+| block device registry、lease、pending register/unregister、lookup/list | [/root/github/asterinas/kernel/core/comps/block/src/lib.rs](../kernel/core/comps/block/src/lib.rs) |
+| 分区设备适配 `BlockDeviceLease`/新 block 接口 | [/root/github/asterinas/kernel/core/comps/block/src/partition.rs](../kernel/core/comps/block/src/partition.rs) |
+| request queue 适配 BIO range/split 语义 | [/root/github/asterinas/kernel/core/comps/block/src/request_queue.rs](../kernel/core/comps/block/src/request_queue.rs) |
 | **原有块设备驱动：mlsdisk/nvme/virtio** |  |
-| mlsdisk block device 适配新 block 接口 | [/root/atom/asterinas/kernel/core/comps/mlsdisk/src/lib.rs](../kernel/core/comps/mlsdisk/src/lib.rs) |
-| mlsdisk 底层 disk 层适配新 block 接口 | [/root/atom/asterinas/kernel/core/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs](../kernel/core/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs) |
-| nvme block device 适配新 block 接口 | [/root/atom/asterinas/kernel/core/comps/nvme/src/lib.rs](../kernel/core/comps/nvme/src/lib.rs) |
-| nvme block device 实现适配新 block 接口 | [/root/atom/asterinas/kernel/core/comps/nvme/src/device/block_device.rs](../kernel/core/comps/nvme/src/device/block_device.rs) |
-| virtio block module 适配新 block 接口 | [/root/atom/asterinas/kernel/core/comps/virtio/src/lib.rs](../kernel/core/comps/virtio/src/lib.rs) |
-| virtio block 子模块导出/适配 | [/root/atom/asterinas/kernel/core/comps/virtio/src/device/block/mod.rs](../kernel/core/comps/virtio/src/device/block/mod.rs) |
-| virtio block device 实现适配新 block 接口 | [/root/atom/asterinas/kernel/core/comps/virtio/src/device/block/device.rs](../kernel/core/comps/virtio/src/device/block/device.rs) |
-| **原有 device 框架：/root/atom/asterinas/kernel/core/src/device** |  |
-| devtmpfs runtime node/symlink 创建、删除、rename，设备注册入口扩展 | [/root/atom/asterinas/kernel/core/src/device/mod.rs](../kernel/core/src/device/mod.rs) |
-| misc 设备初始化接入 Device Mapper control device | [/root/atom/asterinas/kernel/core/src/device/misc/mod.rs](../kernel/core/src/device/misc/mod.rs) |
-| `/dev/mapper/control` ioctl ABI、create/remove/rename/table/status/deps/list | [/root/atom/asterinas/kernel/core/src/device/misc/device_mapper.rs](../kernel/core/src/device/misc/device_mapper.rs) |
-| block runtime registry、devtmpfs block node、mapper alias、open count | [/root/atom/asterinas/kernel/core/src/device/registry/block.rs](../kernel/core/src/device/registry/block.rs) |
-| block registry 对外导出 `register_block_mapper` 等能力 | [/root/atom/asterinas/kernel/core/src/device/registry/mod.rs](../kernel/core/src/device/registry/mod.rs) |
-| **原有 fs/VFS/page cache：/root/atom/asterinas/kernel/core/src** |  |
-| exfat 挂载改用 `BlockDeviceLease` | [/root/atom/asterinas/kernel/core/src/fs/fs_impls/exfat/fs.rs](../kernel/core/src/fs/fs_impls/exfat/fs.rs) |
-| ext2 挂载改用 `BlockDeviceLease` | [/root/atom/asterinas/kernel/core/src/fs/fs_impls/ext2/fs.rs](../kernel/core/src/fs/fs_impls/ext2/fs.rs) |
-| ext2 fs type 适配 block device lease 解析 | [/root/atom/asterinas/kernel/core/src/fs/fs_impls/ext2/fs_type.rs](../kernel/core/src/fs/fs_impls/ext2/fs_type.rs) |
-| ext2 测试工具适配 block device lease | [/root/atom/asterinas/kernel/core/src/fs/fs_impls/ext2/test_utils.rs](../kernel/core/src/fs/fs_impls/ext2/test_utils.rs) |
-| procfs 接入 `/proc/devices` | [/root/atom/asterinas/kernel/core/src/fs/fs_impls/procfs/mod.rs](../kernel/core/src/fs/fs_impls/procfs/mod.rs) |
-| `/proc/devices` 内容生成 | [/root/atom/asterinas/kernel/core/src/fs/fs_impls/procfs/devices.rs](../kernel/core/src/fs/fs_impls/procfs/devices.rs) |
-| VFS block device 解析改用 lease | [/root/atom/asterinas/kernel/core/src/fs/vfs/fs_apis/registry.rs](../kernel/core/src/fs/vfs/fs_apis/registry.rs) |
-| dentry 条件 unlink/rmdir 支撑 runtime devtmpfs 回滚 | [/root/atom/asterinas/kernel/core/src/fs/vfs/path/dentry.rs](../kernel/core/src/fs/vfs/path/dentry.rs) |
-| Path 暴露条件 unlink/rmdir 接口 | [/root/atom/asterinas/kernel/core/src/fs/vfs/path/mod.rs](../kernel/core/src/fs/vfs/path/mod.rs) |
-| page cache 测试工具适配 block device lease | [/root/atom/asterinas/kernel/core/src/vm/page_cache/tests/utils.rs](../kernel/core/src/vm/page_cache/tests/utils.rs) |
-| **用户态回归测试：/root/atom/asterinas/test/initramfs/src/regression** |  |
-| Device Mapper control ABI 回归测试 C 程序 | [/root/atom/asterinas/test/initramfs/src/regression/device/device_mapper.c](../test/initramfs/src/regression/device/device_mapper.c) |
-| device 回归测试入口接入 DM 测试 | [/root/atom/asterinas/test/initramfs/src/regression/device/run_test.sh](../test/initramfs/src/regression/device/run_test.sh) |
-| `/proc/devices` 回归测试 C 程序 | [/root/atom/asterinas/test/initramfs/src/regression/fs/procfs/devices.c](../test/initramfs/src/regression/fs/procfs/devices.c) |
-| fs 回归测试入口接入 `/proc/devices` 测试 | [/root/atom/asterinas/test/initramfs/src/regression/fs/run_test.sh](../test/initramfs/src/regression/fs/run_test.sh) |
-| block device 文件 I/O 回归测试适配 DM/块设备行为 | [/root/atom/asterinas/test/initramfs/src/regression/io/file_io/block_device.c](../test/initramfs/src/regression/io/file_io/block_device.c) |
-| **DM 系统测试脚本：/root/atom/asterinas/myshell** |  |
-| 本地启动辅助脚本 | [/root/atom/asterinas/myshell/br.sh](../myshell/br.sh) |
-| DM 系统测试统一入口 | [/root/atom/asterinas/myshell/run_dm_system_tests.sh](../myshell/run_dm_system_tests.sh) |
-| DM NixOS 测试公共库 | [/root/atom/asterinas/myshell/lib/dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh) |
-| control-plane 系统验收 | [/root/atom/asterinas/myshell/run_dm_control_plane_test.sh](../myshell/run_dm_control_plane_test.sh) |
-| raw DM dataplane 系统验收 | [/root/atom/asterinas/myshell/run_dm_dataplane_test.sh](../myshell/run_dm_dataplane_test.sh) |
-| LVM2 PV/VG/LV topology 系统验收 | [/root/atom/asterinas/myshell/run_lvm2_topology_test.sh](../myshell/run_lvm2_topology_test.sh) |
-| linear LVM2/ext2/reboot integration | [/root/atom/asterinas/myshell/dm_linear/run_lvm2_linear_integration_test.sh](../myshell/dm_linear/run_lvm2_linear_integration_test.sh) |
-| striped LVM2/ext2/reboot integration | [/root/atom/asterinas/myshell/dm_striped/run_lvm2_striped_integration_test.sh](../myshell/dm_striped/run_lvm2_striped_integration_test.sh) |
-| mixed linear+striped LVM2/ext2/reboot integration | [/root/atom/asterinas/myshell/dm_mixed/run_lvm2_mixed_integration_test.sh](../myshell/dm_mixed/run_lvm2_mixed_integration_test.sh) |
+| mlsdisk block device 适配新 block 接口 | [/root/github/asterinas/kernel/core/comps/mlsdisk/src/lib.rs](../kernel/core/comps/mlsdisk/src/lib.rs) |
+| mlsdisk 底层 disk 层适配新 block 接口 | [/root/github/asterinas/kernel/core/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs](../kernel/core/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs) |
+| nvme block device 适配新 block 接口 | [/root/github/asterinas/kernel/core/comps/nvme/src/lib.rs](../kernel/core/comps/nvme/src/lib.rs) |
+| nvme block device 实现适配新 block 接口 | [/root/github/asterinas/kernel/core/comps/nvme/src/device/block_device.rs](../kernel/core/comps/nvme/src/device/block_device.rs) |
+| virtio block module 适配新 block 接口 | [/root/github/asterinas/kernel/core/comps/virtio/src/lib.rs](../kernel/core/comps/virtio/src/lib.rs) |
+| virtio block 子模块导出/适配 | [/root/github/asterinas/kernel/core/comps/virtio/src/device/block/mod.rs](../kernel/core/comps/virtio/src/device/block/mod.rs) |
+| virtio block device 实现适配新 block 接口 | [/root/github/asterinas/kernel/core/comps/virtio/src/device/block/device.rs](../kernel/core/comps/virtio/src/device/block/device.rs) |
+| **原有 device 框架：/root/github/asterinas/kernel/core/src/device** |  |
+| devtmpfs runtime node/symlink 创建、删除、rename，设备注册入口扩展 | [/root/github/asterinas/kernel/core/src/device/mod.rs](../kernel/core/src/device/mod.rs) |
+| misc 设备初始化接入 Device Mapper control device | [/root/github/asterinas/kernel/core/src/device/misc/mod.rs](../kernel/core/src/device/misc/mod.rs) |
+| `/dev/mapper/control` ioctl ABI、create/remove/rename/table/status/deps/list | [/root/github/asterinas/kernel/core/src/device/misc/device_mapper.rs](../kernel/core/src/device/misc/device_mapper.rs) |
+| block runtime registry、devtmpfs block node、mapper alias、open count | [/root/github/asterinas/kernel/core/src/device/registry/block.rs](../kernel/core/src/device/registry/block.rs) |
+| block registry 对外导出 `register_block_mapper` 等能力 | [/root/github/asterinas/kernel/core/src/device/registry/mod.rs](../kernel/core/src/device/registry/mod.rs) |
+| **原有 fs/VFS/page cache：/root/github/asterinas/kernel/core/src** |  |
+| exfat 挂载改用 `BlockDeviceLease` | [/root/github/asterinas/kernel/core/src/fs/fs_impls/exfat/fs.rs](../kernel/core/src/fs/fs_impls/exfat/fs.rs) |
+| ext2 挂载改用 `BlockDeviceLease` | [/root/github/asterinas/kernel/core/src/fs/fs_impls/ext2/fs.rs](../kernel/core/src/fs/fs_impls/ext2/fs.rs) |
+| ext2 fs type 适配 block device lease 解析 | [/root/github/asterinas/kernel/core/src/fs/fs_impls/ext2/fs_type.rs](../kernel/core/src/fs/fs_impls/ext2/fs_type.rs) |
+| ext2 测试工具适配 block device lease | [/root/github/asterinas/kernel/core/src/fs/fs_impls/ext2/test_utils.rs](../kernel/core/src/fs/fs_impls/ext2/test_utils.rs) |
+| procfs 接入 `/proc/devices` | [/root/github/asterinas/kernel/core/src/fs/fs_impls/procfs/mod.rs](../kernel/core/src/fs/fs_impls/procfs/mod.rs) |
+| `/proc/devices` 内容生成 | [/root/github/asterinas/kernel/core/src/fs/fs_impls/procfs/devices.rs](../kernel/core/src/fs/fs_impls/procfs/devices.rs) |
+| VFS block device 解析改用 lease | [/root/github/asterinas/kernel/core/src/fs/vfs/fs_apis/registry.rs](../kernel/core/src/fs/vfs/fs_apis/registry.rs) |
+| dentry 条件 unlink/rmdir 支撑 runtime devtmpfs 回滚 | [/root/github/asterinas/kernel/core/src/fs/vfs/path/dentry.rs](../kernel/core/src/fs/vfs/path/dentry.rs) |
+| Path 暴露条件 unlink/rmdir 接口 | [/root/github/asterinas/kernel/core/src/fs/vfs/path/mod.rs](../kernel/core/src/fs/vfs/path/mod.rs) |
+| page cache 测试工具适配 block device lease | [/root/github/asterinas/kernel/core/src/vm/page_cache/tests/utils.rs](../kernel/core/src/vm/page_cache/tests/utils.rs) |
+| **用户态回归测试：/root/github/asterinas/test/initramfs/src/regression** |  |
+| Device Mapper control ABI 回归测试 C 程序 | [/root/github/asterinas/test/initramfs/src/regression/device/device_mapper.c](../test/initramfs/src/regression/device/device_mapper.c) |
+| device 回归测试入口接入 DM 测试 | [/root/github/asterinas/test/initramfs/src/regression/device/run_test.sh](../test/initramfs/src/regression/device/run_test.sh) |
+| `/proc/devices` 回归测试 C 程序 | [/root/github/asterinas/test/initramfs/src/regression/fs/procfs/devices.c](../test/initramfs/src/regression/fs/procfs/devices.c) |
+| fs 回归测试入口接入 `/proc/devices` 测试 | [/root/github/asterinas/test/initramfs/src/regression/fs/run_test.sh](../test/initramfs/src/regression/fs/run_test.sh) |
+| block device 文件 I/O 回归测试适配 DM/块设备行为 | [/root/github/asterinas/test/initramfs/src/regression/io/file_io/block_device.c](../test/initramfs/src/regression/io/file_io/block_device.c) |
+| **DM 系统测试脚本：/root/github/asterinas/myshell** |  |
+| 本地启动辅助脚本 | [/root/github/asterinas/myshell/br.sh](../myshell/br.sh) |
+| DM 系统测试统一入口 | [/root/github/asterinas/myshell/run_dm_system_tests.sh](../myshell/run_dm_system_tests.sh) |
+| DM NixOS 测试公共库 | [/root/github/asterinas/myshell/lib/dm_nixos_test.sh](../myshell/lib/dm_nixos_test.sh) |
+| control-plane 系统验收 | [/root/github/asterinas/myshell/run_dm_control_plane_test.sh](../myshell/run_dm_control_plane_test.sh) |
+| raw DM dataplane 系统验收 | [/root/github/asterinas/myshell/run_dm_dataplane_test.sh](../myshell/run_dm_dataplane_test.sh) |
+| LVM2 PV/VG/LV topology 系统验收 | [/root/github/asterinas/myshell/run_lvm2_topology_test.sh](../myshell/run_lvm2_topology_test.sh) |
+| linear LVM2/ext2/reboot integration | [/root/github/asterinas/myshell/dm_linear/run_lvm2_linear_integration_test.sh](../myshell/dm_linear/run_lvm2_linear_integration_test.sh) |
+| striped LVM2/ext2/reboot integration | [/root/github/asterinas/myshell/dm_striped/run_lvm2_striped_integration_test.sh](../myshell/dm_striped/run_lvm2_striped_integration_test.sh) |
+| mixed linear+striped LVM2/ext2/reboot integration | [/root/github/asterinas/myshell/dm_mixed/run_lvm2_mixed_integration_test.sh](../myshell/dm_mixed/run_lvm2_mixed_integration_test.sh) |
 | **NixOS/QEMU/工具脚本** |  |
-| NixOS 配置接入 DM/LVM2 测试环境 | [/root/atom/asterinas/distro/etc_nixos/configuration.nix](../distro/etc_nixos/configuration.nix) |
-| hello-asterinas overlay 支撑测试镜像包 | [/root/atom/asterinas/distro/etc_nixos/overlays/hello-asterinas/default.nix](../distro/etc_nixos/overlays/hello-asterinas/default.nix) |
-| NixOS 镜像构建脚本适配 DM 测试镜像 | [/root/atom/asterinas/tools/nixos/build_nixos.sh](../tools/nixos/build_nixos.sh) |
-| NixOS/QEMU 运行脚本适配多盘 DM 测试 | [/root/atom/asterinas/tools/nixos/run.sh](../tools/nixos/run.sh) |
-| QEMU 参数脚本适配 DM 多盘场景 | [/root/atom/asterinas/tools/qemu_args.sh](../tools/qemu_args.sh) |
+| NixOS 配置接入 DM/LVM2 测试环境 | [/root/github/asterinas/distro/etc_nixos/configuration.nix](../distro/etc_nixos/configuration.nix) |
+| hello-asterinas overlay 支撑测试镜像包 | [/root/github/asterinas/distro/etc_nixos/overlays/hello-asterinas/default.nix](../distro/etc_nixos/overlays/hello-asterinas/default.nix) |
+| NixOS 镜像构建脚本适配 DM 测试镜像 | [/root/github/asterinas/tools/nixos/build_nixos.sh](../tools/nixos/build_nixos.sh) |
+| NixOS/QEMU 运行脚本适配多盘 DM 测试 | [/root/github/asterinas/tools/nixos/run.sh](../tools/nixos/run.sh) |
+| QEMU 参数脚本适配 DM 多盘场景 | [/root/github/asterinas/tools/qemu_args.sh](../tools/qemu_args.sh) |
 | **文档与记录** |  |
-| 协作与当前分支说明 | [/root/atom/asterinas/AGENTS.md](../AGENTS.md) |
-| DM 技术设计与实现说明 | [/root/atom/asterinas/docs/device-mapper-technical-design-and-implementation.md](device-mapper-technical-design-and-implementation.md) |
-| DM 配图与定位索引草稿 | [/root/atom/asterinas/docs/img.md](img.md) |
-| 非 DM 内核框架修改说明 | [/root/atom/asterinas/docs/non-device-mapper-change-rationale.md](non-device-mapper-change-rationale.md) |
-| DM 测试记录/说明 | [/root/atom/asterinas/docs/test.md](test.md) |
-| DM 技术设计 DOCX | [/root/atom/asterinas/docs/Asterinas_DeviceMapper_技术设计与实现说明.docx](Asterinas_DeviceMapper_技术设计与实现说明.docx) |
+| 协作与当前分支说明 | [/root/github/asterinas/AGENTS.md](../AGENTS.md) |
+| DM 技术设计与实现说明 | [/root/github/asterinas/docs/device-mapper-technical-design-and-implementation.md](device-mapper-technical-design-and-implementation.md) |
+| DM 配图与定位索引草稿 | [/root/github/asterinas/docs/img.md](img.md) |
+| 非 DM 内核框架修改说明 | [/root/github/asterinas/docs/non-device-mapper-change-rationale.md](non-device-mapper-change-rationale.md) |
+| DM 测试记录/说明 | [/root/github/asterinas/docs/test.md](test.md) |
+| DM 技术设计 DOCX | [/root/github/asterinas/docs/Asterinas_DeviceMapper_技术设计与实现说明.docx](Asterinas_DeviceMapper_技术设计与实现说明.docx) |
 
 ## Device Mapper 函数到 ktest 索引
 
@@ -279,10 +279,10 @@ flowchart TB
 
 | 改动范围 | 执行目录与命令 | 说明 |
 |---|---|---|
-| 单个函数 | 在 `<crate-dir>` 执行 `CONSOLE=ttyS0 cargo osdk test <完整测试函数名>` | 最快确认当前函数对应场景。 |
-| 单个模块 | 在 `<crate-dir>` 执行 `CONSOLE=ttyS0 cargo osdk test <crate>::<module>::tests` | 适合改 `linear.rs`、`striped.rs`、`table.rs` 等模块，一次运行模块全部 ktest。 |
-| 整个 DM crate | 在 `kernel/core/comps/device-mapper` 执行 `CONSOLE=ttyS0 cargo osdk test` | 覆盖 DM crate 内部 ktest；从仓库根目录查看本轮 `qemu.log`。 |
-| ioctl ABI 或完整控制面 | 在 `kernel/core` 执行 `CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon aster_core::device::misc::device_mapper::tests` | 覆盖 core ioctl 层 ktest，验证 `/dev/mapper/control` 的 Linux ABI 语义；日志仍位于仓库根目录。 |
+| 单个函数 | 在 `<crate-dir>` 执行 `cargo osdk test <完整测试函数名>` | 最快确认当前函数对应场景。 |
+| 单个模块 | 在 `<crate-dir>` 执行 `cargo osdk test <crate>::<module>::tests` | 适合改 `linear.rs`、`striped.rs`、`table.rs` 等模块，一次运行模块全部 ktest。 |
+| 整个 DM crate | 在 `kernel/core/comps/device-mapper` 执行 `cargo osdk test` | 覆盖 DM crate 内部 ktest；从仓库根目录查看本轮 `qemu.log`。 |
+| ioctl ABI 或完整控制面 | 在 `kernel/core` 执行 `cargo osdk test --kcmd-args=earlycon aster_core::device::misc::device_mapper::tests` | 覆盖 core ioctl 层 ktest，验证 `/dev/mapper/control` 的 Linux ABI 语义；日志仍位于仓库根目录。 |
 | 阶段验收 | 跑对应 NixOS/LVM2 系统测试 | 验证 `dmsetup`/LVM2 用户态工具到 block I/O 的完整链路。 |
 
 ## 整体取舍建议
