@@ -5,14 +5,14 @@
 | 项目 | 事实 |
 |---|---|
 | 状态 | 已推送；最终 SHA 验证通过。 |
-| 实际 Git branch | `pr` |
+| 实际 Git branch | `mapped-bio-ranges` |
 | base | `98e717275` (`main`) |
 | 当前远端 HEAD | `c14d68c93` |
 | 提交主题 | `block: add mapped BIO ranges` |
 | 远端事件 | 已通过 `git push --force-with-lease` 更新 fork 分支，移除旧 merge 历史。 |
 | 依赖 PR | 无。 |
 
-本文档使用稳定编号 **PR 1**；实际分支名为 `pr`。
+本文档使用稳定编号 **PR 1**；当前分支名为 `mapped-bio-ranges`。
 
 ## 2. Git 与远端历史
 
@@ -21,6 +21,7 @@
 | 2026-09-28 | 将原 block 补丁线性重放到 source `main` | `98e717275` | `c14d68c93` | 无冲突；只保留单一 block 提交。 |
 | 2026-09-28 | 安全强制更新 fork 分支 | `98e717275` | `c14d68c93` | `--force-with-lease` 成功移除旧 merge 历史。 |
 | 2026-09-28 | 容器内最终 SHA 验证 | `98e717275` | `c14d68c93` | `HEAD` 与 `origin/pr` 一致；完整 PR gate 通过。 |
+| 2026-09-28 | 语义化分支迁移 | `98e717275` | `c14d68c93` | fork 从 `pr` 创建并切换为 `mapped-bio-ranges`，随后删除旧 `pr`；提交内容不变。 |
 
 最终 diff 仅修改：
 
@@ -58,7 +59,7 @@ kernel/core/comps/block/src/request_queue.rs
 
 ### 最终 HEAD `c14d68c93`
 
-执行环境为 `fork_Asterinas:/root/pr-tree`。工作树直接检出当前 `pr`，验证完成后确认其 clean，且 `HEAD` 与 `origin/pr` 均为 `c14d68c93`；随后按流程删除临时工作树。
+该验证是历史上在 `fork_Asterinas:/root/pr-tree` 完成的：当时工作树检出分支 `pr`，验证后确认其 clean，且 `HEAD` 与 `origin/pr` 均为 `c14d68c93`；随后按当时流程删除临时工作树。这不改变后续 PR 直接从 `main` 创建分支的规范。
 
 | 层次 | 命令 | 结果 | 状态 |
 |---|---|---|---|
@@ -76,7 +77,7 @@ kernel/core/comps/block/src/request_queue.rs
 
 ## 6. 已知边界与后续动作
 
-1. 若 `pr` 的 base、HEAD 或三文件范围变化，必须从更新后的 `pr` 创建新的 `/root/pr-tree`，重新执行完整 PR gate；不得复用本次结果。
+1. 若 `mapped-bio-ranges` 的 base、HEAD 或三文件范围变化，先同步 `main` 到当前 upstream，再直接在该分支完成 rebase 与完整 PR gate；不得复用本次结果。
 2. PR 2 的 tracked device lease 保持独立审计和决策，不随 PR 1 扩大范围。
 
 ## 7. Upstream maintainer description

@@ -54,6 +54,13 @@ Local environment:
 - Container project path: `/root/asterinas`.
 - Commands in project docs and examples assume they are run inside `fork_Asterinas` from `/root/asterinas`, unless explicitly marked as host commands.
 
+### PR Branch Workflow
+
+- Keep `dm` as the authority branch for implementing and directly validating Device Mapper behavior.
+- Before preparing a new upstream PR, ensure the working tree is clean, fast-forward `main` to the current `upstream/main`, then create the PR branch directly from `main`.
+- Name the branch after the concise PR title in kebab-case, such as `mapped-bio-ranges`; do not use generic names such as `pr` or `pr1`.
+- Move only the verified minimal production diff from `dm` onto that branch. Run the final validation, commit, and push directly on the PR branch; do not create a separate PR worktree.
+
 Resource checks before commands that may consume noticeable CPU or memory,
 especially builds, ktests, QEMU/NixOS runs, patch generation, and large document
 rewrites:

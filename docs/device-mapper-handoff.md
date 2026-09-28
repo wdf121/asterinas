@@ -24,10 +24,10 @@
 
 ### PR 1 已推送且完成最终验证
 
-- PR 编号为 **PR 1**；实际 branch 为 `pr`。
+- PR 编号为 **PR 1**；当前 branch 为 `mapped-bio-ranges`。
 - 远端 HEAD 为 `c14d68c93`，base 为 `98e717275`；diff 严格限于 block 的 `bio.rs`、`partition.rs` 和 `request_queue.rs`。
-- 在 `fork_Asterinas:/root/pr-tree` 上完成最终 SHA 验证：`make check`、block crate ktest（6/0）、`make ktest`（245/0）与 `make kernel` 均通过；完成后已确认 `HEAD == origin/pr == c14d68c93` 且工作树 clean。
-- 临时 `/root/pr-tree` 已删除；本地与远端 `pr` 分支保留。旧 merge 历史已通过 `--force-with-lease` 从 fork 分支移除。
+- 历史最终验证曾在 `fork_Asterinas:/root/pr-tree` 完成：`make check`、block crate ktest（6/0）、`make ktest`（245/0）与 `make kernel` 均通过；验证时的 `pr` HEAD 与 `origin/pr` 均为 `c14d68c93`。
+- 当前分支采用语义化名称；fork 的旧 `pr` 引用已删除。旧 merge 历史已通过 `--force-with-lease` 从 fork 分支移除。
 
 详见 [PR 1 档案](../log/PR/PR-1-mapped-bio-ranges.md)。
 
@@ -39,14 +39,14 @@
 
 ## 下一步
 
-1. PR 1 若出现 base、HEAD 或范围变更，必须从更新后的 `pr` 创建 `/root/pr-tree`，重新运行完整 PR gate；当前结果只适用于 `c14d68c93`。
-2. 当前 `dm` 工作区保留通用 NixOS 测试盘定位改动及其本地文档记录；后续在 `dm` 收敛并验证新增行为后，才裁剪新的 PR。
-3. PR 2 保持审核完成、尚未决定制备的状态；除非用户授权，不主动推进。
+1. PR 1 已完成；只有其 base、HEAD 或三文件范围变化时，才同步 `main` 并在 `mapped-bio-ranges` 分支重新验证。
+2. **PR 2 已获授权推进**：先在权威 `dm` 关闭 block-device lease 的三个现有审核阻塞——registry lock 下 `device.name()` 的重入死锁、VirtIO 分区刷新忽略旧分区 unregister 结果、MlsDisk facade 与 RawDisk backing lease 的 drop 生命周期边界。
+3. 三项阻塞关闭并完成所有者 ktest 后，同步 `main` 到当前 upstream，从 `main` 直接创建 `block-device-leases`，迁移最小生产 diff 并在该分支完成最终验证、提交和 push。此时才为 PR 2 创建独立档案。
 
 ## 安全规则
 
 - 写入、测试、提交前先核对 `git status --short`。
 - 不覆盖、回退、格式化或提交来源不明的改动。
-- `dm` 的构建和测试默认在 `fork_Asterinas:/root/asterinas` 中进行；PR 验证固定从当前 `pr` 创建容器内 `/root/pr-tree`，完成 push/远端核对后删除该临时工作树。
+- `dm` 的构建和测试默认在 `fork_Asterinas:/root/asterinas` 中进行；新 PR 在已同步的 `main` 上直接创建语义化分支，并在该分支完成验证、提交与 push。
 - QEMU、ktest、C regression 与 NixOS system test 必须串行。
 - 默认不 push。
