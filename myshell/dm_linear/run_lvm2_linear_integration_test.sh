@@ -148,8 +148,8 @@ echo '=== STEP 1: check dm control device, linear target, and two test disks ===
 test -c /dev/mapper/control
 dmsetup targets | tee /tmp/linear-integration-targets.txt
 grep -q '^linear' /tmp/linear-integration-targets.txt
-TEST_DISK=$(aster-dm-disk-locator)
-TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
+TEST_DISK=$(aster-test-disk-locator 1)
+TEST_DISK2=$(aster-test-disk-locator 2)
 printf 'TEST_DISK=%s\nTEST_DISK2=%s\n' "${TEST_DISK}" "${TEST_DISK2}"
 test "${TEST_DISK}" != "${TEST_DISK2}"
 test -b "${TEST_DISK}"
@@ -282,8 +282,8 @@ check_linear_shrunk_table() {
 }
 
 echo '=== STEP 1: recover the cross-PV linear LV after reboot ==='
-TEST_DISK=$(aster-dm-disk-locator)
-TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
+TEST_DISK=$(aster-test-disk-locator 1)
+TEST_DISK2=$(aster-test-disk-locator 2)
 printf 'TEST_DISK=%s\nTEST_DISK2=%s\n' "${TEST_DISK}" "${TEST_DISK2}"
 test "${TEST_DISK}" != "${TEST_DISK2}"
 test -b "${TEST_DISK}"
@@ -368,8 +368,8 @@ dep_token() {
 }
 
 echo '=== STEP 1: recover the shrunken linear LV after reboot ==='
-TEST_DISK=$(aster-dm-disk-locator)
-TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
+TEST_DISK=$(aster-test-disk-locator 1)
+TEST_DISK2=$(aster-test-disk-locator 2)
 printf 'TEST_DISK=%s\nTEST_DISK2=%s\n' "${TEST_DISK}" "${TEST_DISK2}"
 test "${TEST_DISK}" != "${TEST_DISK2}"
 test -b "${TEST_DISK}"

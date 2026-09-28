@@ -94,7 +94,7 @@ in
     SYSTEMD_LOG_LEVEL = "crit";
   };
   system.systemBuilderCommands = ''
-    echo "PATH=/bin:/nix/var/nix/profiles/system/sw/bin earlycon loglevel=${config.aster_nixos.log-level} console=${config.aster_nixos.console} systemd.getty_auto=no -- root=/dev/vda2 init=/nix/var/nix/profiles/system/init rd.break=${
+    echo "PATH=/bin:/nix/var/nix/profiles/system/sw/bin earlycon loglevel=${config.aster_nixos.log-level} console=${config.aster_nixos.console} systemd.getty_auto=no -- root=/dev/vda2 init=/nix/var/nix/profiles/system/init aster.test_disk_first=/dev/vde rd.break=${
       if config.aster_nixos.break-into-stage-1-shell then "1" else "0"
     }"  > $out/kernel-params
     sed -i 's_^\([[:space:]]*\)\(exec > >(tee -i /run/log/stage-2-init.log) 2>&1\)$_\1# \2_' $out/init

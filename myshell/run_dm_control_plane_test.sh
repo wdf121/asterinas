@@ -414,12 +414,12 @@ run_expect_failure TARGET_VERSION_UNKNOWN dmsetup target-version aster_unknown
 echo CHECK_PASS_DMSETUP_STATIC_VERSION_TARGETS
 
 step '=== STEP 2: locate backing disks for table-dependent commands ==='
-echo 'CMD_LOCATE_DISK1: aster-dm-disk-locator'
-TEST_DISK=$(aster-dm-disk-locator) || fail_precondition locate_disk1_failed
+echo 'CMD_LOCATE_DISK1: aster-test-disk-locator 1'
+TEST_DISK=$(aster-test-disk-locator 1) || fail_precondition locate_disk1_failed
 printf 'TEST_DISK=%s
 ' "${TEST_DISK}"
-echo 'CMD_LOCATE_DISK2: aster-dm-disk-locator vdmtest2'
-TEST_DISK2=$(aster-dm-disk-locator vdmtest2) || fail_precondition locate_disk2_failed
+echo 'CMD_LOCATE_DISK2: aster-test-disk-locator 2'
+TEST_DISK2=$(aster-test-disk-locator 2) || fail_precondition locate_disk2_failed
 printf 'TEST_DISK2=%s
 ' "${TEST_DISK2}"
 [ "${TEST_DISK}" != "${TEST_DISK2}" ] || fail_precondition duplicate_backing_disks

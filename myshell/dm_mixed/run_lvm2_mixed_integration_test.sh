@@ -159,9 +159,9 @@ test -c /dev/mapper/control
 dmsetup targets | tee /tmp/mixed-lvm2-targets.txt
 grep -q '^linear' /tmp/mixed-lvm2-targets.txt
 grep -q '^striped' /tmp/mixed-lvm2-targets.txt
-TEST_DISK=$(aster-dm-disk-locator)
-TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
-TEST_DISK3=$(aster-dm-disk-locator vdmtest3)
+TEST_DISK=$(aster-test-disk-locator 1)
+TEST_DISK2=$(aster-test-disk-locator 2)
+TEST_DISK3=$(aster-test-disk-locator 3)
 printf 'TEST_DISK=%s\nTEST_DISK2=%s\nTEST_DISK3=%s\n' "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
 test "$TEST_DISK" != "$TEST_DISK2"
 test "$TEST_DISK" != "$TEST_DISK3"
@@ -304,9 +304,9 @@ check_mixed_table_status_deps() {
 }
 
 echo '=== STEP 1: recover mixed linear + striped LV after reboot ==='
-TEST_DISK=$(aster-dm-disk-locator)
-TEST_DISK2=$(aster-dm-disk-locator vdmtest2)
-TEST_DISK3=$(aster-dm-disk-locator vdmtest3)
+TEST_DISK=$(aster-test-disk-locator 1)
+TEST_DISK2=$(aster-test-disk-locator 2)
+TEST_DISK3=$(aster-test-disk-locator 3)
 printf 'TEST_DISK=%s\nTEST_DISK2=%s\nTEST_DISK3=%s\n' "$TEST_DISK" "$TEST_DISK2" "$TEST_DISK3"
 test "$TEST_DISK" != "$TEST_DISK2"
 test "$TEST_DISK" != "$TEST_DISK3"
