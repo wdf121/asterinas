@@ -145,15 +145,13 @@ dep_token() {
 }
 
 locate_striped_disks() {
-    local count=$1 index serial disk label existing dev
+    local count=$1 index disk label existing dev
     index=1
     while [ "${index}" -le "${count}" ]; do
+        disk=$(aster-test-disk-locator "${index}")
         if [ "${index}" -eq 1 ]; then
-            disk=$(aster-dm-disk-locator)
             label=TEST_DISK
         else
-            serial=vdmtest${index}
-            disk=$(aster-dm-disk-locator "${serial}")
             label=TEST_DISK${index}
         fi
         printf '%s=%s\n' "${label}" "${disk}"
@@ -347,15 +345,13 @@ dep_token() {
 }
 
 locate_striped_disks() {
-    local count=$1 index serial disk label existing dev
+    local count=$1 index disk label existing dev
     index=1
     while [ "${index}" -le "${count}" ]; do
+        disk=$(aster-test-disk-locator "${index}")
         if [ "${index}" -eq 1 ]; then
-            disk=$(aster-dm-disk-locator)
             label=TEST_DISK
         else
-            serial=vdmtest${index}
-            disk=$(aster-dm-disk-locator "${serial}")
             label=TEST_DISK${index}
         fi
         printf '%s=%s\n' "${label}" "${disk}"
@@ -501,15 +497,13 @@ dep_token() {
 }
 
 locate_striped_disks() {
-    local count=$1 index serial disk label existing dev
+    local count=$1 index disk label existing dev
     index=1
     while [ "${index}" -le "${count}" ]; do
+        disk=$(aster-test-disk-locator "${index}")
         if [ "${index}" -eq 1 ]; then
-            disk=$(aster-dm-disk-locator)
             label=TEST_DISK
         else
-            serial=vdmtest${index}
-            disk=$(aster-dm-disk-locator "${serial}")
             label=TEST_DISK${index}
         fi
         printf '%s=%s\n' "${label}" "${disk}"

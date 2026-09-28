@@ -138,9 +138,9 @@ dmsetup targets | tee /tmp/dm-dataplane-targets.txt
 for target in linear striped error zero; do
     grep -q "^${target}" /tmp/dm-dataplane-targets.txt
 done
-DISK1=$(aster-dm-disk-locator)
-DISK2=$(aster-dm-disk-locator vdmtest2)
-DISK3=$(aster-dm-disk-locator vdmtest3)
+DISK1=$(aster-test-disk-locator 1)
+DISK2=$(aster-test-disk-locator 2)
+DISK3=$(aster-test-disk-locator 3)
 printf 'TEST_DISK1=%s\nTEST_DISK2=%s\nTEST_DISK3=%s\n' "$DISK1" "$DISK2" "$DISK3"
 test "$DISK1" != "$DISK2"
 test "$DISK1" != "$DISK3"

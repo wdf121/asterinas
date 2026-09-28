@@ -282,12 +282,7 @@ mapper_name() {
 }
 
 locate_disk() {
-    serial=$1
-    if [ "${serial}" = "vdmtest" ]; then
-        aster-dm-disk-locator
-    else
-        aster-dm-disk-locator "${serial}"
-    fi
+    aster-test-disk-locator "$1"
 }
 
 record_dm_state() {
@@ -310,10 +305,10 @@ cleanup_lvm() {
 trap 'status=$?; if [ "${status}" -ne 0 ]; then echo TEST_FAIL_LVM2_TOPOLOGY status=${status}; fi; cleanup_lvm; sync; poweroff; exit ${status}' EXIT
 
 step '=== STEP 1: locate LVM2 test disks ==='
-DISK1=$(locate_disk vdmtest) || fail_precondition locate_disk1_failed
-DISK2=$(locate_disk vdmtest2) || fail_precondition locate_disk2_failed
-DISK3=$(locate_disk vdmtest3) || fail_precondition locate_disk3_failed
-DISK4=$(locate_disk vdmtest4) || fail_precondition locate_disk4_failed
+DISK1=$(locate_disk 1) || fail_precondition locate_disk1_failed
+DISK2=$(locate_disk 2) || fail_precondition locate_disk2_failed
+DISK3=$(locate_disk 3) || fail_precondition locate_disk3_failed
+DISK4=$(locate_disk 4) || fail_precondition locate_disk4_failed
 printf 'TEST_DISK1=%s\nTEST_DISK2=%s\nTEST_DISK3=%s\nTEST_DISK4=%s\n' "${DISK1}" "${DISK2}" "${DISK3}" "${DISK4}"
 [ -b "${DISK1}" ] || fail_precondition missing_test_disk1
 [ -b "${DISK2}" ] || fail_precondition missing_test_disk2
