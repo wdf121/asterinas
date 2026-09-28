@@ -29,7 +29,11 @@ CMDLINE ?=
 # Asterinas will automatically fall back to tty0 if hvc0 is not available.
 # Note that currently the virtual terminal (tty0) can only work with
 # linux-efi-handover64 and linux-efi-pe64 boot protocol.
+ifeq ($(SCHEME), sifive_u)
+CONSOLE ?= ttyS0
+else
 CONSOLE ?= hvc0
+endif
 # End of global build options.
 
 # GDB debugging and profiling options.
@@ -72,8 +76,7 @@ CONFORMANCE_TEST_GVISOR_FILTER ?= ""
 XFSTESTS_FS_TYPE ?= ext2
 XFSTESTS_RUNLIST ?= short.list
 XFSTESTS_DISK_SIZE ?= 12G
-XFSTESTS_TEST_DEV ?= /dev/vdd
-XFSTESTS_SCRATCH_DEV ?= /dev/vde
+
 # Specify whether to build regression tests under `test/initramfs/src/regression`.
 ENABLE_REGRESSION_TEST ?= false
 # Whitespace-separated regression directories or executable paths to run; empty runs all.
@@ -87,6 +90,14 @@ VHOST ?= off
 # The name server listed by /etc/resolv.conf inside the Asterinas VM
 DNS_SERVER ?= none
 # End of network settings
+
+# Virtio-fs settings. Set VIRTIOFS=on to attach a virtio-fs device. Set
+# VIRTIOFS_SCRATCH=on to attach a second device (requires VIRTIOFS=on).
+# VIRTIOFS_CACHE accepts auto, always, never, or metadata.
+VIRTIOFS ?= off
+VIRTIOFS_SCRATCH ?= off
+VIRTIOFS_CACHE ?= auto
+# End of Virtio-fs settings.
 
 # NixOS settings
 NIXOS_DISK_SIZE_IN_MB ?= 16384
@@ -137,6 +148,7 @@ CARGO_OSDK_BUILD_ARGS += --kcmd-args="CONFORMANCE_TEST_EXTRA_BLOCKLISTS=$(CONFOR
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="CONFORMANCE_TEST_SELECTOR=$(CONFORMANCE_TEST_SELECTOR)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="CONFORMANCE_TEST_GVISOR_FILTER=$(CONFORMANCE_TEST_GVISOR_FILTER)"
 ifeq ($(CONFORMANCE_TEST_SUITE), xfstests)
+include test/initramfs/src/conformance/xfstests/build_config.mk
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_FS_TYPE=$(XFSTESTS_FS_TYPE)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_RUNLIST=$(XFSTESTS_RUNLIST)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_TEST_DEV=$(XFSTESTS_TEST_DEV)"
@@ -154,8 +166,6 @@ ENABLE_REGRESSION_TEST := true
 export VSOCK=on
 CARGO_OSDK_BUILD_ARGS += --init-args="/test/run_vsock_test.sh"
 endif
-
-include test/initramfs/src/conformance/xfstests/build_config.mk
 
 ifeq ($(RELEASE_LTO), 1)
 CARGO_OSDK_COMMON_ARGS += --profile release-lto
@@ -245,6 +255,15 @@ endif
 
 ifeq ($(INITRAMFS),on)
 CARGO_OSDK_COMMON_ARGS += $(CARGO_OSDK_INITRAMFS_OPTION)
+endif
+CARGO_OSDK_VIRTIOFSD := ./tools/run_virtiofsd.sh --cache-mode $(VIRTIOFS_CACHE) --work-dir
+ifeq ($(VIRTIOFS),on)
+# Each Make invocation gets an isolated virtio-fs work directory under /tmp.
+VIRTIOFS_WORK_DIR := $(shell mktemp -d -p /tmp asterinas-virtiofs-XXXXXX)
+CARGO_OSDK_COMMON_ARGS += --qemu-with-daemon="$(CARGO_OSDK_VIRTIOFSD) $(VIRTIOFS_WORK_DIR)"
+endif
+ifeq ($(VIRTIOFS_SCRATCH),on)
+CARGO_OSDK_COMMON_ARGS += --qemu-with-daemon="$(CARGO_OSDK_VIRTIOFSD) $(VIRTIOFS_WORK_DIR)/scratch"
 endif
 
 CARGO_OSDK_BUILD_ARGS += $(CARGO_OSDK_COMMON_ARGS)

@@ -14,7 +14,7 @@ use osdk_heap_allocator::{HeapAllocator, type_from_layout};
 
 pub mod page_cache;
 pub(crate) mod perms;
-pub(crate) mod vmar;
+pub mod vmar;
 
 #[ostd::global_frame_allocator]
 static FRAME_ALLOCATOR: FrameAllocator = FrameAllocator;

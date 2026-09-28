@@ -16,7 +16,10 @@ use crate::{
     prelude::*,
     process::{Process, signal::Pollable},
     util::ioctl::RawIoctl,
-    vm::{page_cache::Vmo, vmar::MapHandle},
+    vm::{
+        page_cache::Vmo,
+        vmar::{FileMmapRequest, MapHandle},
+    },
 };
 
 /// The basic operations defined on a file
@@ -90,7 +93,13 @@ pub(crate) trait FileLike: Pollable + Send + Sync + Any {
     }
 
     /// Obtains the mappable object to map this file into the user address space.
-    fn mappable(&self) -> Result<MappableObject<'_>> {
+    ///
+    /// If this file has a corresponding mappable object of [`Mappable`],
+    /// then it can be either an inode or an MMIO region.
+    ///
+    /// Implementations may inspect the mapping request to reject unsupported
+    /// mapping semantics.
+    fn mappable(&self, request: FileMmapRequest) -> Result<MappableObject<'_>> {
         // `ENODEV` means that "The underlying filesystem of the specified file does not support
         // memory mapping".
         // Reference: <https://man7.org/linux/man-pages/man2/mmap.2.html>.
@@ -337,7 +346,7 @@ impl StatusFlagsUpdate {
 }
 
 /// An object that may be memory mapped into the user address space.
-pub(crate) enum MappableObject<'a> {
+pub enum MappableObject<'a> {
     /// A VMO (i.e., page cache).
     Vmo(Arc<Vmo>),
     /// A device mapping.
@@ -349,7 +358,11 @@ pub trait Mappable {
     /// Fills the memory region to map with `handle`.
     ///
     /// `offset` specifies the file offset, which must be page-aligned.
-    fn map(&self, offset: usize, handle: MapHandle) -> Box<dyn MappedObject>;
+    ///
+    /// This method may fail after some pages have already been installed
+    /// through `handle`. In this case, the caller should remove those pages
+    /// and destroy the memory mapping.
+    fn map(&self, offset: usize, handle: MapHandle) -> Result<Box<dyn MappedObject>>;
 }
 
 /// A trait that describes memory mapping behavior for special files (after `mmap`).
