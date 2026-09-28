@@ -146,6 +146,11 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 myshell/run_dm_system_tests.sh --m
   recovery, non-DM consumers, and expected future extensions. Do not choose a
   patch-local optimum that weakens correctness, cohesion, or long-term evolution
   merely to shrink or simplify one PR.
+- If review evidence indicates an upstream-code bug, unsafe behavior, or semantic
+  gap, report it to the user before changing local code. State the upstream
+  evidence, concrete impact, whether it blocks the current work, and the available
+  local responses. Do not silently repair, work around, weaken tests for, or
+  classify an upstream issue as a local `dm` defect without user direction.
 
 ## Linux Device Mapper Semantic Alignment
 
