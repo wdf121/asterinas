@@ -95,12 +95,12 @@
 | `Makefile` | 构建与清理入口 | 提供适合 DM 系统验收的构建/清理入口，包括测试盘清理。 | LVM2 会写入 PV/VG/LV 元数据，旧测试盘状态会污染下次验证。 |
 | `distro/etc_nixos/configuration.nix` | NixOS guest 环境 | 内置 `lvm2`、`e2fsprogs`、`util-linux`、`strace` 和测试盘 locator。 | DM/LVM2 验收依赖真实用户态工具，启动后临时补装不可重复。 |
 | `distro/etc_nixos/modules/systemd.nix` | NixOS/systemd 启动 | 调整系统服务和启动行为以减少 guest 启动阻塞。 | 系统验收需要在限定时间内进入 root shell，慢启动会掩盖真实测试结果。 |
-| `distro/etc_nixos/overlays/hello-asterinas/default.nix` | Nix overlay | 构建并安装 `aster-dm-disk-locator`。 | 多测试盘不能依赖 `/dev/vdX` 枚举顺序，需要按 VirtIO serial 稳定定位。 |
+| `distro/etc_nixos/overlays/hello-asterinas/default.nix` | Nix overlay | 构建并安装通用 `aster-test-disk-locator`。 | 固定 QEMU block PCI 拓扑，并通过 `/proc/cmdline` 声明首块测试盘；guest 按序号推导并验证设备，不依赖已移除的 VirtIO private ioctl 或隐式枚举。 |
 | `tools/nixos/build_nixos.sh` | NixOS image 构建入口 | 调用 NixOS 镜像构建流程。 | guest 用户工具与 locator 的声明主要位于 NixOS 配置和 overlay；本脚本不应被描述为其主要实现位置。 |
 | `tools/nixos/run.sh` | NixOS/QEMU 启动 | 支持多块 `DM_TEST_IMAGES`；设置 root disk boot order；校验测试盘安全；隔离 OVMF/boot protocol 影响。 | striped、mixed、跨 PV LVM2 和 reboot recovery 都依赖多块持久测试盘；同时不能误伤 root image。 |
 | `tools/qemu_args.sh` | QEMU 参数生成 | 统一组织 acceleration、firmware 与通用 QEMU 参数。 | KVM/OVMF 等启动参数应在该层理解；多盘、root disk 保护与测试盘安全检查的主要逻辑位于 `tools/nixos/run.sh`。 |
 | `myshell/br.sh` | 本地启动辅助 | 适配当前 boot/run 参数约定。 | 手工验证路径需要跟随 NixOS/QEMU 启动链路变化。 |
-| `docs/test.md` | 开发测试手册 | 说明在目标 crate 手动执行 `CONSOLE=ttyS0 cargo osdk test`。 | ktest 需要可重复的 crate-local 手动入口。 |
+| `docs/test.md` | 开发测试手册 | 说明在目标 crate 手动执行 `cargo osdk test`。 | ktest 需要可重复的 crate-local 手动入口。 |
 | `.gitignore` | 仓库忽略规则 | 忽略 DM/NixOS 验收产生的本地临时产物。 | 多盘系统测试会生成 raw image、日志或中间文件，不能污染提交。 |
 | `osdk/deps/test-kernel/src/lib.rs` | test kernel 支撑 | 适配 ktest 或 test kernel dependency 变化。 | DM crate ktest 需要能在当前 test kernel 环境下链接运行。 |
 | `ostd/src/arch/x86/cpu/cpuid.rs` | x86 CPU 支撑 | 启动/虚拟化环境相关适配。 | DM 系统验收依赖稳定 guest 启动，底层 CPU feature 处理不能成为干扰项。 |

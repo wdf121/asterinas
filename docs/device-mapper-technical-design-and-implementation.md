@@ -807,8 +807,8 @@ request queue 按 **current range** 合并相邻且同类型的 BIO，driver 接
 | 层级 | 入口 | 验证对象 | 不替代的内容 |
 |---|---|---|---|
 | 静态检查 | `git diff --check`、format 检查 | 文档/源码格式和工作区异常 | 编译与语义 |
-| DM crate ktest | 在 `kernel/core/comps/device-mapper` 执行 `CONSOLE=ttyS0 cargo osdk test ...` | target、table、split、completion、状态机 | 用户态 ABI 与真实 driver |
-| core ktest | 在 `kernel/core` 执行 `CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon ...` | control ioctl façade 的命令 helper、registry、table lifecycle | LVM2/filesystem 互操作 |
+| DM crate ktest | 在 `kernel/core/comps/device-mapper` 执行 `cargo osdk test ...` | target、table、split、completion、状态机 | 用户态 ABI 与真实 driver |
+| core ktest | 在 `kernel/core` 执行 `cargo osdk test --kcmd-args=earlycon ...` | control ioctl façade 的命令 helper、registry、table lifecycle | LVM2/filesystem 互操作 |
 | initramfs C 回归 | `REGRESSION_TESTS=device/device_mapper` focused regression | raw control ABI、runtime node/alias rollback、ext2 mount lease、range ioctl 与 WAIT signal/restart | 完整 target 数据面和 LVM2 编排 |
 | NixOS system suite | `run_dm_system_tests.sh --<suite>` | dmsetup/LVM2、真实块设备、ext2、reboot 恢复 | 内部失败分支的精确定位 |
 
@@ -856,7 +856,7 @@ request queue 按 **current range** 合并相邻且同类型的 BIO，driver 接
 | mixed table | `--mixed-integration` |
 | PV/VG/LV 生命周期 | `--lvm2-topology` |
 
-QEMU、ktest 和 NixOS system test 必须串行，避免镜像和测试盘锁冲突；命令应优先在 `myAsterinas` 容器的 `/root/asterinas` 执行。
+QEMU、ktest 和 NixOS system test 必须串行，避免镜像和测试盘锁冲突；命令应优先在 `fork_Asterinas` 容器的 `/root/asterinas` 执行。
 
 ---
 

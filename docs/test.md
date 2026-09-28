@@ -38,38 +38,38 @@
 
 | 测试范围 | 执行目录 | 直接命令 | 覆盖范围 / 文件 |
 |---|---|---|---|
-| `aster-device-mapper` 全量 | `kernel/core/comps/device-mapper` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test` | `device.rs`、`manager.rs`、`table.rs`、`target/**`。 |
-| core：DM ioctl / runtime 模块 | `kernel/core` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon aster_core::device::misc::device_mapper::tests` | `kernel/core/src/device/misc/device_mapper.rs`。 |
-| core：runtime block registry 模块 | `kernel/core` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon aster_core::device::registry::block::tests` | `kernel/core/src/device/registry/block.rs`。 |
-| `aster-block` 全量 | `kernel/core/comps/block` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test` | BIO、注册/注销与 lease、device ID、partition、request queue。 |
-| core：动态设备路径模块 | `kernel/core` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon aster_core::device::tests` | `kernel/core/src/device/mod.rs`：动态 devtmpfs 路径校验。 |
+| `aster-device-mapper` 全量 | `kernel/core/comps/device-mapper` | `cargo osdk test` | `device.rs`、`manager.rs`、`table.rs`、`target/**`。 |
+| core：DM ioctl / runtime 模块 | `kernel/core` | `cargo osdk test --kcmd-args=earlycon aster_core::device::misc::device_mapper::tests` | `kernel/core/src/device/misc/device_mapper.rs`。 |
+| core：runtime block registry 模块 | `kernel/core` | `cargo osdk test --kcmd-args=earlycon aster_core::device::registry::block::tests` | `kernel/core/src/device/registry/block.rs`。 |
+| `aster-block` 全量 | `kernel/core/comps/block` | `cargo osdk test` | BIO、注册/注销与 lease、device ID、partition、request queue。 |
+| core：devtmpfs 模块 | `kernel/core` | `cargo osdk test --kcmd-args=earlycon aster_core::fs::fs_impls::devtmpfs::tests` | `kernel/core/src/fs/fs_impls/devtmpfs/**`：运行期节点与 identity 路径。 |
 
 **定向排障入口**：以下模块已包含在对应 crate 全量中；仅在定位失败或局部复测时使用，不需要在全量通过后逐条重复执行。
 
 | 测试范围 | 执行目录 | 直接命令 | 覆盖范围 / 文件 |
 |---|---|---|---|
-| DM component：table 模块 | `kernel/core/comps/device-mapper` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_device_mapper::table::tests` | `kernel/core/comps/device-mapper/src/table.rs`。 |
-| DM component：manager 模块 | `kernel/core/comps/device-mapper` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_device_mapper::manager::tests` | `kernel/core/comps/device-mapper/src/manager.rs`。 |
-| block component：BIO 模块 | `kernel/core/comps/block` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_block::bio::tests` | `kernel/core/comps/block/src/bio.rs`。 |
-| block component：注册与 lease | `kernel/core/comps/block` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_block::tests` | `kernel/core/comps/block/src/lib.rs`：注册、注销、lease 与事务回滚。 |
-| block component：device ID 模块 | `kernel/core/comps/block` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_block::device_id::tests` | `kernel/core/comps/block/src/device_id.rs`：major 快照与持有期。 |
-| block component：partition 模块 | `kernel/core/comps/block` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_block::partition::tests` | `kernel/core/comps/block/src/partition.rs`：range BIO 偏移与溢出。 |
-| block component：request queue 模块 | `kernel/core/comps/block` | `CARGO_NET_OFFLINE=true CONSOLE=ttyS0 cargo osdk test aster_block::request_queue::tests` | `kernel/core/comps/block/src/request_queue.rs`：range 合并与 segment 上限。 |
+| DM component：table 模块 | `kernel/core/comps/device-mapper` | `cargo osdk test aster_device_mapper::table::tests` | `kernel/core/comps/device-mapper/src/table.rs`。 |
+| DM component：manager 模块 | `kernel/core/comps/device-mapper` | `cargo osdk test aster_device_mapper::manager::tests` | `kernel/core/comps/device-mapper/src/manager.rs`。 |
+| block component：BIO 模块 | `kernel/core/comps/block` | `cargo osdk test aster_block::bio::tests` | `kernel/core/comps/block/src/bio.rs`。 |
+| block component：注册与 lease | `kernel/core/comps/block` | `cargo osdk test aster_block::tests` | `kernel/core/comps/block/src/lib.rs`：注册、注销、lease 与事务回滚。 |
+| block component：device ID 模块 | `kernel/core/comps/block` | `cargo osdk test aster_block::device_id::tests` | `kernel/core/comps/block/src/device_id.rs`：major 快照与持有期。 |
+| block component：partition 模块 | `kernel/core/comps/block` | `cargo osdk test aster_block::partition::tests` | `kernel/core/comps/block/src/partition.rs`：range BIO 偏移与溢出。 |
+| block component：request queue 模块 | `kernel/core/comps/block` | `cargo osdk test aster_block::request_queue::tests` | `kernel/core/comps/block/src/request_queue.rs`：range 合并与 segment 上限。 |
 
 以下 console/日志说明适用于当前默认 x86_64、非 TDX 配置。ktest 结果经 early serial 输出，不能与普通内核的 `/dev/console` 选择混为一谈。
 
 | 参数 / 日志 | 默认或写法 | 作用 | 手动查看 |
 |---|---|---|---|
-| `CONSOLE=hvc0` | 未显式设置 `CONSOLE` 时默认。 | virtconsole 接终端；ktest 结果走独立 UART，不在终端显示。 | `less qemu-serial.log` |
-| `CONSOLE=ttyS0` | `make ktest` 默认；手动 ktest 表中显式指定。 | UART 接终端；ktest 结果同时显示在终端并写入 `qemu.log`。 | `less qemu.log` |
-| 模块 selector | `crate::...::tests` | 一次选择该模块中的全部 `#[ktest]`；不需要逐个填写函数名。 | 在仓库根目录按上述 console 设置查看对应日志。 |
+| `CONSOLE=hvc0` | 未显式设置 `CONSOLE` 时默认。 | virtconsole 接终端；ktest UART 结果写入独立日志，不在终端显示。 | `less qemu-serial.log` |
+| `CONSOLE=ttyS0` | 仅交互式排障时显式设置，不属于默认命令。 | UART 接终端；ktest 结果同时显示在终端并写入 `qemu.log`。 | `less qemu.log` |
+| 模块 selector | `crate::...::tests` | 一次选择该模块中的全部 `#[ktest]`；不需要逐个填写函数名。 | 默认查看 `qemu-serial.log`；排障时按显式 console 设置查看。 |
 | 无 selector | 上表 DM、block crate 全量命令。 | 执行当前目录所选 crate 在当前构建配置下的全部 ktest；不代表 core 或 workspace 全量已验证。 | 同上。 |
-| 离线依赖 | `CARGO_NET_OFFLINE=true` | 仅使用本地缓存；缓存缺失时报错，不自动联网拉取。 | 命令终端输出。 |
-| core early console | `--kcmd-args=earlycon` | 启用 core 的早期串口；只设置 `CONSOLE=ttyS0` 不会启用它。 | 结果输出到终端和根目录 `qemu.log`。 |
+| 离线依赖 | `CARGO_NET_OFFLINE=true` 仅用于网络或依赖问题的排障/恢复。 | 仅使用本地缓存；缓存缺失时报错。标准验证不设置该变量。 | 命令终端输出。 |
+| core early console | `--kcmd-args=earlycon` | 启用 core 的早期串口；它是 core ktest 输出的必要内核参数，不等同于 host 的 `CONSOLE` 覆盖。 | 默认写入根目录 `qemu-serial.log`。 |
 
 core 链入的早期参数解析器默认关闭 early console；未传 `earlycon` 时，ktest 的 `early_print!` 输出会被丢弃。上表 core 模块均使用带 `--kcmd-args=earlycon` 的命令实测通过。DM/block 使用 OSTD 默认开启 early console 的解析器，保留其已实测通过的原命令，不额外添加参数。
 
-上表所列测试入口均使用仓库根目录的 OSDK manifest，QEMU 日志因此位于**仓库根目录**，不是调用命令的 crate 目录；查看日志的命令应在仓库根目录执行。`hvc0` 下的 `qemu.log` 记录 virtconsole/终端 mux 输出，不是 ktest UART 结果日志；`ttyS0` 下不会为本轮创建 `qemu-serial.log`，已有同名文件可能是旧日志。
+上表所列测试入口均使用仓库根目录的 OSDK manifest，QEMU 日志因此位于**仓库根目录**，不是调用命令的 crate 目录；默认 `hvc0` 下的 ktest UART 结果写入 `qemu-serial.log`。仅在排障时显式设置 `CONSOLE=ttyS0`，此时输出写入 `qemu.log`；已有同名文件可能是旧日志。
 
 ## 4. initramfs C 回归：原始用户 ABI
 
@@ -87,7 +87,7 @@ C 测试源码
 
 ### 4.1 执行环境与准备
 
-以下命令已在项目容器 `myAsterinas` 的 `/root/asterinas` 中实测。除非命令明确包含 `docker exec`，本节命令均从该容器内的仓库根目录执行。
+2026-09-28 已在 `fork_Asterinas` 的 `/root/asterinas`、当前 `dm` SHA `78f4eb24a` 上重跑 focused Device Mapper C 回归。除非命令明确包含 `docker exec`，本节命令均从该容器内的仓库根目录执行；其他历史测试结果仍须以各自执行 SHA 和日志判断。
 
 运行前确认没有其他 QEMU、ktest 或 NixOS 测试占用测试镜像；这些测试必须串行运行。可在宿主机检查：
 
@@ -98,7 +98,7 @@ pgrep -af 'qemu-system|cargo osdk test|make run_kernel'
 若当前位于宿主机，可进入项目容器：
 
 ```bash
-docker exec -it -w /root/asterinas myAsterinas bash
+docker exec -it -w /root/asterinas fork_Asterinas bash
 ```
 
 ### 4.2 Device Mapper focused C 回归
@@ -168,7 +168,7 @@ less qemu-serial.log
 
 1. `make run_kernel` 退出码为 0；
 2. 各测试函数的局部 summary 均为 `0 tests failed`；
-3. ELF 的累计汇总为 `test result: ok. 159 passed; 0 failed`；
+3. ELF 的累计汇总为 `test result: ok. 182 passed; 0 failed`；
 4. 日志包含：
 
 ```text
@@ -182,10 +182,10 @@ All regression tests passed.
 
 | 测试范围 | 容器内仓库根目录执行的命令 | 通过判定 |
 |---|---|---|
-| 启动协议、早期初始化、rootfs、initramfs 可用性 | `CARGO_NET_OFFLINE=true RELEASE=1 AUTO_TEST=boot INTEL_TDX=0 make run_kernel` | 命令退出码为 0，根目录 `qemu.log` 包含 `Successfully booted.`。 |
-| 一个 regression 目录 | `CARGO_NET_OFFLINE=true RELEASE=1 AUTO_TEST=regression INTEL_TDX=0 REGRESSION_TESTS=<directory> make run_kernel` | 所选目录完成，最终包含 `All regression tests passed.`。 |
-| 单个 C ELF | `CARGO_NET_OFFLINE=true RELEASE=1 AUTO_TEST=regression INTEL_TDX=0 REGRESSION_TESTS=<directory>/<binary> make run_kernel` | 对应 ELF 成功结束，最终包含 `All regression tests passed.`。 |
-| 全量 initramfs regression | `CARGO_NET_OFFLINE=true RELEASE=1 AUTO_TEST=regression INTEL_TDX=0 make run_kernel` | 遍历 `/test` 下全部一级测试目录，最终包含 `All regression tests passed.`。 |
+| 启动协议、早期初始化、rootfs、initramfs 可用性 | `AUTO_TEST=boot make run_kernel` | 命令退出码为 0，根目录 `qemu.log` 包含 `Successfully booted.`。 |
+| 一个 regression 目录 | `AUTO_TEST=regression REGRESSION_TESTS=<directory> make run_kernel` | 所选目录完成，最终包含 `All regression tests passed.`。 |
+| 单个 C ELF | `AUTO_TEST=regression REGRESSION_TESTS=<directory>/<binary> make run_kernel` | 对应 ELF 成功结束，最终包含 `All regression tests passed.`。 |
+| 全量 initramfs regression | `AUTO_TEST=regression make run_kernel` | 遍历 `/test` 下全部一级测试目录，最终包含 `All regression tests passed.`。 |
 
 `REGRESSION_TESTS` 接受相对 selector。目录 selector 执行该目录的 `run_test.sh`，ELF selector 直接执行对应程序；不要传绝对路径、`.`、路径穿越或包含空格的 selector。目录 `run_test.sh` 使用 `set -e` 传播失败，C ELF 通过非零退出码报告失败。
 
@@ -213,7 +213,7 @@ All regression tests passed.
 
 ### 5.2 Device Mapper 系统测试
 
-Device Mapper 系统测试启动完整 NixOS guest，通过真实 `dmsetup`、LVM2、ext2 和 virtio-blk 测试盘验证用户空间工作流。以下命令均从项目容器 `myAsterinas` 内的 `/root/asterinas` 执行。
+Device Mapper 系统测试启动完整 NixOS guest，通过真实 `dmsetup`、LVM2、ext2 和 virtio-blk 测试盘验证用户空间工作流。以下命令的历史实测记录来自项目容器 `myAsterinas` 的 `/root/asterinas`；后续执行应使用 `fork_Asterinas` 容器内的同一路径。
 
 “端到端”必须注明链路边界：control-plane、dataplane 和 LVM2 topology 只分别贯通控制面、裸块数据面和 LVM2 拓扑；验证“LVM2 → DM → ext2 → 文件读写 → 扩缩容 → 跨启动恢复”的完整存储闭环，必须运行 integration selector。
 
@@ -268,8 +268,8 @@ Device Mapper 系统测试启动完整 NixOS guest，通过真实 `dmsetup`、LV
 | 保留文件 | `RESET_DM_TEST_IMAGES=0` | 只避免 suite 开始前删除文件；测试仍会改写镜像内容。 |
 | 手动创建 | `fallocate -l 512M <path>` | 需要预先准备镜像时使用。 |
 | 安全限制 | 普通文件、路径唯一、不能是 `target/nixos/asterinas.img` | runner 会拒绝根盘、重复路径、非普通文件和含空白字符的路径。 |
-| virtio 序列号 | `vdmtest`、`vdmtest2`、`vdmtest3`…… | 测试盘按传入顺序编号。 |
-| guest 设备定位 | `aster-dm-disk-locator [serial]` | 测试不依赖固定 `/dev/vdX`；以日志中的 `TEST_DISK*=` 为实际设备名。 |
+| virtio 序列号 | `vdmtest`、`vdmtest2`、`vdmtest3`…… | runner 记录的 host 侧诊断标签，不作为 guest ABI。 |
+| guest 设备定位 | `aster-test-disk-locator <正整数序号>` | QEMU 固定 root、通用 fixture 与测试盘的 PCI block 拓扑；NixOS cmdline 以 `aster.test_disk_first=/dev/vde` 声明第 1 块测试盘，locator 按序号推导并验证块设备。以日志中的 `TEST_DISK*=` 为实际设备名。 |
 
 需要手动创建默认最多使用的四块盘时执行：
 

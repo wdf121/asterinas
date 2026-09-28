@@ -296,7 +296,7 @@ cargo osdk test \
 
 ### 8.1 `CONSOLE=hvc0` 与 `CONSOLE=ttyS0`
 
-`CONSOLE` 是 host 环境变量，由 `tools/qemu_args.sh` 读取，用于决定 QEMU 怎样连接 guest 的 UART 和 virtio console。ktest runner 通过 UART 输出测试结果。
+`CONSOLE` 是 host 环境变量，由 `tools/qemu_args.sh` 读取，用于决定 QEMU 怎样连接 guest 的 UART 和 virtio console。ktest runner 通过 UART 输出测试结果。标准测试不设置该变量；`CONSOLE=ttyS0` 只用于需要直接观察 UART 输出的交互式排障。
 
 | host 设置 | QEMU 的 UART 后端 | ktest 原始输出位置 | 当前终端能否直接看到 ktest | 实时查看方式 | 适用情况 |
 |---|---|---|---|---|---|

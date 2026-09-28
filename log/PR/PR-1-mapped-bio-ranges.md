@@ -4,22 +4,23 @@
 
 | 项目 | 事实 |
 |---|---|
-| 状态 | 已推送；最终 SHA 验证待完成。 |
-| 实际 Git branch | `dm-pr1a-mapped-range` |
-| base | `98e717275` (`origin/main`) |
+| 状态 | 已推送；最终 SHA 验证通过。 |
+| 实际 Git branch | `pr` |
+| base | `98e717275` (`main`) |
 | 当前远端 HEAD | `c14d68c93` |
 | 提交主题 | `block: add mapped BIO ranges` |
 | 远端事件 | 已通过 `git push --force-with-lease` 更新 fork 分支，移除旧 merge 历史。 |
 | 依赖 PR | 无。 |
 
-本文档使用稳定编号 **PR 1**；`1a` 仅保留在历史 Git branch 名中，不作为 PR 编号。
+本文档使用稳定编号 **PR 1**；实际分支名为 `pr`。
 
 ## 2. Git 与远端历史
 
 | 日期 | 事件 | base | HEAD | 结论 |
 |---|---|---|---|---|
 | 2026-09-28 | 将原 block 补丁线性重放到 source `main` | `98e717275` | `c14d68c93` | 无冲突；只保留单一 block 提交。 |
-| 2026-09-28 | 安全强制更新 fork 分支 | `98e717275` | `c14d68c93` | `--force-with-lease` 成功移除旧 `Merge branch 'asterinas:main' into dm-pr1a-mapped-range` 历史。 |
+| 2026-09-28 | 安全强制更新 fork 分支 | `98e717275` | `c14d68c93` | `--force-with-lease` 成功移除旧 merge 历史。 |
+| 2026-09-28 | 容器内最终 SHA 验证 | `98e717275` | `c14d68c93` | `HEAD` 与 `origin/pr` 一致；完整 PR gate 通过。 |
 
 最终 diff 仅修改：
 
@@ -57,21 +58,26 @@ kernel/core/comps/block/src/request_queue.rs
 
 ### 最终 HEAD `c14d68c93`
 
+执行环境为 `fork_Asterinas:/root/pr-tree`。工作树直接检出当前 `pr`，验证完成后确认其 clean，且 `HEAD` 与 `origin/pr` 均为 `c14d68c93`；随后按流程删除临时工作树。
+
 | 层次 | 命令 | 结果 | 状态 |
 |---|---|---|---|
-| 静态准入 | `make check` | 未在最终 SHA 执行。 | 待执行 |
-| 内核测试 | `make ktest` | 未在最终 SHA 执行。 | 待执行 |
-| 内核构建 | `make kernel` | 未在最终 SHA 执行。 | 待执行 |
+| 范围与空白 | `git diff --check main...HEAD` | diff 仅为 `bio.rs`、`partition.rs`、`request_queue.rs`，无空白错误。 | 通过 |
+| 格式 | `cargo fmt --check --all` | 格式检查通过。 | 通过 |
+| 静态准入 | `make check` | Rust、C、Nix、拼写与聚合静态检查通过。 | 通过 |
+| ktest 前提 | `make initramfs` | initramfs、`ext2.img` 与其他测试镜像构建完成。 | 通过 |
+| block 专项 ktest | `cd kernel/core/comps/block && cargo osdk test` | 以标准命令运行，无离线或 console 覆盖；guest 中 6 passed，0 failed，覆盖 remap、offset、overflow、partition 与 queue merge。 | 通过 |
+| 项目级 ktest | `make ktest` | 5 个 crate、245 项测试全部完成，无失败。 | 通过 |
+| 内核构建 | `make kernel` | 非测试内核及 ISO 构建完成。 | 通过 |
 
-### 历史背景（不能替代最终验证）
+### 历史背景
 
-权威 `dm` 上的 block crate、DM crate 及早期 PR worktree 曾运行相关 ktest/构建，证明该补丁演进过程中的局部行为；这些结果对应旧 base 或旧 HEAD，不能作为 `c14d68c93` 的最终验证结论。
+权威 `dm` 上的 block crate、DM crate 及早期 PR worktree 的测试仍只作为补丁演进背景；上述 final-HEAD 结果才是 `c14d68c93` 的 PR 验证事实。
 
 ## 6. 已知边界与后续动作
 
-1. 在最终 SHA `c14d68c93` 上串行运行 `make check`、`make ktest`、`make kernel`，并将每项命令、日期、环境和结果回填本节。
-2. 若 final HEAD 或 base 再次改变，重新验证并追加 Git 事件；不得复用当前待执行状态外的旧结果。
-3. PR 2 的 tracked device lease 保持独立审计和决策，不随 PR 1 扩大范围。
+1. 若 `pr` 的 base、HEAD 或三文件范围变化，必须从更新后的 `pr` 创建新的 `/root/pr-tree`，重新执行完整 PR gate；不得复用本次结果。
+2. PR 2 的 tracked device lease 保持独立审计和决策，不随 PR 1 扩大范围。
 
 ## 7. Upstream maintainer description
 
@@ -105,16 +111,19 @@ Excluded: range BIO operations, device leases, runtime/VFS node lifecycle, Devic
 
 ### Testing
 
-Final-HEAD validation is pending for `c14d68c93`:
+Validated on final PR HEAD `c14d68c93`:
 
 ```text
+cargo fmt --check --all
 make check
+make initramfs
+cd kernel/core/comps/block && cargo osdk test
 make ktest
 make kernel
 ```
 
-Historical tests on earlier bases are intentionally not presented as final-HEAD results.
+The block ktest completed with 6 passed and 0 failed using the standard command without offline or console overrides. The project ktest completed 245 tests across 5 crates with no failures.
 
 ### Review notes
 
-Please focus review on the logical-versus-mapped range invariant, overflow rejection without partial mutation, and request-queue contiguity after layered remapping.
+Please focus review on the logical-versus-mapped range invariant, overflow rejection without partial mutation, and request-queue contiguity after layered remapping. Please let me know if any part of the design or scope needs clarification. I’m happy to discuss it and will respond promptly.

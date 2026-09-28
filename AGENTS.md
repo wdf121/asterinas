@@ -22,8 +22,8 @@ the kernel (`kernel/`) is entirely safe Rust.
 All development is done inside the project Docker container:
 
 ```bash
-docker run -it --privileged --network=host -v /dev:/dev \
-  -v $(pwd)/asterinas:/root/asterinas \
+docker run -it --name fork_Asterinas --privileged --network=host -v /dev:/dev \
+  -v /root/github/asterinas:/root/asterinas \
   asterinas/dev:0.18.1-20260926
 ```
 
@@ -48,11 +48,11 @@ Daily engineering, learning, analysis/review, validation, failures, and conclusi
 
 Local environment:
 
-- Host repository path: `/root/atom/asterinas`.
+- Host repository path: `/root/github/asterinas`.
 - Working branch: `dm`.
-- Docker container: `myAsterinas`.
+- Docker container: `fork_Asterinas`.
 - Container project path: `/root/asterinas`.
-- Commands in project docs and examples assume they are run inside the container from `/root/asterinas`, unless explicitly marked as host commands.
+- Commands in project docs and examples assume they are run inside `fork_Asterinas` from `/root/asterinas`, unless explicitly marked as host commands.
 
 Resource checks before commands that may consume noticeable CPU or memory,
 especially builds, ktests, QEMU/NixOS runs, patch generation, and large document
@@ -82,26 +82,25 @@ git diff --check
 git status --short
 ```
 
-Run targeted ktests from the target Cargo crate directory with an explicit
-serial console. Use the module `::tests` selector to run all tests in that
-module:
+Run targeted ktests from the target Cargo crate directory. Use the module `::tests`
+selector to run all tests in that module:
 
 ```bash
 cd kernel/core/comps/device-mapper
-CONSOLE=ttyS0 cargo osdk test aster_device_mapper::table::tests
+cargo osdk test aster_device_mapper::table::tests
 
 cd ../../
-CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon \
+cargo osdk test --kcmd-args=earlycon \
   aster_core::device::misc::device_mapper::tests
 ```
 
 Do not use root `make ktest CARGO_OSDK_TEST_ARGS="..."` as the default targeted
-ktest entry. Run `CONSOLE=ttyS0 cargo osdk test [module::tests]` from the target
-crate directory. Core tests additionally require `--kcmd-args=earlycon` for
-observable ktest output. Inspect QEMU logs from the repository root: with the
-current default x86_64 non-TDX `ttyS0` path, use `qemu.log`; `hvc0` uses
-`qemu-serial.log`. A pre-existing serial log may be stale when the current run
-uses `ttyS0`.
+ktest entry. Run `cargo osdk test [module::tests]` from the target crate
+directory. Core tests additionally require `--kcmd-args=earlycon` for observable
+ktest output. Inspect QEMU logs from the repository root: the default x86_64
+non-TDX `hvc0` path writes ktest UART output to `qemu-serial.log`.
+`CONSOLE=ttyS0` is diagnostic-only and may be added when interactive serial
+output is needed; it writes the UART stream to `qemu.log`.
 
 Run QEMU, ktest, and NixOS system tests serially to avoid image lock conflicts,
 especially around `test/initramfs/build/ext2.img`. For new NixOS system suite
@@ -115,7 +114,8 @@ suspect command filtering, wrong crate working directory, root `make ktest`
 argument override, missing KVM or initramfs arguments, leftover processes, or
 image-lock issues; inspect output and processes, stop only processes started
 for the current run, then retry from the target crate directory with
-`CONSOLE=ttyS0 cargo osdk test`.
+`cargo osdk test`. Add `CONSOLE=ttyS0` only while diagnosing missing or delayed
+serial output.
 
 Do not modify KVM, RELEASE, QEMU, NixOS boot protocol, or `myshell/br.sh` unless
 explicitly requested. Run DM system tests through explicit canonical suite

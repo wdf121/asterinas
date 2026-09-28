@@ -46,20 +46,20 @@ P0 主链语义收敛
 
 ```bash
 cd kernel/core/comps/device-mapper
-CONSOLE=ttyS0 cargo osdk test
+cargo osdk test
 ```
 
 按模块运行时使用完整 module `::tests` selector：
 
 ```bash
-CONSOLE=ttyS0 cargo osdk test aster_device_mapper::table::tests
+cargo osdk test aster_device_mapper::table::tests
 ```
 
 跨到 core ioctl/runtime 时：
 
 ```bash
 cd kernel/core
-CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon \
+cargo osdk test --kcmd-args=earlycon \
   aster_core::device::misc::device_mapper::tests
 ```
 

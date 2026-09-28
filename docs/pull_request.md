@@ -16,20 +16,26 @@
 4. 通用 block、VFS、runtime 能力必须能独立成立，不能仅以“DM 需要”为由扩大通用改动。
 5. PR 可以形成 stacked series；前置 PR 合入或 base/HEAD 改变后，后续 PR 必须重新核对冲突和相关验证。
 
-### 1.2 生命周期
+### 1.2 固定工作树生命周期
+
+每个 PR 固定在容器内 `/root/pr-tree` 制备；该目录是目标 PR 分支的临时工作目录，不是复制 patch 后再回填的第二条分支。常驻工作区保留在 `dm`，以继续维护权威实现和未提交开发状态，PR 流程不得要求对它执行 stash、切换或清理。
 
 ```text
 权威 dm 实现与验证
-  → 最小生产 diff 提取
+  → 更新当前目标 pr（保留其已有提交和前置 PR 依赖）
+  → 在 /root/pr-tree 直接检出当前 pr
   → 审核范围、生命周期、并发与失败边界
-  → 重放到最终 source main
-  → 在最终 HEAD 验证
-  → push / force-with-lease
+  → 在工作树中暂存候选内容并验证
+  → 将已验证的同一源码树提交为 pr HEAD
+  → push / force-with-lease，并核对远端 HEAD
+  → 删除 /root/pr-tree；保留本地与远端 pr 分支
   → 更新 PR 档案与本文件历史
 ```
 
-- `git push --force-with-lease` 只用于 rebase 后已知的远端分支，拒绝覆盖本地未知的远端更新。
-- 每条测试证据必须记录命令、执行 SHA、环境和结果。旧 SHA 的成功结果只能作为历史背景，不能证明最终 HEAD。
+- 新建 stacked PR 时，目标 `pr` 以当前 source `main` 或其依赖的前置 PR 为 base；更新既有 PR 时，`/root/pr-tree` 必须从该 PR 分支的当前 HEAD 创建，保留其所有已有提交。
+- 候选内容应先暂存，再在工作树中完成验证；提交后必须确认 `pr` 的 `HEAD^{tree}` 与验证前的候选 tree 相同。这样测试通过的源码树就是最终 `pr` 事实，而非需要额外搬运的副本。
+- `git push --force-with-lease` 只用于 rebase 后已知的远端分支，拒绝覆盖本地未知的远端更新。删除工作树只能发生在 push 完成且远端 HEAD 已核对后；删除工作树不会删除本地或远端 `pr` 分支。
+- 每条测试证据必须记录命令、候选 tree、提交后的 PR SHA、环境和结果。旧 tree/SHA 的成功结果只能作为历史背景，不能证明当前 PR。
 - `log/PR/` 只为实际制备的 PR 建档；规划中的 PR 保留在本文件，不创建空档案。
 
 ### 1.3 事实来源优先级
@@ -46,13 +52,14 @@
 
 | PR | 主题 | 状态 | base | HEAD | 档案 |
 |---|---|---|---|---|---|
-| PR 1 | `block: add mapped BIO ranges` | 已推送；最终 SHA 验证待完成 | `98e717275` | `c14d68c93` | [PR 1 档案](../log/PR/PR-1-mapped-bio-ranges.md) |
+| PR 1 | `block: add mapped BIO ranges` | 已推送；最终 SHA 验证通过 | `98e717275` | `c14d68c93` | [PR 1 档案](../log/PR/PR-1-mapped-bio-ranges.md) |
 
 | 日期 | PR | 事件 | 事实 |
 |---|---|---|---|
 | 2026-09-28 | PR 1 | 线性重建与推送 | 以 `98e717275` 为 base 重建单一 `c14d68c93`，仅包含 3 个 block 文件；通过 `--force-with-lease` 更新 fork 分支，移除旧 merge 历史。 |
+| 2026-09-28 | PR 1 | 最终 SHA 验证 | 在 `fork_Asterinas:/root/pr-tree` 验证 `c14d68c93`：`make check`、block crate ktest（6/0）、`make ktest`（245/0）与 `make kernel` 均通过；验证后工作树已删除。 |
 
-PR 1 实际 Git branch 仍为 `dm-pr1a-mapped-range`，但文档中的稳定编号统一为 **PR 1**。
+PR 1 的实际 Git branch 为 `pr`；文档中的稳定编号统一为 **PR 1**。
 
 ## 3. 规划中的 stacked PR 系列
 

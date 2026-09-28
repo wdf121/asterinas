@@ -1,6 +1,6 @@
 # Asterinas 根 Makefile 目标完整链路说明
 
-本文档说明 `/root/atom/asterinas/Makefile` 中常用构建、运行、NixOS 相关目标的完整执行链路，重点覆盖：
+本文档说明 `/root/github/asterinas/Makefile` 中常用构建、运行、NixOS 相关目标的完整执行链路，重点覆盖：
 
 - `make kernel`
 - `make run_kernel`
@@ -299,7 +299,7 @@ cd kernel && cargo osdk run ...
 `kernel/` 下没有单独的 `OSDK.toml`，所以 `cargo-osdk` 会回到 workspace root，读取根目录：
 
 ```text
-/root/atom/asterinas/OSDK.toml
+/root/github/asterinas/OSDK.toml
 ```
 
 ### 4.1 默认 OSDK 配置
@@ -436,7 +436,7 @@ test/initramfs/build/initramfs.cpio
 同时根 Makefile 会给 OSDK 追加：
 
 ```text
---initramfs=/root/atom/asterinas/test/initramfs/build/initramfs.cpio
+--initramfs=/root/github/asterinas/test/initramfs/build/initramfs.cpio
 ```
 
 ### 5.3 initramfs 的 Nix 构建命令
@@ -943,10 +943,10 @@ distro/etc_nixos/configuration.nix
 2. 计算路径：
 
 ```text
-ASTERINAS_DIR=/root/atom/asterinas
-ASTER_IMAGE_PATH=/root/atom/asterinas/target/nixos/asterinas.img
-DISTRO_DIR=/root/atom/asterinas/distro
-CONFIG_PATH=/root/atom/asterinas/distro/etc_nixos/configuration.nix
+ASTERINAS_DIR=/root/github/asterinas
+ASTER_IMAGE_PATH=/root/github/asterinas/target/nixos/asterinas.img
+DISTRO_DIR=/root/github/asterinas/distro
+CONFIG_PATH=/root/github/asterinas/distro/etc_nixos/configuration.nix
 ```
 
 3. 把 `TARGET_ARCH` 转换成 Nix system：
@@ -1170,13 +1170,13 @@ fallocate -l 512M target/nixos/test.img
 如果设置第二块盘：
 
 ```bash
-DM_TEST_IMAGE_2=/root/atom/asterinas/target/nixos/test2.img make run_nixos
+DM_TEST_IMAGE_2=/root/github/asterinas/target/nixos/test2.img make run_nixos
 ```
 
 会追加第二块：
 
 ```text
--drive if=none,format=raw,id=dmtest2,file=/root/atom/asterinas/target/nixos/test2.img,cache=none
+-drive if=none,format=raw,id=dmtest2,file=/root/github/asterinas/target/nixos/test2.img,cache=none
 -device virtio-blk-pci,bus=pcie.0,addr=0xd,drive=dmtest2,serial=vdmtest2,disable-legacy=on,disable-modern=off
 ```
 

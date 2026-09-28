@@ -242,7 +242,7 @@ NIX_CONFIG="substitute = false" RELEASE=1 AUTO_TEST=regression \
   INTEL_TDX=0 REGRESSION_TESTS=device/device_mapper make run_kernel
 ```
 
-focused 命令使用 `REGRESSION_TESTS=device/device_mapper` 选择单一已打包 C ELF；该回归覆盖 raw control ABI、linear table load、node/alias rollback、ext2 lease、range ioctl、无 `SA_RESTART` 的 `EINTR` 对照、真实 `SA_RESTART` 自动重启与 rename/setuuid 唤醒。对应 core wait/registry 模块测试从 `kernel/core` 使用 `CONSOLE=ttyS0 cargo osdk test --kcmd-args=earlycon <module>::tests`；DM component 测试则从目标 crate 目录运行，不应混用入口。
+focused 命令使用 `REGRESSION_TESTS=device/device_mapper` 选择单一已打包 C ELF；该回归覆盖 raw control ABI、linear table load、node/alias rollback、ext2 lease、range ioctl、无 `SA_RESTART` 的 `EINTR` 对照、真实 `SA_RESTART` 自动重启与 rename/setuuid 唤醒。对应 core wait/registry 模块测试从 `kernel/core` 使用 `cargo osdk test --kcmd-args=earlycon <module>::tests`；DM component 测试则从目标 crate 目录运行，不应混用入口。
 
 ### 8.4 必要补强与不应伪造的覆盖
 
