@@ -4,7 +4,7 @@
 >
 > **职责边界**：每个已实际制备的 PR 的技术细节、Git 元数据、验证证据和英文 maintainer 描述记录在 [`log/PR/`](../log/PR/)；日报只记录当天发生的操作与结论。
 >
-> **最后更新**：2026-09-28。
+> **最后更新**：2026-09-29。
 
 ## 1. 规范
 
@@ -61,20 +61,37 @@
 
 PR 1 的当前 Git branch 为 `mapped-bio-ranges`；文档中的稳定编号统一为 **PR 1**。
 
-## 3. 规划中的 stacked PR 系列
+## 3. 规划中的上游 PR 系列与依赖
 
-| 顺序 | 建议主题 | 内容边界 | 最小验证 | 主要风险 |
-|---|---|---|---|---|
-| 1 | `block: add mapped BIO ranges` | `SubmittedBio` mapped range、partition 偏移与 request queue 合并；排除 range BIO 和 lease。 | block crate 相关 ktest、静态检查与内核构建。 | logical/mapped range 混用、映射溢出、完成生命周期。 |
-| 2 | `block: add tracked device leases` | `BlockDeviceLease`、pending/live/removing 状态与真实非 DM 使用者。 | registry、VFS mount、文件系统定向 ktest。 | 生命周期、锁序、失败回滚、VirtIO 分区跟踪。 |
-| 3 | `block: add discard and zeroout operations` | range BIO、block wrapper、virtio/NVMe 适配及必要 ABI。 | block/back-end ktest 与用户 ABI 回归。 | 后端语义、错误通道、枚举完整性。 |
-| 4 | `vfs: support identity-safe runtime block nodes` | identity-safe 删除、runtime node/link、必要 registry/VFS 基础。 | VFS/registry ktest。 | 替换对象保护、失败回滚。 |
-| 5 | `dm: add mapper table and linear I/O path` | DM component、target 抽象、table、mapper block device、linear 最小路径。 | DM crate ktest。 | table lease、BIO 映射/拆分、in-flight 生命周期。 |
-| 6 | `dm: add control device and mapper lifecycle` | 基础 ioctl、create/remove/rename/status/list、节点发布回滚。 | core ioctl ktest 与 C ABI 回归。 | `dm_ioctl` ABI、primary/alias 原子性。 |
-| 7 | `dm: add table lifecycle and event waiting` | load/clear/status/deps、suspend/resume、WAIT 信号语义。 | core ioctl ktest 与 C ABI 回归。 | 锁持有、`EINTR`、`SA_RESTART`。 |
-| 8 | `dm: add additional targets` | zero/error；striped 另行覆盖多 backing 与跨段 I/O。 | target/table ktest 与 C ABI 回归。 | fan-out、聚合完成、错误锁存。 |
+PR 1 是已推送的独立 block 基础 PR。后续编号表示建议的评审和合入顺序，而不是必须按编号创建的全量 stack：只有存在真实源码依赖的 PR 才以未合入前置 PR 为 base；其余 PR 均可从已同步的 `main` 独立制备和评审。
 
-该表表达依赖与评审顺序，不表示每个 PR 已开始制备。
+```text
+PR 1 mapped BIO ranges ─┬─→ PR 3 discard / zeroout
+                        └─→ PR 5 DM core + linear
+
+PR 2 tracked device leases ─┬─→ PR 4 runtime/VFS nodes
+                            └─→ PR 5 DM core + linear
+
+PR 5 → PR 6 control-device primitives
+PR 4 + PR 6 → PR 7 table lifecycle / nodes / wait
+
+PR 3 + PR 7 → PR 8 zero / error targets
+PR 3 + PR 7 → PR 9 striped target
+```
+
+| 顺序 | 建议主题 | 真实前置 | 内容边界 | 最小验证 | 主要风险 |
+|---|---|---|---|---|---|
+| 1 | `block: add mapped BIO ranges` | 无；已推送。 | `SubmittedBio` mapped range、partition 偏移与 request queue 合并；排除 range BIO 和 lease。 | block crate 相关 ktest、静态检查与内核构建。 | logical/mapped range 混用、映射溢出、完成生命周期。 |
+| 2 | `block: add tracked device leases` | 无；不依赖 PR 1。 | live registry 的 `BlockDeviceLease`、普通 VFS mount/rootfs、ext2/exfat 持有者；排除 Pending/Removing token、runtime node、MlsDisk 与分区刷新事务。 | registry、VFS mount、文件系统定向 ktest。 | 生命周期、锁序、失败释放。 |
+| 3 | `block: add discard and zeroout operations` | PR 1。 | range BIO、block wrapper、virtio/NVMe 适配及必要 ABI。 | block/back-end ktest 与用户 ABI 回归。 | 后端语义、错误通道、枚举完整性。 |
+| 4 | `vfs: support identity-safe runtime block nodes` | PR 2。 | identity-safe 删除、runtime node/link、必要 registry/VFS 基础；不混入 DM ioctl。 | VFS/registry ktest。 | 替换对象保护、失败回滚。 |
+| 5 | `dm: add mapper table and linear I/O path` | PR 1、PR 2。 | DM component、target 抽象、table、mapper block device 和 linear 的 read/write/flush 最小路径；不接入 runtime 节点或 ioctl。 | DM crate ktest。 | table lease、BIO 映射/拆分、in-flight 生命周期。 |
+| 6 | `dm: add control device primitives` | PR 5。 | control device、tableless create、list/基础查询与无表 remove；不声明 table load、runtime primary/alias 发布或 WAIT 已可用。 | core ioctl ktest。 | `dm_ioctl` ABI、tableless 状态与 manager 一致性。 |
+| 7 | `dm: add table lifecycle and event waiting` | PR 4、PR 6。 | table load/clear/status/deps、首次 primary/alias 发布及回滚、suspend/resume、WAIT 信号语义。 | core ioctl ktest 与 C ABI 回归。 | 节点事务、锁持有、`EINTR`、`SA_RESTART`。 |
+| 8 | `dm: add zero and error targets` | PR 3、PR 7。 | 无 backing 的 zero/error target、range I/O 完成与状态/查询。 | target/table ktest 与 C ABI 回归。 | 无 backing 完成、range 语义、错误状态。 |
+| 9 | `dm: add striped target` | PR 3、PR 7。 | 多 backing lease、chunk 映射、跨 chunk/target BIO 拆分、fan-out 与完成聚合。 | target/table ktest、C ABI 与 LVM2 定向验收。 | 多设备生命周期、跨段映射、完成聚合与错误锁存。 |
+
+PR 6 与 PR 7 按首次 `DM_TABLE_LOAD` 发布 primary、首次 resume 发布 alias 的实际生命周期分界。zero/error 与 striped 的风险模型不同，必须拆分评审，不能再以“additional targets”合并表述。
 
 ## 4. 文件归属与排除规则
 
@@ -83,10 +100,10 @@ PR 1 的当前 Git branch 为 `mapped-bio-ranges`；文档中的稳定编号统�
 | 类别 | 主要路径 | 归属 |
 |---|---|---|
 | BIO 映射基础 | `kernel/core/comps/block/src/bio.rs`、`partition.rs`、`request_queue.rs` | PR 1。 |
-| tracked lease | block registry、VFS、ext2/exfat、MlsDisk 的真实 lease 使用 | PR 2。 |
+| tracked lease | block registry、VFS、rootfs、ext2/exfat 的真实 lease 使用 | PR 2。 |
 | range BIO 与后端适配 | `BioType::Discard` / `WriteZeroes`、virtio/NVMe、必要 ioctl | PR 3。 |
 | runtime/VFS 基础 | registry、VFS path、必要 procfs 支持 | PR 4。 |
-| DM component | `kernel/core/comps/device-mapper/**` | PR 5 与 PR 8。 |
+| DM component | `kernel/core/comps/device-mapper/**` | PR 5、PR 8 与 PR 9。 |
 | DM ioctl 与生命周期 | `kernel/core/src/device/misc/device_mapper/**` | PR 6 与 PR 7。 |
 
 ### 4.2 必须排除
@@ -100,23 +117,17 @@ PR 1 的当前 Git branch 为 `mapped-bio-ranges`；文档中的稳定编号统�
 
 ## 5. PR 2 审核状态（尚未制备）
 
-PR 2 的候选语义是“对已注册 block-device generation 的长期使用权”，而不是 DM 专用引用计数：
+PR 2 的候选语义是“对处于 live 状态的已注册 block-device generation 的长期使用权”，而不是 DM 专用引用计数：
 
 ```text
-Pending：不可见、不可 lookup
 Live：可取得 BlockDeviceLease
-Removing：拒绝新的 lookup/lease
-lease_count = 0：才允许 unregister
-未提交 token Drop：恢复为 Live
+lease_count > 0：unregister 返回 Busy
+最后一个 lease drop：允许 unregister
 ```
 
-候选范围包括 block registry lease、VFS mount source 解析、ext2/exfat 使用路径、MlsDisk backing lease 与 VirtIO 分区刷新。PR 2 已获授权推进，但以下问题必须先在权威 `dm` 关闭，才可从最新 `main` 制备 `block-device-leases` 分支：
+候选范围是 block registry lease、VFS mount source 解析、rootfs 按名称解析，以及 ext2/exfat 使用路径。权威 `dm` 中为 runtime node 保留的 Pending/Removing token API 不进入 PR 2；MlsDisk backing lease lifecycle 与 VirtIO 分区刷新事务也不进入本 PR，分别等待独立所有权设计或 PR 4 的 registry transaction。
 
-1. `lookup_by_name` 持 registry lock 调用 `device.name()` 的潜在重入死锁；
-2. VirtIO 分区刷新忽略旧分区 unregister 结果；
-3. MlsDisk facade drop 与内部 RawDisk backing lease 的生命周期边界。
-
-状态：**已授权在 `dm` 推进 PR 2 前置工作；尚未制备 PR 分支**。三项阻塞关闭并完成直接验证前，不创建 PR 档案、不将候选结论表述为已实现或已验证。
+当前 `dm` 已完成并定向验证：按名称查找不在 registry 锁下调用 `device.name()`；`lookup_lease_by_name` 取得 tracked lease；rootfs 和 `FsCreationCtx` 不再把 registry device 降级成 untracked lease。尚未制备 PR 分支：仍需从最新 `main` 提取不含 token/runtime/MlsDisk/partition 的最小 diff，完成该分支最终验证后才创建 PR 档案。
 
 ## 6. PR 档案更新要求
 

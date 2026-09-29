@@ -1,6 +1,6 @@
 # Device Mapper 对话交接
 
-> **最后更新**：2026-09-28
+> **最后更新**：2026-09-29
 >
 > **定位**：本文件只记录当前停点、阅读入口、工作区边界和下一步决策；详细 PR 技术事实以 [`log/PR/`](../log/PR/) 为准，操作时间线以 [daily log](../log/daily/) 为准。
 
@@ -40,8 +40,8 @@
 ## 下一步
 
 1. PR 1 已完成；只有其 base、HEAD 或三文件范围变化时，才同步 `main` 并在 `mapped-bio-ranges` 分支重新验证。
-2. **PR 2 已获授权推进**：先在权威 `dm` 关闭 block-device lease 的三个现有审核阻塞——registry lock 下 `device.name()` 的重入死锁、VirtIO 分区刷新忽略旧分区 unregister 结果、MlsDisk facade 与 RawDisk backing lease 的 drop 生命周期边界。
-3. 三项阻塞关闭并完成所有者 ktest 后，同步 `main` 到当前 upstream，从 `main` 直接创建 `block-device-leases`，迁移最小生产 diff 并在该分支完成最终验证、提交和 push。此时才为 PR 2 创建独立档案。
+2. 后续上游系列已按 PR 1 的独立、最小闭环标准复审：PR 2 不依赖 PR 1；PR 3 依赖 PR 1；PR 4 依赖 PR 2；PR 5 依赖 PR 1 与 PR 2；PR 6 仅依赖 PR 5 并承载 control-device primitives；PR 7 依赖 PR 4 与 PR 6，承载 table lifecycle、首次 primary/alias 节点事务和 WAIT；zero/error 与 striped 分拆为 PR 8、PR 9。完整边界与依赖图以 [PR 规范](pull_request.md#3-规划中的上游-pr-系列与依赖) 为准。
+3. **PR 2 核心 lease 范围已获授权推进**：权威 `dm` 已实现并定向验证 registry tracked lease 的无重入按名称查找、rootfs 的 tracked lease 传递，以及预解析 VFS context 的生命周期保护。PR 2 只提取 live registry lease、普通 VFS mount/rootfs 与 ext2/exfat holder；Pending/Removing token、runtime node、MlsDisk facade 生命周期和 VirtIO 分区刷新事务均排除，分别留给 PR 4 或后续独立阶段。完成所有核心直接验证后，同步 `main` 到当前 upstream，从 `main` 直接创建 `block-device-leases`，迁移最小生产 diff 并在该分支完成最终验证、提交和 push；此时才为 PR 2 创建独立档案。
 
 ## 安全规则
 
