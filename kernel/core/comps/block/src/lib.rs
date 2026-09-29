@@ -459,6 +459,78 @@ pub fn lookup_lease(id: DeviceId) -> Option<BlockDeviceLease> {
     })
 }
 
+fn registered_devices_snapshot() -> Vec<Arc<RegisteredBlockDevice>> {
+    DEVICE_REGISTRY.lock().values().cloned().collect()
+}
+
+fn lookup_live_device(registered: &Arc<RegisteredBlockDevice>) -> Option<Arc<dyn BlockDevice>> {
+    let registry = DEVICE_REGISTRY.lock();
+    let current = registry.get(&registered.id.to_raw())?;
+    if !Arc::ptr_eq(current, registered) {
+        return None;
+    }
+    let state = current.state.lock();
+    (state.status == RegistrationStatus::Live).then(|| current.device.clone())
+}
+
+fn acquire_lease(registered: &Arc<RegisteredBlockDevice>) -> Option<BlockDeviceLease> {
+    let registry = DEVICE_REGISTRY.lock();
+    let current = registry.get(&registered.id.to_raw())?;
+    if !Arc::ptr_eq(current, registered) {
+        return None;
+    }
+    let mut state = current.state.lock();
+    if state.status != RegistrationStatus::Live {
+        return None;
+    }
+    state.lease_count = state.lease_count.checked_add(1)?;
+    drop(state);
+
+    Some(BlockDeviceLease {
+        device: current.device.clone(),
+        registered: Some(current.clone()),
+    })
+}
+
+/// Looks up a block device by its kernel device name.
+pub fn lookup_by_name(name: &str) -> Option<Arc<dyn BlockDevice>> {
+    registered_devices_snapshot()
+        .into_iter()
+        .filter(|registered| registered.device.name() == name)
+        .find_map(|registered| lookup_live_device(&registered))
+}
+
+/// Gets a lease for a published block device by its kernel device name.
+///
+/// The device name is resolved without holding registry locks because block device
+/// implementations may reenter the registry from [`BlockDevice::name`].
+pub fn lookup_lease_by_name(name: &str) -> Option<BlockDeviceLease> {
+    registered_devices_snapshot()
+        .into_iter()
+        .filter(|registered| registered.device.name() == name)
+        .find_map(|registered| acquire_lease(&registered))
+}
+
+/// Scans registered whole-disk devices and updates their partitions.
+pub fn scan_partitions() {
+    let devices = collect_all();
+    for device in devices {
+        if device.is_partition() {
+            continue;
+        }
+
+        let Some(partition_manager) = device.partition_manager() else {
+            continue;
+        };
+
+        let Some(partition_infos) = partition::parse(&device) else {
+            continue;
+        };
+
+        partition_manager.update(&device, partition_infos);
+    }
+}
+
 static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<RegisteredBlockDevice>>> =
     Mutex::new(BTreeMap::new());
 
@@ -554,6 +626,51 @@ mod tests {
             let _ = lookup(self.id);
             self.id
         }
+    }
+
+    #[derive(Debug)]
+    struct ReentrantNameBlockDevice {
+        id: DeviceId,
+    }
+
+    impl ReentrantNameBlockDevice {
+        fn new(minor: u32) -> Arc<Self> {
+            Arc::new(Self {
+                id: DeviceId::new(MajorId::new(510), MinorId::new(minor)),
+            })
+        }
+    }
+
+    impl BlockDevice for ReentrantNameBlockDevice {
+        fn enqueue(&self, _bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            unreachable!()
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta::default()
+        }
+
+        fn name(&self) -> &str {
+            let _ = lookup(self.id);
+            "block-registry-reentrant-name-test"
+        }
+
+        fn id(&self) -> DeviceId {
+            self.id
+        }
+    }
+
+    #[ktest]
+    fn lookup_by_name_allows_registry_reentry() {
+        let device = ReentrantNameBlockDevice::new(9);
+        let id = device.id();
+        register(device).unwrap();
+
+        assert!(lookup_by_name("block-registry-reentrant-name-test").is_some());
+        let lease = lookup_lease_by_name("block-registry-reentrant-name-test").unwrap();
+        assert_eq!(unregister(id).unwrap_err(), Error::Busy);
+        drop(lease);
+        assert!(unregister(id).is_ok());
     }
 
     #[ktest]

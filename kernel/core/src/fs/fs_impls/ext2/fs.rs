@@ -754,6 +754,29 @@ mod test {
     }
 
     #[ktest]
+    fn registered_backing_lease_blocks_unregistration() {
+        clocks::init_for_ktest();
+        let fixture = Ext2FixtureBuilder::new(3, 512).build().unwrap();
+        let device = fixture.disk.clone() as Arc<dyn BlockDevice>;
+        let id = device.id();
+        aster_block::register(device).unwrap();
+
+        let ext2 = Ext2::open(
+            aster_block::lookup_lease(id).unwrap(),
+            FsFlags::empty(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            aster_block::unregister(id).unwrap_err(),
+            aster_block::Error::Busy
+        );
+
+        drop(ext2);
+        assert!(aster_block::unregister(id).is_ok());
+    }
+
+    #[ktest]
     fn sync_metadata_writes_primary_and_backup() {
         clocks::init_for_ktest();
         let fixture = Ext2FixtureBuilder::new(3, 512)

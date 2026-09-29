@@ -128,7 +128,7 @@ impl<'a> FsCreationCtx<'a> {
 
     /// Creates a file system creation context from an already resolved block device.
     pub(in crate::fs) fn from_block_device(
-        block_device: Arc<dyn BlockDevice>,
+        block_device: BlockDeviceLease,
         flags: FsFlags,
         args: Option<&'a str>,
     ) -> Self {
@@ -207,6 +207,67 @@ impl<'a> FsCreationCtx<'a> {
         self.block_device = BlockDeviceResolution::Resolved(block_device);
 
         Ok(())
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use aster_block::{
+        BlockDevice, BlockDeviceMeta,
+        bio::{BioEnqueueError, SubmittedBio},
+    };
+    use device_id::{DeviceId, MajorId, MinorId};
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestBlockDevice {
+        id: DeviceId,
+    }
+
+    impl TestBlockDevice {
+        fn new(minor: u32) -> Arc<Self> {
+            Arc::new(Self {
+                id: DeviceId::new(MajorId::new(512), MinorId::new(minor)),
+            })
+        }
+    }
+
+    impl BlockDevice for TestBlockDevice {
+        fn enqueue(&self, _bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            unreachable!()
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta::default()
+        }
+
+        fn name(&self) -> &str {
+            "fs-creation-context-test"
+        }
+
+        fn id(&self) -> DeviceId {
+            self.id
+        }
+    }
+
+    #[ktest]
+    fn pre_resolved_context_keeps_tracked_lease() {
+        let device = TestBlockDevice::new(1);
+        let id = device.id();
+        aster_block::register(device).unwrap();
+
+        let lease = aster_block::lookup_lease(id).unwrap();
+        let mut context = FsCreationCtx::from_block_device(lease, FsFlags::empty(), None);
+        assert!(context.resolve_block_device().is_ok());
+        assert_eq!(
+            aster_block::unregister(id).unwrap_err(),
+            aster_block::Error::Busy
+        );
+
+        drop(context);
+        assert!(aster_block::unregister(id).is_ok());
     }
 }
 

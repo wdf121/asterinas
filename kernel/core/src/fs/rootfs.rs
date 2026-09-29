@@ -89,19 +89,23 @@ pub(crate) fn find_init(path_resolver: &PathResolver) -> Result<Option<(Path, &'
 }
 
 fn open_rootfs(root: &str, fs_flags: FsFlags) -> Result<FsAndRoot> {
+    let device = lookup_root_device(root)?;
+    open_rootfs_from_candidates(device, rootfs_types(), fs_flags)
+}
+
+fn lookup_root_device(root: &str) -> Result<aster_block::BlockDeviceLease> {
     // Treat a `/dev/...` value of `root` as a Linux-compatible root device spec, not as a VFS path
     // lookup.
     // Reference: <https://elixir.bootlin.com/linux/v6.18/source/drivers/base/devtmpfs.c#L358-L359>.
     let device_name = root
         .strip_prefix("/dev/")
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "root must name a /dev block device"))?;
-    let device = aster_block::lookup_by_name(device_name)
-        .ok_or_else(|| Error::with_message(Errno::ENODEV, "root block device not found"))?;
-    open_rootfs_from_candidates(device, rootfs_types(), fs_flags)
+    aster_block::lookup_lease_by_name(device_name)
+        .ok_or_else(|| Error::with_message(Errno::ENODEV, "root block device not found"))
 }
 
 fn open_rootfs_from_candidates(
-    device: Arc<dyn aster_block::BlockDevice>,
+    device: aster_block::BlockDeviceLease,
     rootfs_types: &[&dyn DynFsType],
     fs_flags: FsFlags,
 ) -> Result<FsAndRoot> {
@@ -201,3 +205,62 @@ static RO_PARAM: SetRootMountReadOnly = SetRootMountReadOnly;
 static RW_PARAM: SetRootMountReadWrite = SetRootMountReadWrite;
 aster_cmdline::define_flag_param!("ro", RO_PARAM);
 aster_cmdline::define_flag_param!("rw", RW_PARAM);
+
+#[cfg(ktest)]
+mod tests {
+    use aster_block::{
+        BlockDevice, BlockDeviceMeta,
+        bio::{BioEnqueueError, SubmittedBio},
+    };
+    use device_id::{DeviceId, MajorId, MinorId};
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestBlockDevice {
+        id: DeviceId,
+    }
+
+    impl TestBlockDevice {
+        fn new(minor: u32) -> Arc<Self> {
+            Arc::new(Self {
+                id: DeviceId::new(MajorId::new(513), MinorId::new(minor)),
+            })
+        }
+    }
+
+    impl BlockDevice for TestBlockDevice {
+        fn enqueue(&self, _bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            unreachable!()
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta::default()
+        }
+
+        fn name(&self) -> &str {
+            "rootfs-lease-test"
+        }
+
+        fn id(&self) -> DeviceId {
+            self.id
+        }
+    }
+
+    #[ktest]
+    fn root_device_lookup_keeps_tracked_lease() {
+        let device = TestBlockDevice::new(1);
+        let id = device.id();
+        aster_block::register(device).unwrap();
+
+        let lease = lookup_root_device("/dev/rootfs-lease-test").unwrap();
+        assert_eq!(
+            aster_block::unregister(id).unwrap_err(),
+            aster_block::Error::Busy
+        );
+
+        drop(lease);
+        assert!(aster_block::unregister(id).is_ok());
+    }
+}
