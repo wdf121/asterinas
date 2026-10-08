@@ -77,6 +77,7 @@
 | **P7** | deferred remove<br>完整 control ABI | **用户价值：**扩大 Linux 命令和生命周期兼容面。<br><br>**依赖：**`DM_TARGET_MSG`、`DM_DEV_SET_GEOMETRY`、`DM_DEV_ARM_POLL`、IMA。<br><br>**排序原因：**需要延迟 node/manager 生命周期或额外 ABI 语义。 |
 | **P8** | DM-on-DM stacking<br>完整 queue stacking | **用户价值：**mapper 作为 backing、异构 queue limit/descriptor 组合。<br><br>**依赖：**依赖图、环检测、lease/flush/remove 级联、通用 block metadata 和 driver capability。<br><br>**排序原因：**`table.rs` 当前拒绝 DmDevice backing；对 DM 与通用 block 框架改动很大。 |
 | **P9** | uevent / sysfs / udev<br>systemd activation | **用户价值：**减少显式 scan、mknodes、activate 等运维操作。<br><br>**依赖：**事件分发、sysfs 属性、用户态规则与服务协同。<br><br>**排序原因：**外部生态依赖最强、非 DM 专属。 |
+| **P10** | 通用物理 block-device 热插拔<br>运行期 VirtIO/PCI 插盘与真实 USB mass-storage | **用户价值：**系统运行中发现、发布并安全移除物理存储设备。<br><br>**依赖：**总线 add/remove 与 driver probe/unbind、运行期 block registry/devtmpfs 主盘和分区节点事务、I/O worker 生命周期、in-flight I/O 失败收束、open/mount/lease/cache/DM backing 的移除协调；真实 USB 还需要 xHCI 与 mass-storage 驱动。完成上述内核链路后，可选接入 sysfs/NETLINK_KOBJECT_UEVENT/udev。<br><br>**排序原因：**当前启动期 VirtIO/NVMe 枚举和 DM runtime node 已可用，但缺少通用运行期 add/remove 链路；该能力跨总线、driver、VFS 和用户态生态，非 DM 主链所需，置于当前路线最低优先级。 |
 
 ## 7. 用户、运维、产品与架构决策视角
 
