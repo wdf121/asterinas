@@ -54,8 +54,12 @@
 | 格式与局部空白 | 通过。 | `cargo fmt --check --all` 通过；校准 diff 的 `git diff --check` 通过。 |
 | kernel-aware 编译 | 通过，保留 8 条既有 warning。 | `VDSO_LIBRARY_DIR=/root/linux_vdso`、隔离 target 下的 `cargo osdk check --manifest-path kernel/core/Cargo.toml` 通过；覆盖合并后的 `aster-device`、`aster-device-mapper` 和 `aster-core` 编译图。 |
 | 全分支空白检查 | 未通过，均为既有历史内容。 | `git diff --check main..dm` 命中历史 patch 归档及旧日志的尾随空白；本轮未修改这些文件。 |
-| `make check` | 未完成。 | 环境缺少 `jq`，随后命中既有 DOCX 文件与 `log/daily/2026-8-31.md` 的尾随空白；未进入完整 clippy/格式矩阵。 |
-| QEMU/ktest/系统回归 | 未运行。 | 未重新验证 block、DM、core ioctl、C ABI 与 NixOS suites；不得沿用为本轮已验证事实。 |
+| `make check` | 未通过。 | 在 clippy 前被既有 DOCX 文件与 `log/daily/2026-8-31.md` 的尾随空白阻断；宿主环境另缺少 `jq`，均未修改。 |
+| `make initramfs` | 通过。 | 容器中重建 initramfs 与镜像；这是 `make ktest` 的自动前置步骤，本轮仅作为单独排障/输入验证执行。 |
+| `make kernel` | 通过，保留既有 warning。 | 容器中完成普通非测试内核与 ISO 构建，覆盖标准发布构建路径。 |
+| block / DM 补充 ktest | 通过。 | block crate 28 passed、DM crate 87 passed；覆盖同步后的 BIO/lease 与 DM table/target/lifecycle 回归，但不是全量 ktest 的替代。 |
+| `make ktest` | 未通过。 | OSTD 的 `ostd::arch::vm::vmx::vmcs::test::switch_and_reuse_vmcs` 发生 atomic mode 检查 panic（210 passed，1 failed）；后续 Asterinas 构建又因代理 502 无法获取 `smoltcp`。完整 gate 未完成。 |
+| C ABI / NixOS 系统回归 | 未运行。 | 当前完整同步验证已被 `make check` 和 `make ktest` 阻断，不得宣布本轮同步验证完成。 |
 
 ## 6. 2026-09-24 验证矩阵（历史）
 
@@ -89,9 +93,10 @@
 3. 固定顺序：配置/构建入口 → 通用基础设施 → DM 语义 → 分层测试与验收。
 4. 每个文本冲突、API 差异或自动合并语义问题，记录两侧行为、取舍、影响和验证入口；若依据既有取舍自动处理，rebase 后必须与安全引用的最终树比较，不能仅以“无冲突”作为正确性结论。
 5. 测试必须串行执行、逐项即时汇报；完成后确认 `git log --merges main..dm` 无输出，并更新本文档、daily、交接和 PR 状态。
+6. 每次同步的完整容器验证门槛固定为 `make check`、`make ktest` 与 `make kernel`，均在 `fork_Asterinas:/root/asterinas` 串行执行。`make ktest` 已依赖 `initramfs` 并启动 QEMU 测试内核，除非单独排查镜像构建，否则不得将 `make initramfs` 作为额外独立 gate。任一门槛未通过或被环境/既有问题阻断时，只能记录为“验证未完成”，不得宣布同步验证完成。
 
 ## 9. 当前停点
 
-本地 `dm` 已线性同步至 `main` `10a241870`，并已提交最终树校准与同步规则；`backup/dm-merge-2100c9052` 保留为本轮审计和恢复引用。当前仅完成格式和 kernel-aware 编译验证，未重新运行 QEMU、ktest、C ABI 或 NixOS 回归。
+本地 `dm` 已线性同步至 `main` `10a241870`，并已提交最终树校准与同步规则；`backup/dm-merge-2100c9052` 保留为本轮审计和恢复引用。容器内 `make initramfs`、`make kernel`、block 28/0 和 DM 87/0 已通过，但强制 gate 的 `make check` 与 `make ktest` 均未通过；本轮同步验证尚未完成。
 
 `dm` 因 rebase 与 `origin/dm` 分叉，且当前凭证问题尚未解决；在用户恢复凭证并明确确认前不得 push。后续 PR 仍只能从权威 `dm` 提取最小补丁，不能直接交付整条同步历史。
