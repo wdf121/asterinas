@@ -88,12 +88,13 @@
 
 ## 8. 后续同步规则
 
-1. 同步前记录权威 `dm` HEAD、目标 `main`、merge-base 与工作区状态；先隔离未提交研发内容，并在任何历史重写前创建可恢复的安全引用。
-2. 可以用 worktree 预演冲突，但正式同步必须回到权威 `dm`，使用 `git rebase main` 线性重放；不得创建 merge commit。
-3. 固定顺序：配置/构建入口 → 通用基础设施 → DM 语义 → 分层测试与验收。
-4. 每个文本冲突、API 差异或自动合并语义问题，记录两侧行为、取舍、影响和验证入口；若依据既有取舍自动处理，rebase 后必须与安全引用的最终树比较，不能仅以“无冲突”作为正确性结论。
-5. 测试必须串行执行、逐项即时汇报；完成后确认 `git log --merges main..dm` 无输出，并更新本文档、daily、交接和 PR 状态。
-6. 每次同步的完整容器验证门槛固定为 `make check`、`make ktest` 与 `make kernel`，均在 `fork_Asterinas:/root/asterinas` 串行执行。`make ktest` 已依赖 `initramfs` 并启动 QEMU 测试内核，除非单独排查镜像构建，否则不得将 `make initramfs` 作为额外独立 gate。任一门槛未通过或被环境/既有问题阻断时，只能记录为“验证未完成”，不得宣布同步验证完成。
+1. 同步前记录权威 `dm` HEAD、候选 `main` SHA、merge-base 与工作区状态；先隔离未提交研发内容，并在任何历史重写前创建可恢复的安全引用。
+2. 在合并前，先在容器的干净独立 worktree 中验证候选 `main` SHA 的同步基线；基线失败时报告为上游/环境问题并讨论处理方案，禁止直接 rebase 到 `dm` 后再归因。
+3. 候选 `main` 基线通过后，正式同步必须回到权威 `dm`，使用 `git rebase main` 线性重放；不得创建 merge commit。
+4. 固定顺序：配置/构建入口 → 通用基础设施 → DM 语义 → 分层测试与验收。
+5. 每个文本冲突、API 差异或自动合并语义问题，记录两侧行为、取舍、影响和验证入口；若依据既有取舍自动处理，rebase 后必须与安全引用的最终树比较，不能仅以“无冲突”作为正确性结论。
+6. 测试必须串行执行、逐项即时汇报；完成后确认 `git log --merges main..dm` 无输出，并更新本文档、daily、交接和 PR 状态。
+7. 候选 `main` 基线与同步后的 `dm` 均应执行相同的完整容器验证门槛：`make check`、`make ktest` 与 `make kernel`，均在 `fork_Asterinas:/root/asterinas` 串行执行。`make ktest` 已依赖 `initramfs` 并启动 QEMU 测试内核，除非单独排查镜像构建，否则不得将 `make initramfs` 作为额外独立 gate。任一门槛未通过或被环境/既有问题阻断时，只能记录为“验证未完成”，不得宣布对应基线或同步验证完成。
 
 ## 9. 当前停点
 
