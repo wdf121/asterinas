@@ -21,6 +21,7 @@
   services.udev.enable = false;
 
   services.getty.autologinUser = "root";
+  services.getty.loginProgram = "${pkgs.util-linux.bin}/bin/login";
   systemd.services."serial-getty@hvc0".enable = false;
   users.users.root = {
     shell = "${pkgs.bash}/bin/bash";

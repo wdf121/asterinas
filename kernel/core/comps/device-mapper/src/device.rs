@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{collections::VecDeque, string::String, sync::Arc};
+use alloc::{collections::VecDeque, format, string::String, sync::Arc};
 use core::{
     fmt::{Debug, Display, Formatter},
     sync::atomic::{AtomicUsize, Ordering},
@@ -122,7 +122,7 @@ impl InitialResumeGuard<'_> {
         drop(self.state.take());
         ostd::error!(
             "[dm-debug] state initial-resume committed name={} dev={} replay_postponed={}",
-            self.device.name(),
+            self.device.mapper_name(),
             DeviceIdLogLabel(self.device.id()),
             replay_count
         );
@@ -131,9 +131,14 @@ impl InitialResumeGuard<'_> {
 }
 
 /// A runtime Device Mapper block device.
+///
+/// Its [`BlockDevice`] identity is the immutable `dm-<minor>` primary name.
+/// The separately locked mapper alias is used only by the control plane for
+/// manager indexes, UUID resolution, and `/dev/mapper/<alias>` publication.
 pub struct DmDevice {
     id_owner: DmDeviceIdOwner,
-    name: Mutex<String>,
+    primary_name: String,
+    mapper_name: Mutex<String>,
     uuid: Mutex<Option<String>>,
     lifecycle: Mutex<()>,
     state: Mutex<DmDeviceState>,
@@ -142,10 +147,16 @@ pub struct DmDevice {
 }
 
 impl DmDevice {
-    pub(crate) fn new(id_owner: DmDeviceIdOwner, name: String, uuid: Option<String>) -> Self {
+    pub(crate) fn new(
+        id_owner: DmDeviceIdOwner,
+        mapper_name: String,
+        uuid: Option<String>,
+    ) -> Self {
+        let primary_name = format!("dm-{}", id_owner.id().minor().get());
         Self {
             id_owner,
-            name: Mutex::new(name),
+            primary_name,
+            mapper_name: Mutex::new(mapper_name),
             uuid: Mutex::new(uuid),
             lifecycle: Mutex::new(()),
             state: Mutex::new(DmDeviceState::default()),
@@ -242,26 +253,24 @@ impl DmDevice {
         if count != 0 {
             ostd::error!(
                 "[dm-debug] state postponed-bios failed name={} dev={} count={}",
-                self.name(),
+                self.mapper_name(),
                 DeviceIdLogLabel(self.id()),
                 count
             );
         }
     }
 
-    /// Returns a cloned device name, including updates after rename.
-    pub fn name(&self) -> String {
-        self.name.lock().clone()
+    /// Returns a cloned snapshot of the mutable mapper alias.
+    pub fn mapper_name(&self) -> String {
+        self.mapper_name.lock().clone()
     }
 
-    /// Renames the DM device.
+    /// Updates the mutable mapper alias without changing the stable primary name.
     ///
-    /// This only updates the device's internal name and does not affect I/O
-    /// state. The control plane is responsible for synchronizing the manager
-    /// index and block device registration.
-    pub fn rename(&self, new_name: String) {
-        let mut name = self.name.lock();
-        *name = new_name;
+    /// The control plane synchronizes manager indexes and devtmpfs aliases before
+    /// calling this method, so data-plane block device identity remains immutable.
+    pub fn rename_mapper(&self, new_name: String) {
+        *self.mapper_name.lock() = new_name;
     }
 
     /// Returns the Device Mapper UUID, or `None` if creation omitted it.
@@ -308,7 +317,7 @@ impl DmDevice {
         self.state.lock().inactive = Some(table);
         ostd::error!(
             "[dm-debug] state table-loaded name={} dev={} slot=inactive targets={} sectors={}",
-            self.name(),
+            self.mapper_name(),
             DeviceIdLogLabel(self.id()),
             target_count,
             capacity
@@ -324,7 +333,7 @@ impl DmDevice {
         let cleared = self.state.lock().inactive.take().is_some();
         ostd::error!(
             "[dm-debug] state table-cleared name={} dev={} cleared={}",
-            self.name(),
+            self.mapper_name(),
             DeviceIdLogLabel(self.id()),
             cleared
         );
@@ -350,7 +359,7 @@ impl DmDevice {
         drop(state);
         ostd::error!(
             "[dm-debug] state suspended name={} dev={} mode=flush",
-            self.name(),
+            self.mapper_name(),
             DeviceIdLogLabel(self.id())
         );
         Ok(())
@@ -371,7 +380,7 @@ impl DmDevice {
                 drop(state);
                 ostd::error!(
                     "[dm-debug] state suspended name={} dev={} mode=noflush",
-                    self.name(),
+                    self.mapper_name(),
                     DeviceIdLogLabel(self.id())
                 );
                 Ok(())
@@ -453,7 +462,7 @@ impl DmDevice {
         self.replay_postponed(replay);
         ostd::error!(
             "[dm-debug] state resumed name={} dev={} replaced_active={} replay_postponed={}",
-            self.name(),
+            self.mapper_name(),
             DeviceIdLogLabel(self.id()),
             replaced_active,
             replay_count
@@ -495,7 +504,7 @@ impl DmDevice {
         };
         ostd::error!(
             "[dm-debug] state event-published name={} dev={} event_nr={}",
-            self.name(),
+            self.mapper_name(),
             DeviceIdLogLabel(self.id()),
             event_nr
         );
@@ -546,8 +555,8 @@ impl BlockDevice for DmDevice {
             .unwrap_or_default()
     }
 
-    fn name(&self) -> String {
-        self.name.lock().clone()
+    fn name(&self) -> &str {
+        self.primary_name.as_str()
     }
 
     fn id(&self) -> DeviceId {
@@ -559,7 +568,8 @@ impl Debug for DmDevice {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DmDevice")
             .field("id", &self.id())
-            .field("name", &self.name)
+            .field("primary_name", &self.primary_name)
+            .field("mapper_name", &self.mapper_name)
             .field("uuid", &self.uuid)
             .field("status", &self.status())
             .finish()
@@ -639,8 +649,8 @@ mod tests {
             }
         }
 
-        fn name(&self) -> String {
-            String::from("dm-deferred-backing-test")
+        fn name(&self) -> &str {
+            "dm-deferred-backing-test"
         }
 
         fn id(&self) -> DeviceId {
@@ -660,8 +670,8 @@ mod tests {
             }
         }
 
-        fn name(&self) -> String {
-            String::from("dm-rejecting-backing-test")
+        fn name(&self) -> &str {
+            "dm-rejecting-backing-test"
         }
 
         fn id(&self) -> DeviceId {
@@ -682,8 +692,8 @@ mod tests {
             }
         }
 
-        fn name(&self) -> String {
-            String::from("dm-backing-test")
+        fn name(&self) -> &str {
+            "dm-backing-test"
         }
 
         fn id(&self) -> DeviceId {

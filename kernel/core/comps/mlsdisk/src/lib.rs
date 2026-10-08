@@ -204,7 +204,7 @@ mod test {
             }
         }
 
-        fn name(&self) -> String {
+        fn name(&self) -> &str {
             todo!()
         }
 

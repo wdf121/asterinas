@@ -1,5 +1,11 @@
-{ lib, pkgs, stdenv, callPackage, testPlatform ? "asterinas"
-, enableTdxAttest ? false, }:
+{
+  lib,
+  pkgs,
+  stdenv,
+  callPackage,
+  testPlatform ? "asterinas",
+  enableTdxAttest ? false,
+}:
 let
   scripts = lib.fileset.toSource {
     root = ./../../src/regression/scripts;
@@ -22,20 +28,43 @@ let
 
   tdxAttest = callPackage ./tdx-attest.nix { };
 
-  allPkgs = lib.genAttrs subDirs commonBuild // {
-    network = callPackage ./common.nix (commonArgs // {
-      dir = "network";
-      extraAttrs = { C_FLAGS = "-I${pkgs.libnl.dev}/include/libnl3"; };
-      extraBuildInputs = [ pkgs.libnl ];
-    });
-  } // lib.optionalAttrs
-    (enableTdxAttest && pkgs.hostPlatform.system == "x86_64-linux") {
-      intel_tdx = callPackage ./common.nix (commonArgs // {
-        dir = "intel_tdx";
-        extraAttrs = { TDX_ATTEST_DIR = "${tdxAttest}/QuoteGeneration"; };
-      });
+  allPkgs =
+    lib.genAttrs subDirs commonBuild
+    // {
+      device = callPackage ./common.nix (
+        commonArgs
+        // {
+          dir = "device";
+          extraAttrs = {
+            C_FLAGS = "-I${pkgs.libdrm.dev}/include/libdrm";
+          };
+          extraBuildInputs = [ pkgs.libdrm ];
+        }
+      );
+      network = callPackage ./common.nix (
+        commonArgs
+        // {
+          dir = "network";
+          extraAttrs = {
+            C_FLAGS = "-I${pkgs.libnl.dev}/include/libnl3";
+          };
+          extraBuildInputs = [ pkgs.libnl ];
+        }
+      );
+    }
+    // lib.optionalAttrs (enableTdxAttest && pkgs.hostPlatform.system == "x86_64-linux") {
+      intel_tdx = callPackage ./common.nix (
+        commonArgs
+        // {
+          dir = "intel_tdx";
+          extraAttrs = {
+            TDX_ATTEST_DIR = "${tdxAttest}/QuoteGeneration";
+          };
+        }
+      );
     };
-in {
+in
+{
   package = stdenv.mkDerivation {
     pname = "regression";
     version = "0.1.0";

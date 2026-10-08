@@ -18,6 +18,7 @@ enum Leaf {
     ProcessorFreq = 0x16,
 
     HypervisorBase = 0x40000000,
+    KvmFeatures = 0x40000001,
     HypervisorTiming = 0x40000010,
     ExtBase = 0x80000000,
 }

@@ -236,8 +236,8 @@ mod tests {
             }
         }
 
-        fn name(&self) -> String {
-            String::from("linear-test")
+        fn name(&self) -> &str {
+            "linear-test"
         }
 
         fn id(&self) -> DeviceId {

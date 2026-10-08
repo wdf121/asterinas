@@ -33,9 +33,10 @@ use runtime::MapperRuntimeCoordinator;
 
 use crate::{
     context::current_userspace,
-    device::{Device, DeviceType, DevtmpfsInodeMeta, block_open_count, registry::char},
+    device::{Device, DeviceType, block_open_count, registry::char},
     events::IoEvents,
     fs::{
+        devtmpfs::DevtmpfsNodeMeta,
         file::{InodeType, PerOpenFileOps, StatusFlags},
         vfs::{
             inode::FileOps,
@@ -88,7 +89,7 @@ const DM_TABLE_STATUS_CMD: u8 = 12;
 const DM_LIST_VERSIONS_CMD: u8 = 13;
 const DM_GET_TARGET_VERSION_CMD: u8 = 17;
 
-const DM_VERSION: [u32; 3] = [4, 48, 0];
+const DM_VERSION: [u32; 3] = [4, 50, 0];
 
 const DM_READONLY_FLAG: u32 = 1 << 0;
 const DM_SUSPEND_FLAG: u32 = 1 << 1;
@@ -176,8 +177,8 @@ impl Device for DmControlDevice {
         self.id
     }
 
-    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
-        Some(DevtmpfsInodeMeta::new("mapper/control"))
+    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
+        Some(DevtmpfsNodeMeta::new("mapper/control").unwrap())
     }
 
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
@@ -451,7 +452,7 @@ fn create_device(buffer: &mut [u8]) -> Result<()> {
     let device = ControlWorkflow::new(manager()).create(request)?;
     ostd::error!(
         "[dm-debug] control create committed name={} dev={} requested_minor={:?}",
-        device.name(),
+        device.mapper_name(),
         DeviceIdLogLabel(device.id()),
         requested_minor
     );
@@ -466,7 +467,7 @@ fn remove_device(buffer: &mut [u8]) -> Result<()> {
         workflow.remove(device)?;
         ostd::error!(
             "[dm-debug] control remove committed name={} dev={}",
-            device.name(),
+            device.mapper_name(),
             DeviceIdLogLabel(device.id())
         );
         clear_device_header(buffer)
@@ -551,7 +552,7 @@ fn device_rename(buffer: &mut [u8]) -> Result<()> {
         ostd::error!(
             "[dm-debug] control rename committed kind={} name={} dev={}",
             kind,
-            device.name(),
+            device.mapper_name(),
             DeviceIdLogLabel(device.id())
         );
         fill_device_header(buffer, device)
@@ -566,7 +567,7 @@ fn table_load(buffer: &mut [u8]) -> Result<()> {
         table_load_for_device(buffer, device)?;
         ostd::error!(
             "[dm-debug] control table-load committed name={} dev={} targets={} readonly={} primary_registered={}",
-            device.name(),
+            device.mapper_name(),
             DeviceIdLogLabel(device.id()),
             target_count,
             readonly,
@@ -662,18 +663,18 @@ fn device_suspend(buffer: &mut [u8]) -> Result<()> {
         match workflow.transition(device, request)? {
             LifecycleOutcome::Suspended { noflush } => ostd::error!(
                 "[dm-debug] control suspend committed name={} dev={} noflush={}",
-                device.name(),
+                device.mapper_name(),
                 DeviceIdLogLabel(device.id()),
                 noflush
             ),
             LifecycleOutcome::Resumed { initial: true } => ostd::error!(
                 "[dm-debug] control resume committed name={} dev={} initial=true alias_published=true",
-                device.name(),
+                device.mapper_name(),
                 DeviceIdLogLabel(device.id())
             ),
             LifecycleOutcome::Resumed { initial: false } => ostd::error!(
                 "[dm-debug] control resume committed name={} dev={} initial=false",
-                device.name(),
+                device.mapper_name(),
                 DeviceIdLogLabel(device.id())
             ),
         }
@@ -1467,8 +1468,8 @@ mod tests {
             }
         }
 
-        fn name(&self) -> String {
-            String::from("dm-status-test-backing")
+        fn name(&self) -> &str {
+            "dm-status-test-backing"
         }
 
         fn id(&self) -> DeviceId {
@@ -1521,8 +1522,8 @@ mod tests {
             }
         }
 
-        fn name(&self) -> String {
-            String::from("dm-deferred-control-test-backing")
+        fn name(&self) -> &str {
+            "dm-deferred-control-test-backing"
         }
 
         fn id(&self) -> DeviceId {
@@ -1702,7 +1703,7 @@ mod tests {
         );
 
         assert!(Arc::ptr_eq(
-            &manager.lookup_name(&device.name()).unwrap(),
+            &manager.lookup_name(&device.mapper_name()).unwrap(),
             &device
         ));
         assert_eq!(device.status(), status_before);
@@ -1721,7 +1722,7 @@ mod tests {
         })
         .unwrap();
 
-        assert!(manager.lookup_name(&device.name()).is_none());
+        assert!(manager.lookup_name(&device.mapper_name()).is_none());
         assert_eq!(device.status().event_nr, 1);
     }
 
@@ -1750,8 +1751,8 @@ mod tests {
 
         assert_eq!(outcome.attempted, 2);
         assert_eq!(outcome.removed, 1);
-        assert!(manager.lookup_name(&retained.name()).is_some());
-        assert!(manager.lookup_name(&removed.name()).is_none());
+        assert!(manager.lookup_name(&retained.mapper_name()).is_some());
+        assert!(manager.lookup_name(&removed.mapper_name()).is_none());
     }
 
     #[ktest]
@@ -1972,7 +1973,7 @@ mod tests {
         let device = manager
             .create("dm-lifecycle-stale".to_string(), None, None)
             .unwrap();
-        manager.remove(&device.name()).unwrap();
+        manager.remove(&device.mapper_name()).unwrap();
 
         assert_eq!(
             with_current_device_lifecycle_in(&manager, &device, |_| Ok(()))
@@ -2097,7 +2098,7 @@ mod tests {
         );
         assert_eq!(
             required_c_string(&buffer, OFF_NAME, DM_NAME_LEN, "名称").unwrap(),
-            device.name()
+            device.mapper_name()
         );
         assert_eq!(
             required_c_string(&buffer, OFF_UUID, DM_UUID_LEN, "UUID").unwrap(),
@@ -3268,7 +3269,7 @@ mod tests {
         assert!(manager.lookup_name("dm-rename-old").is_none());
         assert_eq!(manager.lookup_name("dm-rename-new").unwrap().id(), id);
         assert_eq!(manager.lookup_uuid("dm-rename-uuid").unwrap().id(), id);
-        assert_eq!(device.name(), "dm-rename-new");
+        assert_eq!(device.mapper_name(), "dm-rename-new");
     }
 
     #[ktest]
@@ -3296,7 +3297,7 @@ mod tests {
             manager.lookup_name("dm-rename-same").unwrap().id(),
             device.id()
         );
-        assert_eq!(device.name(), "dm-rename-same");
+        assert_eq!(device.mapper_name(), "dm-rename-same");
         assert_eq!(device.status(), status_before);
     }
 
@@ -3350,7 +3351,7 @@ mod tests {
         assert_eq!(manager.lookup_name("dm-rollback-old").unwrap().id(), id);
         assert!(manager.lookup_name("dm-rollback-new").is_none());
         assert_eq!(manager.lookup_uuid("dm-rollback-uuid").unwrap().id(), id);
-        assert_eq!(device.name(), "dm-rollback-old");
+        assert_eq!(device.mapper_name(), "dm-rollback-old");
         assert_eq!(device.status(), status_before);
         assert!(
             manager
@@ -3378,7 +3379,7 @@ mod tests {
 
         device_rename(&mut buffer).unwrap();
 
-        assert_eq!(device.name(), "dm-uuid-rename-name");
+        assert_eq!(device.mapper_name(), "dm-uuid-rename-name");
         assert_eq!(device.uuid().unwrap(), "dm-uuid-rename-new");
         assert!(manager().lookup_uuid("dm-uuid-rename-old").is_none());
         assert_eq!(
@@ -3488,7 +3489,13 @@ mod tests {
 
         let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
         let uuid = uuid_device.uuid().unwrap();
-        write_c_string_fixed(&mut buffer, OFF_NAME, DM_NAME_LEN, &name_device.name()).unwrap();
+        write_c_string_fixed(
+            &mut buffer,
+            OFF_NAME,
+            DM_NAME_LEN,
+            &name_device.mapper_name(),
+        )
+        .unwrap();
         write_c_string_fixed(&mut buffer, OFF_UUID, DM_UUID_LEN, &uuid).unwrap();
         write_u64(&mut buffer, OFF_DEV, name_device.id().as_encoded_u64()).unwrap();
         assert_eq!(
@@ -4752,11 +4759,11 @@ mod tests {
             .create("dm-list-second".to_string(), None, None)
             .unwrap();
 
-        let first_name = first.name();
+        let first_name = first.mapper_name();
         let first_uuid = first.uuid().unwrap().to_string();
         let (first_extension, first_len) =
             name_list_record_layout(first_name.len() + 1, first_uuid.len() + 1).unwrap();
-        let second_name = second.name();
+        let second_name = second.mapper_name();
         let (second_extension, second_len) =
             name_list_record_layout(second_name.len() + 1, 0).unwrap();
         let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE + first_len + second_len);
@@ -4854,7 +4861,7 @@ mod tests {
         let device = manager
             .create("dm-short-list-device".to_string(), None, None)
             .unwrap();
-        let record_len = name_list_record_layout(device.name().len() + 1, 0)
+        let record_len = name_list_record_layout(device.mapper_name().len() + 1, 0)
             .unwrap()
             .1;
         let mut devices = test_buffer(DM_IOCTL_HEADER_SIZE + record_len - 1);

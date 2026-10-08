@@ -42,7 +42,7 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct ExfatFs {
+pub(crate) struct ExfatFs {
     block_device: BlockDeviceLease,
     super_block: ExfatSuperBlock,
 
@@ -72,7 +72,7 @@ const FAT_LRU_CACHE_SIZE: usize = 1024;
 pub(super) const EXFAT_ROOT_INO: Ino = 1;
 
 impl ExfatFs {
-    pub fn open(
+    pub(crate) fn open(
         block_device: BlockDeviceLease,
         mount_option: ExfatMountOptions,
     ) -> Result<Arc<Self>> {

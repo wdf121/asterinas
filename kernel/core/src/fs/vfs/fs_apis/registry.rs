@@ -106,8 +106,12 @@ pub(crate) struct FsCreationCtx<'a> {
     source: Option<&'a str>,
     flags: FsFlags,
     args: Option<&'a str>,
-    task_ctx: &'a Context<'a>,
-    block_device: Option<BlockDeviceLease>,
+    block_device: BlockDeviceResolution<'a>,
+}
+
+enum BlockDeviceResolution<'a> {
+    Pending(&'a Context<'a>),
+    Resolved(BlockDeviceLease),
 }
 
 impl<'a> FsCreationCtx<'a> {
@@ -165,14 +169,14 @@ impl<'a> FsCreationCtx<'a> {
 
     /// Resolves the mount source into a block device.
     pub(in crate::fs) fn resolve_block_device(&mut self) -> Result<&BlockDeviceLease> {
-        if self.block_device.is_none() {
+        if self.block_device().is_none() {
             self.do_resolve_block_device()?;
         }
 
         Ok(self.block_device().unwrap())
     }
 
-    fn block_device(&self) -> Option<&Arc<dyn BlockDevice>> {
+    fn block_device(&self) -> Option<&BlockDeviceLease> {
         match &self.block_device {
             BlockDeviceResolution::Pending(_) => None,
             BlockDeviceResolution::Resolved(block_device) => Some(block_device),

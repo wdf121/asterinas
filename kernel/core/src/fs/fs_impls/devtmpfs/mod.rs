@@ -23,9 +23,11 @@ mod tree;
 mod worker;
 
 pub(in crate::fs) use fs::singleton;
-pub(crate) use tree::DevtmpfsNode;
 pub use tree::DevtmpfsNodeMeta;
-pub(crate) use worker::{create_node, delete_node};
+pub(crate) use tree::{DevtmpfsHandle, DevtmpfsNode};
+pub(crate) use worker::{
+    create_node, create_symlink, delete, delete_node, rename_no_replace, validate,
+};
 
 pub(super) fn init() {
     fs::init();
@@ -46,7 +48,8 @@ mod tests {
     use ostd::prelude::ktest;
 
     use super::{
-        DevtmpfsNode, DevtmpfsNodeMeta, create_node, delete_node, singleton, tree, worker,
+        DevtmpfsNode, DevtmpfsNodeMeta, create_node, delete, delete_node, rename_no_replace,
+        singleton, tree, validate, worker,
     };
     use crate::{
         device::DeviceType,
@@ -167,7 +170,6 @@ mod tests {
 
         let path = "__devtmpfs_ktest_mismatch";
         create_node(char_node(path, 240, 6)).unwrap();
-
         delete_node(char_node(path, 240, 7)).unwrap();
 
         let inode = tree::lookup_path(path).unwrap();

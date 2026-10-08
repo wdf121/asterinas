@@ -17,7 +17,7 @@ use ostd::{
         dma::{DmaStream, FromAndToDevice},
         io::util::{HasVmReaderWriter, VmReaderWriterResult},
     },
-    sync::WaitQueue,
+    sync::{LocalIrqDisabled, SpinLock, WaitQueue},
 };
 use spin::Once;
 
@@ -460,8 +460,10 @@ impl SubmittedBio {
         }));
     }
 
-    /// Completes the `Bio` by consuming `self`, releasing the segments, and
-    /// invoking the callback function.
+    /// Completes the `Bio` by consuming `self`, releasing the segments, invoking
+    /// the callback function, and publishing the final status.
+    ///
+    /// The final status becomes visible only after the callback returns.
     ///
     /// When the driver finishes the request for this `Bio`, it will call this method.
     pub fn complete(mut self, status: BioStatus) {
@@ -575,7 +577,7 @@ impl BioMetadata {
         &self.sid_range
     }
 
-    pub fn status(&self) -> BioStatus {
+    fn status(&self) -> BioStatus {
         BioStatus::try_from(self.status.load(Ordering::Acquire)).unwrap()
     }
 }
@@ -667,7 +669,7 @@ pub struct BioSegment {
 struct BioSegmentInner {
     /// Internal DMA slice.
     // TODO: The direction is currently `FromAndToDevice`. Implement compile-time checking.
-    storage: Slice<DmaBuffer<FromAndToDevice>>,
+    storage: Slice<Arc<DmaBuffer<FromAndToDevice>>>,
     direction: BioDirection,
 }
 
@@ -727,7 +729,10 @@ impl BioSegment {
             .unwrap_or_else(|| {
                 let dma_stream = DmaStream::alloc_uninit(nblocks, false).unwrap();
                 BioSegmentInner {
-                    storage: Slice::new(DmaBuffer::Direct(dma_stream), offset..offset + len),
+                    storage: Slice::new(
+                        Arc::new(DmaBuffer::Direct(dma_stream)),
+                        offset..offset + len,
+                    ),
                     direction,
                 }
             });
@@ -748,7 +753,7 @@ impl BioSegment {
         let dma_stream = DmaStream::map(segment, false).unwrap();
         Self {
             inner: Arc::new(BioSegmentInner {
-                storage: Slice::new(DmaBuffer::Direct(dma_stream), 0..len),
+                storage: Slice::new(Arc::new(DmaBuffer::Direct(dma_stream)), 0..len),
                 direction,
             }),
         }
@@ -774,9 +779,9 @@ impl BioSegment {
         self.inner.dma_slice().offset().start % BLOCK_SIZE
     }
 
-    /// Returns the inner DMA slice.
-    pub fn inner_dma_slice(&self) -> &Slice<Arc<DmaStream>> {
-        &self.inner.dma_slice
+    /// Returns the DMA slice.
+    pub fn dma_slice(&self) -> &Slice<Arc<DmaBuffer<FromAndToDevice>>> {
+        self.inner.dma_slice()
     }
 
     /// Creates a sector-aligned subsegment sharing the underlying DMA allocation.
@@ -787,19 +792,10 @@ impl BioSegment {
         }
         Self {
             inner: Arc::new(BioSegmentInner {
-                dma_slice: self.inner.dma_slice.slice(range),
+                storage: self.inner.dma_slice().slice(range),
                 direction: self.inner.direction,
-                from_pool: false,
             }),
         }
-    }
-
-    /// Returns the inner DMA object.
-    ///
-    /// Note that the slicing will be ignored. This is only for testing.
-    #[cfg(ktest)]
-    pub fn inner_dma(&self) -> &Arc<DmaStream> {
-        self.inner.dma_slice.mem_obj()
     }
 }
 
@@ -822,7 +818,7 @@ impl HasVmReaderWriter for BioSegment {
 }
 
 impl BioSegmentInner {
-    fn dma_slice(&self) -> &Slice<DmaBuffer<FromAndToDevice>> {
+    fn dma_slice(&self) -> &Slice<Arc<DmaBuffer<FromAndToDevice>>> {
         &self.storage
     }
 }
@@ -877,7 +873,7 @@ impl BioSegmentPool {
         let arena = self.arena_pool.alloc(nblocks)?;
         Some(BioSegmentInner {
             storage: Slice::new(
-                DmaBuffer::Arena(arena),
+                Arc::new(DmaBuffer::Arena(arena)),
                 offset_within_first_block..offset_within_first_block + len,
             ),
             direction: self.direction,

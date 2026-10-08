@@ -18,7 +18,6 @@ pub(crate) use registry::{
     block_mapper_alias_is_published, block_open_count, lookup, publish_block_mapper_alias,
     register_block_mapper_primary, rename_block_mapper, unregister_block_mapper,
 };
-use spin::Once;
 
 use crate::{
     fs::{devtmpfs::DevtmpfsNodeMeta, file::PerOpenFileOps},
@@ -36,8 +35,7 @@ pub trait Device: Send + Sync + 'static {
     /// Returns the metadata that specifies a device inode to be created in devtmpfs, if any.
     fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta>;
 
-    /// Opens the device, returning a file-like object that the userspace can interact with by
-    /// doing I/O.
+    /// Opens the device, returning a file-like object that userspace can interact with by I/O.
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>>;
 }
 
@@ -51,8 +49,8 @@ impl Debug for dyn Device {
     }
 }
 
-/// Device type
-#[derive(Debug)]
+/// Device type.
+#[derive(Clone, Copy, Debug)]
 pub enum DeviceType {
     Char,
     Block,

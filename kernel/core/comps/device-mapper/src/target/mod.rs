@@ -347,8 +347,8 @@ mod tests {
             }
         }
 
-        fn name(&self) -> String {
-            String::from("target-parser-test")
+        fn name(&self) -> &str {
+            "target-parser-test"
         }
 
         fn id(&self) -> DeviceId {

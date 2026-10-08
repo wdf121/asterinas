@@ -27,11 +27,7 @@ members = [
     "ostd/libs/ostd-test",
     "ostd/libs/padding-struct",
     "kernel",
-    "kernel/comps/block",
-    "kernel/comps/cmdline",
-    "kernel/comps/console",
-    "kernel/comps/device-mapper",
-    "kernel/comps/framebuffer",
+    "kernel/comps/drm",
     "kernel/comps/i8042",
     "kernel/comps/simpledrm",
     "kernel/comps/uart",
@@ -40,6 +36,7 @@ members = [
     "kernel/core/comps/cmdline",
     "kernel/core/comps/console",
     "kernel/core/comps/device",
+    "kernel/core/comps/device-mapper",
     "kernel/core/comps/framebuffer",
     "kernel/core/comps/input",
     "kernel/core/comps/logger",
@@ -86,11 +83,7 @@ default-members = [
     "osdk/deps/test-kernel",
     "ostd",
     "kernel",
-    "kernel/comps/block",
-    "kernel/comps/cmdline",
-    "kernel/comps/console",
-    "kernel/comps/device-mapper",
-    "kernel/comps/framebuffer",
+    "kernel/comps/drm",
     "kernel/comps/i8042",
     "kernel/comps/simpledrm",
     "kernel/comps/uart",
@@ -99,6 +92,7 @@ default-members = [
     "kernel/core/comps/cmdline",
     "kernel/core/comps/console",
     "kernel/core/comps/device",
+    "kernel/core/comps/device-mapper",
     "kernel/core/comps/framebuffer",
     "kernel/core/comps/input",
     "kernel/core/comps/logger",
@@ -176,11 +170,7 @@ padding-struct = { path = "ostd/libs/padding-struct", version = "0.2.0" }
 aster-core = { path = "kernel/core", default-features = false }
 
 # Crates under kernel/comps
-aster-block = { path = "kernel/comps/block" }
-aster-cmdline = { path = "kernel/comps/cmdline" }
-aster-console = { path = "kernel/comps/console" }
-aster-device-mapper = { path = "kernel/comps/device-mapper" }
-aster-framebuffer = { path = "kernel/comps/framebuffer" }
+aster-drm = { path = "kernel/comps/drm" }
 aster-i8042 = { path = "kernel/comps/i8042" }
 aster-simpledrm = { path = "kernel/comps/simpledrm" }
 aster-uart = { path = "kernel/comps/uart" }
@@ -190,6 +180,7 @@ aster-block = { path = "kernel/core/comps/block" }
 aster-cmdline = { path = "kernel/core/comps/cmdline" }
 aster-console = { path = "kernel/core/comps/console" }
 aster-device = { path = "kernel/core/comps/device" }
+aster-device-mapper = { path = "kernel/core/comps/device-mapper" }
 aster-framebuffer = { path = "kernel/core/comps/framebuffer" }
 aster-input = { path = "kernel/core/comps/input" }
 aster-logger = { path = "kernel/core/comps/logger" }

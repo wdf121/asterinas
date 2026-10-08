@@ -8,9 +8,11 @@
 # Other arguments are configured via environmental variables:
 #  - OVMF: "on" or "off";
 #  - FORCE_OVMF: "on" to keep OVMF enabled regardless of boot method;
-#  - BOOT_METHOD: "qemu-direct", "grub-rescue-iso" or "grub-qcow2";
-#  - BOOT_PROTOCOL: "multiboot", "multiboot2", "linux-legacy32", "linux-efi-pe64" or "linux-efi-handover64";
-#  - NETDEV: "user" or "tap";
+#  - OVMF_DIR: directory containing OVMF.fd, OVMF_VARS.fd and microvm/MICROVM.fd;
+#  - BOOT_METHOD: "vmm-direct", "grub-rescue-iso" or "grub-qcow2";
+#  - BOOT_PROTOCOL: "multiboot", "multiboot2", "pvh", "linux-legacy32", "linux-efi-pe64" or "linux-efi-handover64";
+#  - NETDEV: "user", "tap" or "none" ("none" is not supported by microvm);
+#  - QEMU_DISPLAY: QEMU display backend, default is "vnc=0.0.0.0:$VNC_PORT", or "none" to disable it;
 #  - VHOST: "off" or "on";
 #  - VSOCK: "off" or "on";
 #  - VIRTIOFS: "off" or "on";
@@ -30,6 +32,9 @@
 
 OVMF=${OVMF:-"on"}
 FORCE_OVMF=${FORCE_OVMF:-"off"}
+# Directory holding OVMF.fd, OVMF_VARS.fd and microvm/MICROVM.fd. Defaults to the
+# Docker image's path; the Nix dev shell exports this to the Nix store instead.
+OVMF_DIR=${OVMF_DIR:-/root/ovmf/release}
 VHOST=${VHOST:-"off"}
 VSOCK=${VSOCK:-"off"}
 VIRTIOFS=${VIRTIOFS:-"off"}
@@ -154,6 +159,39 @@ else
     KVM_ARGS=""
 fi
 
+if [ "$1" = "aarch64" ]; then
+    # QEMU in KVM mode on a native aarch64 host only accepts host-compatible
+    # CPU models (e.g. `host` or `max`).
+    if [ "${ENABLE_KVM:-1}" = "1" ] && [ -e /dev/kvm ] && [ "$(uname -m)" = "aarch64" ]; then
+        CPU_MODEL=host
+    else
+        CPU_MODEL=cortex-a72
+    fi
+    QEMU_ARGS="\
+        $KVM_ARGS \
+        -cpu ${CPU_MODEL} \
+        -machine virt,gic-version=3 \
+        -m ${MEM:-8G} \
+        -smp ${SMP:-1} \
+        --no-reboot \
+        -nographic \
+        -display none \
+        -monitor chardev:mux \
+        -chardev stdio,id=mux,mux=on,signal=off,logfile=qemu.log \
+        -drive if=none,format=raw,id=x0,file=./test/initramfs/build/ext2.img \
+        -drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img \
+        -drive if=none,format=raw,id=x2,file=./test/initramfs/build/ltp_dev.img \
+        -device virtio-blk-device,drive=x2 \
+        -device virtio-blk-device,drive=x1 \
+        -device virtio-blk-device,drive=x0 \
+        -device virtio-keyboard-device \
+        -device virtio-serial-device \
+        $CONSOLE_ARGS \
+    "
+    echo $QEMU_ARGS
+    exit 0
+fi
+
 if [ "$1" = "tdx" ]; then
     if [ "${ENABLE_KVM}" != "1" ]; then
         echo "TDX requires ENABLE_KVM=1" 1>&2
@@ -201,7 +239,7 @@ fi
 
 COMMON_QEMU_ARGS="\
     $KVM_ARGS \
-    -cpu Icelake-Server,+x2apic \
+    -cpu Icelake-Server,+x2apic,+vmx \
     -smp ${SMP:-1} \
     -m ${MEM:-8G} \
     --no-reboot \
@@ -338,7 +376,7 @@ fi
 # linux-efi-* protocols require OVMF; other protocols (e.g. multiboot) do not.
 if [ "$FORCE_OVMF" = "on" ]; then
     OVMF="on"
-elif [ "$BOOT_METHOD" = "qemu-direct" ]; then
+elif [ "$BOOT_METHOD" = "vmm-direct" ]; then
     if [ "$BOOT_PROTOCOL" = "linux-efi-pe64" ] || [ "$BOOT_PROTOCOL" = "linux-efi-handover64" ]; then
         OVMF="on"
     else

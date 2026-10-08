@@ -218,7 +218,7 @@ impl QueryWorkflow {
         (
             DeviceSnapshot {
                 id: device.id(),
-                name: device.name(),
+                name: device.mapper_name(),
                 uuid: device.uuid(),
                 status,
             },
@@ -329,7 +329,9 @@ impl<'a> ControlWorkflow<'a> {
         unregister_runtime(device)?;
         device.fail_postponed_bios();
         device.notify_event();
-        self.manager.remove(&device.name()).map_err(map_dm_error)?;
+        self.manager
+            .remove(&device.mapper_name())
+            .map_err(map_dm_error)?;
         Ok(())
     }
 
@@ -366,7 +368,7 @@ impl<'a> ControlWorkflow<'a> {
                     ));
                 }
                 self.manager
-                    .rename_uuid(&device.name(), uuid.clone())
+                    .rename_uuid(&device.mapper_name(), uuid.clone())
                     .map_err(map_dm_error)
             }
             RenameRequest::Name(new_name) => {
@@ -377,7 +379,7 @@ impl<'a> ControlWorkflow<'a> {
                     runtime.rename(device, new_name)
                 } else {
                     self.manager
-                        .rename(&device.name(), new_name)
+                        .rename(&device.mapper_name(), new_name)
                         .map_err(map_dm_error)
                 }
             }

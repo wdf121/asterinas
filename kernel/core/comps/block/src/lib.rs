@@ -49,10 +49,6 @@ pub mod request_queue;
 
 use ::device_id::DeviceId;
 use component::{ComponentInitError, init_component};
-pub use device_id::{
-    EXTENDED_DEVICE_ID_ALLOCATOR, MajorIdOwner, acquire_major, acquire_major_with_name,
-    allocate_major, allocate_major_with_name, major_devices,
-};
 use ostd::sync::Mutex;
 
 #[derive(Debug)]
@@ -213,7 +209,10 @@ use self::{
     prelude::*,
 };
 pub use self::{
-    device_id::{MAX_MAJOR, MajorIdOwner, acquire_major, allocate_major},
+    device_id::{
+        MAX_MAJOR, MajorIdOwner, acquire_major, acquire_major_with_name, allocate_major,
+        allocate_major_with_name, major_devices,
+    },
     partition::PartitionManager,
 };
 
@@ -235,7 +234,7 @@ pub trait BlockDevice: Send + Sync + Any + Debug {
     fn metadata(&self) -> BlockDeviceMeta;
 
     /// Returns the name of the block device.
-    fn name(&self) -> String;
+    fn name(&self) -> &str;
 
     /// Returns the device ID of the block device.
     fn id(&self) -> DeviceId;
@@ -584,8 +583,8 @@ mod tests {
             BlockDeviceMeta::default()
         }
 
-        fn name(&self) -> String {
-            String::from("block-registry-test")
+        fn name(&self) -> &str {
+            "block-registry-test"
         }
 
         fn id(&self) -> DeviceId {
@@ -617,8 +616,8 @@ mod tests {
             BlockDeviceMeta::default()
         }
 
-        fn name(&self) -> String {
-            String::from("block-registry-reentrant-id-test")
+        fn name(&self) -> &str {
+            "block-registry-reentrant-id-test"
         }
 
         fn id(&self) -> DeviceId {

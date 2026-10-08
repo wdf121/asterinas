@@ -683,31 +683,27 @@ impl DirDentry<'_> {
         Ok(())
     }
 
-    /// 仅当当前目录项仍指向预期 inode 时删除它。
-    pub(super) fn unlink_if_matches(
-        &self,
-        name: &str,
-        expected_inode: &Arc<dyn Inode>,
-    ) -> Result<()> {
+    /// Deletes `expected` only if `name` still names the same dentry.
+    pub(super) fn unlink_if_matches(&self, name: &str, expected: &Dentry) -> Result<()> {
         if is_dot_or_dotdot(name) {
             return_errno_with_message!(Errno::EISDIR, "unlink on . or ..");
         }
 
         let dir_inode = self.inode();
-        let child_inode = self.remove_child(name, |dir_inode, name| {
-            let current_inode = dir_inode.lookup(name)?;
-            if !Arc::ptr_eq(&current_inode, expected_inode) {
+        let child_dentry = self.remove_child(name, |dir_inode, child| {
+            if !core::ptr::eq(child, expected) {
                 return_errno_with_message!(Errno::ESTALE, "the directory entry was replaced");
             }
-            dir_inode.unlink(name)
+            dir_inode.unlink(child)
         })?;
+        let child_inode = child_dentry.inode();
 
         let nlinks = child_inode.metadata()?.nr_hard_links;
-        fs::vfs::notify::on_link_count(&child_inode);
+        fs::vfs::notify::on_link_count(child_inode);
         if nlinks == 0 {
-            fs::vfs::notify::on_inode_removed(&child_inode);
+            fs::vfs::notify::on_inode_removed(child_inode);
         }
-        fs::vfs::notify::on_delete(dir_inode, &child_inode, || name.to_string());
+        fs::vfs::notify::on_delete(dir_inode, child_inode, || name.to_string());
         if nlinks == 0 {
             let publisher = child_inode.fs_event_publisher_or_init();
             let removed_nr_subscribers = publisher.disable_new_and_remove_subscribers();
@@ -719,12 +715,8 @@ impl DirDentry<'_> {
         Ok(())
     }
 
-    /// 仅当当前目录项仍指向预期 inode 时删除空目录。
-    pub(super) fn rmdir_if_matches(
-        &self,
-        name: &str,
-        expected_inode: &Arc<dyn Inode>,
-    ) -> Result<()> {
+    /// Removes the empty `expected` directory only if `name` still names it.
+    pub(super) fn rmdir_if_matches(&self, name: &str, expected: &Dentry) -> Result<()> {
         if is_dot(name) {
             return_errno_with_message!(Errno::EINVAL, "rmdir on .");
         }
@@ -733,19 +725,19 @@ impl DirDentry<'_> {
         }
 
         let dir_inode = self.inode();
-        let child_inode = self.remove_child(name, |dir_inode, name| {
-            let current_inode = dir_inode.lookup(name)?;
-            if !Arc::ptr_eq(&current_inode, expected_inode) {
+        let child_dentry = self.remove_child(name, |dir_inode, child| {
+            if !core::ptr::eq(child, expected) {
                 return_errno_with_message!(Errno::ESTALE, "the directory entry was replaced");
             }
-            dir_inode.rmdir(name)
+            dir_inode.rmdir(child)
         })?;
+        let child_inode = child_dentry.inode();
 
         let nlinks = child_inode.metadata()?.nr_hard_links;
         if nlinks == 0 {
-            fs::vfs::notify::on_inode_removed(&child_inode);
+            fs::vfs::notify::on_inode_removed(child_inode);
         }
-        fs::vfs::notify::on_delete(dir_inode, &child_inode, || name.to_string());
+        fs::vfs::notify::on_delete(dir_inode, child_inode, || name.to_string());
         if nlinks == 0 {
             let publisher = child_inode.fs_event_publisher_or_init();
             let removed_nr_subscribers = publisher.disable_new_and_remove_subscribers();
@@ -843,6 +835,18 @@ impl DirDentry<'_> {
         new_name: &str,
         mode: RenameMode,
     ) -> Result<()> {
+        self.rename_if_matches(old_name, None, new_dir, new_name, mode)
+    }
+
+    /// Renames `expected` only if `old_name` still resolves to the same dentry.
+    pub(super) fn rename_if_matches(
+        &self,
+        old_name: &str,
+        expected: Option<&Dentry>,
+        new_dir: &DirDentry,
+        new_name: &str,
+        mode: RenameMode,
+    ) -> Result<()> {
         if is_dot_or_dotdot(old_name) {
             return_errno_with_message!(Errno::EBUSY, "old_name is . or ..");
         }
@@ -875,6 +879,11 @@ impl DirDentry<'_> {
             let mut children = self.children.write();
 
             let old_dentry = self.resolve_child_for_rename(&mut children, old_name)?;
+            if let Some(expected) = expected
+                && !core::ptr::eq(old_dentry.as_ref(), expected)
+            {
+                return_errno_with_message!(Errno::ESTALE, "the directory entry was replaced");
+            }
             let old_inode = old_dentry.inode();
             let new_dentry = match self.resolve_child_for_rename(&mut children, new_name) {
                 Ok(new_dentry) => {
@@ -929,6 +938,11 @@ impl DirDentry<'_> {
                 write_lock_children_on_two_dentries(self, new_dir);
 
             let old_dentry = self.resolve_child_for_rename(&mut old_children, old_name)?;
+            if let Some(expected) = expected
+                && !core::ptr::eq(old_dentry.as_ref(), expected)
+            {
+                return_errno_with_message!(Errno::ESTALE, "the directory entry was replaced");
+            }
             let old_inode = old_dentry.inode();
             let new_dentry = match new_dir.resolve_child_for_rename(&mut new_children, new_name) {
                 Ok(new_dentry) => {

@@ -37,6 +37,7 @@
   environment.systemPackages = with pkgs; [
     aster-test-disk-locator
     e2fsprogs
+    gitMinimal
     hello-asterinas
     lvm2
     strace

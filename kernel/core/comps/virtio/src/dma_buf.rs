@@ -69,6 +69,12 @@ impl<D: DmaDirection> DmaBuf for Slice<DmaBuffer<D>> {
     }
 }
 
+impl<D: DmaDirection> DmaBuf for Slice<Arc<DmaBuffer<D>>> {
+    fn len(&self) -> usize {
+        self.size()
+    }
+}
+
 impl DmaBuf for TxBuffer {
     fn len(&self) -> usize {
         self.size()

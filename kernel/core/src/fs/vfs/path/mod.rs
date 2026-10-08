@@ -787,24 +787,24 @@ impl Path {
         dir_dentry.unlink(name)
     }
 
-    /// 仅当名称仍指向预期路径的 inode 时删除目录项。
+    /// Deletes a name only if it still names the expected dentry.
     pub(crate) fn unlink_if_matches(&self, name: &str, expected: &Self) -> Result<()> {
         if !Arc::ptr_eq(&self.mount, &expected.mount) {
             return_errno_with_message!(Errno::EXDEV, "the operation cannot cross mounts");
         }
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         self.check_dir_entry_mutation()?;
-        dir_dentry.unlink_if_matches(name, expected.inode())
+        dir_dentry.unlink_if_matches(name, &expected.dentry)
     }
 
-    /// 仅当名称仍指向预期路径的 inode 时删除空目录。
+    /// Removes a directory only if it still names the expected dentry.
     pub(crate) fn rmdir_if_matches(&self, name: &str, expected: &Self) -> Result<()> {
         if !Arc::ptr_eq(&self.mount, &expected.mount) {
             return_errno_with_message!(Errno::EXDEV, "the operation cannot cross mounts");
         }
         let dir_dentry = self.dentry.as_dir_dentry_or_err()?;
         self.check_dir_entry_mutation()?;
-        dir_dentry.rmdir_if_matches(name, expected.inode())
+        dir_dentry.rmdir_if_matches(name, &expected.dentry)
     }
 
     /// Removes a directory by `rmdir()` the inner inode.
@@ -835,6 +835,35 @@ impl Path {
         }
 
         old_dir_dentry.rename(old_name, &new_dir_dentry, new_name, mode)
+    }
+
+    /// Renames a name with no-replace or replacement semantics only if the
+    /// source directory entry is still `expected`.
+    pub(crate) fn rename_if_matches(
+        &self,
+        old_name: &str,
+        expected: &Self,
+        new_dir: &Self,
+        new_name: &str,
+        mode: RenameMode,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(&self.mount, &expected.mount) || !Arc::ptr_eq(&self.mount, &new_dir.mount) {
+            return_errno_with_message!(Errno::EXDEV, "the operation cannot cross mounts");
+        }
+
+        let old_dir_dentry = self.dentry.as_dir_dentry_or_err()?;
+        let new_dir_dentry = new_dir.dentry.as_dir_dentry_or_err()?;
+        self.check_dir_entry_mutation()?;
+        if !Arc::ptr_eq(&self.dentry, &new_dir.dentry) {
+            new_dir.check_dir_entry_mutation()?;
+        }
+        old_dir_dentry.rename_if_matches(
+            old_name,
+            Some(&expected.dentry),
+            &new_dir_dentry,
+            new_name,
+            mode,
+        )
     }
 }
 

@@ -1,8 +1,19 @@
-{ target ? "x86_64", enableBenchmarkTest ? false, enableConformanceTest ? false
-, enableRegressionTest ? false, enableTdxAttest ? false
-, conformanceTestSuite ? "ltp", conformanceTestWorkDir ? "/tmp"
-, regressionTestPlatform ? "asterinas", dnsServer ? "none", smp ? 1
-, initramfsCompressed ? true, }:
+{
+  target ? "x86_64",
+  enableBenchmarkTest ? false,
+  enableConformanceTest ? false,
+  enableRegressionTest ? false,
+  enableTdxAttest ? false,
+  conformanceTestSuite ? "ltp",
+  conformanceTestWorkDir ? "/tmp",
+  conformanceTestSelector ? "",
+  regressionTestPlatform ? "asterinas",
+  dnsServer ? "none",
+  smp ? 1,
+  initramfsCompressed ? true,
+  benchmarkName ? "none",
+  system ? builtins.currentSystem,
+}:
 let
   crossSystem.config =
     if target == "x86_64" then

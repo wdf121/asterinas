@@ -406,8 +406,8 @@ mod tests {
             }
         }
 
-        fn name(&self) -> String {
-            String::from("range-wrapper-test")
+        fn name(&self) -> &str {
+            "range-wrapper-test"
         }
 
         fn id(&self) -> DeviceId {

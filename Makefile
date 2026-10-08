@@ -7,10 +7,11 @@ TARGET_ARCH ?= x86_64
 BENCHMARK ?= none
 BOOT_METHOD ?= grub-rescue-iso
 BOOT_PROTOCOL ?= multiboot2
+ENABLE_KVM ?= 1
 INTEL_TDX ?= 0
 MEM ?= 8G
 OVMF ?= on
-RELEASE ?= 1
+RELEASE ?= 0
 RELEASE_LTO ?= 0
 LOG_LEVEL ?= error
 SCHEME ?= ""
@@ -79,8 +80,6 @@ XFSTESTS_DISK_SIZE ?= 12G
 
 # Specify whether to build regression tests under `test/initramfs/src/regression`.
 ENABLE_REGRESSION_TEST ?= false
-# Whitespace-separated regression directories or executable paths to run; empty runs all.
-REGRESSION_TESTS ?=
 # End of auto test features.
 
 # Network settings
@@ -158,7 +157,7 @@ CARGO_OSDK_BUILD_ARGS += --init-args="/opt/run_conformance_test.sh"
 else ifeq ($(AUTO_TEST), regression)
 ENABLE_REGRESSION_TEST := true
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="INTEL_TDX=$(INTEL_TDX)"
-CARGO_OSDK_BUILD_ARGS += --init-args="/test/run_regression_test.sh $(REGRESSION_TESTS)"
+CARGO_OSDK_BUILD_ARGS += --init-args="/test/run_regression_test.sh"
 else ifeq ($(AUTO_TEST), boot)
 CARGO_OSDK_BUILD_ARGS += --init-args="/test/boot_hello.sh"
 else ifeq ($(AUTO_TEST), vsock)
@@ -244,6 +243,12 @@ else ifeq ($(BOOT_PROTOCOL), pvh)
 # PVH uses the vmm-direct boot method, so there is no GRUB boot protocol to pass.
 else
 CARGO_OSDK_COMMON_ARGS += --grub-boot-protocol=$(BOOT_PROTOCOL)
+endif
+
+ifeq ($(ENABLE_KVM), 1)
+	ifeq ($(shell [ -e /dev/kvm ] && [ "$$(uname -m)" = "$(TARGET_ARCH)" ] && echo yes),yes)
+	CARGO_OSDK_COMMON_ARGS += --qemu-args="-accel kvm"
+	endif
 endif
 
 # Skip GZIP to make encoding and decoding of initramfs faster
@@ -391,22 +396,6 @@ run_nixos:
     else \
         ./tools/nixos/run.sh nixos; \
     fi
-
-.PHONY: rm_dm
-rm_dm:
-	@if [ -n "$${DM_TEST_IMAGES:-}" ]; then \
-		images=( $$DM_TEST_IMAGES ); \
-	else \
-		shopt -s nullglob; \
-		images=(target/nixos/test.img target/nixos/test[0-9]*.img); \
-	fi; \
-	if [ "$${#images[@]}" -gt 0 ]; then \
-		echo "Removing Device Mapper test images:"; \
-		printf '%s\n' "$${images[@]}"; \
-		rm -f "$${images[@]}"; \
-	else \
-		echo "No Device Mapper test images to remove"; \
-	fi
 
 # Build the Asterinas NixOS patched packages
 cachix:

@@ -152,8 +152,8 @@ impl BlockDevice for Ext2MemoryDisk {
         }
     }
 
-    fn name(&self) -> String {
-        String::from("ext2-memory-disk")
+    fn name(&self) -> &str {
+        "ext2-memory-disk"
     }
 
     fn id(&self) -> DeviceId {

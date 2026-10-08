@@ -28,7 +28,7 @@ struct Hooks;
 impl KernelHooks for Hooks {
     fn create_devnode(&self, request: &DevNodeRequest) -> core::result::Result<(), HookError> {
         let node = to_devtmpfs_node(request).map_err(|_| HookError)?;
-        devtmpfs::create_node(node).map_err(|error| {
+        devtmpfs::create_node(node).map(|_| ()).map_err(|error| {
             warn!(
                 "failed to create devtmpfs node {:?}: {:?}",
                 request.path, error
