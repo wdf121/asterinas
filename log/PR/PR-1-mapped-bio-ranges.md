@@ -55,6 +55,45 @@ kernel/core/comps/block/src/request_queue.rs
 
 审阅重点：logical 与 mapped range 不得混用；连续性判断必须以 queue 所见 range 为准；失败映射不得部分修改 state。
 
+### 4.1 BIO 对象模型与学习要点（补充）
+
+本节是对本 PR 数据模型的学习/审阅补充，不改变第 3 节的正式范围和第 5 节的历史验证结论。
+
+#### 生命周期与共享边界
+
+`Bio` 是尚未交给 block device 的逻辑 I/O 请求：它持有请求类型、调用者可见的 sector range、数据 `segments` 和可选 completion callback。提交时，`Bio` 被消费并转换为 `SubmittedBio`；后者持有执行 I/O 所需的 `segments` 与 callback。完成时释放 segments、运行 callback、发布最终状态。
+
+`BioMetadata` 被 `Arc` 共享给 `SubmittedBio` 与等待方：它保存请求身份（`type_`、logical range）以及跨异步完成边界的状态（`status`、`wait_queue`）。因此它不是 request data buffer 的所有者，而是请求身份与完成状态的共享锚点。
+
+```text
+Bio ──submit──> SubmittedBio ──queue/driver──> complete
+  └────────────── Arc<BioMetadata> ──────────────┘
+                   ↑
+                IoBatch/waiter
+```
+
+#### 地址层级
+
+| 坐标 | 所在对象 | 可变性 | 含义 |
+|---|---|---|---|
+| logical range | `BioMetadata::sid_range` | 不可变 | 调用者最初向当前设备请求的范围 |
+| mapped range | `SubmittedBio::mapped_sid_range` | 可变 | 当前 block layer 转发给下一层的范围 |
+| queue-visible range | `BioRequest::sid_range` | 可因合并扩展 | 当前 queue 所服务设备实际处理的范围 |
+
+提交时 mapped range 从 logical range 复制初始化。partition 或后续 target 只变换 mapped range；新模型中的 request queue 直接使用该范围。因而“物理地址”只应理解为**当前设备层可处理的地址**，而不是分层栈中的全局绝对坐标。旧模型则保存 logical range 加单一 `sid_offset`，由 queue 临时计算其可处理范围。
+
+#### `status` 与 `wait_queue`
+
+`status` 是完成状态而不是调度位置：正常路径为 `Init → Submit → Complete/NotSupported/NoSpace/IoError`。`submit` 的 CAS 防止重复提交；enqueue 失败时状态回退为 `Init`。完成方在 callback 后以 release 语义发布最终状态，等待方以 acquire 语义读取它，从而将完成结果和此前 callback 的效果交给等待方。
+
+`wait_queue` 是等待 I/O 完成的任务队列：当状态仍为 `Submit`，等待方睡眠；完成方写入最终状态后 `wake_all`，等待方重新检查状态并映射为 I/O 结果。它不同于 `BioRequestSingleQueue`：后者保存等待 driver 消费的 I/O 请求，用于排队与合并；前者只负责通知提交者完成。
+
+#### `BioSegment` 与长度汇总
+
+一个 `BioSegment` 是带方向信息的 DMA 可访问有效内存 slice。DMA backing memory 按 block/page 粒度分配和池化（当前 pool 是每方向 `4096 × 4 KiB = 16 MiB`），而 block I/O 按 512 B sector 寻址和计量；segment 的有效 offset 与长度必须 sector 对齐。BIO/SubmittedBio 持有 segment 直到完成或丢弃，此后 backing memory 才能被回收或复用。`Vec<BioSegment>` 表示一次 I/O 可使用多段有效内存，不意味着每个 page 必然是一个 segment。
+
+`Bio::new` 通过每个 segment 的**有效**长度得到 `nsectors`，不以 backing allocation capacity 代替实际传输长度。PR 1 将原本的直接 `.sum()` 改为 `try_fold(0_u64, u64::checked_add)`，并对 logical range 终点使用 checked arithmetic。对于已分析的 pool 上界，单 BIO 的有效长度至多为 `32768 = 2^15` 个 sector，远低于 `u64` 的表示上界；因此这两处构造期 hardening 的可达性尚无支撑，且不直接服务于 mapped-range 主线。仍存在非 pool 映射入口，尚未完成全部调用路径审计；本记录只保留该范围判断，未据此修改源码或改变 PR 结论。
+
 ## 5. 验证证据
 
 ### 最终 HEAD `c14d68c93`
