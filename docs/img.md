@@ -18,7 +18,6 @@ flowchart TB
         subgraph DM_INIT["初始化 Device Mapper control"]
             direction TB
             C["初始化<br/>DM_MANAGER"]
-            D["构造 DM control<br/>字符设备"]
             E["绑定 Linux ABI<br/>设备号 10:236"]
             F["声明 devtmpfs 路径<br/>mapper/control"]
         end
