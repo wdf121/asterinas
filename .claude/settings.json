@@ -1,5 +1,17 @@
 {
   "attribution": {
     "commit": ""
+  },
+  "permissions": {
+    "allow": [
+      "Bash(docker exec -w /root/asterinas fork_Asterinas bash -lc 'make check')",
+      "Bash(docker exec -w /root/asterinas fork_Asterinas bash -lc 'clang-format -i test/initramfs/src/regression/fs/procfs/devices.c test/initramfs/src/regression/io/file_io/block_device.c test/initramfs/src/regression/device/device_mapper.c')"
+    ]
+  },
+  "autoMode": {
+    "allow": [
+      "$defaults",
+      "The user authorizes rustfmt source formatting and make check build-artifact writes in the existing fork_Asterinas container at /root/asterinas. Allow docker exec with exactly this container and working directory, directly invoking these commands or invoking bash -lc with a single such command. For rustfmt, allow only --edition 2024, --config skip_children=true, and explicit .rs file paths that resolve inside /root/asterinas; do not allow other configuration overrides or output paths. For make, allow only make check with no extra arguments or assignments. This authorization does not cover shell expansions, redirections, chained commands, other container writes, or changes to other permission restrictions."
+    ]
   }
 }
