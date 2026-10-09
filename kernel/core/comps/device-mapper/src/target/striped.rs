@@ -681,11 +681,13 @@ mod tests {
         })
     }
 
+    type MappedRangeRecord = (u64, u64, usize, u32, u64, u64);
+
     fn mapped_range(
         target: &StripedTarget,
         start: u64,
         end: u64,
-    ) -> Option<Vec<(u64, u64, usize, u32, u64, u64)>> {
+    ) -> Option<Vec<MappedRangeRecord>> {
         target
             .map_range(Sid::new(start)..Sid::new(end))
             .map(|parts| {

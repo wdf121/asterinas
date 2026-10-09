@@ -1385,7 +1385,7 @@ mod tests {
         let table = Arc::new(
             DmTable::new_targets_with_readonly(
                 vec![Box::new(
-                    crate::target::linear::LinearTarget::new(
+                    LinearTarget::new(
                         Sid::new(0),
                         128,
                         Sid::new(16),

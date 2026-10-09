@@ -311,7 +311,8 @@ fn validate_ioctl_buffer_layout(data_size: usize, data_start: usize) -> Result<(
     if !(DM_IOCTL_HEADER_SIZE..=DM_IOCTL_MAX_SIZE).contains(&data_size) {
         return_errno_with_message!(Errno::EINVAL, "dm_ioctl.data_size 超出允许范围");
     }
-    if data_start < DM_IOCTL_HEADER_SIZE || data_start > data_size || data_start % 8 != 0 {
+    if data_start < DM_IOCTL_HEADER_SIZE || data_start > data_size || !data_start.is_multiple_of(8)
+    {
         return_errno_with_message!(Errno::EINVAL, "dm_ioctl.data_start 无效或未按 8 字节对齐");
     }
     Ok(())
@@ -934,6 +935,7 @@ fn lookup_device_with_policy(buffer: &[u8], policy: DeviceLookupPolicy) -> Resul
     lookup_device_in_manager_with_policy(buffer, manager(), policy)
 }
 
+#[cfg(ktest)]
 fn lookup_device_in_manager(buffer: &[u8], manager: &DmManager) -> Result<Arc<DmDevice>> {
     lookup_device_in_manager_with_policy(buffer, manager, DeviceLookupPolicy::RejectIsolated)
 }
@@ -998,6 +1000,7 @@ fn with_current_device_lifecycle_with_policy<T>(
     with_current_device_lifecycle_in_with_policy(manager(), device, policy, operation)
 }
 
+#[cfg(ktest)]
 fn with_current_device_lifecycle_in<T>(
     manager: &DmManager,
     device: &Arc<DmDevice>,
@@ -1131,7 +1134,7 @@ fn validate_target_spec_next(data_start: usize, next: usize, buffer_len: usize) 
     if next == 0 {
         return Ok(buffer_len);
     }
-    if next < DM_TARGET_SPEC_SIZE || next % 8 != 0 {
+    if next < DM_TARGET_SPEC_SIZE || !next.is_multiple_of(8) {
         return_errno_with_message!(Errno::EINVAL, "dm_target_spec.next 无效");
     }
     let next_spec = data_start.checked_add(next).ok_or_else(invalid_buffer)?;

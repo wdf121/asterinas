@@ -26,6 +26,8 @@ use crate::{
     target::{DmTarget, DmTargetBox, TargetIoAction, linear::LinearTarget},
 };
 
+type BioPart<'a> = (Range<Sid>, &'a dyn DmTarget);
+
 /// A contiguous, immutable Device Mapper table installed on a mapped device.
 #[derive(Debug)]
 pub struct DmTable {
@@ -239,11 +241,7 @@ impl DmTable {
     }
 
     /// Splits a logical range at DM target boundaries before target-local remapping.
-    fn bio_parts(
-        &self,
-        start: Sid,
-        end: u64,
-    ) -> Result<Vec<(Range<Sid>, &dyn DmTarget)>, BioEnqueueError> {
+    fn bio_parts(&self, start: Sid, end: u64) -> Result<Vec<BioPart<'_>>, BioEnqueueError> {
         let mut cursor = start.to_raw();
         let mut parts = Vec::new();
         while cursor < end {
@@ -1702,7 +1700,7 @@ mod tests {
                 0,
                 4,
                 "1 4 1:1 0",
-                &[backing.clone()],
+                core::slice::from_ref(&backing),
             )])
             .unwrap(),
         );
