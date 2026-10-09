@@ -113,9 +113,13 @@ Run QEMU, ktest, and NixOS system tests serially to avoid image lock conflicts,
 especially around `test/initramfs/build/ext2.img`. For new NixOS system suite
 runs, set `GUEST_READY_TIMEOUT=40` and `GUEST_QEMU_TIMEOUT=180`: the former
 limits boot to the guest shell, while the latter limits the complete lifecycle
-of each QEMU guest. DM system suites inherit the Makefile default `RELEASE=1`.
-Use `RELEASE=0` only for an explicitly requested debugging run; debug-mode
-results are diagnostic evidence and do not replace release acceptance. If a
+of each QEMU guest. The root Makefile defaults to `RELEASE=0` (dev).
+DM system suites launch an existing NixOS root image via `make run_nixos`;
+they do not rebuild or install the current kernel source. Release acceptance
+requires an image built and installed from the intended source with an explicit
+release configuration. Record the image's source and profile; setting
+`RELEASE=1` only when launching a suite does not convert an existing dev image.
+Dev-mode results do not replace release acceptance. If a
 ktest/QEMU/NixOS run makes no relevant progress for about three minutes,
 suspect command filtering, wrong crate working directory, root `make ktest`
 argument override, missing KVM or initramfs arguments, leftover processes, or

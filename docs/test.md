@@ -1,12 +1,14 @@
 # Asterinas 开发测试手册
 
+各验证阶段的底层执行链见 [生产代码验证链路](production-code-validation-chain.md)。
+
 本文用于把**改动位置或行为**转换为可执行的测试动作：
 
 ```text
 改动位置或行为 → 最低测试层 → 命令 → 日志 → 通过判定 → 是否升级到下一层
 ```
 
-命令默认在仓库根目录执行。修改先通过静态准入；随后从最能定位问题的运行时层开始，不以更高层测试替代更低层的定点断言。
+命令默认在项目容器 `fork_Asterinas` 的仓库根目录 `/root/asterinas` 执行，只有标明的 crate-local 命令切换目录。修改先通过静态准入；随后从最能定位问题的运行时层开始，不以更高层测试替代更低层的定点断言。
 
 ## 1. 三个运行时测试层的分工
 
@@ -30,9 +32,23 @@
 
 `git diff --check` 覆盖 diff 的通用文本问题，`cargo fmt --check` 仅覆盖 Rust，`make check` 是项目聚合检查。三者都不证明内核已启动、用户 ABI 正确或端到端流程可用。
 
+2026-10-08 已在当日未提交修复上完成容器 `make check`（退出码 0）。当前 gate 对生产与 `--ktests` 配置分别运行 clippy，并运行 udeps；C 和 NixOS 部分在这里只检查测试源码，不运行 guest。尾随空白检查忽略二进制，typos 排除 `patches/**` 历史归档，其余源码与正式文档仍受检查。逐阶段执行链及 `udeps 0.1.61` 跨 target 重复包警告的解释见 [验证链路 §1.4](production-code-validation-chain.md#14-make-check-的完整静态检查链)，失败与修复文件清单见 [当日日志](../log/daily/2026-10-8.md)。
+
 ## 3. ktest：内核内部逻辑
 
-以下命令均已在项目容器内按所列执行目录实测通过，使用默认 dev 构建和本地依赖缓存。执行目录相对于容器仓库根目录 `/root/asterinas`；未实测的根 workspace 和 core 全量入口不列入此表。无 selector 的命令按当前目录选择测试 crate，执行前必须确认目录。
+以下 crate-local 命令保留原有实测入口，执行目录相对于容器仓库根目录 `/root/asterinas`。
+无 selector 的命令按当前目录选择测试 crate，执行前必须确认目录；历史通过结果不自动覆盖最新源码。
+定向结果必须同时确认目标匹配数量大于 0、目标测试零失败、整次命令退出码为 0；runner 枚举的测试总数和 `filtered out` 不计入实际通过数量。
+记录 HEAD、相关未提交源码差异、实际命令与独立保存的本轮日志；没有直接测试覆盖的改动应标明缺口，不能以邻近模块通过代替。
+
+上游同步默认保留 `make check`、`make kernel`，并按影响范围选取定向 ktest；范围包括新增、冲突解决及受接口、依赖或语义变化影响的代码，不能只看文本冲突。
+候选 `main` 在干净独立 worktree 中先验证上游适用的范围，集成后的 `dm` 追加 DM 专属回归；详见 [同步规则](upstream-sync.md#8-后续同步规则)。
+
+只有经讨论需要扩大范围时，才在仓库根目录执行完整 `make ktest`，由当前 `default-members` 决定范围。
+它自动依赖 initramfs，并在根 Makefile 中指定 `CONSOLE=ttyS0`，与下表手动命令的默认 `hvc0` 日志路径不同；完整结果须看整次命令输出与退出码，不能仅统计最后一次覆盖的 `qemu.log`。
+2026-10-08 的 VMX 测试修复和网络恢复证据见 [当日日志](../log/daily/2026-10-8.md)。
+该日完整 ktest 早于后续 lint 源码修复；10 月 8—9 日又对修复后工作区完成 DM component 87/0、core DM ioctl 81/0、devtmpfs 6/0、runtime registry 8/0、VMCS 1/0 的定向回归，各命令 exit 0。
+本轮结果与覆盖缺口见 [回归收尾日志](../log/daily/2026-10-9.md)，不代表 C/NixOS 回归或全仓验证通过。
 
 **默认回归清单**：DM、block 各运行一次 crate 全量，core 运行以下三个模块。
 
@@ -56,7 +72,8 @@
 | block component：partition 模块 | `kernel/core/comps/block` | `cargo osdk test aster_block::partition::tests` | `kernel/core/comps/block/src/partition.rs`：range BIO 偏移与溢出。 |
 | block component：request queue 模块 | `kernel/core/comps/block` | `cargo osdk test aster_block::request_queue::tests` | `kernel/core/comps/block/src/request_queue.rs`：range 合并与 segment 上限。 |
 
-以下 console/日志说明适用于当前默认 x86_64、非 TDX 配置。ktest 结果经 early serial 输出，不能与普通内核的 `/dev/console` 选择混为一谈。
+下表只说明上述手动 crate-local 命令在默认 x86_64、非 TDX 配置下的 console/日志行为；根 `make ktest` 默认指定 `CONSOLE=ttyS0`，不适用表中的默认 `hvc0` 路径。
+ktest 结果经 early serial 输出，不能与普通内核的 `/dev/console` 选择混为一谈。
 
 | 参数 / 日志 | 默认或写法 | 作用 | 手动查看 |
 |---|---|---|---|
@@ -87,7 +104,8 @@ C 测试源码
 
 ### 4.1 执行环境与准备
 
-2026-09-28 已在 `fork_Asterinas` 的 `/root/asterinas`、当前 `dm` SHA `78f4eb24a` 上重跑 focused Device Mapper C 回归。除非命令明确包含 `docker exec`，本节命令均从该容器内的仓库根目录执行；其他历史测试结果仍须以各自执行 SHA 和日志判断。
+2026-09-28 已在 `fork_Asterinas` 的 `/root/asterinas`、当时的 `dm` SHA `78f4eb24a` 上重跑 focused Device Mapper C 回归；这不是当前 HEAD 的复测结果。
+除非命令明确包含 `docker exec`，本节命令均从该容器内的仓库根目录执行；其他历史测试结果仍须以各自执行 SHA 和日志判断。
 
 运行前确认没有其他 QEMU、ktest 或 NixOS 测试占用测试镜像；这些测试必须串行运行。可在宿主机检查：
 
@@ -126,7 +144,7 @@ CARGO_NET_OFFLINE=true RELEASE=1 AUTO_TEST=regression \
 | `AUTO_TEST=regression` | 必须显式设置；默认值为 `none`。 | 构建 regression C ELF，并让 guest 启动后进入 initramfs regression runner。 |
 | `REGRESSION_TESTS=device/device_mapper` | focused 回归必须设置；省略时运行全量 regression。 | 让 runner 直接执行 `/test/device/device_mapper`。 |
 | `CARGO_NET_OFFLINE=true` | 可选。 | Cargo 仅使用本地依赖缓存，缓存缺失时直接报错。 |
-| `RELEASE=1` | 可选；当前默认值就是 `1`。 | 明确使用 release 配置，避免外部环境覆盖默认值。 |
+| `RELEASE=1` | release 验收时显式指定。 | 当前根 Makefile 默认 `RELEASE=0`；历史命令中的 `RELEASE=1` 不能解释为当前裸 `make run_kernel` 的默认值。 |
 | `INTEL_TDX=0` | 可选；当前默认值就是 `0`。 | 明确使用非 TDX 配置，避免外部环境覆盖默认值。 |
 | `make run_kernel` | 必须执行的 Make target。 | 构建内核和 initramfs，启动 QEMU，并等待 guest 回归结束。 |
 
@@ -250,12 +268,16 @@ Device Mapper 系统测试启动完整 NixOS guest，通过真实 `dmsetup`、LV
 
 | 准备项 | 命令或默认值 | 判定与说明 |
 |---|---|---|
-| 构建 NixOS 根盘 | `make nixos` | 首次运行或根盘不存在时执行。 |
+| 构建 NixOS 根盘 | `RELEASE=1 make nixos` | release 验收前从待验源码构建并安装内核到根盘；普通调试构建与 release 验收分开记录。已有镜像也必须核对源码版本与构建配置，不能只检查文件存在。 |
 | 检查根盘 | `test -f target/nixos/asterinas.img` | 退出码必须为 0；该镜像是 guest 根盘，不能作为测试盘。 |
 | 创建测试盘目录 | `mkdir -p target/nixos/dm-test` | 建议把一次性 DM 测试盘集中放在该目录。 |
 | 检查并发任务 | `pgrep -af 'qemu-system|cargo osdk test|make run_kernel|make run_nixos'` | 六项测试不能与 QEMU、ktest、C 回归或其他 NixOS 测试并发。已有 QEMU 时脚本会报告 `existing_qemu`。 |
 | 默认 guest 就绪时限 | `GUEST_READY_TIMEOUT=40` | 每次 guest shell 未在时限内就绪时失败。 |
 | 默认 QEMU 生命周期时限 | `GUEST_QEMU_TIMEOUT=180` | 适用于每次 guest 的启动、命令注入、测试执行和关机。 |
+
+当前六项 DM suite 经 `myshell/lib/dm_nixos_test.sh` 调用 `make run_nixos`，由 `tools/nixos/run.sh` 启动已有根盘；这条路径不自动重新构建或安装当前源码。
+因此，在 suite 命令前设置 `RELEASE=1` 不能把已有 dev 镜像变成 release 镜像；必须记录根盘中内核的构建来源、profile，以及 suite 的本轮结果。
+根 Makefile 当前默认 `RELEASE=0`，不能将旧说明中的“继承默认 release”作为验收依据。
 
 测试盘是 host 上的普通 raw 镜像，由 `tools/nixos/run.sh` 作为独立 virtio-blk 设备附加给 guest。测试会覆盖扇区并创建或清除 LVM 元数据，**绝不能使用 NixOS 根盘、业务盘或需要保留内容的镜像。**
 

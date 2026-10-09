@@ -8,6 +8,8 @@
 
 - `cargo fmt --all --check` 证明 Rust 代码格式没有偏离 rustfmt 输出。
 - `git diff --check` 证明当前 diff 没有 Git 能识别的空白错误和冲突 marker。
+- `make check` 聚合静态检查，包含生产/ktest 配置的 clippy、依赖使用、Rust/C/Nix 格式和拼写；它不运行 guest 测试。
+- `make kernel` 构建普通内核与启动产物，不启动 QEMU，也不证明用户态回归通过。
 - `make ktest` 证明被选中的 kernel crate 能被 OSDK 构造成测试内核，并在 QEMU 中由 ktest runner 执行。
 - DM 系统测试证明真实 NixOS guest 内的 `dmsetup`、LVM2、文件系统和真实 block device I/O 链路可用。
 
@@ -195,13 +197,51 @@ cargo osdk test --kcmd-args=earlycon \
 
 `git status --short` 的作用是确认本轮留下的文件是否都在预期范围内。手动 ktest 虽从目标 crate 目录启动，但当前使用仓库根 OSDK manifest，因此日志应在仓库根目录查看：默认 `hvc0` 的 ktest UART 输出在 `qemu-serial.log`。仅在交互式排障时显式设置 `CONSOLE=ttyS0`，并查看 `qemu.log`；不要提交运行日志。
 
+### 1.4 `make check` 的完整静态检查链
+
+在宿主机发起时使用容器入口：
+
+```bash
+docker exec -w /root/asterinas fork_Asterinas bash -lc 'make check'
+```
+
+以下顺序依据当前 [Makefile](../Makefile)、[clippy_check.sh](../tools/clippy_check.sh) 和各子目录的 `check` 目标核对；前一阶段失败会阻断后续阶段。
+
+| 顺序 | 检查 | 边界与失败解释 |
+|---|---|---|
+| 1 | 准备 `cargo-osdk`，枚举 workspace members | `print_workspace_members.sh` 依赖 Cargo、Python 和 `jq`；宿主工具缺失不应误报为 DM 源码错误。 |
+| 2 | tracked 文本文件尾随空白 | `git grep -I` 跳过二进制内容，既有 `:!*.patch` 规则跳过 patch；不同于只检查当前 diff 的 `git diff --check`。 |
+| 3 | workspace lint 声明与 Rust 格式 | 各成员启用 workspace lints；`format_all.sh --check` 还覆盖脚本列出的独立 crate 和示例。 |
+| 4 | default-members clippy | 普通配置与 `--ktests` 配置分别检查；普通配置通过不代表测试辅助代码没有 lint。`-Dwarnings` 会将 `dead_code`、可见性和风格问题升级为错误。 |
+| 5 | default-members 依赖使用检查 | `cargo osdk udeps` 会再次编译并读取依赖信息；这是静态依赖检查，不是再次运行 ktest。 |
+| 6 | non-default members 与 setup | 非默认成员运行 `cargo clippy --all-targets`、`cargo udeps`；x86_64 的 `linux-bzimage/setup` 独立检查普通/ktest 配置及依赖。 |
+| 7 | Nix 与 initramfs 回归源码格式 | Nix 格式检查后，initramfs C 源码通过 `clang-format --dry-run --Werror` 检查；不运行 C ELF。 |
+| 8 | NixOS 测试工具源码检查 | `test/nixos` 执行 Rust 格式、clippy 和 Nix 格式检查；不启动 NixOS guest。 |
+| 9 | 拼写检查 | `typos` 使用 `.typos.toml`；2026-10-08 起排除 `patches/**` 历史补丁归档，源码和正式文档仍受检查。 |
+
+2026-10-08 已在 `dm` 的 `7a0aa4fd3` 加当日未提交修复上完成一次完整 `make check`，退出码 0。该结果属于当时的工作区快照，不代表裸 HEAD 或随后编辑的文档已经重新完成相同验证；完整问题、文件与输出索引见 [当日日志](../log/daily/2026-10-8.md)。
+
+当日排障经验：
+
+- 宿主运行曾出现缺少 `jq`、`component` crate 的 `E0463`；回到容器后不再出现。`E0463` 的宿主根因未继续定位，不应写成已确认的缓存问题，也不应据此修改依赖。
+- DM 生产代码与测试代码分两轮暴露 lint；使用私有类型别名、测试专用 `#[cfg(ktest)]`、较窄可见性和等价标准库写法修复，不用全局 `allow` 掩盖。
+- 删除 `dead_code` 前先查生产、测试和同步历史。闲置 VFS 条件删除包装被移除，但实际 devtmpfs 的 `RamInode` identity 检查保留，普通 rename 使用的 `DirDentry::rename_if_matches` 也保留。
+- 容器 `cargo-udeps 0.1.61` 对不同 target 的相同 PackageId 声明输出重复包警告；当日已定位到工具映射未区分 target，涉及声明与候选 `main` 一致。三个依赖检查阶段均成功，不为消除该警告删除架构依赖或改写 lockfile。
+- 定向使用与 gate 相同的 formatter，仅修改失败文件。不要直接运行会对所有 tracked 文件执行文本替换的根 `make format`，尤其工作区含 DOCX、历史归档或他人改动时。
+
 ## 2. `make ktest` 背后到底在做什么
 
-通用入口：
+完整聚合入口（不是每次上游同步的默认门槛）：
 
 ```bash
 make ktest
 ```
+
+同步默认按新增代码、冲突解决和接口/语义影响链选择定向 ktest，同时保留 `make check`、`make kernel`。
+先验证候选 main 的上游适用范围，再在集成后的 dm 上补充相关及 DM 专属回归；影响难以限定时先讨论扩大范围。
+具体约束见 [后续同步规则](upstream-sync.md#8-后续同步规则)。
+
+当前根 `Makefile` 的 `ktest` 目标依赖 `initramfs` 与 `cargo-osdk`，运行 workspace `default-members`，并为该目标指定 `CONSOLE=ttyS0`；其串口输出与 `qemu.log` 不应套用手动 crate-local 命令默认 `hvc0` 的说明。每个 crate 运行都可能覆盖同名 QEMU 日志，完整统计必须保留整次命令输出，并同时记录退出码，不能只把最后一个 crate 的 `qemu.log` 当全量结果。
 
 定向入口在目标 crate 目录手动执行：
 
@@ -274,6 +314,25 @@ tail -n 100 qemu-serial.log
 ```
 
 手动定向测试时，在目标 crate 目录运行 `cargo osdk test <crate>::<module>::tests`；core 测试还要传 `--kcmd-args=earlycon`。默认 `hvc0` 的 UART 输出查看根目录 `qemu-serial.log`；仅在排障时设置 `CONSOLE=ttyS0` 并查看 `qemu.log`，已有日志可能是旧文件。
+
+### 2.1 运行时失败与依赖下载失败必须分开
+
+2026-10-08 的同一轮 `make ktest` 曾先出现 VMCS 测试 panic，再出现获取 `smoltcp` 的代理 502。二者发生在不同层：
+
+- **guest 测试层**：`VmxGuard::acquire_vmx` 和析构要求可睡眠上下文；`disable_preempt` 的 guard 活着时处于 atomic mode。测试必须只在 VMCS load/read/write/deactivate 的局部作用域禁用抢占，在 VMX guard 的 drop/reacquire 前恢复，不能删除生产断言或绕过该测试。
+- **host 依赖层**：502、低速或下载超时发生在 Cargo 获取依赖时，不是 DM I/O 超时，也不是 QEMU guest 卡死。容器 Cargo 的 HTTP 超时、低速阈值、重试及 git CLI 配置属于环境状态，默认不出现在共享源码的 `git diff` 中；不能把网络重试配置描述为代码修复或网络已彻底稳定。
+
+当日实际配置、分轮输出与验证边界统一见 [当日日志](../log/daily/2026-10-8.md)，不以单个 crate 的通过覆盖后续下载失败。
+
+### 2.2 `make kernel` 与运行测试的区别
+
+`make kernel` 根据当前配置准备 initramfs 或 rootfs，然后在 `kernel` 目录执行 `cargo osdk build`，生成普通内核及启动 bundle；`make run_kernel` 才通过 `cargo osdk run` 启动 guest。
+当前根 `Makefile` 默认 `RELEASE=0`，OSDK 未指定 profile 时默认使用 `dev`，因此裸构建不能写成 release 验收。
+默认 `grub-rescue-iso` 生成的启动 ISO 也不等于 NixOS 安装 ISO，更不证明安装或 guest 回归已执行。
+
+DM 系统测试脚本经 `make run_nixos` 启动已有 `target/nixos/asterinas.img`，不自动重建或安装当前源码。
+release 验收必须先从待验源码显式构建并更新根盘，例如 `RELEASE=1 make nixos`，再逐项执行 suite；仅在 suite 启动时指定 `RELEASE=1` 不能改变既有镜像的 profile。
+应分别记录源码快照、内核/镜像构建结果与 guest 测试结果，不能把其中一项通过替代另外两项。
 
 ## 3. DM system test 背后在做什么
 

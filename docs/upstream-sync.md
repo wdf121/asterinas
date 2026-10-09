@@ -8,7 +8,9 @@
 
 `dm` 已以 126 个提交线性重放到 `main` `10a241870`，`main..dm` 不含 merge commit。重放后以安全引用 `backup/dm-merge-2100c9052` 校准最终树，恢复此前已确认的 DM、block、devtmpfs、QEMU 与构建取舍；校准提交与该引用的源码树一致。
 
-本轮只完成格式和 kernel-aware 编译层验证，不等同于全仓 CI、ktest、QEMU 或 NixOS 系统回归。由于 rebase 重写了本地历史，当前 `dm` 与 `origin/dm` 分叉；恢复凭证后只有在明确确认的前提下，才能用 `git push --force-with-lease` 更新远端。
+早期验证仅完成格式和 kernel-aware 编译等局部检查，不能当作全仓验证通过；下文早期矩阵保留当时失败事实，后续修复及定向复测以 [当日日志](../log/daily/2026-10-8.md) 为准。
+2026-10-08 经用户确认，后续同步改为静态检查、普通构建与按影响范围选择的定向 ktest，不默认执行完整 ktest，详见第 8 节。
+由于 rebase 重写了本地历史，当前 `dm` 与 `origin/dm` 分叉；只有在凭证可用且明确确认的前提下，才能用 `git push --force-with-lease` 更新远端。
 
 ## 2. 2026-10-08 同步时间线
 
@@ -45,7 +47,9 @@
 | driver | upstream VirtIO/NVMe 采用 partition manager、稳定名称和新的 DMA 描述符路径；`dm` 需保留 discard/zeroout。旧 VirtIO GET_ID/host_id 路径在失败时无界循环。 | 采用 upstream partition manager/初始化/稳定名称，保留 discard/zeroout，添加 `DmaBuf for Slice<Arc<DmaBuffer<_>>>`，移除 GET_ID/host_id 路径；NixOS 测试盘改由固定 PCI block 拓扑和 cmdline 声明的首盘路径定位。 | DMA child slice 可进入 VirtIO descriptor；测试定位不再依赖私有 VirtIO ioctl。 |
 | DM UAPI 版本 | focused C ABI 使用 Linux dm-ioctl 头文件期望 `4.50.0`，而 `dm` kernel 仍返回 `4.48.0`；这不是 upstream 改动，而是验证暴露的既有契约缺口。 | `DM_VERSION` 返回 `4.50.0`。 | focused C ABI 由 181/1 收敛为 182/0；版本号表示 ioctl ABI 契约，不表示完整 Linux DM target 集。 |
 
-## 5. 2026-10-08 验证矩阵
+## 5. 2026-10-08 早期验证矩阵
+
+本表记录当时的执行状态，不代表后续修复后的最终状态；后续结果见 [当日日志](../log/daily/2026-10-8.md)。
 
 | 层次 | 实际结果 | 覆盖与边界 |
 |---|---|---|
@@ -56,7 +60,7 @@
 | 全分支空白检查 | 未通过，均为既有历史内容。 | `git diff --check main..dm` 命中历史 patch 归档及旧日志的尾随空白；本轮未修改这些文件。 |
 | `make check` | 未通过。 | 在 clippy 前被既有 DOCX 文件与 `log/daily/2026-8-31.md` 的尾随空白阻断；宿主环境另缺少 `jq`，均未修改。 |
 | `make initramfs` | 通过。 | 容器中重建 initramfs 与镜像；这是 `make ktest` 的自动前置步骤，本轮仅作为单独排障/输入验证执行。 |
-| `make kernel` | 通过，保留既有 warning。 | 容器中完成普通非测试内核与 ISO 构建，覆盖标准发布构建路径。 |
+| `make kernel` | 通过，保留既有 warning。 | 当时记录为容器中完成普通非测试内核与启动 ISO 构建；不能据此称为 release 验收，根 Makefile 当前默认 `RELEASE=0`。 |
 | block / DM 补充 ktest | 通过。 | block crate 28 passed、DM crate 87 passed；覆盖同步后的 BIO/lease 与 DM table/target/lifecycle 回归，但不是全量 ktest 的替代。 |
 | `make ktest` | 未通过。 | OSTD 的 `ostd::arch::vm::vmx::vmcs::test::switch_and_reuse_vmcs` 发生 atomic mode 检查 panic（210 passed，1 failed）；后续 Asterinas 构建又因代理 502 无法获取 `smoltcp`。完整 gate 未完成。 |
 | C ABI / NixOS 系统回归 | 未运行。 | 当前完整同步验证已被 `make check` 和 `make ktest` 阻断，不得宣布本轮同步验证完成。 |
@@ -94,10 +98,35 @@
 4. 固定顺序：配置/构建入口 → 通用基础设施 → DM 语义 → 分层测试与验收。
 5. 每个文本冲突、API 差异或自动合并语义问题，记录两侧行为、取舍、影响和验证入口；若依据既有取舍自动处理，rebase 后必须与安全引用的最终树比较，不能仅以“无冲突”作为正确性结论。
 6. 测试必须串行执行、逐项即时汇报；完成后确认 `git log --merges main..dm` 无输出，并更新本文档、daily、交接和 PR 状态。
-7. 候选 `main` 基线与同步后的 `dm` 均应执行相同的完整容器验证门槛：`make check`、`make ktest` 与 `make kernel`，均在 `fork_Asterinas:/root/asterinas` 串行执行。`make ktest` 已依赖 `initramfs` 并启动 QEMU 测试内核，除非单独排查镜像构建，否则不得将 `make initramfs` 作为额外独立 gate。任一门槛未通过或被环境/既有问题阻断时，只能记录为“验证未完成”，不得宣布对应基线或同步验证完成。
+7. 每次同步按下表验证：main 的预验证用于区分上游/环境问题，**同步完成后的最终集成验证必须在权威 dm 分支执行**，不能用 main 基线结果替代。
+
+| 阶段 | 执行位置 | 固定顺序与范围 |
+|---|---|---|
+| 同步前基线 | 容器内候选 main 的干净独立 worktree。 | `make check` → `make kernel` → 上游改动影响范围内的定向 ktest。 |
+| rebase 后最终验证 | `fork_Asterinas:/root/asterinas` 的权威 dm 分支。 | `make check` → `make kernel` → 新增、冲突解决及接口/语义影响链的定向 ktest，包含相关 DM 回归。 |
+| 按需补充 | 同步后的 dm。 | 影响 syscall/ioctl 等用户 ABI 或真实存储工作流时，运行对应 C 回归或系统测试。 |
+
+定向 ktest 从目标 crate 目录执行 `cargo osdk test …`，selector 按当前分支实际模块选择。
+例如上游 block 接口变化，即使 DM 文件没有文本冲突，也须验证受影响的 block 与 DM 调用链。
+
+### 验证范围与完成判定
+
+- main 和 dm 两边均不默认执行完整 `make ktest`。调度、内存、锁、OSDK 等变化导致影响难以限定时，先报告并讨论扩大范围。
+- 执行前列出“改动 → 测试入口”；不要求每次同步都运行全部 DM 模块、C 回归或系统测试。
+- `make check` 已包含格式检查，不重复列出独立格式检查命令；格式失败先按授权范围修复，再重跑检查。
+- `make kernel` 默认是 dev 构建，不能表述为 release 验收；完整 ktest 若经讨论运行，已自动依赖 initramfs，不重复增加独立 initramfs gate。
+- 构建和运行时测试串行；选定检查全部成功，测试实际匹配并执行、零失败且命令 exit 0，才可宣布相应范围验证通过。零匹配或内部跳过不能证明目标路径已验证，没有直接测试的改动明确记录缺口。
+- 每项记录分支、源码版本与相关未提交差异、配置、实际命令、测试数量、退出码和日志。后续再改相关源码，需补跑受影响项目；旧结果不能替代当前源码验证。
+- 失败、环境阻塞或未预期 warning 出现时先停止并讨论，不继续扩大验证范围；候选 main 基线未通过时，不进入 dm rebase。
+- dm 最终验证通过后还须确认 `git log --merges main..dm` 无输出。定向通过不是全仓验证通过，也不自动授权提交或 push。
 
 ## 9. 当前停点
 
-本地 `dm` 已线性同步至 `main` `10a241870`，并已提交最终树校准与同步规则；`backup/dm-merge-2100c9052` 保留为本轮审计和恢复引用。容器内 `make initramfs`、`make kernel`、block 28/0 和 DM 87/0 已通过，但强制 gate 的 `make check` 与 `make ktest` 均未通过；本轮同步验证尚未完成。
+本地 `dm` 已线性同步至 `main` `10a241870`；`backup/dm-merge-2100c9052` 保留为本轮审计和恢复引用。
+10 月 8 日后续完整 ktest 已 exit 0，之后 lint 修复后的完整静态检查及普通 dev 内核/启动 ISO 构建也已 exit 0，原始证据见 [当日日志](../log/daily/2026-10-8.md)。
+完整 ktest 早于后续源码清理，不能称为当前同一快照的全量验证。
+10 月 8—9 日针对未提交修复串行完成 DM component 87/0、core DM ioctl 81/0、devtmpfs 6/0、runtime registry 8/0、VMCS 1/0，合计 183 项通过，各命令 exit 0，相关源码差异指纹保持一致。
+VMCS 首次零匹配不计入，修正路径后实际执行通过；结果及覆盖缺口见 [10 月 9 日日志](../log/daily/2026-10-9.md)。
+本轮没有 C guest 或 NixOS 系统复测，不宣称全仓或完整系统验收通过；源码修复、C 格式及检查配置已按五点提交至 `c02b6ec26`，后续定向规则与文档更新归入第六个文档提交。
 
 `dm` 因 rebase 与 `origin/dm` 分叉，且当前凭证问题尚未解决；在用户恢复凭证并明确确认前不得 push。后续 PR 仍只能从权威 `dm` 提取最小补丁，不能直接交付整条同步历史。

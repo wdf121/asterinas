@@ -1,8 +1,19 @@
 # Device Mapper 当前项目状态
 
-> **更新日期**：2026-09-24。
+> **更新日期**：2026-10-09。
 >
-> **事实来源**：当前工作区相对 `e31b265a3` 的实际 diff 与当前源码。daily log 只用于交叉核对已执行动作，不替代源码事实。
+> **事实来源**：实现以当前源码为准，验证以对应源码版本和实际命令输出为准；历史日志不自动证明当前工作区通过。
+
+## 当前停点摘要
+
+- 最近核对 main 为 `10a241870`，同步收尾前五个提交已完成至 `c02b6ec26`，文档收尾随本次文档提交记录；已线性 rebase，`main..dm` 无 merge commit。不是实时远端状态声明。
+- 10 月 8 日完整 ktest 通过早于后续 lint 修改；之后 make check、普通 dev 内核/启动 ISO 构建有成功输出。
+- 修复后的跨日定向复测为 DM 87/0、core ioctl 81/0、devtmpfs 6/0、runtime registry 8/0、VMCS 1/0，共 183 项通过；不是全仓或 C/NixOS 验收。
+- 普通 VFS rename、完整 mount source 路径及 procfs 的直接覆盖缺口保留；不能以邻近模块通过替代。
+- PR 在新 PR 分支最终验证；同步在 rebase 后 dm 最终验证，候选 main 先做干净基线。两边均采用 make check、make kernel 与按影响范围的定向 ktest，不默认全量。
+- 用户已授权六点拆分提交：前五点已提交，文档为第六点。检查由用户手动执行，助手不启动检查、构建或测试；未 push。
+
+证据见 [10 月 8 日](daily/2026-10-8.md)、[10 月 9 日](daily/2026-10-9.md) 日志；接手入口见 [正式交接](../docs/device-mapper-handoff.md)。
 
 ## 1. 当前方向
 
@@ -42,7 +53,7 @@ P0 主链语义收敛
 
 ### 3.1 ktest
 
-当前定向/完整 ktest 从目标 Cargo crate 目录运行，不再使用已删除的 `myshell/ktest_crate.sh`：
+定向模块测试或单个 crate 全量测试从目标 Cargo crate 目录运行；这里的 crate 全量不等于根 workspace 的完整 `make ktest`：
 
 ```bash
 cd kernel/core/comps/device-mapper
@@ -98,9 +109,13 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
   myshell/run_dm_system_tests.sh --mixed-integration
 ```
 
-`--control-plane-non-wait` 已删除，不再作为当前入口。系统 suite 默认 release；只有明确调试时才指定 `RELEASE=0`。
+`--control-plane-non-wait` 已删除，不再作为当前入口。
+根 Makefile 默认 `RELEASE=0`；系统 suite 启动已有 NixOS 镜像，不自动重建当前源码。
+release 验收须确认镜像来自目标源码的显式 release 构建，不能仅在 suite 启动时设置 `RELEASE=1`，也不能把旧镜像结果当作当前源码验证。
 
 `--dataplane` 当前使用三块测试盘；其长 guest 脚本在未显式覆盖时使用 `GUEST_INPUT_LINE_DELAY=0.05`。公共 harness 负责 FIFO 注入、ready/lifecycle 超时和 QEMU process-group 清理。
+
+### 3.4 历史系统验证（不代表当前源码复测）
 
 2026-09-22 已按默认 `GUEST_READY_TIMEOUT=40`、`GUEST_QEMU_TIMEOUT=180` 串行完成六个 canonical suite：control-plane、dataplane、LVM2 topology、linear integration、striped integration 与 mixed integration 均出现 guest、host 和聚合通过标记。LVM2 topology 首次运行发现 `lvs -o ... segtype` 对双 linear segment 返回重复汇总行；测试改为单独验证 LV 汇总的 `seg_count=2`，DM table/dependencies 仍验证两个 backing，复跑通过。每个 suite 的 `/tmp/*-test.log` 是唯一验收日志；host 事件和 QEMU/guest 输出经运行期 FIFO 单写入，FIFO 退出即删，正常路径不保留 `*-qemu-running.txt`。2026-09-23 的 readonly P0 control-plane 验收因默认 40 秒 ready timeout 两次未进入 guest；重建 `target/nixos/asterinas.img` 后，以用户授权的 `GUEST_READY_TIMEOUT=50`、`GUEST_QEMU_TIMEOUT=180` 复跑通过，guest 63 秒完成、全程 71 秒，`SUMMARY_GAP_DM_CONTROL_PLANE: 0`。
 
@@ -122,18 +137,13 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
 ## 5. 新对话接手顺序
 
 ```text
-CLAUDE.md
-→ AGENTS.md
-→ docs/device-mapper-source-evidence.md
-→ docs/global.md
-→ docs/device-mapper-technical-design-and-implementation.md
-→ docs/test.md
-→ docs/review.md
-→ docs/non-device-mapper-change-rationale.md
-→ log/daily/2026-9-18.md
-→ log/daily/2026-9-20.md
-→ git status --short
-→ git diff e31b265a3
+CLAUDE.md / AGENTS.md
+→ docs/device-mapper-handoff.md
+→ 本项目状态
+→ docs/pull_request.md / docs/upstream-sync.md
+→ log/daily/2026-10-8.md / log/daily/2026-10-9.md
+→ 按任务阅读源码证据、设计或测试手册
+→ 核对当前工作区与实际任务的比较基线
 ```
 
 接手时不假定工作区干净；先按当前 diff 判断生产、测试基础设施与文档的改动归属。QEMU、ktest 和 NixOS system test 必须串行执行。

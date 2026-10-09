@@ -72,8 +72,10 @@
 | `kernel/core/src/fs/fs_impls/exfat/fs.rs` | exfat filesystem | 适配 block lease 生命周期。 | 通用文件系统 block mount 语义不能只让 ext2 特判成立。 |
 | `kernel/core/src/fs/fs_impls/ext2/test_utils.rs` | ext2 测试辅助 | 测试辅助代码改用 lease 形式的 block device。 | 测试路径需要和真实 mount 生命周期一致，避免绕过 lease。 |
 | `kernel/core/src/vm/page_cache/tests/utils.rs` | page cache 测试辅助 | 适配新的 block device 持有方式。 | page cache 测试也会构造 block-backed 场景，需要跟随 block trait/lease 变化。 |
-| `kernel/core/src/fs/vfs/path/dentry.rs` | VFS path 删除 | 支持条件 unlink/rmdir 能力。 | mapper alias 创建失败、rename 回滚和删除时，必须避免误删非目标节点。 |
-| `kernel/core/src/fs/vfs/path/mod.rs` | VFS path API | 暴露条件删除路径操作。 | device registry 需要通过 VFS 安全维护 `/dev/dm-N` 和 `/dev/mapper/<name>`。 |
+| `kernel/core/src/fs/vfs/path/dentry.rs` | VFS dentry 操作 | 普通 `rename` 仍调用 `DirDentry::rename_if_matches`；2026-10-08 删除无调用的 `unlink_if_matches`、`rmdir_if_matches`。 | devtmpfs identity 删除已迁移到 `RamInode`，不能再将旧 VFS helper 描述为 mapper 节点保护主路径。 |
+| `kernel/core/src/fs/vfs/path/mod.rs` | VFS path API | 保留当前 Path 接口；2026-10-08 删除无调用的条件 unlink/rmdir/rename 包装。 | 对照同步安全引用与历史确认是旧迁移残留，不是本次同步遗漏调用；不改变现有生产路径。 |
+| `kernel/core/src/fs/file/inode_attr/type.rs` | inode 类型判断 | 2026-10-08 删除无调用的 `is_device`。 | mount source 已使用严格 `BlockDevice` 判断，不能把字符设备纳入块文件系统源。 |
+| `kernel/core/src/fs/fs_impls/devtmpfs/tree.rs`、`kernel/core/src/fs/fs_impls/ramfs/fs.rs` | devtmpfs inode identity | `DevtmpfsHandle` 携带 inode 身份；tree 通过 `unlink_if_same`、`rmdir_if_same`、`rename_no_replace_if_same` 在目录操作中复核身份。 | 外部替换节点时仍拒绝错误删除/覆盖；当日仅将 tree 的 `core::fmt::Debug` 简写为已导入的 `Debug`，未改 RamInode 实现。 |
 | `kernel/core/src/fs/fs_impls/procfs/devices.rs` | `/proc/devices` | 输出 block major/name，例如 `device-mapper`、`virtblk`、`nvme`。 | LVM2 和 util-linux 会通过 Linux 常用发现路径识别 block major。 |
 | `kernel/core/src/fs/fs_impls/procfs/mod.rs` | procfs 汇总 | 接入 `/proc/devices` 输出。 | 用户态工具依赖 procfs 观察内核设备能力。 |
 | `kernel/core/comps/virtio/src/device/block/device.rs` | virtio-blk 后端 | 适配新的 BIO/request queue；承接 DM remap 后的 read/write/flush/discard/write-zeroes。 | NixOS 系统验收的测试盘主要是 virtio-blk，DM 数据面最终会落到这里。 |
@@ -119,7 +121,25 @@
 | `test/initramfs/src/regression/fs/run_test.sh` | fs regression runner | 接入 procfs devices 回归。 | 新增 procfs 兼容输出需要进入现有 regression 流程。 |
 | `test/initramfs/src/regression/io/file_io/block_device.c` | block file I/O regression | 覆盖 block device 文件打开、size/ioctl 或基础 I/O 行为。 | DM mapper 和普通 block device 都依赖 block file 用户态入口。 |
 
-## 7. 边界说明
+## 7. 2026-10-08 验证修复的文件归属
+
+以下是同步验证暴露的问题修复，不代表新增 DM 能力。完整失败顺序、命令输出索引与运行版本边界见 [当日日志](../log/daily/2026-10-8.md)。
+
+| 文件 | 本次修复与原因 | 不改变的边界 |
+|---|---|---|
+| `ostd/src/arch/x86/vm/vmx/vmcs.rs` | 缩短 VMCS 测试中两个 preempt guard 的作用域，让 VMX acquire/drop 位于可睡眠上下文。 | 仅修测试，不放宽生产 atomic-mode 断言。 |
+| `kernel/core/comps/device-mapper/src/table.rs` | 用私有 `BioPart<'a>` 命名逻辑 range/target 元组；测试用 `core::slice::from_ref` 代替单元素切片的 clone。 | 不改变分段、借用关系、映射或完成语义。 |
+| `kernel/core/comps/device-mapper/src/device.rs`、`target/striped.rs` | 测试使用已导入的 `LinearTarget`；striped 测试给记录元组命名 `MappedRangeRecord`。 | 不改变 target 实现、测试断言或覆盖。 |
+| `kernel/core/src/device/misc/device_mapper.rs` | 两个仅供测试调用的 wrapper 加 `#[cfg(ktest)]`；8 字节对齐检查改用 `is_multiple_of`。 | 生产仍使用带 policy 的接口，ABI 接受/拒绝条件不变。 |
+| `kernel/core/src/fs/fs_impls/procfs/devices.rs` | `DevicesFileOps` 及 `new_inode` 收紧为 `pub(super)`。 | `/proc/devices` 内容及注册路径不变。 |
+| VFS/type/devtmpfs 文件 | 删除无调用残留并简化冗余限定，具体归属见第 4 节。 | 保留实际使用的 inode 身份保护与 rename 实现。 |
+| `Makefile`、`.typos.toml` | 尾随空白检查用 `git grep -I` 忽略二进制；拼写检查排除 `patches/**` 历史归档。 | 文本源码和正式文档仍受检查；不修改补丁编码、hash 或历史内容。 |
+| 三个 C 回归文件 | `device/device_mapper.c`、`fs/procfs/devices.c`、`io/file_io/block_device.c` 按容器 clang-format 调整换行/缩进。 | 未改断言或逻辑；格式检查通过不表示 C guest 回归已运行。 |
+| `.claude/settings.json` | 添加指定容器/目录下的 `make check`、定向 rustfmt 与三个 C 文件格式化许可。 | 这是协作配置，不属于内核实现；未放开任意 Docker 写操作。 |
+
+网络超时处理位于容器 Cargo 配置，不是共享仓库源码改动；因此不会出现在上述源码 diff 中，也不应为了补齐记录而改写 `Cargo.lock`。
+
+## 8. 边界说明
 
 | 不在本文展开的内容 | 原因 | 应查看的位置 |
 |---|---|---|
