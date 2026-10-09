@@ -182,8 +182,8 @@ static void restart_signal_handler(int signal)
 
 	(void)signal;
 	if (restart_signal_fd >= 0) {
-		write_result = write(restart_signal_fd, &delivered,
-				     sizeof(delivered));
+		write_result =
+			write(restart_signal_fd, &delivered, sizeof(delivered));
 		(void)write_result;
 	}
 	errno = saved_errno;
@@ -421,8 +421,8 @@ FN_TEST(device_mapper_range_ioctl_validates_byte_ranges)
 	int device_created = 0;
 
 	snprintf(name, sizeof(name), "dm-range-%ld", (long)getpid());
-	control_fd = TEST_RES(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC),
-			      _ret >= 0);
+	control_fd =
+		TEST_RES(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC), _ret >= 0);
 	if (control_fd < 0)
 		goto cleanup;
 	init_named_ioctl(&io, name);
@@ -432,7 +432,8 @@ FN_TEST(device_mapper_range_ioctl_validates_byte_ranges)
 	device_created = 1;
 
 	init_zero_table(table.bytes, sizeof(table.bytes), name, 8);
-	if (TEST_RES(ioctl(control_fd, DM_TABLE_LOAD, table.bytes), _ret == 0) < 0)
+	if (TEST_RES(ioctl(control_fd, DM_TABLE_LOAD, table.bytes), _ret == 0) <
+	    0)
 		goto cleanup;
 	init_named_ioctl(&io, name);
 	if (TEST_RES(ioctl(control_fd, DM_DEV_SUSPEND, &io), _ret == 0) < 0)
@@ -557,8 +558,8 @@ FN_TEST(device_mapper_wait_restarts_after_signal)
 	close(result_pipe[1]);
 	result_pipe[1] = -1;
 
-	wait_result = TEST_RES(wait_fd_readable(ready_pipe[0], 2000),
-			       _ret == 1);
+	wait_result =
+		TEST_RES(wait_fd_readable(ready_pipe[0], 2000), _ret == 1);
 	if (wait_result != 1)
 		goto cleanup;
 	if (TEST_RES(read(ready_pipe[0], &notification, sizeof(notification)),
@@ -566,13 +567,14 @@ FN_TEST(device_mapper_wait_restarts_after_signal)
 		goto cleanup;
 
 	/* The original ioctl must still be pending when the signal is sent. */
-	wait_result = TEST_RES(wait_fd_readable(result_pipe[0], 100), _ret == 0);
+	wait_result =
+		TEST_RES(wait_fd_readable(result_pipe[0], 100), _ret == 0);
 	if (wait_result != 0)
 		goto cleanup;
 	if (TEST_RES(kill(pid, SIGUSR1), _ret == 0) < 0)
 		goto cleanup;
-	wait_result = TEST_RES(wait_fd_readable(signal_pipe[0], 2000),
-			       _ret == 1);
+	wait_result =
+		TEST_RES(wait_fd_readable(signal_pipe[0], 2000), _ret == 1);
 	if (wait_result != 1)
 		goto cleanup;
 	if (TEST_RES(read(signal_pipe[0], &notification, sizeof(notification)),
@@ -580,14 +582,15 @@ FN_TEST(device_mapper_wait_restarts_after_signal)
 		goto cleanup;
 
 	/* SA_RESTART must keep the original ioctl pending until a DM event occurs. */
-	wait_result = TEST_RES(wait_fd_readable(result_pipe[0], 100), _ret == 0);
+	wait_result =
+		TEST_RES(wait_fd_readable(result_pipe[0], 100), _ret == 0);
 	if (wait_result != 0)
 		goto cleanup;
 	init_rename_ioctl(rename.bytes, sizeof(rename.bytes), dev, 0, renamed);
 	if (TEST_RES(ioctl(fd, DM_DEV_RENAME, rename.bytes), _ret == 0) < 0)
 		goto cleanup;
-	wait_result = TEST_RES(wait_fd_readable(result_pipe[0], 2000),
-			       _ret == 1);
+	wait_result =
+		TEST_RES(wait_fd_readable(result_pipe[0], 2000), _ret == 1);
 	if (wait_result != 1)
 		goto cleanup;
 	if (TEST_RES(read(result_pipe[0], &result, sizeof(result)),

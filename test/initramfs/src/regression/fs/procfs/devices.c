@@ -81,7 +81,8 @@ FN_TEST(devices_reports_device_mapper_major)
 		while (line > buf && line[-1] != '\n') {
 			line--;
 		}
-		TEST_RES(sscanf(line, "%u device-mapper", &mapper_major), _ret == 1);
+		TEST_RES(sscanf(line, "%u device-mapper", &mapper_major),
+			 _ret == 1);
 	}
 	TEST_RES(mapper_major, _ret > 0 && _ret <= 4095);
 

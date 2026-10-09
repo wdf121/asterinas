@@ -44,7 +44,8 @@ FN_TEST(legacy_block_ioctls_report_linux_compatible_values)
 
 	TEST_SUCC(ioctl(fd, BLKGETSIZE, &legacy_sectors));
 	TEST_SUCC(ioctl(fd, BLKGETSIZE64, &byte_size));
-	TEST_RES((uint64_t)legacy_sectors * SECTOR_SIZE == byte_size, _ret == 1);
+	TEST_RES((uint64_t)legacy_sectors * SECTOR_SIZE == byte_size,
+		 _ret == 1);
 	TEST_SUCC(ioctl(fd, BLKRAGET, &readahead));
 	TEST_RES(readahead == 0, _ret == 1);
 
