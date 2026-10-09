@@ -12,10 +12,10 @@ use crate::{
 };
 
 /// Inode operations for `/proc/devices`.
-pub struct DevicesFileOps;
+pub(super) struct DevicesFileOps;
 
 impl DevicesFileOps {
-    pub fn new_inode(parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
+    pub(super) fn new_inode(parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
         // Reference:
         // <https://elixir.bootlin.com/linux/v6.16.5/source/fs/proc/devices.c>
         // <https://elixir.bootlin.com/linux/v6.16.5/source/fs/proc/generic.c#L549-L550>

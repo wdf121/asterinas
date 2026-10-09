@@ -119,7 +119,7 @@ pub(crate) struct DevtmpfsHandle {
     path: String,
 }
 
-impl core::fmt::Debug for DevtmpfsHandle {
+impl Debug for DevtmpfsHandle {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DevtmpfsHandle")
             .field("path", &self.path)
