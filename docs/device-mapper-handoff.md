@@ -5,10 +5,12 @@
 
 ## 当前停点
 
-- 最近核对的本地 main 为 `10a241870`，同步收尾的前五个提交已完成，最后一个为 `c02b6ec26`；文档收尾随本次文档提交记录。这里不代表远端实时状态。
-- dm 已线性 rebase 到该 main，最近核对 `main..dm` 无 merge commit；安全引用 `backup/dm-merge-2100c9052` 保留。后续禁止用 merge 同步。
-- 用户已授权六点拆分提交；源码、C 格式及检查配置已分五次提交，文档为第六点。不创建新 PR，不 push。
-- **本次文档收尾的检查由用户手动执行，助手按授权更新并提交文档，不启动检查、构建或测试。**
+- 本地 dm HEAD 为 `2699dfed0`，本地 main 为 `10a241870`。用户已提供 dm 推送成功输出；本轮未查询远端。
+- dm 已线性 rebase；后续禁止用 merge 同步。
+- PR 1 已无冲突 rebase 到本地 main，HEAD 为 `67ed6c70f`；range-diff 一致、三文件范围不变、无 merge。用户反馈验证通过，未提供原始输出；新 SHA 尚无本次推送记录。
+- PR 2 分支 `dm-linear-io-path` 已建立，用户已手敲最小 linear 和 DmDevice，开始首个构造测试；不是只读规划阶段，也尚未完成制备。
+- 当前在 dm；PR 2 代码保存在 stash `43291518c58869e5dd59efb1bc253f1af378c985`（pr2-code），不在分支 HEAD。文档已恢复，后续切分支前先保存文档。
+- 文档收尾已授权，不新建文档、不提交或 push。用户手敲与执行测试，助手按完整的小主题讲解、核对，不代写功能；曾单独获授权执行 PR 1 rebase 和备份分支删除。
 
 ## 已有验证与边界
 
@@ -39,9 +41,12 @@ VMCS 首次 selector 零匹配不算通过，修正后实际执行 1 项通过�
 
 ## PR 状态与下一步
 
-- PR 1 历史记录：`mapped-bio-ranges`，base `98e717275`、HEAD `c14d68c93`；曾完成验证和推送。此处不是本次远端复核，历史完整 ktest 与临时工作树记录保留，不作为当前操作模板。详见 [PR 1 档案](../log/PR/PR-1-mapped-bio-ranges.md)。
-- PR 2 尚未制备新分支。既定候选范围为 live registry lease、普通 VFS mount/rootfs 与 ext2/exfat holder；排除 token/runtime node、MlsDisk 和分区事务，详见 [PR 规范](pull_request.md)。
-- 本次按用户授权分点提交；用户手动检查文档后再决定是否进入 PR 2。后续创建分支或 push 仍需另行授权。
+- PR 1 的旧 `c14d68c93` 有历史验证和推送记录；当前本地 `67ed6c70f` 的验证只有用户反馈，不混用旧快照证据。详见 [PR 1 档案](../log/PR/PR-1-mapped-bio-ranges.md)。
+- PR 2 完成 crate 接入、LinearTarget 构造/元数据/转发、DmDevice 接口，首个几何测试已写入 stash，未报告测试执行结果。组件 cargo osdk check 通过是用户在添加测试前的反馈。
+- 保留局部校验，不扩展 block 框架；不变量、空请求及统一准入校验后续在 dm 讨论。完整取舍已归档到 [PR 规范第 5 节](pull_request.md#5-pr-2-制备状态与设计取舍)，不再依赖 Git 本地临时笔记。
+- 旧 lease 分支和两条 backup 分支已删除；后续是否建立备份先问用户。
+- 下一步从构造测试组继续，先补边界用例，再验证转发与完成路径。测试 cfg 注释是用户有意调整，不擅自修复。恢复代码前核对 stash 身份，不将其应用到 dm 的完整组件上。
+- PR 是完整 dm 的缩小版本，适配在 PR 分支验证；共有缺陷仍先修 dm。每份后续 PR 基于上一份 PR + 最新已核对 main。
 
 ## 阅读顺序
 

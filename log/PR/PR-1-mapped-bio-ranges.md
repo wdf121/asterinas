@@ -4,10 +4,11 @@
 
 | 项目 | 事实 |
 |---|---|
-| 状态 | 已推送；最终 SHA 验证通过。 |
+| 状态 | 本地已重放到新 main；用户反馈新基线验证通过，原始输出未归档。旧 c14d68c93 曾完成验证与推送。 |
 | 实际 Git branch | `mapped-bio-ranges` |
-| base | `98e717275` (`main`) |
-| 当前远端 HEAD | `c14d68c93` |
+| 当前本地 base / HEAD | `10a241870` / `67ed6c70f` |
+| 历史 base / HEAD | `98e717275` / `c14d68c93` |
+| 最近有推送证据的远端 HEAD | `c14d68c93`；本轮未复核远端，也未推送新 SHA。 |
 | 提交主题 | `block: add mapped BIO ranges` |
 | 远端事件 | 已通过 `git push --force-with-lease` 更新 fork 分支，移除旧 merge 历史。 |
 | 依赖 PR | 无。 |
@@ -23,7 +24,9 @@
 | 2026-09-28 | 容器内最终 SHA 验证 | `98e717275` | `c14d68c93` | `HEAD` 与 `origin/pr` 一致；完整 PR gate 通过。 |
 | 2026-09-28 | 语义化分支迁移 | `98e717275` | `c14d68c93` | fork 从 `pr` 创建并切换为 `mapped-bio-ranges`，随后删除旧 `pr`；提交内容不变。 |
 
-最终 diff 仅修改：
+2026-10-09 执行 `git rebase main` 无冲突，`c14d68c93` 重放为 `67ed6c70f`。祖先检查退出码 0，`main..mapped-bio-ranges` 无 merge commit，`git range-diff 98e717275..c14d68c93 main..mapped-bio-ranges` 显示 `=`，`git diff --check` 通过。此次安全备份随后按用户要求删除，PR 2 从新 HEAD 建立。
+
+重放后 diff 仍仅修改：
 
 ```text
 kernel/core/comps/block/src/bio.rs
@@ -96,9 +99,13 @@ Bio ──submit──> SubmittedBio ──queue/driver──> complete
 
 ## 5. 验证证据
 
-### 最终 HEAD `c14d68c93`
+### 当前本地 HEAD `67ed6c70f`
 
-该验证是历史上在 `fork_Asterinas:/root/pr-tree` 完成的：当时工作树检出分支 `pr`，验证后确认其 clean，且 `HEAD` 与 `origin/pr` 均为 `c14d68c93`；随后按当时流程删除临时工作树。这不改变后续 PR 直接从 `main` 创建分支的规范。
+用户在 rebase 后明确反馈验证已通过，但对话未提供实际命令输出、测试数量及退出码。记录为用户反馈，不将旧 HEAD 的 6/0、245/0 等结果移用到新 SHA，也不编造当前验证日志。本轮助手仅执行上节列出的 Git 范围和历史检查。
+
+### 历史已验证 HEAD `c14d68c93`
+
+该验证是历史上在 `fork_Asterinas:/root/pr-tree` 完成的：当时工作树检出分支 `pr`，验证后确认其 clean，且 `HEAD` 与 `origin/pr` 均为 `c14d68c93`；随后按当时流程删除临时工作树。该历史流程不作为新制备模板；当前采用上一份 PR + 最新已核对 main 的线性分支规则。
 
 | 层次 | 命令 | 结果 | 状态 |
 |---|---|---|---|
@@ -117,7 +124,8 @@ Bio ──submit──> SubmittedBio ──queue/driver──> complete
 ## 6. 已知边界与后续动作
 
 1. 若 `mapped-bio-ranges` 的 base、HEAD 或三文件范围变化，先同步 `main` 到当前 upstream，再直接在该分支完成 rebase 与完整 PR gate；不得复用本次结果。
-2. PR 2 的 tracked device lease 保持独立审计和决策，不随 PR 1 扩大范围。
+2. PR 2 现为最小单段 linear 数据面，基于更新后的 PR 1；通用 tracked lease 路线已暂缓。
+3. 下方英文维护者描述保留旧 SHA 的历史验证事实；实际再次发布前，须按新 SHA 的证据更新，不能当作 67ed6c70f 的完整验收描述直接发布。
 
 ## 7. Upstream maintainer description
 
