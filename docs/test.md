@@ -90,113 +90,45 @@ core 链入的早期参数解析器默认关闭 early console；未传 `earlycon
 
 ## 4. initramfs C 回归：原始用户 ABI
 
-C 回归用于验证真实用户进程能否通过 syscall、ioctl、设备节点和 VFS 正确使用内核接口。测试源码先被编译为用户态 ELF，再与 shell runner 一起打包进 initramfs；QEMU 启动 Asterinas 后，由 guest 中的 regression runner 执行 ELF。它与直接运行内核内部 Rust 断言的 ktest 分工不同，不能互相替代。
+C 回归把测试源码编译为用户态 ELF，与 shell runner 一起打包进 initramfs；QEMU 启动 Asterinas 后，guest 内的 regression runner 执行 ELF，验证真实用户进程能否通过 syscall、ioctl、设备节点和 VFS 正确使用内核接口。它与直接运行内核内部 Rust 断言的 ktest 分工不同，不能互相替代。
 
-```text
-C 测试源码
-  → 编译为用户态 ELF
-  → 打包进 initramfs
-  → QEMU 启动 Asterinas guest
-  → /init 启动 regression runner
-  → runner 执行指定 ELF
-  → ELF 通过 libc/syscall 进入内核
-```
+### 4.1 运行命令
 
-### 4.1 执行环境与准备
-
-2026-09-28 已在 `fork_Asterinas` 的 `/root/asterinas`、当时的 `dm` SHA `78f4eb24a` 上重跑 focused Device Mapper C 回归；这不是当前 HEAD 的复测结果。
-除非命令明确包含 `docker exec`，本节命令均从该容器内的仓库根目录执行；其他历史测试结果仍须以各自执行 SHA 和日志判断。
-
-运行前确认没有其他 QEMU、ktest 或 NixOS 测试占用测试镜像；这些测试必须串行运行。可在宿主机检查：
+命令均在容器内仓库根目录执行；测试必须串行，运行前确认没有其他 QEMU、ktest 或 NixOS 测试占用测试镜像：
 
 ```bash
 pgrep -af 'qemu-system|cargo osdk test|make run_kernel'
 ```
 
-若当前位于宿主机，可进入项目容器：
-
-```bash
-docker exec -it -w /root/asterinas fork_Asterinas bash
-```
-
-### 4.2 Device Mapper focused C 回归
-
-在容器内的 `/root/asterinas` 执行最小必要命令：
+Device Mapper focused 回归的最小命令：
 
 ```bash
 AUTO_TEST=regression \
   REGRESSION_TESTS=device/device_mapper make run_kernel
 ```
 
-其中，`AUTO_TEST=regression` 启用 C regression 的构建和 guest runner；`REGRESSION_TESTS=device/device_mapper` 让 runner 直接执行 initramfs 中的 `/test/device/device_mapper` 用户态 ELF。这两个参数是 focused Device Mapper C 回归的必要参数。
+`AUTO_TEST=regression` 构建回归 ELF 并让 guest 启动后进入 regression runner；`REGRESSION_TESTS=device/device_mapper` 让 runner 只执行 `/test/device/device_mapper`，省略时运行全量。可选参数：`RELEASE=1`（release 内核，默认 0）、`CARGO_NET_OFFLINE=true`（仅用本地 Cargo 缓存）、`INTEL_TDX=0`（默认值即 0，显式写出只为防环境覆盖）。
 
-若需要固定为本次已验证的离线、release、非 TDX 配置，使用完整复现命令：
+对应源码为 `test/initramfs/src/regression/device/device_mapper.c`，覆盖：tableless DM ioctl（`DM_VERSION`、create、status、table status、remove 的结构体布局、flag、返回值和 errno）、`/dev/dm-N` 与 `/dev/mapper/<name>` 运行时节点事务与冲突回滚、ext2 mount lease（挂载期间删除返回 `EBUSY`）、`BLKDISCARD`/`BLKZEROOUT` 范围边界、WAIT ioctl 的 `EINTR`/`SA_RESTART`/事件唤醒。该入口验证原始用户 ABI，不替代 DM/block crate ktest，也不替代 NixOS 系统测试。
 
-```bash
-CARGO_NET_OFFLINE=true RELEASE=1 AUTO_TEST=regression \
-  INTEL_TDX=0 REGRESSION_TESTS=device/device_mapper make run_kernel
-```
+### 4.2 通过判定与日志
 
-参数的必要性与作用如下：
-
-| 参数 | 必要性 | 作用 |
-|---|---|---|
-| `AUTO_TEST=regression` | 必须显式设置；默认值为 `none`。 | 构建 regression C ELF，并让 guest 启动后进入 initramfs regression runner。 |
-| `REGRESSION_TESTS=device/device_mapper` | focused 回归必须设置；省略时运行全量 regression。 | 让 runner 直接执行 `/test/device/device_mapper`。 |
-| `CARGO_NET_OFFLINE=true` | 可选。 | Cargo 仅使用本地依赖缓存，缓存缺失时直接报错。 |
-| `RELEASE=1` | release 验收时显式指定。 | 当前根 Makefile 默认 `RELEASE=0`；历史命令中的 `RELEASE=1` 不能解释为当前裸 `make run_kernel` 的默认值。 |
-| `INTEL_TDX=0` | 可选；当前默认值就是 `0`。 | 明确使用非 TDX 配置，避免外部环境覆盖默认值。 |
-| `make run_kernel` | 必须执行的 Make target。 | 构建内核和 initramfs，启动 QEMU，并等待 guest 回归结束。 |
-
-对应源码为 `test/initramfs/src/regression/device/device_mapper.c`。该回归覆盖：
-
-| 覆盖范围 | 主要验证内容 |
-|---|---|
-| tableless DM ioctl | `DM_VERSION`、create、status、table status、remove 的结构体布局、flag、返回值和 errno。 |
-| runtime 节点事务 | `/dev/dm-N` 与 `/dev/mapper/<name>` 的创建，以及路径冲突后的回滚和重试。 |
-| mount lease | ext2 挂载期间删除 mapper 返回 `EBUSY`，卸载后可以删除。 |
-| block range ioctl | `BLKDISCARD`、`BLKZEROOUT` 的合法范围、对齐、溢出、越界和零长度边界。 |
-| WAIT 中断 | 未设置 `SA_RESTART` 时，信号中断最终向用户态返回 `EINTR`；设备不存在时返回对应 errno。 |
-| WAIT 自动重启 | 设置 `SA_RESTART` 后，signal handler 实际执行，原 ioctl 不提前返回，并在 rename 事件后成功完成。 |
-| WAIT 事件唤醒 | rename 和 setuuid 推进 event，唤醒 waiter，并正确回填 `dm_ioctl` header。 |
-
-该入口验证原始用户 ABI，不替代 DM/block crate ktest，也不替代使用 `dmsetup`、LVM2 和真实发行版用户空间的 NixOS 系统测试。
-
-### 4.3 日志查看与通过判定
-
-QEMU 的主日志写入仓库根目录 `qemu.log`。命令运行时可以直接观察终端；运行结束后，在容器内的 `/root/asterinas` 查看：
-
-```bash
-less qemu.log
-```
-
-只提取 Device Mapper 回归的执行结果：
-
-```bash
-grep -E 'Running test /test/device/device_mapper|summary:|test result:|Test /test/device/device_mapper passed\.|All regression tests passed\.|failed' qemu.log
-```
-
-需要排查早期启动、串口或主日志缺失问题时，再查看 UART 副本：
-
-```bash
-less qemu-serial.log
-```
-
-一次成功的 focused Device Mapper C 回归必须同时满足：
-
-1. `make run_kernel` 退出码为 0；
-2. 各测试函数的局部 summary 均为 `0 tests failed`；
-3. ELF 的累计汇总为 `test result: ok. 182 passed; 0 failed`；
-4. 日志包含：
+命令退出码为 0，且仓库根目录 `qemu.log` 末尾包含：
 
 ```text
 Test /test/device/device_mapper passed.
 All regression tests passed.
 ```
 
-若 `make run_kernel` 失败，以本次命令生成的终端输出和 `qemu.log` 为准。不要用旧日志中的成功标记判断本轮结果。
+只提取执行结果：
 
-### 4.4 其他 C 回归入口
+```bash
+grep -E 'Running test /test/device/device_mapper|summary:|test result:|Test /test/device/device_mapper passed\.|All regression tests passed\.|failed' qemu.log
+```
+
+失败时以本次命令生成的终端输出和 `qemu.log` 为准，不要用旧日志中的成功标记判断本轮结果。排查早期启动或串口问题时再看 `qemu-serial.log`。
+
+### 4.3 其他 C 回归入口
 
 | 测试范围 | 容器内仓库根目录执行的命令 | 通过判定 |
 |---|---|---|
@@ -205,9 +137,11 @@ All regression tests passed.
 | 单个 C ELF | `AUTO_TEST=regression REGRESSION_TESTS=<directory>/<binary> make run_kernel` | 对应 ELF 成功结束，最终包含 `All regression tests passed.`。 |
 | 全量 initramfs regression | `AUTO_TEST=regression make run_kernel` | 遍历 `/test` 下全部一级测试目录，最终包含 `All regression tests passed.`。 |
 
-`REGRESSION_TESTS` 接受相对 selector。目录 selector 执行该目录的 `run_test.sh`，ELF selector 直接执行对应程序；不要传绝对路径、`.`、路径穿越或包含空格的 selector。目录 `run_test.sh` 使用 `set -e` 传播失败，C ELF 通过非零退出码报告失败。
+`REGRESSION_TESTS` 接受相对 selector：目录 selector 执行该目录的 `run_test.sh`，ELF selector 直接执行对应程序；不要传绝对路径、`.`、路径穿越或包含空格的 selector。
 
-### 4.5 常见失败定位
+已知环境限制：在本机容器上，全量回归会稳定失败于 `process/cgroup` 的 CPU 计时用例（busy 任务 2 秒仅记账约 0.6 秒，判据要求 ≥1.9 秒），与被测改动无关；日常验证请使用 focused selector。
+
+### 4.4 常见失败定位
 
 | 现象 | 优先检查 |
 |---|---|
@@ -277,7 +211,7 @@ Device Mapper 系统测试启动完整 NixOS guest，通过真实 `dmsetup`、LV
 
 当前六项 DM suite 经 `myshell/lib/dm_nixos_test.sh` 调用 `make run_nixos`，由 `tools/nixos/run.sh` 启动已有根盘；这条路径不自动重新构建或安装当前源码。
 因此，在 suite 命令前设置 `RELEASE=1` 不能把已有 dev 镜像变成 release 镜像；必须记录根盘中内核的构建来源、profile，以及 suite 的本轮结果。
-根 Makefile 当前默认 `RELEASE=0`，不能将旧说明中的“继承默认 release”作为验收依据。
+根 Makefile 当前默认 `RELEASE=1`；但 suite 不重建根盘，验收依据始终是根盘中内核的实际构建来源与 profile，而不是 Makefile 默认值。
 
 测试盘是 host 上的普通 raw 镜像，由 `tools/nixos/run.sh` 作为独立 virtio-blk 设备附加给 guest。测试会覆盖扇区并创建或清除 LVM 元数据，**绝不能使用 NixOS 根盘、业务盘或需要保留内容的镜像。**
 
@@ -309,18 +243,19 @@ fallocate -l 512M target/nixos/dm-test/disk4.img
 
 | 测试范围 | 必须同时出现的成功标记 | 完整日志 |
 |---|---|---|
-| DM 控制面 | `SUMMARY_GAP_DM_CONTROL_PLANE: 0`<br>`TEST_PASS_DM_CONTROL_PLANE`<br>`HOST_PASS_DM_CONTROL_PLANE`<br>`HOST_PASS_DM_SYSTEM_TESTS --control-plane` | `/tmp/dm-control-plane-test.log` |
-| DM 裸块数据面 | `TEST_PASS_DM_DATAPLANE`<br>`HOST_PASS_DM_DATAPLANE`<br>`HOST_PASS_DM_SYSTEM_TESTS --dataplane` | `/tmp/dm-dataplane-test.log` |
-| LVM2 拓扑 | `SUMMARY_GAP_LVM2_TOPOLOGY: 0`<br>`TEST_PASS_LVM2_TOPOLOGY`<br>`HOST_PASS_LVM2_TOPOLOGY`<br>`HOST_PASS_DM_SYSTEM_TESTS --lvm2-topology` | `/tmp/lvm2-topology-test.log` |
-| Linear 完整流程 | `TEST_PASS_DM_LINEAR_INTEGRATION_FIRST`<br>`TEST_PASS_DM_LINEAR_INTEGRATION_SECOND`<br>`TEST_PASS_DM_LINEAR_INTEGRATION_THIRD`<br>`HOST_PASS_DM_LINEAR_INTEGRATION`<br>`HOST_PASS_DM_SYSTEM_TESTS --linear-integration` | `/tmp/dm-linear-integration-test.log` |
-| Striped 完整流程 | `TEST_PASS_DM_STRIPED_INTEGRATION_FIRST`<br>`TEST_PASS_DM_STRIPED_INTEGRATION_SECOND`<br>`TEST_PASS_DM_STRIPED_INTEGRATION_THIRD`<br>`HOST_PASS_DM_STRIPED_INTEGRATION`<br>`HOST_PASS_DM_SYSTEM_TESTS --striped-integration` | `/tmp/dm-striped-integration-test.log` |
-| Mixed 完整流程 | `TEST_PASS_DM_MIXED_INTEGRATION_FIRST`<br>`TEST_PASS_DM_MIXED_INTEGRATION_SECOND`<br>`HOST_PASS_DM_MIXED_INTEGRATION`<br>`HOST_PASS_DM_SYSTEM_TESTS --mixed-integration` | `/tmp/dm-mixed-integration-test.log` |
+| DM 控制面 | `SUMMARY_GAP_DM_CONTROL_PLANE: 0`<br>`TEST_PASS_DM_CONTROL_PLANE`<br>`HOST_PASS_DM_CONTROL_PLANE`<br>`HOST_PASS_DM_SYSTEM_TESTS --control-plane` | `/tmp/dm-test/dm-control-plane/latest/` |
+| DM 裸块数据面 | `TEST_PASS_DM_DATAPLANE`<br>`HOST_PASS_DM_DATAPLANE`<br>`HOST_PASS_DM_SYSTEM_TESTS --dataplane` | `/tmp/dm-test/dm-dataplane/latest/` |
+| LVM2 拓扑 | `SUMMARY_GAP_LVM2_TOPOLOGY: 0`<br>`TEST_PASS_LVM2_TOPOLOGY`<br>`HOST_PASS_LVM2_TOPOLOGY`<br>`HOST_PASS_DM_SYSTEM_TESTS --lvm2-topology` | `/tmp/dm-test/lvm2-topology/latest/` |
+| Linear 完整流程 | `TEST_PASS_DM_LINEAR_INTEGRATION_FIRST`<br>`TEST_PASS_DM_LINEAR_INTEGRATION_SECOND`<br>`TEST_PASS_DM_LINEAR_INTEGRATION_THIRD`<br>`HOST_PASS_DM_LINEAR_INTEGRATION`<br>`HOST_PASS_DM_SYSTEM_TESTS --linear-integration` | `/tmp/dm-test/dm-linear-integration/latest/` |
+| Striped 完整流程 | `TEST_PASS_DM_STRIPED_INTEGRATION_FIRST`<br>`TEST_PASS_DM_STRIPED_INTEGRATION_SECOND`<br>`TEST_PASS_DM_STRIPED_INTEGRATION_THIRD`<br>`HOST_PASS_DM_STRIPED_INTEGRATION`<br>`HOST_PASS_DM_SYSTEM_TESTS --striped-integration` | `/tmp/dm-test/dm-striped-integration/latest/` |
+| Mixed 完整流程 | `TEST_PASS_DM_MIXED_INTEGRATION_FIRST`<br>`TEST_PASS_DM_MIXED_INTEGRATION_SECOND`<br>`HOST_PASS_DM_MIXED_INTEGRATION`<br>`HOST_PASS_DM_SYSTEM_TESTS --mixed-integration` | `/tmp/dm-test/dm-mixed-integration/latest/` |
 
-每条命令退出码必须为 0，本轮日志中不能出现 `TEST_FAIL_*`、`HOST_FAIL_*` 或 panic。每个 suite 只有一个权威的持久 `LOG`：其中按实际顺序同时记录 host 的 `HOST_*` 事件、QEMU/guest 完整输出、`TEST_*` 结果和最终聚合标记。运行期间的 FIFO 会在 suite 退出后自动删除；正常路径不创建 `*-qemu-running.txt`。根目录 `qemu.log`、`qemu-serial.log` 仅用于通用 runner 的补充诊断，不能替代 suite `LOG` 作为本轮验收依据。快速提取六类日志中的结果、gap 和实际测试盘：
+每条命令退出码必须为 0，本轮日志中不能出现 `TEST_FAIL_*`、`HOST_FAIL_*` 或 panic。结构化日志（各 suite 默认开启，`DM_STRUCT_LOG=0` 回退 legacy 单流 `/tmp/*-test.log`）为每次运行生成独立目录 `/tmp/dm-test/<slug>/<日期-时间>/`，并把 `<slug>/latest` 指向它。目录内四类产物：`console.log`（QEMU/guest 完整原始输出）、`console.clean.log`（剥离转义序列与控制字节的派生视图，可直接 `cat`）、`summary.log`（host 里程碑、`HOST_*`/`TEST_*` 判定与最终聚合标记）、按 guest 分文件的 `qemu-stderr-*`。验收以本轮运行目录为准，不得引用旧目录的成功标记；`latest` 会被下一次运行更新，判定前先核对目录名的时间戳。根目录 `qemu.log`、`qemu-serial.log` 仅用于通用 runner 的补充诊断，不能替代运行目录作为本轮验收依据。快速提取最新一次运行的结果、gap 和实际测试盘：
 
 ```bash
+run=/tmp/dm-test/dm-control-plane/latest
 grep -aE '^(TEST_|HOST_|SUMMARY_GAP_|OBSERVE_|TEST_DISK|DEV[0-9]*=|Kernel panic|panicked)' \
-  /tmp/dm-*-test.log /tmp/lvm2-topology-test.log
+  "$run/summary.log" "$run/console.clean.log"
 ```
 
 `run_dm_system_tests.sh` 只提供统一 selector 和最终聚合标记；实际测试逻辑由六个子脚本执行。使用 `./myshell/run_dm_system_tests.sh --help` 查看当前 selector，使用具体子脚本的 `--help` 查看参数。
@@ -340,11 +275,11 @@ GUEST_READY_TIMEOUT=60 GUEST_QEMU_TIMEOUT=240 \
 | `existing_qemu` 或镜像 write lock | 检查其他 QEMU、ktest、C 回归或 NixOS 测试；保持串行，不终止不属于本轮的进程。 |
 | 测试盘被拒绝 | 检查是否误用根盘、重复路径、非普通文件，或路径包含空白字符。 |
 | `locate_disk*` / `missing_test_disk*` | 检查 `Attaching Device Mapper test image` 和 `TEST_DISK*=`；确认盘数满足所选 selector。 |
-| `guest_ready_timeout` | 查看对应 `/tmp/*.log`，确认 guest 是否启动到 shell；不要通过重启容器掩盖启动问题。 |
+| `guest_ready_timeout` | 查看本轮运行目录的 `summary.log` 与 `console.log` 末尾，确认 guest 是否启动到 shell；不要通过重启容器掩盖启动问题。 |
 | `guest_lifecycle_timeout` | 根据 `phase=ready/input/execution_or_shutdown` 判断卡在启动、命令注入、执行还是关机。 |
 | integration 第一阶段通过、后续阶段失败 | 不要重建或替换测试盘；检查上一阶段是否有序卸载、停用、关机，以及下一阶段的扫描、激活、table 和文件 MD5 断言。 |
 | `OBSERVE_GAP_*` 或 `SUMMARY_GAP_*` 非 0 | 从首个 gap 对应的 `SCENARIO_`、`STATUS_` 和 stdout/stderr 开始定位。 |
-| `TEST_FAIL_*`、`HOST_FAIL_*` 或 panic | 以本轮 `/tmp/*.log` 的首个失败为准；必要时再检查仓库根目录 `qemu-serial.log`。 |
+| `TEST_FAIL_*`、`HOST_FAIL_*` 或 panic | 以本轮运行目录 `summary.log`、`console.clean.log` 的首个失败为准；必要时再检查仓库根目录 `qemu-serial.log`。 |
 
 ### 5.3 ISO 与安装后验证
 
