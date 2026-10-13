@@ -61,6 +61,35 @@ Local environment:
 - Name the branch after the concise PR title in kebab-case, such as `mapped-bio-ranges`; do not use generic names such as `pr` or `pr1`.
 - Move only the verified minimal production diff from `dm` onto that branch. Run the final validation, commit, and push directly on the PR branch; do not create a separate PR worktree.
 
+### Upstream Sync Workflow
+
+- Sync entry point: fetch upstream, fast-forward local `main` to `upstream/main`
+  (pure fast-forward, never conflicts), scout the delta, then rebase `dm`
+  linearly. Never merge; confirm `git log --merges main..dm` is empty.
+- Scout before spending build time: grade the upstream blast radius from the
+  commit range. A docs/test-only delta may skip the baseline; changes to kernel
+  core, the build system, dependency manifests, or the CI image require it.
+- Run the baseline on the checked-out `main` inside the container: `make check`
+  then `make kernel` (no full `make ktest`). A baseline failure is reported as
+  an upstream/environment problem, never as a DM merge regression. Do not use
+  nested worktrees for the baseline: workspace resolution walks into the main
+  checkout's workspace root, and fresh checkout timestamps force a cargo-osdk
+  reinstall.
+- Create a safety ref (`dm-backup-YYYYMMDD`) and keep rerere enabled before the
+  rebase; delete the ref after targeted verification passes.
+- Conflict adjudication: local workflow facts (`AGENTS.md` blocks, `log/`) keep
+  the dm side; lockfiles and dependency versions take the upstream side, then
+  normalize with one online cargo run in the container as a separate sync
+  commit; a dm fix overlapped by a new upstream implementation is skipped only
+  after the fix's intent is confirmed to be covered, otherwise report first.
+- Targeted verification after the rebase must cover new code, conflict
+  resolutions, and semantically adjacent call chains (same file or caller even
+  without a text conflict).
+- Upstream container-image bumps are recorded during the sync; align the image
+  and rerun targeted verification in it before creating a PR.
+- Do not rebase already-pushed unmerged PR branches as part of the `dm` sync;
+  handle them separately with their own backup refs and PR archives.
+
 Resource checks before commands that may consume noticeable CPU or memory,
 especially builds, ktests, QEMU/NixOS runs, patch generation, and large document
 rewrites:
