@@ -85,4 +85,6 @@ case "${SUITE}" in
 esac
 
 "${SCRIPT_DIR}/${SUITE_SCRIPTS[${SUITE}]}"
-printf 'HOST_PASS_DM_SYSTEM_TESTS %s\n' "${SUITE}" | tee -a "${SUITE_LOG}"
+# `\r\033[K` claims the terminal line: this races with the shell echo of the
+# wrapped command line the same way the suite milestones do.
+printf '\r\033[KHOST_PASS_DM_SYSTEM_TESTS %s\n' "${SUITE}" | tee -a "${SUITE_LOG}"

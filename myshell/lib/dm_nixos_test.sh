@@ -12,9 +12,43 @@ DM_LOG_TEST_ID=
 DM_LOG_FIFO=
 DM_LOG_FD=
 DM_LOG_WRITER_PID=
+# Structured logging (opt-in per suite via DM_STRUCT_LOG=1): one directory per
+# run under DM_TEST_LOG_ROOT, holding the full interleaved stream (console.log),
+# the host-side milestones and conclusions (summary.log), and per-boot QEMU
+# stderr. The terminal only carries milestone lines; legacy suites keep the old
+# single-stream tee behavior.
+DM_STRUCT_LOG=${DM_STRUCT_LOG:-0}
+DM_TEST_LOG_ROOT=${DM_TEST_LOG_ROOT:-/tmp/dm-test}
+DM_LOG_RUN_DIR=
+DM_SUMMARY_LOG=
+DM_TEST_START_TS=
+
+# Emits a host-side milestone: summary.log and the terminal only, never the
+# interleaved console stream (guest output already carries its own markers).
+dm_step() {
+    if [ "${DM_STRUCT_LOG}" = "1" ]; then
+        local ts
+        ts=$(date +%T)
+        printf '[%s] %s\n' "${ts}" "$*" >>"${DM_SUMMARY_LOG}"
+        # `\r\033[K` claims the whole terminal line: the suite races with the
+        # shell echo of a wrapped command line, and printing from wherever the
+        # cursor happens to be splices both texts into one line.
+        printf '\r\033[K[%s] DM-TEST %s\n' "${ts}" "$*"
+    else
+        dm_emit "$*"
+    fi
+}
 
 dm_emit() {
     printf '\n%s\n' "$*" >&"${DM_LOG_FD}"
+    if [ "${DM_STRUCT_LOG}" = "1" ]; then
+        printf '[%s] %s\n' "$(date +%T)" "$*" >>"${DM_SUMMARY_LOG}"
+        case "$*" in
+            TEST_PASS_*|HOST_PASS_*|TEST_FAIL_*|HOST_FAIL_*)
+                printf '\r\033[K[%s] DM-TEST %s\n' "$(date +%T)" "$*"
+                ;;
+        esac
+    fi
 }
 
 dm_close_log() {
@@ -28,6 +62,21 @@ dm_close_log() {
     if [ -n "${DM_LOG_WRITER_PID}" ]; then
         wait "${DM_LOG_WRITER_PID}" || true
         DM_LOG_WRITER_PID=
+    fi
+    if [ -n "${DM_LOG_RUN_DIR}" ] && [ -f "${LOG}" ]; then
+        # A plain-text copy of the console, safe to `cat` on any terminal.
+        # The raw stream contains escape sequences the guest cannot avoid:
+        # systemd's PID 1 broadcasts an OSC 3008 boot-context record (UAPI
+        # Group spec 15) plus cursor/palette probes on /dev/console at boot,
+        # unconditionally and with no opt-out (upstream issue systemd#41973).
+        # Real-time filtering at the FIFO is not an option — the FIFO must be
+        # consumed by `tee` only — so this derived view is built after the
+        # writer has drained it. Parsing order matters: string-type sequences
+        # (OSC/DCS/PM/APC) are consumed first, then CSI, then remaining ESC
+        # introducers, and finally every control byte except \n and \t is
+        # deleted, so the output is provably printable text.
+        perl -pe 's/\e(\]|\^|_|P)[^\a\e]*(?:\a|\e\\)//g; s/\e\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]//g; s/\e[\x20-\x2f]+[\x30-\x7e]//g; s/\e[\x20-\x7e]//g; tr/\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f//d' \
+            "${LOG}" >"${DM_LOG_RUN_DIR}/console.clean.log" || true
     fi
     if [ -n "${DM_LOG_FIFO}" ]; then
         rm -f "${DM_LOG_FIFO}"
@@ -51,6 +100,34 @@ dm_init_log() {
 
     DM_LOG_TEST_ID=${test_id}
     slug=$(_dm_test_tmp_slug "${test_id}")
+    DM_TEST_START_TS=$(date +%s)
+    if [ "${DM_STRUCT_LOG:-0}" = "1" ]; then
+        # Run directory names follow the local clock of whoever runs the suite
+        # (the container exports TZ=Asia/Shanghai), not a hardcoded offset.
+        DM_LOG_RUN_DIR="${DM_TEST_LOG_ROOT}/${slug}/$(date +%Y-%m-%d-%H-%M)"
+        DM_SUMMARY_LOG="${DM_LOG_RUN_DIR}/summary.log"
+        LOG="${DM_LOG_RUN_DIR}/console.log"
+        mkdir -p "${DM_LOG_RUN_DIR}"
+        ln -sfn "${DM_LOG_RUN_DIR}" "${DM_TEST_LOG_ROOT}/${slug}/latest"
+        : >"${LOG}"
+        : >"${DM_SUMMARY_LOG}"
+        DM_LOG_FIFO=$(mktemp -u "/tmp/${slug}-log.XXXXXX")
+        mkfifo "${DM_LOG_FIFO}"
+        # The console stream keeps the original interleaving of host and guest
+        # lines, tee-ed from the FIFO exactly like the legacy mode. No filter
+        # may sit between the FIFO and `tee`: QEMU writes its non-tty stdout
+        # non-blocking, and a consumer that reads in small chunks (e.g.
+        # `sed -u`) throttles the chardev write path until the guest console
+        # stalls. The serial `\r` therefore stays in this file; readiness
+        # polling matches substrings, and every derived view strips the `\r`.
+        tee -a "${LOG}" <"${DM_LOG_FIFO}" >/dev/null &
+        DM_LOG_WRITER_PID=$!
+        exec {DM_LOG_FD}>"${DM_LOG_FIFO}"
+        trap 'dm_close_log' EXIT
+        trap 'dm_report_host_error "$?" "$LINENO"' ERR
+        dm_step "suite started log_dir=${DM_LOG_RUN_DIR}"
+        return
+    fi
     DM_LOG_FIFO=$(mktemp -u "/tmp/${slug}-log.XXXXXX")
     : >"${LOG}"
     mkfifo "${DM_LOG_FIFO}"
@@ -198,10 +275,20 @@ dm_run_guest_script() (
     fi
     start_at=$(date -Is)
     dm_emit "HOST_INFO_${test_id} ${label}_guest_started_at=${start_at}"
-    DM_TEST_IMAGES="${dm_test_images}" \
-    DM_TEST_IMAGE="${DM_TEST_IMAGE}" \
-    DM_TEST_IMAGE_2="${DM_TEST_IMAGE_2}" \
-    setsid make run_nixos 3>&- 4>&- <"${fifo}" >"${DM_LOG_FIFO}" 2>&1 &
+    dm_step "BOOT ${label} starting lifecycle_timeout=${lifecycle_timeout_seconds}s"
+    if [ "${DM_STRUCT_LOG}" = "1" ]; then
+        DM_QEMU_STDERR_LOG="${DM_LOG_RUN_DIR}/qemu-stderr-${label}.log"
+        : >"${DM_QEMU_STDERR_LOG}"
+        DM_TEST_IMAGES="${dm_test_images}" \
+        DM_TEST_IMAGE="${DM_TEST_IMAGE}" \
+        DM_TEST_IMAGE_2="${DM_TEST_IMAGE_2}" \
+        setsid make run_nixos 3>&- 4>&- <"${fifo}" >"${DM_LOG_FIFO}" 2>"${DM_QEMU_STDERR_LOG}" &
+    else
+        DM_TEST_IMAGES="${dm_test_images}" \
+        DM_TEST_IMAGE="${DM_TEST_IMAGE}" \
+        DM_TEST_IMAGE_2="${DM_TEST_IMAGE_2}" \
+        setsid make run_nixos 3>&- 4>&- <"${fifo}" >"${DM_LOG_FIFO}" 2>&1 &
+    fi
     qemu_pid=$!
     exec 3>"${fifo}"
     feeder_fd_open=1
@@ -341,6 +428,7 @@ dm_run_guest_script() (
         qemu_pid=
     fi
     completed_at=$(date -Is)
+    dm_step "BOOT ${label} finished status=${qemu_status} elapsed=$(($(date +%s) - start_ts))s"
     dm_emit "HOST_INFO_${test_id} ${label}_guest_completed_at=${completed_at} lifecycle_after=$(($(date +%s) - start_ts))s status=${qemu_status}"
     return "${qemu_status}"
 )
@@ -348,6 +436,7 @@ dm_print_summary() {
     local test_id=$1
     local include=$2
     local exclude=${3:-${DM_SUMMARY_EXCLUDE}}
+    local summary_sink=${DM_SUMMARY_LOG:-/dev/null}
 
     dm_emit "HOST_INFO_${test_id} summary:"
     if [ ! -f "${LOG}" ]; then
@@ -357,7 +446,9 @@ dm_print_summary() {
 
     grep -aE "${include}" "${LOG}" \
         | grep -avE "${exclude}" \
+        | tr -d '\r' \
         | awk 'BEGIN { seen = 0 } /^=== STEP|^=== CHECK|^DM_TABLE_.*_BEGIN/ { if (seen) print ""; seen = 1 } { print } /^DM_TABLE_.*_END/ { print "" }' \
+        | tee -a "${summary_sink}" \
         || true
 }
 
@@ -372,6 +463,7 @@ dm_log_has_failure_marker() {
 
 dm_print_failure_context() {
     local test_id=$1
+    local summary_sink=${DM_SUMMARY_LOG:-/dev/null}
 
     dm_emit "HOST_INFO_${test_id} log=${LOG}"
     if [ ! -f "${LOG}" ]; then
@@ -381,7 +473,7 @@ dm_print_failure_context() {
     if grep -aq 'Error 65' "${LOG}"; then
         dm_emit "HOST_INFO_${test_id} qemu_error_65=asterinas_exit_failure_before_guest_shell"
     fi
-    grep -aE 'TEST_FAIL|HOST_FAIL|ERROR:|assertion failed|panic|panicked|Error [0-9]+|No space left|Input/output error|Command failed' "${LOG}" | tail -n 40 || true
+    grep -aE 'TEST_FAIL|HOST_FAIL|ERROR:|assertion failed|panic|panicked|Error [0-9]+|No space left|Input/output error|Command failed' "${LOG}" | tr -d '\r' | tail -n 40 | tee -a "${summary_sink}" || true
     if [ -f qemu-serial.log ]; then
         while IFS= read -r line; do
             dm_emit "QEMU_SERIAL: ${line}"
@@ -406,7 +498,9 @@ dm_run_single_guest_test() {
         exit 1
     fi
 
+    dm_step "${pass_marker}"
     dm_emit "HOST_PASS_${test_id}"
+    dm_step "RESULT: PASS total_elapsed=$(($(date +%s) - DM_TEST_START_TS))s"
 }
 
 dm_run_two_guest_test() {
@@ -438,7 +532,9 @@ dm_run_two_guest_test() {
         exit 1
     fi
 
+    dm_step "${second_pass}"
     dm_emit "HOST_PASS_${test_id}"
+    dm_step "RESULT: PASS total_elapsed=$(($(date +%s) - DM_TEST_START_TS))s"
 }
 
 # Runs a three-boot flow while preserving one host log and checking each guest's marker.
@@ -463,6 +559,7 @@ dm_run_three_guest_test() {
         rm -f "${second_script}" "${third_script}"
         exit 1
     fi
+    dm_step "${first_pass}"
 
     dm_run_guest_script "${test_id}" "${second_script}" second || second_status=$?
     rm -f "${second_script}"
@@ -473,6 +570,7 @@ dm_run_three_guest_test() {
         rm -f "${third_script}"
         exit 1
     fi
+    dm_step "${second_pass}"
 
     dm_run_guest_script "${test_id}" "${third_script}" third || third_status=$?
     rm -f "${third_script}"
@@ -484,5 +582,7 @@ dm_run_three_guest_test() {
         exit 1
     fi
 
+    dm_step "${third_pass}"
     dm_emit "HOST_PASS_${test_id}"
+    dm_step "RESULT: PASS total_elapsed=$(($(date +%s) - DM_TEST_START_TS))s"
 }

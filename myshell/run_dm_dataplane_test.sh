@@ -21,6 +21,8 @@ Optional environment variables:
   DM_DATAPLANE_STEP5_IO_TIMEOUT
                             Per-operation Step 5 I/O timeout in seconds, default 20
   RESET_DM_TEST_IMAGES      1 to delete test images before running, default 1
+  DM_STRUCT_LOG             1 (default) to write one log directory per run under DM_TEST_LOG_ROOT with a quiet milestone terminal output, 0 for the legacy single-stream log
+  DM_TEST_LOG_ROOT          Root directory for structured log runs, default /tmp/dm-test
 
 Expected success markers:
   TEST_PASS_DM_DATAPLANE
@@ -28,6 +30,11 @@ Expected success markers:
 EOF
     exit 0
 fi
+
+# Enable the structured per-run logging (see myshell/lib/dm_nixos_test.sh);
+# set DM_STRUCT_LOG=0 to fall back to the legacy single-stream log.
+# This must be decided before sourcing the lib, which applies its own default.
+DM_STRUCT_LOG=${DM_STRUCT_LOG:-1}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/..")

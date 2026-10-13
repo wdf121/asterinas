@@ -14,6 +14,8 @@ segment boundary, recovery after growth, shrink back to one segment, and recover
 after shrink.
 
 Optional environment variables:
+  DM_STRUCT_LOG                    1 (default) to write one log directory per run under DM_TEST_LOG_ROOT with a quiet milestone terminal output, 0 for the legacy single-stream log
+  DM_TEST_LOG_ROOT                 Root directory for structured log runs, default /tmp/dm-test
   DM_TEST_IMAGE                    First backing test image path, default target/nixos/test.img
   DM_TEST_IMAGE_2                  Second backing test image path, default target/nixos/test2.img
   DM_LINEAR_INTEGRATION_LOG        Host-side log path, default /tmp/dm-linear-integration-test.log
@@ -35,6 +37,11 @@ Expected success markers:
 EOF
     exit 0
 fi
+
+# Enable the structured per-run logging (see myshell/lib/dm_nixos_test.sh);
+# set DM_STRUCT_LOG=0 to fall back to the legacy single-stream log.
+# This must be decided before sourcing the lib, which applies its own default.
+DM_STRUCT_LOG=${DM_STRUCT_LOG:-1}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
