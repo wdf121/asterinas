@@ -212,6 +212,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-device-mapper"
+version = "0.1.0"
+dependencies = [
+ "aster-block",
+ "device-id",
+ "ostd",
+]
+
+[[package]]
 name = "aster-drm"
 version = "0.1.0"
 dependencies = [
