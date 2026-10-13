@@ -80,6 +80,8 @@ XFSTESTS_DISK_SIZE ?= 12G
 
 # Specify whether to build regression tests under `test/initramfs/src/regression`.
 ENABLE_REGRESSION_TEST ?= false
+# Whitespace-separated regression directories or executable paths to run; empty runs all.
+REGRESSION_TESTS ?=
 # End of auto test features.
 
 # Network settings
@@ -157,7 +159,7 @@ CARGO_OSDK_BUILD_ARGS += --init-args="/opt/run_conformance_test.sh"
 else ifeq ($(AUTO_TEST), regression)
 ENABLE_REGRESSION_TEST := true
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="INTEL_TDX=$(INTEL_TDX)"
-CARGO_OSDK_BUILD_ARGS += --init-args="/test/run_regression_test.sh"
+CARGO_OSDK_BUILD_ARGS += --init-args="/test/run_regression_test.sh $(REGRESSION_TESTS)"
 else ifeq ($(AUTO_TEST), boot)
 CARGO_OSDK_BUILD_ARGS += --init-args="/test/boot_hello.sh"
 else ifeq ($(AUTO_TEST), vsock)
