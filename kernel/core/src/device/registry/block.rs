@@ -3,10 +3,15 @@
 use alloc::format;
 
 use aster_block::{BLOCK_SIZE, BlockDevice, SECTOR_SIZE, bio::BioStatus, id::Sid};
+use aster_device::{
+    class::{self, Class, ClassDevice, ClassHandle},
+    common::{Attr, DevNum},
+};
 use aster_nvme::NvmeBlockDevice;
 use aster_virtio::device::block::device::BlockDevice as VirtIoBlockDevice;
 use device_id::DeviceId;
 use ostd::mm::VmIo;
+use spin::Once;
 
 use crate::{
     context::current_userspace,
@@ -145,6 +150,7 @@ struct BlockFile {
     state: Arc<Mutex<BlockFileState>>,
     lifecycle: Mutex<()>,
     node: Mutex<Option<DevtmpfsHandle>>,
+    model_device: Mutex<Option<Arc<BlockModelDevice>>>,
     mapper_alias: Mutex<Option<(String, DevtmpfsHandle)>>,
     removing: Mutex<Option<aster_block::PendingBlockDeviceUnregistration>>,
 }
@@ -180,6 +186,7 @@ impl BlockFile {
             })),
             lifecycle: Mutex::new(()),
             node: Mutex::new(None),
+            model_device: Mutex::new(None),
             mapper_alias: Mutex::new(None),
             removing: Mutex::new(None),
         }
@@ -836,13 +843,72 @@ fn validate_mapper_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `block` class: block devices such as `/dev/vda` and `/dev/dm-0`.
+///
+/// The block registry creates and removes the `/dev` nodes of its devices
+/// together with their identity-checked devtmpfs handles, so the device model
+/// only supplies the sysfs view: the directory under `/sys/devices/virtual/`,
+/// the `/sys/class/block` entry, and the `/sys/dev/block/<major>:<minor>` link.
+struct BlockClass;
+
+impl Class for BlockClass {
+    const NAME: &'static str = "block";
+    type Device = DeviceId;
+    const CREATES_DEVNODE: bool = false;
+
+    fn dev_attrs(&self) -> &'static [Attr<ClassDevice<Self>>] {
+        &[]
+    }
+}
+
+/// A block device, as seen by the device model.
+type BlockModelDevice = ClassDevice<BlockClass>;
+
+static BLOCK_CLASS: Once<Arc<ClassHandle<BlockClass>>> = Once::new();
+
+/// Publishes the device-model entry of a registered block device.
+///
+/// The entry lives as long as the block registry entry: it is published right
+/// after the registry insert, and every rollback and removal path goes through
+/// `remove_wrapper_if_matches`, which unregisters it.
+fn register_model_device(block_file: &Arc<BlockFile>) -> Result<()> {
+    let handle = BLOCK_CLASS.call_once(|| {
+        // Kernel-mode tests exercise the runtime registration paths without
+        // the first-kthread init, so they set the device model up here too.
+        #[cfg(ktest)]
+        aster_device::init_for_ktest();
+        class::register(BlockClass).expect("the block class name is valid")
+    });
+
+    let device = BlockModelDevice::builder(handle, block_file.path.clone(), block_file.id())
+        .devnum(DevNum::block(block_file.id()))
+        .build();
+    aster_device::add_device(&device)?;
+
+    let mut model_device = block_file.model_device.lock();
+    assert!(model_device.is_none());
+    *model_device = Some(device);
+    Ok(())
+}
+
 fn remove_wrapper_if_matches(block_file: &Arc<BlockFile>) {
-    let mut registry = DEVICE_REGISTRY.lock();
-    if registry
-        .get(&block_file.id().to_raw())
-        .is_some_and(|current| Arc::ptr_eq(current, block_file))
+    let removed = {
+        let mut registry = DEVICE_REGISTRY.lock();
+        if registry
+            .get(&block_file.id().to_raw())
+            .is_some_and(|current| Arc::ptr_eq(current, block_file))
+        {
+            registry.remove(&block_file.id().to_raw())
+        } else {
+            None
+        }
+    };
+    // Unregister outside of the registry lock: the device model walks the
+    // sysfs tree, which must not re-enter the block registry under its lock.
+    if removed.is_some()
+        && let Some(model_device) = block_file.model_device.lock().take()
     {
-        registry.remove(&block_file.id().to_raw());
+        let _ = aster_device::remove_device(&model_device);
     }
 }
 
@@ -859,6 +925,12 @@ fn register_pending_wrapper(device: Arc<dyn BlockDevice>, path: String) -> Resul
         return_errno_with_message!(Errno::EEXIST, "the block device wrapper already exists");
     }
     registry.insert(id, block_file.clone());
+    drop(registry);
+
+    if let Err(error) = register_model_device(&block_file) {
+        remove_wrapper_if_matches(&block_file);
+        return Err(error);
+    }
     Ok(block_file)
 }
 
@@ -873,6 +945,12 @@ fn register_wrapper_with_path(
         return_errno_with_message!(Errno::EEXIST, "the block device wrapper already exists");
     }
     registry.insert(id, block_file.clone());
+    drop(registry);
+
+    if let Err(error) = register_model_device(&block_file) {
+        remove_wrapper_if_matches(&block_file);
+        return Err(error);
+    }
     Ok(block_file)
 }
 
@@ -1125,6 +1203,21 @@ mod tests {
 
         unregister_mapper(id, mapper_name).unwrap();
         assert!(lookup(id).is_none());
+    }
+
+    #[ktest]
+    fn runtime_registration_publishes_and_unpublishes_device_model_entry() {
+        devtmpfs::init_for_ktest();
+        let device = TestBlockDevice::new(42);
+        let id = device.id();
+        register_mapper_primary(device).unwrap();
+
+        let block_file = lookup_runtime_block_file(id).unwrap();
+        assert!(block_file.model_device.lock().is_some());
+
+        unregister_mapper(id, "runtime-model-entry").unwrap();
+        assert!(lookup(id).is_none());
+        assert!(block_file.model_device.lock().is_none());
     }
 
     #[ktest]

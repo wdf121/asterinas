@@ -212,9 +212,14 @@ fn add_steps(this: &Arc<dyn AnyDevice>) -> Result<()> {
         let index = registry::get().dev_index(devnum.kind());
         add_link(index.as_ref(), &devnum.to_string(), &path)?;
         base.links().lock().dev_index = true;
-        let request = devnode_request(this.as_ref(), devnum);
-        hooks::create_devnode(request.clone())?;
-        *base.devnode().lock() = Some(request);
+        // A device whose class publishes its own nodes only asks for the
+        // index entry; recording no request also keeps `teardown` from
+        // deleting a node it does not own.
+        if subsystem.creates_devnode() {
+            let request = devnode_request(this.as_ref(), devnum);
+            hooks::create_devnode(request.clone())?;
+            *base.devnode().lock() = Some(request);
+        }
     }
 
     // No fallible registration steps remain. The path is now stable, and

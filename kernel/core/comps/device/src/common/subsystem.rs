@@ -94,6 +94,11 @@ impl Subsystem {
     pub(crate) fn keeps_glue_dir(&self) -> bool {
         self.ops.as_ref().is_some_and(|ops| ops.keeps_glue_dir())
     }
+
+    /// Returns whether the device model creates the `/dev` node of a device in this subsystem.
+    pub(crate) fn creates_devnode(&self) -> bool {
+        self.ops.as_ref().is_none_or(|ops| ops.creates_devnode())
+    }
 }
 
 impl core::fmt::Debug for Subsystem {
@@ -126,6 +131,13 @@ pub(crate) trait SubsystemOps: Send + Sync + 'static {
     /// Returns whether a class device under a class-device parent still gets a glue directory
     /// (always false for a bus).
     fn keeps_glue_dir(&self) -> bool;
+
+    /// Returns whether the device model creates the `/dev` node of a device
+    /// in this subsystem.
+    ///
+    /// A class can opt out for devices that publish their own nodes;
+    /// such a device still gets its `/sys/dev` index entry.
+    fn creates_devnode(&self) -> bool;
 
     /// Records a newly added device: a bus probes for a driver, a class notifies its observers.
     fn on_added(&self, dev: &Arc<dyn AnyDevice>);

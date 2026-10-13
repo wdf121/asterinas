@@ -122,6 +122,20 @@ impl HookSlot {
             }
         }
     }
+
+    /// Returns the requests queued for hooks that are not installed yet.
+    #[cfg(ktest)]
+    pub(crate) fn pending_requests(&self) -> Vec<DevNodeRequest> {
+        self.pending.lock().clone()
+    }
+}
+
+/// Returns the requests queued for hooks that are not installed yet.
+///
+/// Kernel-mode tests use this to check which devices asked for a `/dev` node.
+#[cfg(ktest)]
+pub(crate) fn pending_requests() -> Vec<DevNodeRequest> {
+    HOOKS.pending_requests()
 }
 
 /// The shared hook slot.

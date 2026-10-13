@@ -57,6 +57,13 @@ pub trait Class: Sized + Send + Sync + 'static {
         None
     }
 
+    /// Whether the device model creates the `/dev` node of a device in this class.
+    ///
+    /// A class whose devices publish their own nodes sets this to `false`:
+    /// such a device still gets its `/sys/dev/<kind>/<major>:<minor>` index entry,
+    /// and the device model neither creates nor deletes its node.
+    const CREATES_DEVNODE: bool = true;
+
     /// Returns the attributes shared by all devices on this class.
     fn dev_attrs(&self) -> &'static [Attr<ClassDevice<Self>>];
 
@@ -179,6 +186,10 @@ impl<C: Class> SubsystemOps for ClassHandle<C> {
 
     fn keeps_glue_dir(&self) -> bool {
         C::KEEPS_GLUE_DIR
+    }
+
+    fn creates_devnode(&self) -> bool {
+        C::CREATES_DEVNODE
     }
 
     fn on_added(&self, dev: &Arc<dyn AnyDevice>) {

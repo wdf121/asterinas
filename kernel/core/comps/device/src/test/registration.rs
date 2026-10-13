@@ -15,8 +15,8 @@ use super::{
 };
 use crate::{
     bus::BusDevice,
-    class::{ClassDevice, ClassObserver},
-    common::{BareDevice, DevNum, Error},
+    class::{self, Class, ClassDevice, ClassObserver},
+    common::{Attr, BareDevice, DevNum, Error},
 };
 
 #[ktest]
@@ -284,4 +284,51 @@ fn bus_device_registration_and_probe() {
     class
         .unregister_observer(&(observer as Arc<dyn ClassObserver<ToyBlock>>))
         .unwrap();
+}
+
+/// A block class whose devices publish their own `/dev` nodes.
+struct SelfPublishingBlock;
+
+/// A payload for `SelfPublishingBlock` devices.
+struct SelfPublishingDisk;
+
+impl Class for SelfPublishingBlock {
+    const NAME: &'static str = "selfblk";
+    type Device = SelfPublishingDisk;
+    const CREATES_DEVNODE: bool = false;
+
+    fn dev_attrs(&self) -> &'static [Attr<ClassDevice<Self>>] {
+        &[]
+    }
+}
+
+#[ktest]
+fn self_publishing_class_gets_index_link_but_no_devnode() {
+    crate::init_for_ktest();
+    let class = class::register(SelfPublishingBlock).unwrap();
+    let devnum = DevNum::block(DeviceId::new(MajorId::new(234), MinorId::new(56)));
+
+    // 1. Add the device and check that its sysfs view is complete.
+    let pending_before = crate::hooks::pending_requests().len();
+    let dev = ClassDevice::builder(&class, "self0", SelfPublishingDisk)
+        .devnum(devnum)
+        .build();
+    crate::add_device(&dev).unwrap();
+    assert_eq!(dev.path(), "/devices/virtual/selfblk/self0");
+    assert_eq!(
+        utils::link_target("/dev/block/234:56").unwrap(),
+        "../../devices/virtual/selfblk/self0"
+    );
+
+    // 2. The class opted out of node creation, so no `/dev` node was requested.
+    assert_eq!(
+        crate::hooks::pending_requests().len(),
+        pending_before,
+        "a `/dev` node was requested despite `CREATES_DEVNODE == false`"
+    );
+
+    // 3. Removing the device takes the index link with it.
+    crate::remove_device(&dev).unwrap();
+    assert!(utils::lookup("/dev/block/234:56").is_none());
+    assert!(utils::lookup("/devices/virtual/selfblk").is_none());
 }

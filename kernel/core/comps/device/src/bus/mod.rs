@@ -349,6 +349,10 @@ impl<B: Bus> SubsystemOps for BusHandle<B> {
         false
     }
 
+    fn creates_devnode(&self) -> bool {
+        true
+    }
+
     fn on_added(&self, dev: &Arc<dyn AnyDevice>) {
         let dev = dev
             .as_any()
