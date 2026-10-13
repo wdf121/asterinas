@@ -65,6 +65,7 @@ pub(super) struct Ext2MemoryDisk {
     segment: Segment<()>,
     flush_count: AtomicUsize,
     fail_flush: AtomicBool,
+    fail_write_sector: AtomicUsize,
 }
 
 impl Ext2MemoryDisk {
@@ -78,7 +79,16 @@ impl Ext2MemoryDisk {
             segment,
             flush_count: AtomicUsize::new(0),
             fail_flush: AtomicBool::new(false),
+            fail_write_sector: AtomicUsize::new(usize::MAX),
         }
+    }
+
+    /// Injects an I/O error for writes covering a block, or disables injection.
+    pub(super) fn fail_writes_to(&self, block: Option<u32>) {
+        self.fail_write_sector.store(
+            block.map_or(usize::MAX, |bid| bid as usize * (BLOCK_SIZE / SECTOR_SIZE)),
+            Ordering::Relaxed,
+        );
     }
 
     pub(super) fn segment(&self) -> &Segment<()> {
@@ -117,6 +127,16 @@ impl BlockDevice for Ext2MemoryDisk {
             };
             bio.complete(status);
             return Ok(());
+        }
+
+        if bio.type_() == BioType::Write {
+            let failed_sector = self.fail_write_sector.load(Ordering::Relaxed) as u64;
+            let range = bio.sid_range();
+            let failed_end = failed_sector.saturating_add((BLOCK_SIZE / SECTOR_SIZE) as u64);
+            if range.start.to_raw() < failed_end && failed_sector < range.end.to_raw() {
+                bio.complete(BioStatus::IoError);
+                return Ok(());
+            }
         }
 
         let mut cur_device_ofs = bio.sid_range().start.to_raw() as usize * SECTOR_SIZE;
@@ -500,6 +520,7 @@ pub(super) struct Ext2FixtureBuilder {
     block_bitmap: Option<BlockBitmapInit>,
     inode_bitmap: Option<InodeBitmapInit>,
     custom_device: Option<Arc<dyn BlockDevice>>,
+    derive_bitmap_counts: bool,
 }
 
 impl Ext2FixtureBuilder {
@@ -516,7 +537,17 @@ impl Ext2FixtureBuilder {
             block_bitmap: None,
             inode_bitmap: None,
             custom_device: None,
+            derive_bitmap_counts: false,
         }
+    }
+
+    /// Derives free counts from the initialized bitmaps instead of test hints.
+    ///
+    /// Use this for writeback tests that compare on-disk counters with bitmap
+    /// contents; older fixtures intentionally allow inconsistent counters.
+    pub(super) fn with_bitmap_counts(mut self) -> Self {
+        self.derive_bitmap_counts = true;
+        self
     }
 
     pub(super) fn with_free_blocks(mut self, sb_free_blocks: u32, group0_free_blocks: u16) -> Self {
@@ -716,8 +747,36 @@ impl Ext2FixtureBuilder {
     }
 
     pub(super) fn build(self) -> Result<Ext2Fixture> {
-        let (_, sb, descs, disk, layout) = self.prepare()?;
+        let (mut raw_sb, mut sb, mut descs, disk, layout) = self.prepare()?;
         self.write_bitmaps(&sb, &descs, &disk, &layout);
+
+        if self.derive_bitmap_counts {
+            raw_sb.free_blocks_count = 0;
+            raw_sb.free_inodes_count = 0;
+            for (idx, desc) in descs.iter_mut().enumerate() {
+                let nr_blocks = sb.group_last_block_no(idx) - sb.group_first_block_no(idx) + 1;
+                let nr_inodes = sb
+                    .total_inodes()
+                    .saturating_sub(idx as u32 * sb.nr_inodes_per_group())
+                    .min(sb.nr_inodes_per_group());
+                let count_free = |bid: u32, bits: u32| {
+                    let mut bitmap = [0u8; BLOCK_SIZE];
+                    disk.segment()
+                        .read_bytes(Bid::new(bid as u64).to_offset(), &mut bitmap)
+                        .unwrap();
+                    (0..bits as usize)
+                        .filter(|bit| bitmap[bit / 8] & (1 << (bit % 8)) == 0)
+                        .count() as u16
+                };
+                desc.free_blocks_count = count_free(desc.block_bitmap_bid, nr_blocks);
+                desc.free_inodes_count = count_free(desc.inode_bitmap_bid, nr_inodes);
+                raw_sb.free_blocks_count += u32::from(desc.free_blocks_count);
+                raw_sb.free_inodes_count += u32::from(desc.free_inodes_count);
+            }
+            disk.write_super_block(&raw_sb);
+            sb = SuperBlock::try_from(raw_sb)?;
+            disk.write_group_desc_table(&sb, &descs);
+        }
 
         let root_bid = layout.first_data_bid.saturating_add(1);
         if self.init_root {

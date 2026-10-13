@@ -13,11 +13,11 @@
 //! state: read mode for queries, write mode for allocation, deallocation,
 //! and sync. The `block_groups` vector itself is immutable after mount;
 //! each `BlockGroup` carries its own internal locks (see `block_group`
-//! module documentation). The `group_descriptors_segment` has no dedicated
-//! lock — it is loaded once at mount and updated during `sync` under each
-//! group's metadata write guard, with disjoint descriptor offsets ensuring
-//! no two writers touch the same bytes. `next_generation` is an `AtomicU32`
-//! incremented once per newly allocated inode.
+//! module documentation). Each group stages its slice of
+//! `group_descriptors_segment` under its metadata write guard. The final
+//! metadata pass also holds the superblock write guard to freeze allocation
+//! while refreshing and persisting bitmap and descriptor snapshots.
+//! `next_generation` is an `AtomicU32` incremented once per newly allocated inode.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -517,11 +517,8 @@ impl Ext2 {
 
     /// Syncs cached inodes and block-group-local metadata in all groups.
     pub(super) fn sync_all(&self) -> Result<()> {
-        // `group_descriptors_segment` is updated without a filesystem-wide lock,
-        // but each group writes only its own descriptor slice under its
-        // `metadata.write()` guard.  Because groups are synced sequentially and
-        // their descriptor offsets are disjoint, no two writers touch the same
-        // bytes, so the segment is always consistent.
+        // Inode writeback can change allocation state in other groups. The
+        // final metadata pass refreshes group snapshots with allocation frozen.
         for group in &self.block_groups {
             group.sync_all(&self.group_descriptors_segment)?;
         }
@@ -626,6 +623,14 @@ impl Ext2 {
             return Ok(());
         }
 
+        // Inode writeback or concurrent writers may have changed a group after
+        // its earlier sync pass. Freeze allocation with the superblock lock and
+        // refresh bitmaps and descriptor snapshots before persisting counters.
+        // Do not sync inodes here: their writeback can allocate blocks itself.
+        for group in &self.block_groups {
+            group.sync_metadata(&self.group_descriptors_segment)?;
+        }
+
         let nr_block_groups = sb_guard.nr_block_groups() as usize;
 
         let mut total_free_blocks: u32 = 0;
@@ -694,7 +699,7 @@ mod test {
     use crate::{
         fs::{
             fs_impls::ext2::test_utils::{
-                BlockBitmapInit, Ext2FixtureBuilder, Ext2MemoryDisk, InodeBitmapInit,
+                BlockBitmapInit, Ext2Fixture, Ext2FixtureBuilder, Ext2MemoryDisk, InodeBitmapInit,
                 RawInodeBuilder, assert_errno, create_file, default_fixture, make_valid_group_desc,
                 make_valid_super_block,
             },
@@ -836,6 +841,125 @@ mod test {
                 )
                 .unwrap();
             assert_eq!(backup_desc, primary_desc);
+        }
+    }
+
+    /// Checks persisted counters against actual bitmap bits, not cached state.
+    fn assert_disk_free_counts(fixture: &Ext2Fixture) {
+        let disk = fixture.disk.segment();
+        let sb = &fixture.sb;
+        let desc_offset = Bid::new(sb.group_descriptors_bid(0) as u64).to_offset();
+        let mut total_blocks = 0u32;
+        let mut total_inodes = 0u32;
+        for idx in 0..sb.nr_block_groups() as usize {
+            let desc = disk
+                .read_val::<RawBlockGroup>(desc_offset + idx * size_of::<RawBlockGroup>())
+                .unwrap();
+            let count_free = |bid: u32, bits: u32| {
+                let mut bitmap = [0u8; BLOCK_SIZE];
+                disk.read_bytes(Bid::new(bid as u64).to_offset(), &mut bitmap)
+                    .unwrap();
+                (0..bits as usize)
+                    .filter(|bit| bitmap[bit / 8] & (1 << (bit % 8)) == 0)
+                    .count() as u32
+            };
+            let blocks = count_free(
+                desc.block_bitmap_bid,
+                sb.group_last_block_no(idx) - sb.group_first_block_no(idx) + 1,
+            );
+            let inodes = count_free(
+                desc.inode_bitmap_bid,
+                sb.total_inodes()
+                    .saturating_sub(idx as u32 * sb.nr_inodes_per_group())
+                    .min(sb.nr_inodes_per_group()),
+            );
+            assert_eq!(u32::from(desc.free_blocks_count), blocks);
+            assert_eq!(u32::from(desc.free_inodes_count), inodes);
+            total_blocks += blocks;
+            total_inodes += inodes;
+        }
+        let raw_sb = disk.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET).unwrap();
+        assert_eq!(raw_sb.free_blocks_count, total_blocks);
+        assert_eq!(raw_sb.free_inodes_count, total_inodes);
+        assert_eq!(
+            raw_sb.free_blocks_count,
+            fixture.ext2.super_block().free_blocks_count()
+        );
+    }
+
+    #[ktest]
+    fn sync_disk_counts_after_alloc_free_and_repeat() {
+        clocks::init_for_ktest();
+        let f = Ext2FixtureBuilder::new(1, 128)
+            .with_bitmap_counts()
+            .build()
+            .unwrap();
+        assert_disk_free_counts(&f);
+        let range = f.ext2.alloc_blocks(2, 0).unwrap();
+        f.ext2.sync_all().unwrap();
+        assert_disk_free_counts(&f);
+        f.ext2.free_blocks(range.start, range.len() as u32).unwrap();
+        f.ext2.sync_all().unwrap();
+        assert_disk_free_counts(&f);
+        f.ext2.sync_all().unwrap();
+        assert_disk_free_counts(&f);
+    }
+
+    #[ktest]
+    fn sync_disk_counts_after_late_allocation() {
+        clocks::init_for_ktest();
+        let f = Ext2FixtureBuilder::new(1, 128)
+            .with_bitmap_counts()
+            .build()
+            .unwrap();
+        assert_disk_free_counts(&f);
+        f.ext2.alloc_blocks(1, 0).unwrap();
+        for group in &f.ext2.block_groups {
+            group.sync_all(&f.ext2.group_descriptors_segment).unwrap();
+        }
+        // Model an allocation between the group writeback phase and the final
+        // metadata phase of sync_all. No timing-dependent threads are needed.
+        f.ext2.alloc_blocks(1, 0).unwrap();
+        f.ext2.sync_metadata().unwrap();
+        assert_disk_free_counts(&f);
+    }
+
+    #[ktest]
+    fn sync_disk_counts_after_late_free() {
+        clocks::init_for_ktest();
+        let f = Ext2FixtureBuilder::new(1, 128)
+            .with_bitmap_counts()
+            .build()
+            .unwrap();
+        assert_disk_free_counts(&f);
+        let range = f.ext2.alloc_blocks(2, 0).unwrap();
+        for group in &f.ext2.block_groups {
+            group.sync_all(&f.ext2.group_descriptors_segment).unwrap();
+        }
+        f.ext2.free_blocks(range.start, 1).unwrap();
+        f.ext2.sync_metadata().unwrap();
+        assert_disk_free_counts(&f);
+    }
+
+    #[ktest]
+    fn sync_disk_counts_retry_after_write_error() {
+        clocks::init_for_ktest();
+        let f = Ext2FixtureBuilder::new(1, 128)
+            .with_bitmap_counts()
+            .build()
+            .unwrap();
+        assert_disk_free_counts(&f);
+        for bid in [
+            f.descs[0].block_bitmap_bid,
+            f.sb.group_descriptors_bid(0),
+            f.sb.bid(0),
+        ] {
+            f.ext2.alloc_blocks(1, 0).unwrap();
+            f.disk.fail_writes_to(Some(bid));
+            assert_errno!(f.ext2.sync_all(), Errno::EIO);
+            f.disk.fail_writes_to(None);
+            f.ext2.sync_all().unwrap();
+            assert_disk_free_counts(&f);
         }
     }
 

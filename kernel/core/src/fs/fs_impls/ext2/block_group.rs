@@ -464,7 +464,7 @@ impl BlockGroup {
     /// Dirty bitmaps are written to disk here. If the group descriptor is dirty,
     /// this method updates the caller-provided descriptor table segment; the
     /// caller is responsible for writing that segment to disk.
-    fn sync_metadata(&self, group_descs: &USegment) -> Result<()> {
+    pub(super) fn sync_metadata(&self, group_descs: &USegment) -> Result<()> {
         let mut metadata = self.metadata.write();
 
         // Sync block bitmap.
