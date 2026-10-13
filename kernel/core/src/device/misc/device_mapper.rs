@@ -400,8 +400,8 @@ fn validate_input_flags(command: u8, buffer: &[u8]) -> Result<()> {
     {
         return_errno_with_message!(Errno::EINVAL, "query inactive table flag 不能用于该 ioctl");
     }
-    if flags & DM_UUID_FLAG != 0 && command != DM_DEV_RENAME_CMD {
-        return_errno_with_message!(Errno::EINVAL, "uuid flag 只能用于设备重命名");
+    if flags & DM_UUID_FLAG != 0 && command != DM_DEV_RENAME_CMD && command != DM_LIST_DEVICES_CMD {
+        return_errno_with_message!(Errno::EINVAL, "uuid flag 只能用于设备重命名或列出设备");
     }
     Ok(())
 }
@@ -861,11 +861,13 @@ fn get_target_version(buffer: &mut [u8]) -> Result<()> {
 }
 
 fn list_devices(buffer: &mut [u8]) -> Result<()> {
+    let flags = read_u32(buffer, OFF_FLAGS)?;
+    let include_uuid = flags & DM_UUID_FLAG != 0;
     let devices = manager()
         .devices()
         .into_iter()
         .filter(|device| !aster_block::is_removing(device.id()));
-    list_devices_for_snapshots(buffer, QueryWorkflow::devices(devices))
+    list_devices_for_snapshots(buffer, QueryWorkflow::devices(devices), include_uuid)
 }
 
 /// Lists mapped device names and UUID extensions in Linux `DM_LIST_DEVICES` format.
@@ -874,13 +876,19 @@ fn list_devices_for_devices<I>(buffer: &mut [u8], devices: I) -> Result<()>
 where
     I: IntoIterator<Item = Arc<DmDevice>>,
 {
-    list_devices_for_snapshots(buffer, QueryWorkflow::devices(devices))
+    list_devices_for_snapshots(buffer, QueryWorkflow::devices(devices), true)
 }
 
 /// Encodes one immutable mapper snapshot sequence as Linux name-list records.
+///
+/// When `include_uuid` is false (the caller did not set `DM_UUID_FLAG`), each
+/// record is the compact `dev | next | name\0` form aligned to 8 bytes. When
+/// `include_uuid` is true, the extended form with event number, name-list flags,
+/// and optional UUID is written instead.
 fn list_devices_for_snapshots(
     buffer: &mut [u8],
     devices: impl IntoIterator<Item = DeviceSnapshot>,
+    include_uuid: bool,
 ) -> Result<()> {
     let start = data_start(buffer)?;
     let mut cursor = start;
@@ -888,8 +896,14 @@ fn list_devices_for_snapshots(
 
     for device in devices {
         let name_len = device.name.len() + 1;
-        let uuid_len = device.uuid.as_ref().map_or(0, |uuid| uuid.len() + 1);
-        let (extension_offset, record_len) = name_list_record_layout(name_len, uuid_len)?;
+        let record_len = if include_uuid {
+            let uuid_len = device.uuid.as_ref().map_or(0, |uuid| uuid.len() + 1);
+            let (_, len) = name_list_record_layout(name_len, uuid_len)?;
+            len
+        } else {
+            align_up(12usize.checked_add(name_len).ok_or_else(invalid_buffer)?, 8)?
+        };
+
         if available_from(buffer, cursor) < record_len {
             set_buffer_full(buffer)?;
             break;
@@ -900,16 +914,20 @@ fn list_devices_for_snapshots(
         write_u64(buffer, cursor, device.id.as_encoded_u64())?;
         write_u32(buffer, cursor + 8, 0)?;
         write_c_string(buffer, cursor + 12, &device.name)?;
-        let extension = cursor + extension_offset;
-        write_u32(buffer, extension, device.status.event_nr)?;
-        let name_list_flags = if device.uuid.is_some() {
-            DM_NAME_LIST_FLAG_HAS_UUID
-        } else {
-            DM_NAME_LIST_FLAG_DOESNT_HAVE_UUID
-        };
-        write_u32(buffer, extension + 4, name_list_flags)?;
-        if let Some(uuid) = device.uuid {
-            write_c_string(buffer, extension + 8, &uuid)?;
+        if include_uuid {
+            let uuid_len = device.uuid.as_ref().map_or(0, |uuid| uuid.len() + 1);
+            let (extension_offset, _) = name_list_record_layout(name_len, uuid_len)?;
+            let extension = cursor + extension_offset;
+            write_u32(buffer, extension, device.status.event_nr)?;
+            let name_list_flags = if device.uuid.is_some() {
+                DM_NAME_LIST_FLAG_HAS_UUID
+            } else {
+                DM_NAME_LIST_FLAG_DOESNT_HAVE_UUID
+            };
+            write_u32(buffer, extension + 4, name_list_flags)?;
+            if let Some(uuid) = device.uuid {
+                write_c_string(buffer, extension + 8, &uuid)?;
+            }
         }
         previous = Some(cursor);
         cursor += record_len;
