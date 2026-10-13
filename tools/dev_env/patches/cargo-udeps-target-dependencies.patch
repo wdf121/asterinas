@@ -1,0 +1,21 @@
+Subject: [PATCH] Do not warn about identical target-specific dependency names
+
+cargo-udeps 0.1.61 visits dependencies from multiple target tables. Reusing
+one package under the same dependency name is valid, including when each
+target enables different features. Only a different name for the same
+package makes the package-to-name mapping ambiguous.
+
+Keep the existing warning for distinct names and leave unused-dependency
+analysis unchanged.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -830,5 +830,7 @@
+ 					let names = &mut this[dep.kind()];
+ 					names.by_extern_crate_name.insert(extern_crate_name, dep.name_in_toml());
+ 					if let Some(pkg) = names.by_package_id.insert(to_pkg.package_id(), dep.name_in_toml()) {
+-						shell.warn(format!("duplicate package mentioned in toml {}. {pkg}", to_pkg.package_id()))?;
++						if pkg != dep.name_in_toml() {
++							shell.warn(format!("duplicate package mentioned in toml {}. {pkg}", to_pkg.package_id()))?;
++						}
+ 					}
