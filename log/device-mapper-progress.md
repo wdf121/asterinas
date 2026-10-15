@@ -1,24 +1,21 @@
 # Device Mapper 当前项目状态
 
-> **更新日期**：2026-10-09。
+> **更新日期**：2026-10-14。
 >
 > **事实来源**：实现以当前源码为准，验证以对应源码版本和实际命令输出为准；历史日志不自动证明当前工作区通过。
 
 ## 当前停点摘要
 
-- 本地 main 为 `10a241870`，dm 为 `2699dfed0`；同步收尾提交已完成，历史检查 main..dm 无 merge commit。本轮未查询远端最新状态。
-- 10 月 8 日完整 ktest 通过早于后续 lint 修改；之后 make check、普通 dev 内核/启动 ISO 构建有成功输出。
-- 修复后的跨日定向复测为 DM 87/0、core ioctl 81/0、devtmpfs 6/0、runtime registry 8/0、VMCS 1/0，共 183 项通过；不是全仓或 C/NixOS 验收。
+- 本地 main 为 `77ee3b196`（v0.19.0），dm 为 `726398086`；0.19.0 同步已完成（2026-10-13，154 提交线性重放，无 merge commit）。dm 的 force push 挂起，待用户统一执行。
+- PR 1（mapped BIO ranges，分支 mapped-bio-ranges）：本地重放至 `716a1161b`；远端 #3937 分支仍为旧历史，重推待定。
+- PR 2（dm-linear-io-path）：`d0088c2c9`（6 文件、421 行）；2026-10-14 清除 6 条中文注释洗史并 force-with-lease 重推，ls-remote 实证远端一致；改史后 gate 全绿（check/kernel exit 0，block 6/0，dm 8/0）；PR 未创建，编号待回填。
+- PR 3（dm-control-interface，基于 PR 2）：`d539b725b`，控制设备骨架 + `DM_VERSION` 握手 + flags 校验，19 个 ktest；六条外部 review 评判与修复完毕（失败路径回写 version、major-only 有意、收紧注释、字面量锚定、两段拷贝注释、1MiB 保留）；gate 全绿（check/kernel exit 0，aster-core 全量 ktest 160/0）；未推送。
+- OSDK 0.19.0 ktest selector 为后缀 trie：裸模块路径选择器必匹配空集（EXIT=0 假绿）；定向入口为无 selector 的 crate 全量加串口逐行取证；10-13 日志集成层 81/159 记录已勘误作废。
 - 普通 VFS rename、完整 mount source 路径及 procfs 的直接覆盖缺口保留；不能以邻近模块通过替代。
 - PR 在新 PR 分支最终验证；同步在 rebase 后 dm 最终验证，候选 main 先做干净基线。两边均采用 make check、make kernel 与按影响范围的定向 ktest，不默认全量。
-- 收尾提交已完成至 `2699dfed0`；用户已提供 dm 推送成功输出，本轮未远端复核。
-- PR 路线已重排：PR 2 单段 linear、PR 3 控制配置、PR 4 首次激活与访问。基于上一份 PR + 最新 main；允许简化适配，在 PR 分支独立验证。PR 1 已 rebase 为 `67ed6c70f`；PR 2 从该提交建立 dm-linear-io-path，用户已手敲实现并开始测试。
+- 校验取舍已归入 PR 规范：当前保留局部范围检查，全局不变量与统一校验入口留待 dm 讨论，不扩大 PR 范围。
 
-- PR 2 最小组件已写好构造/元数据/转发及 DmDevice 接口；首个几何测试已写，尚无 ktest 结果。用户反馈 PR 1 验证与添加测试前的组件检查通过，未提供原始输出，不等于 PR 2 最终 gate 通过。
-- 已回 dm 收尾文档，PR 2 未提交代码在 stash `43291518c58869e5dd59efb1bc253f1af378c985`（pr2-code）。下次从构造边界测试继续，不自动恢复 stash。
-- 校验取舍已归入 PR 规范：当前保留局部范围检查，全局不变量与统一校验入口留待 dm 讨论，不扩大 PR 2。
-
-证据见 [10 月 8 日](daily/2026-10-8.md)、[10 月 9 日](daily/2026-10-9.md) 日志；接手入口见 [正式交接](../docs/device-mapper-handoff.md)。
+证据见 [10 月 13 日](daily/2026-10-13.md)、[10 月 14 日](daily/2026-10-14.md) 日志；接手入口见 [正式交接](../docs/device-mapper-handoff.md)。
 
 ## 1. 当前方向
 
@@ -71,12 +68,11 @@ cargo osdk test
 cargo osdk test aster_device_mapper::table::tests
 ```
 
-跨到 core ioctl/runtime 时：
+跨到 core 的 aster_core ktest 时(OSDK 0.19.0 的 selector 为后缀 trie,自函数名段反向匹配,裸模块路径选择器必匹配空集,故不传 selector,以串口聚合计数与逐测试行取证):
 
 ```bash
 cd kernel/core
-cargo osdk test --kcmd-args=earlycon \
-  aster_core::device::misc::device_mapper::tests
+cargo osdk test --kcmd-args=earlycon
 ```
 
 ### 3.2 Initramfs C ABI 回归
@@ -146,7 +142,7 @@ CLAUDE.md / AGENTS.md
 → docs/device-mapper-handoff.md
 → 本项目状态
 → docs/pull_request.md / docs/upstream-sync.md
-→ log/daily/2026-10-8.md / log/daily/2026-10-9.md
+→ log/daily/2026-10-13.md / log/daily/2026-10-14.md（更早日志按需回溯）
 → 按任务阅读源码证据、设计或测试手册
 → 核对当前工作区与实际任务的比较基线
 ```

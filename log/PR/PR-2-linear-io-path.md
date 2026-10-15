@@ -6,11 +6,11 @@
 |---|---|
 | 状态 | 本地已提交并推送;PR 尚未创建,由用户在网页自行创建。 |
 | 实际 Git branch | `dm-linear-io-path` |
-| 当前本地 base / HEAD | `67ed6c70f` / `7a497f9d5` |
-| 远端事件 | 已推送 `origin/dm-linear-io-path`(新建远端分支,非强制更新);GitHub 返回 PR 创建入口 `https://github.com/wdf121/asterinas/pull/new/dm-linear-io-path`。 |
+| 当前本地 base / HEAD | `716a1161b`(PR 1 经 0.19.0 重放后)/ `d0088c2c9` |
+| 远端事件 | 2026-10-13 推送 `origin/dm-linear-io-path`(新建远端分支),GitHub 返回 PR 创建入口 `https://github.com/wdf121/asterinas/pull/new/dm-linear-io-path`;2026-10-14 中文注释清除改写历史后 `--force-with-lease` 重推,`git ls-remote` 实证远端 = `d0088c2c9`。 |
 | 提交主题 | `Add the \`aster-device-mapper\` crate with a linear target` |
-| 提交内容 | 6 文件、422 行:根 `Cargo.toml`/`Cargo.lock` workspace 接入 + 新 crate `kernel/core/comps/device-mapper/`(Cargo.toml、lib.rs、device.rs、linear.rs)。 |
-| 依赖 PR | #3937(PR 1,mapped BIO ranges,open)。 |
+| 提交内容 | 6 文件、421 行:根 `Cargo.toml`/`Cargo.lock` workspace 接入 + 新 crate `kernel/core/comps/device-mapper/`(Cargo.toml、lib.rs、device.rs、linear.rs)。 |
+| 依赖 PR | #3937(PR 1,mapped BIO ranges,open)。PR 2 的 base 是 PR 1 本地重放后的 `716a1161b`;远端 PR 1 分支仍为旧历史,PR 1 重推待定。 |
 
 本文档使用稳定编号 **PR 2**;当前分支名为 `dm-linear-io-path`。
 
@@ -20,6 +20,8 @@
 |---|---|---|---|---|
 | 2026-10-13 | 基于 PR 1 重放后的 `67ed6c70f` 创建分支;用户手敲生产代码(LinearTarget 校验/元数据/enqueue 与 DmDevice 适配层),本轮补齐全部 ktest 并完成 review 修正 | `67ed6c70f` | `7a497f9d5` | 单提交,无 merge 历史 |
 | 2026-10-13 | 推送 `origin/dm-linear-io-path` | 同上 | 同上 | 新建远端分支成功,未遇代理超时 |
+| 2026-10-13 | 随 dm 0.19.0 同步线性重放:base/HEAD → `716a1161b`/`76746c60b`(本地分支,未推送) | `716a1161b` | `76746c60b` | 单提交,无 merge 历史 |
+| 2026-10-14 | 清除 6 条中文注释改写历史(`76746c60b` → `d0088c2c9`),`--force-with-lease` 重推 | `716a1161b` | `d0088c2c9` | 单提交,无 merge 历史;`git ls-remote` 实证远端 `d0088c2c9` |
 
 review 修正(均在提交前完成):中文学习注释英文化并补公开 API doc comment;`LinearTargetError` 补 `#[derive(Clone, Copy, Debug, Eq, PartialEq)]` 与 doc(对齐 `BioEnqueueError` 先例);容量比较改为无损 `nr_sectors as u64`,`BackingRangeOverflow` 语义收窄为仅表示 start+length 溢出(原 `u64::try_from(usize)` 分支不可达,已移除);`metadata()` 补截断不可达的不变式注释;新增 `accepts_write_bio_ending_at_mapping_end`(同时覆盖 Write 正向重映射与 end==length 边界)。
 
@@ -57,6 +59,7 @@ review 修正(均在提交前完成):中文学习注释英文化并补公开 API
 | 静态准入 | `make check` | 用户执行,通过。 | 通过(用户反馈,输出未归档) |
 | 内核构建 | `make kernel` | 用户执行,通过。 | 通过(用户反馈,输出未归档) |
 | 项目级 ktest | `make ktest` | **未执行**,如实记录;若维护者按 PR 1 标准要求,再补跑。 | 未覆盖 |
+| 改史后复验 | `make check` + `make kernel` + block/device-mapper crate ktest(容器内,助手执行) | 2026-10-14,HEAD `d0088c2c9`:check/kernel exit 0;block 6 passed/0 failed;dm 8 passed/0 failed。 | 通过 |
 
 环境注记:本轮排障确认 ktest 必须在 `fork_Asterinas` 容器内执行;宿主机(openEuler)缺 qemu、grub 命名不同且 cargo-osdk 曾指向已删除的 `/root/pr-tree`。曾重装宿主机 cargo-osdk 并误判"旧版带 openEuler 适配",已修正结论:容器环境始终正常,宿主机侧失败均为跑错环境所致。
 
@@ -97,7 +100,7 @@ Excluded: multi-target tables, device registration and node lifecycle, the users
 
 ### Testing
 
-Validated on final PR HEAD `7a497f9d5`:
+Validated on final PR HEAD `d0088c2c9` (re-validated in full after a comment-only history cleanup):
 
 ```text
 make check
