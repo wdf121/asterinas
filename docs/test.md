@@ -109,7 +109,9 @@ AUTO_TEST=regression \
 
 `AUTO_TEST=regression` 构建回归 ELF 并让 guest 启动后进入 regression runner；`REGRESSION_TESTS=device/device_mapper` 让 runner 只执行 `/test/device/device_mapper`，省略时运行全量。可选参数：`RELEASE=1`（release 内核，默认 0）、`CARGO_NET_OFFLINE=true`（仅用本地 Cargo 缓存）、`INTEL_TDX=0`（默认值即 0，显式写出只为防环境覆盖）。
 
-对应源码为 `test/initramfs/src/regression/device/device_mapper.c`，覆盖：tableless DM ioctl（`DM_VERSION`、create、status、table status、remove 的结构体布局、flag、返回值和 errno）、`/dev/dm-N` 与 `/dev/mapper/<name>` 运行时节点事务与冲突回滚、ext2 mount lease（挂载期间删除返回 `EBUSY`）、`BLKDISCARD`/`BLKZEROOUT` 范围边界、WAIT ioctl 的 `EINTR`/`SA_RESTART`/事件唤醒。该入口验证原始用户 ABI，不替代 DM/block crate ktest，也不替代 NixOS 系统测试。
+独立版本握手回归入口为 `make run_kernel AUTO_TEST=regression REGRESSION_TESTS=device/device_mapper_version`，对应 `device_mapper_version.c`，覆盖 major/minor/patch 兼容矩阵、未知命令握手顺序、仅访问 12 字节、保护页及 copyout 错误优先级、持有 fd 后移除 `CAP_SYS_ADMIN` 的拒绝行为。完整 device 目录回归也通过 `run_test.sh` 接入该程序。
+
+原有入口对应源码为 `test/initramfs/src/regression/device/device_mapper.c`，覆盖：tableless DM ioctl（`DM_VERSION`、create、status、table status、remove 的结构体布局、flag、返回值和 errno）、`/dev/dm-N` 与 `/dev/mapper/<name>` 运行时节点事务与冲突回滚、ext2 mount lease（挂载期间删除返回 `EBUSY`）、`BLKDISCARD`/`BLKZEROOUT` 范围边界、WAIT ioctl 的 `EINTR`/`SA_RESTART`/事件唤醒。该入口验证原始用户 ABI，不替代 DM/block crate ktest，也不替代 NixOS 系统测试。
 
 ### 4.2 通过判定与日志
 
@@ -206,8 +208,8 @@ Device Mapper 系统测试启动完整 NixOS guest，通过真实 `dmsetup`、LV
 | 检查根盘 | `test -f target/nixos/asterinas.img` | 退出码必须为 0；该镜像是 guest 根盘，不能作为测试盘。 |
 | 创建测试盘目录 | `mkdir -p target/nixos/dm-test` | 建议把一次性 DM 测试盘集中放在该目录。 |
 | 检查并发任务 | `pgrep -af 'qemu-system|cargo osdk test|make run_kernel|make run_nixos'` | 六项测试不能与 QEMU、ktest、C 回归或其他 NixOS 测试并发。已有 QEMU 时脚本会报告 `existing_qemu`。 |
-| 默认 guest 就绪时限 | `GUEST_READY_TIMEOUT=40` | 每次 guest shell 未在时限内就绪时失败。 |
-| 默认 QEMU 生命周期时限 | `GUEST_QEMU_TIMEOUT=180` | 适用于每次 guest 的启动、命令注入、测试执行和关机。 |
+| 默认 guest 就绪时限 | `GUEST_READY_TIMEOUT=40` | 从启动 QEMU 到 guest shell 就绪的上限。 |
+| 默认 QEMU 生命周期时限 | `GUEST_QEMU_TIMEOUT=180` | 每轮启动、命令注入、测试执行和关机的总上限，包含上述 40 秒阶段，不是额外再加 180 秒。 |
 
 当前六项 DM suite 经 `myshell/lib/dm_nixos_test.sh` 调用 `make run_nixos`，由 `tools/nixos/run.sh` 启动已有根盘；这条路径不自动重新构建或安装当前源码。
 因此，在 suite 命令前设置 `RELEASE=1` 不能把已有 dev 镜像变成 release 镜像；必须记录根盘中内核的构建来源、profile，以及 suite 的本轮结果。
@@ -240,6 +242,26 @@ fallocate -l 512M target/nixos/dm-test/disk4.img
 正式命令只需传入专用路径；默认重置会重新创建镜像。设置 `RESET_DM_TEST_IMAGES=0` 并不把测试变为只读，也不保护已有数据。
 
 #### 5.2.3 通过判定与日志
+
+六套默认启用 `DM_COMPACT_LOG=1`（需同时启用 `DM_STRUCT_LOG=1`）：准备阶段展示测试盘路径、容量、超时边界和测试意图；仅首轮显示 `BOOT starting`，每轮保留就绪耗时、`BOOT finished` 和通过标记，去掉重复绝对时间。最后一轮 PASS 在详细输出之前展示，但仍须通过退出码、失败标记和 guest PASS 三项检查。`DM_COMPACT_LOG=0` 恢复非精简生命周期展示。
+
+单轮就绪字段为 `guest_ready_after`，多轮为 `first_guest_ready_after` 等。默认先删除指定测试盘，再由 runner 创建，因此再次运行显示“待创建容量512MiB”是预期行为；同一套的后续启动不会重置测试盘。
+
+公共 harness 通过 `dm_terminal.py` 旁路观察原始日志，应答 systemd/getty 的终端名称、尺寸和光标查询；QEMU stdout/stderr 仍沿原有 FIFO/tee 路径传输，不在线过滤。该 helper 仅提供固定 24×80 的有限查询应答，不是完整终端模拟器，也不是通用内核时钟修复。
+
+默认集成参数与数据覆盖：
+
+| 套件 | LV 容量（MiB） | 校验数据与边界 |
+|---|---|---|
+| linear | 256 → 第一 PV 内 288 → 跨 PV 768 → 缩回 256 | 第一 PV 288、第二 PV 新增 480；文件 64+240=304>288，覆盖第二 PV；缩容前删除新增文件，保留初始文件。 |
+| striped | 512 → 原双盘组 576 → 新双盘组加入后 1024 → 缩回 512 | 四盘两组，chunk 4 KiB；文件 128+480=608>576，覆盖新增条带段；三轮启动检查。 |
+| mixed | linear 256 + 新增双盘 striped 256 = 512 | 三 PV，chunk 4 KiB；文件 64+256=320>256，覆盖 striped 段；两轮启动检查，不缩容。 |
+
+这些容量都是最终 LV 大小，不是 `lvextend -L +...` 的增量；底层每块盘仍为 512 MiB。默认 PV 数据区从 1 MiB 起、PE 为 4 MiB 时，每盘可分配 508 MiB，两盘共 1016 MiB。PV 元数据/对齐与 ext2 元数据/保留块是不同层的开销，文件覆盖测试也不等于写满压力测试。
+
+control-plane 验证控制命令和生命周期；dataplane 直接比对裸块数据与跨段/条带边界；topology 检查 LVM/DM 拓扑，linear 与 striped 均为 32→64→96→32 MiB，mixed 为 32+32 MiB。这三套不创建文件系统，不做文件 MD5 校验。
+
+**已知限制：**运行目录时间戳仅精确到分钟，日志初始化早于已有 QEMU 检查，同套同分钟重复启动可能覆盖日志；尚未修复，不应并发或紧接着重复启动同套。
 
 | 测试范围 | 必须同时出现的成功标记 | 完整日志 |
 |---|---|---|

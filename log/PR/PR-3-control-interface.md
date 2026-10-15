@@ -1,5 +1,11 @@
 # PR 3:control device skeleton / `Add the Device Mapper control device with \`DM_VERSION\` support`
 
+## 2026-10-15 复核勘误与当前停点
+
+以下第 1–5 节保留 10-14 分支快照及验证历史，不再作为 Linux 握手语义正确的结论。对固定标签 Linux `v6.18.56`、`v7.2.10` 的复核确认：两者均要求 major 相等且客户端 minor 不高于内核 minor，忽略 patch；`DM_VERSION` 仅访问 12 字节版本，不校验其他字段；版本 copyout 失败的 `EFAULT` 优先于版本不兼容的 `EINVAL`。因此，原文“major-only 与 Linux 一致”“两段全量复制对齐 Linux copy_params”及版本查询通用信封校验的兼容性描述均不成立。
+
+成熟 dm 已实现第一阶段修复及真实 ioctl 回归，详见 [10-15 日志](../daily/2026-10-15.md)。**本 PR 分支仍为 `d539b725b`，未同步修复、未重新验证、未推送。** 旧树 ktest 160/0 仅说明原有测试通过，不能证明实际用户内存边界、权限或握手时序正确。后续需单独同步最小握手修复、修正源码注释并在 PR 分支验证；本次不切分支、不推进 PR 发布。
+
 ## 1. 状态与标识
 
 | 项目 | 事实 |

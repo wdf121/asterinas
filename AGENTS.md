@@ -142,7 +142,8 @@ Run QEMU, ktest, and NixOS system tests serially to avoid image lock conflicts,
 especially around `test/initramfs/build/ext2.img`. For new NixOS system suite
 runs, set `GUEST_READY_TIMEOUT=40` and `GUEST_QEMU_TIMEOUT=180`: the former
 limits boot to the guest shell, while the latter limits the complete lifecycle
-of each QEMU guest. The root Makefile defaults to `RELEASE=0` (dev).
+of each QEMU guest, including the shell-ready wait. The root Makefile defaults
+to `RELEASE=1` (release).
 DM system suites launch an existing NixOS root image via `make run_nixos`;
 they do not rebuild or install the current kernel source. Release acceptance
 requires an image built and installed from the intended source with an explicit
@@ -198,6 +199,26 @@ For existing target coverage, prioritize closing semantic and lifecycle gaps wit
 standard upstream Linux Device Mapper over adding new targets. Do not treat
 "the final I/O works" as sufficient compatibility evidence for `dmsetup`,
 LVM2, or other user-visible Linux command behavior.
+
+### Linux 参考版本与更新规则
+
+- **主要语义基线：Linux 6.18 LTS 系列。** 首次固定参考标签为
+  `v6.18.56`，用于已实现 DM 功能的用户态 ABI、错误行为及设备生命周期对照。
+  该约定不扩展为整个 Asterinas 的兼容目标，也不承诺实现该版本的全部 DM 功能。
+- **最新稳定版差异核对：** 首次使用 `v7.2.10`，仅核对当前任务涉及的调用链。
+  后续按阶段核实并记录实际参考版本，不将 `v7.2.10` 永久视为最新稳定版。
+- **主线仅作前瞻参考：** mainline/RC 不默认作为实现或验收要求；引用时固定
+  commit，不以浮动 `master` 作为唯一证据。
+- 每轮设计、实现或 review 均注明实际使用的标签或 commit，区分 LTS 基线行为、
+  新版差异与本项目的有意偏离。Linux 内核版本与 DM ioctl ABI 版本分别记录，
+  不将两套版本号混为一谈。
+- 阶段开始或出现相关重要修复时评估参考版本更新，不因每次发布自动切换基线。
+  新版安全或正确性修复应优先评估是否吸收；新增功能按项目范围取舍，
+  不自动切换 LTS 系列或扩大实现范围，也不要求照搬 Linux 内部实现。
+- 选定参考基线不代表当前代码已通过该基线的兼容性验证；未核对或未测试的事项
+  必须明确标注，不将其他版本上的验证结果直接视为本基线验证通过。
+
+### Observable behavior and evidence
 
 Before designing, implementing, or reviewing a Linux DM ABI or command-semantics
 change, build a per-command observable-state matrix. Cover, when applicable:

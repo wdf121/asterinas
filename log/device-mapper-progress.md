@@ -1,21 +1,24 @@
 # Device Mapper 当前项目状态
 
-> **更新日期**：2026-10-14。
+> **更新日期**：2026-10-15。
 >
 > **事实来源**：实现以当前源码为准，验证以对应源码版本和实际命令输出为准；历史日志不自动证明当前工作区通过。
 
 ## 当前停点摘要
 
-- 本地 main 为 `77ee3b196`（v0.19.0），dm 为 `726398086`；0.19.0 同步已完成（2026-10-13，154 提交线性重放，无 merge commit）。dm 的 force push 挂起，待用户统一执行。
+- 本地 main 为 `77ee3b196`（v0.19.0）；本轮 dm 改动基于 `b5e91dad1`，按握手修复、终端应答、测试日志和文档分点收口，仅本地提交，不 push。0.19.0 同步已完成（2026-10-13，154 提交线性重放，无 merge commit）。
+- 2026-10-15：dm 第一阶段 ABI 修复完成：逐 ioctl 检查 initial user namespace 的 `CAP_SYS_ADMIN`，独立 12 字节版本握手，major/minor 兼容检查与版本 copyout `EFAULT` 优先级；check/kernel exit 0，core ktest 242/0（DM 83），两个 focused C 回归 49/0、195/0。普通命令的快照、结果回写与 secure-data 问题仍待第二阶段。
+- 六套系统测试共 11 轮 guest 串行通过；终端查询旁路应答已接入，精简日志及六套测试意图已实测。linear 默认最终容量改为 768 MiB。最后的单轮 `guest_ready_after` 名称修正仅做静态检查，按用户要求不重跑系统测试。
+- Linux 主语义基线固定为 `v6.18.56`，首次新版差异对照为 `v7.2.10`，两者 DM ABI 均为 4.50.0；这不代表完整 Linux DM 兼容性已验收。
 - PR 1（mapped BIO ranges，分支 mapped-bio-ranges）：本地重放至 `716a1161b`；远端 #3937 分支仍为旧历史，重推待定。
 - PR 2（dm-linear-io-path）：`d0088c2c9`（6 文件、421 行）；2026-10-14 清除 6 条中文注释洗史并 force-with-lease 重推，ls-remote 实证远端一致；改史后 gate 全绿（check/kernel exit 0，block 6/0，dm 8/0）；PR 未创建，编号待回填。
-- PR 3（dm-control-interface，基于 PR 2）：`d539b725b`，控制设备骨架 + `DM_VERSION` 握手 + flags 校验，19 个 ktest；六条外部 review 评判与修复完毕（失败路径回写 version、major-only 有意、收紧注释、字面量锚定、两段拷贝注释、1MiB 保留）；gate 全绿（check/kernel exit 0，aster-core 全量 ktest 160/0）；未推送。
+- PR 3（dm-control-interface，基于 PR 2）：仍为 `d539b725b`，未推送、未同步本轮 dm 修复。10-14 的 160/0 是该旧树的测试记录，不证明握手契约正确；10-15 对固定 Linux 标签的核对已否定“major-only 与 Linux 一致”等旧结论，独立 12 字节握手、minor 校验、错误优先级及相关注释待单独同步验证。PR 1 在审期间不抢推 PR 3。
 - OSDK 0.19.0 ktest selector 为后缀 trie：裸模块路径选择器必匹配空集（EXIT=0 假绿）；定向入口为无 selector 的 crate 全量加串口逐行取证；10-13 日志集成层 81/159 记录已勘误作废。
 - 普通 VFS rename、完整 mount source 路径及 procfs 的直接覆盖缺口保留；不能以邻近模块通过替代。
 - PR 在新 PR 分支最终验证；同步在 rebase 后 dm 最终验证，候选 main 先做干净基线。两边均采用 make check、make kernel 与按影响范围的定向 ktest，不默认全量。
 - 校验取舍已归入 PR 规范：当前保留局部范围检查，全局不变量与统一校验入口留待 dm 讨论，不扩大 PR 范围。
 
-证据见 [10 月 13 日](daily/2026-10-13.md)、[10 月 14 日](daily/2026-10-14.md) 日志；接手入口见 [正式交接](../docs/device-mapper-handoff.md)。
+证据见 [10 月 15 日](daily/2026-10-15.md) 日志（更早阶段见 10 月 13、14 日）；接手入口见 [正式交接](../docs/device-mapper-handoff.md)。
 
 ## 1. 当前方向
 
@@ -111,7 +114,7 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
 ```
 
 `--control-plane-non-wait` 已删除，不再作为当前入口。
-根 Makefile 默认 `RELEASE=0`；系统 suite 启动已有 NixOS 镜像，不自动重建当前源码。
+根 Makefile 默认 `RELEASE=1`；系统 suite 启动已有 NixOS 镜像，不自动重建当前源码。
 release 验收须确认镜像来自目标源码的显式 release 构建，不能仅在 suite 启动时设置 `RELEASE=1`，也不能把旧镜像结果当作当前源码验证。
 
 `--dataplane` 当前使用三块测试盘；其长 guest 脚本在未显式覆盖时使用 `GUEST_INPUT_LINE_DELAY=0.05`。公共 harness 负责 FIFO 注入、ready/lifecycle 超时和 QEMU process-group 清理。
@@ -142,7 +145,7 @@ CLAUDE.md / AGENTS.md
 → docs/device-mapper-handoff.md
 → 本项目状态
 → docs/pull_request.md / docs/upstream-sync.md
-→ log/daily/2026-10-13.md / log/daily/2026-10-14.md（更早日志按需回溯）
+→ log/daily/2026-10-15.md（更早日志按需回溯）
 → 按任务阅读源码证据、设计或测试手册
 → 核对当前工作区与实际任务的比较基线
 ```

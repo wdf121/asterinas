@@ -1,11 +1,15 @@
 # Device Mapper 对话交接
 
-> **最后更新**：2026-10-14。
+> **最后更新**：2026-10-15。
 > 本文件是唯一维护的交接入口；PR 技术档案见 [log/PR](../log/PR/)，实际操作见 [daily](../log/daily/)。
 
 ## 当前停点
 
-- 2026-10-14:PR 3（`dm-control-interface`，基于 PR 2）Stage 1 学习式手敲完成，`d539b725b` = 控制设备骨架 + `DM_VERSION` 握手 + flags 校验 + 19 ktest；六条外部 review 评判修复完毕（详见表后说明与档案），gate 全绿（check/kernel exit 0，aster-core 全量 ktest 160/0）；未推送。档案：[PR-3-control-interface](../log/PR/PR-3-control-interface.md)。
+- 2026-10-15：dm 第一阶段权限与版本握手修复已验证：check/kernel exit 0、core ktest 242/0（DM 83）、版本 C 回归 49/0、成熟 DM C 回归 195/0。按授权分点本地提交，不 push；具体内容和证据见 [当日日志](../log/daily/2026-10-15.md)。
+- PR 3 仍为 `d539b725b`，未同步 dm 修复、未推送。固定 Linux `v6.18.56` / `v7.2.10` 复核已否定旧的 major-only 说明；10-14 的 160/0 不能证明用户 ABI 握手正确。等用户安排后单独同步最小修复并在 PR 分支验证，不因 dm 通过而宣称 PR 3 通过。
+- 六套系统测试共 11 轮 guest 全通过；terminal helper 旁路应答消除本次终端查询等待，日志已精简并补齐测试意图，linear 最终默认容量为 768 MiB。最后 `guest_guest_ready_after` 改名仅静态验证，未重跑系统测试。
+- 普通 ioctl 快照/输出长度/失败回写/secure-data 第二阶段、通用 Jiffies 异常和根盘 fsck 闭环均未完成。分钟粒度日志目录碰撞也未修，避免同套同分钟重复启动。
+- 已授权清除 20 个旧系统运行目录和临时 linear 日志目录；六套各留最新完整运行及 `latest`。旧日志路径仅为历史索引，不能再当作现存证据；时钟/终端排障目录、C 回归证据、根镜像与排障快照均保留。
 - 2026-10-14：PR 2（`dm-linear-io-path`）清除 6 条中文注释洗史至 `d0088c2c9` 并 force-with-lease 重推，ls-remote 实证远端一致；改史后 gate 全绿（check/kernel exit 0，block 6/0，dm 8/0）。PR 未创建，编号待回填。PR 1 本地重放至 `716a1161b`，远端 #3937 分支仍为旧历史，重推待定。
 - 2026-10-13：完成上游 0.19.0 同步，main 快进至 `77ee3b196`，dm 154 提交线性重放（无 merge commit）；dm 的 force push 挂起，待用户统一执行；同步策略已固化进 CLAUDE.md/AGENTS.md。
 - OSDK 0.19.0 ktest selector 为后缀 trie：裸模块路径选择器必匹配空集（EXIT=0 假绿）；定向入口为无 selector 的 crate 全量加串口逐行取证；10-13 日志集成层 81/159 记录已勘误作废。
@@ -65,7 +69,7 @@ dm 在 main（`77ee3b196`）之上的提交序列（SHA 为 0.19.0 线性重放�
 → 本交接
 → [项目状态](../log/device-mapper-progress.md)
 → [PR 规范](pull_request.md) / [上游同步](upstream-sync.md)
-→ [当日日志](../log/daily/2026-10-14.md)。
+→ [当日日志](../log/daily/2026-10-15.md)。
 
 QEMU、ktest、C 回归和 NixOS 测试必须串行；遇失败、环境阻塞或未预期 warning 先报告并讨论。
 不覆盖来源不明改动，不自动提交或 push。
