@@ -24,7 +24,7 @@ Optional environment variables:
   RESET_DM_TEST_IMAGES             1 to delete test images before running, default 1
   LINEAR_INITIAL_LV_MIB            Initial single-PV LV size in MiB, default 256
   LINEAR_SAME_PV_LV_MIB            Same-PV extended LV size in MiB, default 288
-  LINEAR_EXTENDED_LV_MIB           Cross-PV extended LV size in MiB, default 512
+  LINEAR_EXTENDED_LV_MIB           Final LV size after cross-PV growth in MiB, default 768
   LINEAR_SHRUNK_LV_MIB             Final shrunk LV size in MiB, default 256
   LINEAR_BASE_FILE_MIB             Base test file size in MiB, default 64
   LINEAR_GROW_FILE_MIB             Post-cross-PV test file size in MiB, default 240
@@ -57,7 +57,7 @@ GUEST_READY_TIMEOUT=${GUEST_READY_TIMEOUT:-40}
 RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 LINEAR_INITIAL_LV_MIB=${LINEAR_INITIAL_LV_MIB:-256}
 LINEAR_SAME_PV_LV_MIB=${LINEAR_SAME_PV_LV_MIB:-288}
-LINEAR_EXTENDED_LV_MIB=${LINEAR_EXTENDED_LV_MIB:-512}
+LINEAR_EXTENDED_LV_MIB=${LINEAR_EXTENDED_LV_MIB:-768}
 LINEAR_SHRUNK_LV_MIB=${LINEAR_SHRUNK_LV_MIB:-256}
 LINEAR_BASE_FILE_MIB=${LINEAR_BASE_FILE_MIB:-64}
 LINEAR_GROW_FILE_MIB=${LINEAR_GROW_FILE_MIB:-240}
@@ -74,10 +74,12 @@ test "${LINEAR_BASE_FILE_MIB}" -lt "${LINEAR_SHRUNK_LV_MIB}"
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
-dm_emit "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 dm_emit "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
 dm_emit "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
-dm_emit "HOST_INFO_${TEST_ID} initial_lv_mib=${LINEAR_INITIAL_LV_MIB} same_pv_lv_mib=${LINEAR_SAME_PV_LV_MIB} extended_lv_mib=${LINEAR_EXTENDED_LV_MIB} shrunk_lv_mib=${LINEAR_SHRUNK_LV_MIB} base_file_mib=${LINEAR_BASE_FILE_MIB} grow_file_mib=${LINEAR_GROW_FILE_MIB}"
+dm_step "逻辑卷容量：初始创建${LINEAR_INITIAL_LV_MIB}MiB → 在第一块物理卷内扩容至${LINEAR_SAME_PV_LV_MIB}MiB → 加入第二块物理卷跨盘扩容至${LINEAR_EXTENDED_LV_MIB}MiB → 缩容至${LINEAR_SHRUNK_LV_MIB}MiB（底层测试盘容量不变）"
+dm_step "跨盘扩容分配：第一块物理卷保持${LINEAR_SAME_PV_LV_MIB}MiB，第二块物理卷新增$((LINEAR_EXTENDED_LV_MIB - LINEAR_SAME_PV_LV_MIB))MiB，逻辑卷最终${LINEAR_EXTENDED_LV_MIB}MiB"
+dm_step "数据校验：初始写入${LINEAR_BASE_FILE_MIB}MiB文件，扩容后新增${LINEAR_GROW_FILE_MIB}MiB文件，使用MD5验证完整性"
+dm_step "跨盘覆盖：文件数据合计$((LINEAR_BASE_FILE_MIB + LINEAR_GROW_FILE_MIB))MiB > 第一块物理卷为该逻辑卷提供的${LINEAR_SAME_PV_LV_MIB}MiB，确保使用第二块物理卷"
 
 FIRST_GUEST_SCRIPT=$(mktemp /tmp/dm-linear-integration-first.XXXXXX)
 {

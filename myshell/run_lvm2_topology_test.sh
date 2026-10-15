@@ -53,6 +53,10 @@ dm_init_log "${TEST_ID}"
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
+dm_step "测试目标：验证四块盘上的PV/VG/LV创建、扩缩容、激活扫描及移除，核对DM映射表、状态和依赖；不创建文件系统，不做文件MD5校验"
+dm_step "linear容量：初始32MiB → 原物理卷内扩容至64MiB → 第二块物理卷新增32MiB、总容量96MiB → 缩容至32MiB"
+dm_step "striped容量：双盘条带、条带块64KiB；初始32MiB → 原盘组扩容至64MiB → 新盘组新增32MiB、总容量96MiB → 缩容至32MiB"
+dm_step "mixed布局：初始linear段32MiB → 新增双盘striped段32MiB，逻辑卷总容量64MiB"
 dm_emit "HOST_INFO_${TEST_ID} disks=${DM_TEST_IMAGES} serials=vdmtest,vdmtest2,vdmtest3,vdmtest4"
 dm_emit "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 

@@ -18,6 +18,8 @@ DM_LOG_WRITER_PID=
 # stderr. The terminal only carries milestone lines; legacy suites keep the old
 # single-stream tee behavior.
 DM_STRUCT_LOG=${DM_STRUCT_LOG:-0}
+# Structured suites share the compact lifecycle presentation.
+DM_COMPACT_LOG=${DM_COMPACT_LOG:-1}
 DM_TEST_LOG_ROOT=${DM_TEST_LOG_ROOT:-/tmp/dm-test}
 DM_LOG_RUN_DIR=
 DM_SUMMARY_LOG=
@@ -40,6 +42,22 @@ dm_step() {
 }
 
 dm_emit() {
+    if [ "${DM_COMPACT_LOG}" = "1" ] && [ "${DM_STRUCT_LOG}" = "1" ]; then
+        case "$*" in
+            HOST_INFO_*_guest_started_at=*|HOST_INFO_*_guest_completed_at=*)
+                return
+                ;;
+            HOST_INFO_*_guest_ready_after=*)
+                # Keep the elapsed readiness time, without repeating limits.
+                dm_step "${*%% ready_timeout=*}"
+                return
+                ;;
+            HOST_INFO_*\ qemu_lifecycle_timeout=*|HOST_INFO_*\ disk[0-9]=*)
+                # Limits and backing images are reported once during preparation.
+                return
+                ;;
+        esac
+    fi
     printf '\n%s\n' "$*" >&"${DM_LOG_FD}"
     if [ "${DM_STRUCT_LOG}" = "1" ]; then
         printf '[%s] %s\n' "$(date +%T)" "$*" >>"${DM_SUMMARY_LOG}"
@@ -187,6 +205,20 @@ dm_prepare_nixos_test() {
     dm_check_no_qemu "${test_id}"
     dm_check_nixos_image "${test_id}"
     dm_reset_test_images
+    if [ "${DM_COMPACT_LOG}" = "1" ] && [ "${DM_STRUCT_LOG}" = "1" ]; then
+        local image_path image_bytes index=0
+        dm_step "TIMEOUT shell_ready=${GUEST_READY_TIMEOUT:-40}s (QEMU启动到guest shell就绪) lifecycle=${GUEST_QEMU_TIMEOUT:-180}s (启动+测试+关机，包含就绪等待)"
+        while IFS= read -r image_path; do
+            index=$((index + 1))
+            if [ -f "${image_path}" ]; then
+                image_bytes=$(stat -c %s "${image_path}")
+                dm_step "测试盘${index}：${image_path}，容量${image_bytes}字节（$((image_bytes / 1048576))MiB）"
+            else
+                # tools/nixos/run.sh creates missing backing images at 512 MiB.
+                dm_step "测试盘${index}：${image_path}，待创建容量512MiB"
+            fi
+        done < <(dm_test_images)
+    fi
 }
 
 _dm_stop_process_group() {
@@ -275,7 +307,11 @@ dm_run_guest_script() (
     fi
     start_at=$(date -Is)
     dm_emit "HOST_INFO_${test_id} ${label}_guest_started_at=${start_at}"
-    dm_step "BOOT ${label} starting lifecycle_timeout=${lifecycle_timeout_seconds}s"
+    if [ "${DM_COMPACT_LOG}" != "1" ] || [ "${DM_STRUCT_LOG}" != "1" ]; then
+        dm_step "BOOT ${label} starting lifecycle_timeout=${lifecycle_timeout_seconds}s"
+    elif [ "${label}" = "first" ] || [ "${label}" = "guest" ]; then
+        dm_step "BOOT ${label} starting"
+    fi
     if [ "${DM_STRUCT_LOG}" = "1" ]; then
         DM_QEMU_STDERR_LOG="${DM_LOG_RUN_DIR}/qemu-stderr-${label}.log"
         : >"${DM_QEMU_STDERR_LOG}"
@@ -329,7 +365,11 @@ dm_run_guest_script() (
     done
 
     elapsed=$(($(date +%s) - start_ts))
-    dm_emit "HOST_INFO_${test_id} ${label}_guest_ready_after=${elapsed}s ready_timeout=${ready_timeout_seconds}s lifecycle_timeout=${lifecycle_timeout_seconds}s"
+    local ready_label=guest
+    if [ "${label}" != "guest" ]; then
+        ready_label="${label}_guest"
+    fi
+    dm_emit "HOST_INFO_${test_id} ${ready_label}_ready_after=${elapsed}s ready_timeout=${ready_timeout_seconds}s lifecycle_timeout=${lifecycle_timeout_seconds}s"
     setsid bash -c '
         script_file=$1
         input_line_delay=$2
@@ -491,14 +531,22 @@ dm_run_single_guest_test() {
     dm_run_guest_script "${test_id}" "${script_file}" guest || status=$?
     rm -f "${script_file}"
 
-    dm_print_summary "${test_id}" "${summary_include}"
+    if [ "${DM_COMPACT_LOG}" != "1" ] || [ "${DM_STRUCT_LOG}" != "1" ]; then
+        dm_print_summary "${test_id}" "${summary_include}"
+    fi
     if [ "${status}" -ne 0 ] || dm_log_has_failure_marker || ! dm_log_has_marker "${pass_marker}"; then
+        if [ "${DM_COMPACT_LOG}" = "1" ] && [ "${DM_STRUCT_LOG}" = "1" ]; then
+            dm_print_summary "${test_id}" "${summary_include}"
+        fi
         dm_print_failure_context "${test_id}"
         dm_emit "HOST_FAIL_${test_id} qemu_status=${status}"
         exit 1
     fi
 
     dm_step "${pass_marker}"
+    if [ "${DM_COMPACT_LOG}" = "1" ] && [ "${DM_STRUCT_LOG}" = "1" ]; then
+        dm_print_summary "${test_id}" "${summary_include}"
+    fi
     dm_emit "HOST_PASS_${test_id}"
     dm_step "RESULT: PASS total_elapsed=$(($(date +%s) - DM_TEST_START_TS))s"
 }
@@ -521,18 +569,29 @@ dm_run_two_guest_test() {
         rm -f "${second_script}"
         exit 1
     fi
+    if [ "${DM_COMPACT_LOG}" = "1" ] && [ "${DM_STRUCT_LOG}" = "1" ]; then
+        dm_step "${first_pass}"
+    fi
 
     dm_run_guest_script "${test_id}" "${second_script}" second || second_status=$?
     rm -f "${second_script}"
 
-    dm_print_summary "${test_id}" "${summary_include}"
+    if [ "${DM_COMPACT_LOG}" != "1" ] || [ "${DM_STRUCT_LOG}" != "1" ]; then
+        dm_print_summary "${test_id}" "${summary_include}"
+    fi
     if [ "${second_status}" -ne 0 ] || dm_log_has_failure_marker || ! dm_log_has_marker "${second_pass}"; then
+        if [ "${DM_COMPACT_LOG}" = "1" ] && [ "${DM_STRUCT_LOG}" = "1" ]; then
+            dm_print_summary "${test_id}" "${summary_include}"
+        fi
         dm_print_failure_context "${test_id}"
         dm_emit "HOST_FAIL_${test_id} second_qemu_status=${second_status}"
         exit 1
     fi
 
     dm_step "${second_pass}"
+    if [ "${DM_COMPACT_LOG}" = "1" ] && [ "${DM_STRUCT_LOG}" = "1" ]; then
+        dm_print_summary "${test_id}" "${summary_include}"
+    fi
     dm_emit "HOST_PASS_${test_id}"
     dm_step "RESULT: PASS total_elapsed=$(($(date +%s) - DM_TEST_START_TS))s"
 }
@@ -575,14 +634,22 @@ dm_run_three_guest_test() {
     dm_run_guest_script "${test_id}" "${third_script}" third || third_status=$?
     rm -f "${third_script}"
 
-    dm_print_summary "${test_id}" "${summary_include}"
+    if [ "${DM_COMPACT_LOG}" != "1" ] || [ "${DM_STRUCT_LOG}" != "1" ]; then
+        dm_print_summary "${test_id}" "${summary_include}"
+    fi
     if [ "${third_status}" -ne 0 ] || dm_log_has_failure_marker || ! dm_log_has_marker "${third_pass}"; then
+        if [ "${DM_COMPACT_LOG}" = "1" ] && [ "${DM_STRUCT_LOG}" = "1" ]; then
+            dm_print_summary "${test_id}" "${summary_include}"
+        fi
         dm_print_failure_context "${test_id}"
         dm_emit "HOST_FAIL_${test_id} third_qemu_status=${third_status}"
         exit 1
     fi
 
     dm_step "${third_pass}"
+    if [ "${DM_COMPACT_LOG}" = "1" ] && [ "${DM_STRUCT_LOG}" = "1" ]; then
+        dm_print_summary "${test_id}" "${summary_include}"
+    fi
     dm_emit "HOST_PASS_${test_id}"
     dm_step "RESULT: PASS total_elapsed=$(($(date +%s) - DM_TEST_START_TS))s"
 }

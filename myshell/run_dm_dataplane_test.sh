@@ -64,6 +64,9 @@ RESET_DM_TEST_IMAGES=${RESET_DM_TEST_IMAGES:-1}
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
+dm_step "测试目标：直接读写DM块设备并逐字节比对映射设备与底层盘，不创建文件系统"
+dm_step "边界覆盖：4KiB传输跨两个linear段；8KiB传输覆盖三个带底层偏移的linear段、四个条带块及linear到striped边界"
+dm_step "数据校验：另用6KiB数据从条带块内部开始跨边界读写；检查zero读零与丢弃写入、error读写失败；不做容量扩缩容"
 dm_emit "HOST_INFO_${TEST_ID} disks=${DM_TEST_IMAGES} serials=vdmtest,vdmtest2,vdmtest3"
 dm_emit "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 dm_emit "HOST_INFO_${TEST_ID} step5_io_timeout=${DM_DATAPLANE_STEP5_IO_TIMEOUT}s"

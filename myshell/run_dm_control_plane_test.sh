@@ -52,6 +52,8 @@ dm_init_log "${TEST_ID}"
 
 cd "${ASTERINAS_DIR}"
 dm_prepare_nixos_test "${TEST_ID}"
+dm_step "测试目标：通过dmsetup验证设备创建、首次映射表发布、查询、表加载与清除、挂起与恢复、事件等待、重命名及移除"
+dm_step "边界校验：覆盖linear、striped、zero、error目标，以及只读设备和忙设备的生命周期；不创建文件系统，不做文件扩缩容校验"
 dm_emit "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
 dm_emit "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
 dm_emit "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"

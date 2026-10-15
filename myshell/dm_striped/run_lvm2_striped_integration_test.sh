@@ -112,7 +112,10 @@ for image_path in ${DM_TEST_IMAGES}; do
     dm_emit "HOST_INFO_${TEST_ID} disk${index}=${image_path} serial=${serial}"
     index=$((index + 1))
 done
-dm_emit "HOST_INFO_${TEST_ID} pv_count=${STRIPED_PV_COUNT} total_pv_count=${STRIPED_TOTAL_PV_COUNT} initial_lv_mib=${STRIPED_INITIAL_LV_MIB} same_set_lv_mib=${STRIPED_SAME_SET_LV_MIB} extended_lv_mib=${STRIPED_EXTENDED_LV_MIB} shrunk_lv_mib=${STRIPED_SHRUNK_LV_MIB} base_file_mib=${STRIPED_BASE_FILE_MIB} grow_file_mib=${STRIPED_GROW_FILE_MIB} chunk_kib=${STRIPED_CHUNK_KIB}"
+dm_step "测试目标：${STRIPED_TOTAL_PV_COUNT}块盘分两组，每组${STRIPED_PV_COUNT}块PV，条带块${STRIPED_CHUNK_KIB}KiB；验证LVM条带扩缩容、ext2数据和三轮启动恢复"
+dm_step "逻辑卷容量：初始${STRIPED_INITIAL_LV_MIB}MiB → 原盘组扩容至${STRIPED_SAME_SET_LV_MIB}MiB → 新盘组新增$((STRIPED_EXTENDED_LV_MIB - STRIPED_SAME_SET_LV_MIB))MiB、总容量${STRIPED_EXTENDED_LV_MIB}MiB → 缩容至${STRIPED_SHRUNK_LV_MIB}MiB"
+dm_step "数据校验：初始文件${STRIPED_BASE_FILE_MIB}MiB，扩容后新增${STRIPED_GROW_FILE_MIB}MiB；合计$((STRIPED_BASE_FILE_MIB + STRIPED_GROW_FILE_MIB))MiB > 原盘组提供的${STRIPED_SAME_SET_LV_MIB}MiB，确保使用新增条带段，使用MD5校验"
+dm_step "恢复校验：重启检查两个文件；删除新增文件后缩容，再次重启只读校验保留的初始文件"
 
 FIRST_GUEST_SCRIPT=$(mktemp /tmp/dm-striped-integration-first.XXXXXX)
 {

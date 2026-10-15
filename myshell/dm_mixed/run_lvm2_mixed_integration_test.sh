@@ -76,7 +76,10 @@ dm_emit "HOST_INFO_${TEST_ID} qemu_lifecycle_timeout=${GUEST_QEMU_TIMEOUT}s"
 dm_emit "HOST_INFO_${TEST_ID} disk1=${DM_TEST_IMAGE} serial=vdmtest"
 dm_emit "HOST_INFO_${TEST_ID} disk2=${DM_TEST_IMAGE_2} serial=vdmtest2"
 dm_emit "HOST_INFO_${TEST_ID} disk3=${DM_TEST_IMAGE_3} serial=vdmtest3"
-dm_emit "HOST_INFO_${TEST_ID} initial_lv_mib=${MIXED_INITIAL_LV_MIB} extended_lv_mib=${MIXED_EXTENDED_LV_MIB} base_file_mib=${MIXED_BASE_FILE_MIB} grow_file_mib=${MIXED_GROW_FILE_MIB} chunk_kib=${MIXED_STRIPED_CHUNK_KIB}"
+dm_step "测试目标：三块PV构造linear与striped混合逻辑卷，验证扩容、ext2读写及两轮启动恢复；本套不做缩容"
+dm_step "逻辑卷容量：第一块PV创建linear段${MIXED_INITIAL_LV_MIB}MiB → 第二、三块PV新增双盘striped段$((MIXED_EXTENDED_LV_MIB - MIXED_INITIAL_LV_MIB))MiB，总容量${MIXED_EXTENDED_LV_MIB}MiB，条带块${MIXED_STRIPED_CHUNK_KIB}KiB"
+dm_step "数据校验：初始文件${MIXED_BASE_FILE_MIB}MiB，扩容后新增${MIXED_GROW_FILE_MIB}MiB；合计$((MIXED_BASE_FILE_MIB + MIXED_GROW_FILE_MIB))MiB > 初始linear段${MIXED_INITIAL_LV_MIB}MiB，确保使用新增striped段"
+dm_step "恢复校验：扩容后检查文件MD5，重启恢复混合映射后只读挂载，再次检查两个文件MD5"
 
 FIRST_GUEST_SCRIPT=$(mktemp /tmp/dm-mixed-lvm2-first.XXXXXX)
 cat >"${FIRST_GUEST_SCRIPT}" <<'GUEST_SCRIPT'
