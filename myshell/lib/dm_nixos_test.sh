@@ -282,12 +282,12 @@ dm_run_guest_script() (
         DM_TEST_IMAGES="${dm_test_images}" \
         DM_TEST_IMAGE="${DM_TEST_IMAGE}" \
         DM_TEST_IMAGE_2="${DM_TEST_IMAGE_2}" \
-        setsid make run_nixos 3>&- 4>&- <"${fifo}" >"${DM_LOG_FIFO}" 2>"${DM_QEMU_STDERR_LOG}" &
+        setsid python3 "${ASTERINAS_DIR}/myshell/lib/dm_terminal.py" "${LOG}" make run_nixos 3>&- 4>&- <"${fifo}" >"${DM_LOG_FIFO}" 2>"${DM_QEMU_STDERR_LOG}" &
     else
         DM_TEST_IMAGES="${dm_test_images}" \
         DM_TEST_IMAGE="${DM_TEST_IMAGE}" \
         DM_TEST_IMAGE_2="${DM_TEST_IMAGE_2}" \
-        setsid make run_nixos 3>&- 4>&- <"${fifo}" >"${DM_LOG_FIFO}" 2>&1 &
+        setsid python3 "${ASTERINAS_DIR}/myshell/lib/dm_terminal.py" "${LOG}" make run_nixos 3>&- 4>&- <"${fifo}" >"${DM_LOG_FIFO}" 2>&1 &
     fi
     qemu_pid=$!
     exec 3>"${fifo}"
