@@ -24,6 +24,7 @@ set -e
 
 ./devtmpfs_mode
 ./device_mapper
+./device_mapper_version
 ./evdev
 ./framebuffer
 ./full

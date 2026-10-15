@@ -241,6 +241,33 @@ static void run_restart_waiter(uint64_t dev, uint32_t event_nr, int ready_fd,
 // Verifies the ABI envelope accepted by the control device and the LVM reload
 // suppression sequence: create a tableless device, inspect its active table,
 // then remove it. The table-status query must succeed with target_count == 0.
+FN_TEST(device_mapper_reports_version_before_parameter_errors)
+{
+	int fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+
+	for (int i = 0; i < 3; i++) {
+		struct dm_ioctl io;
+
+		init_ioctl(&io);
+		io.version[1] = 0;
+		io.version[2] = UINT32_MAX;
+		if (i == 0)
+			io.data_size = 0;
+		else if (i == 1)
+			io.flags = 1U << 31;
+		else
+			memset(io.name, 'x', sizeof(io.name));
+
+		/* Parameter rejection must not hide the earlier ABI handshake. */
+		TEST(ioctl(fd, DM_DEV_STATUS, &io), EINVAL, _ret == -1);
+		TEST_RES(io.version[0] == DM_VERSION_MAJOR, _ret == 1);
+		TEST_RES(io.version[1] == DM_VERSION_MINOR, _ret == 1);
+		TEST_RES(io.version[2] == DM_VERSION_PATCHLEVEL, _ret == 1);
+	}
+	TEST_SUCC(close(fd));
+}
+END_TEST()
+
 FN_TEST(device_mapper_tableless_status_is_linux_compatible)
 {
 	struct dm_ioctl io;

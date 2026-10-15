@@ -44,7 +44,13 @@ use crate::{
         },
     },
     prelude::*,
-    process::signal::{PollHandle, Pollable},
+    process::{
+        UserNamespace,
+        credentials::capabilities::CapSet,
+        posix_thread::AsPosixThread,
+        signal::{PollHandle, Pollable},
+    },
+    security::lsm::hooks as lsm_hooks,
     util::ioctl::RawIoctl,
 };
 
@@ -224,10 +230,41 @@ impl PerOpenFileOps for DmControlFile {
         false
     }
 
-    /// Handles one Linux DM ioctl by copying user ABI bytes, dispatching, then copying results back.
+    /// Negotiates the DM ABI before copying or validating command-specific data.
+    ///
+    /// Linux checks the caller's capability on every ioctl, including version
+    /// queries. The version exchange touches only three `u32`s, even though the
+    /// ioctl number encodes a full `dm_ioctl`. A version copyout fault takes
+    /// precedence over an incompatible client version.
     fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
+        if lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+            UserNamespace::get_init_singleton().as_ref(),
+            current_thread!().as_posix_thread().unwrap(),
+            CapSet::SYS_ADMIN,
+        ))
+        .is_err()
+        {
+            return_errno_with_message!(Errno::EACCES, "device-mapper ioctl requires CAP_SYS_ADMIN");
+        }
+
         let raw_cmd = raw_ioctl.cmd();
+        if (raw_cmd >> 8) & 0xff != DM_IOCTL_MAGIC {
+            return_errno_with_message!(Errno::ENOTTY, "not a device-mapper ioctl");
+        }
+
+        // Keep version negotiation ahead of command lookup and parameter reads,
+        // as in Linux v6.18.56 drivers/md/dm-ioctl.c:check_version/ctl_ioctl.
+        let mut version = [0u8; size_of::<[u32; 3]>()];
+        current_userspace!().read_bytes(raw_ioctl.arg(), &mut version)?;
+        let version_result = validate_client_version(&version);
+        write_version(&mut version)?;
+        current_userspace!().write_bytes(raw_ioctl.arg(), &version)?;
+        version_result?;
+
         let command = decode_command(raw_cmd)?;
+        if command == DM_VERSION_CMD {
+            return Ok(0);
+        }
         let command_name = command_name(command);
         ostd::error!(
             "[dm-debug] ioctl begin command={} raw_ioctl=0x{:08x}",
@@ -261,18 +298,17 @@ impl PerOpenFileOps for DmControlFile {
             let mut buffer = vec![0u8; data_size];
             current_userspace!().read_bytes(raw_ioctl.arg(), &mut buffer)?;
 
-            let version_result = validate_client_version(&buffer);
+            // Version negotiation already completed using the client's original
+            // bytes. Do not validate a second userspace snapshot as a new request.
             write_version(&mut buffer)?;
             let secure_data = flags & DM_SECURE_DATA_FLAG != 0;
-            let command_result = version_result
-                .and_then(|_| validate_input_flags(command, &buffer))
-                .and_then(|_| {
-                    if command == DM_DEV_WAIT_CMD {
-                        device_wait(&mut buffer)
-                    } else {
-                        handle_command(command, &mut buffer)
-                    }
-                });
+            let command_result = validate_input_flags(command, &buffer).and_then(|_| {
+                if command == DM_DEV_WAIT_CMD {
+                    device_wait(&mut buffer)
+                } else {
+                    handle_command(command, &mut buffer)
+                }
+            });
             let write_result = current_userspace!().write_bytes(raw_ioctl.arg(), &buffer);
             let result = match command_result {
                 Ok(()) => {
@@ -366,10 +402,19 @@ fn command_name(command: u8) -> &'static str {
     }
 }
 
-/// Ensures the userspace libdevmapper major version matches this implementation.
+/// Accepts the same major and a minor no newer than this implementation's ABI.
+///
+/// Linux v6.18.56 `check_version` treats minor revisions as backward compatible
+/// and ignores patch differences. The caller must report the kernel version to
+/// userspace even when this check rejects the client's requested version.
 fn validate_client_version(buffer: &[u8]) -> Result<()> {
-    if read_u32(buffer, OFF_VERSION)? != DM_VERSION[0] {
-        return_errno_with_message!(Errno::EINVAL, "Device Mapper ioctl 主版本不兼容");
+    if read_u32(buffer, OFF_VERSION)? != DM_VERSION[0]
+        || read_u32(buffer, OFF_VERSION + 4)? > DM_VERSION[1]
+    {
+        return_errno_with_message!(
+            Errno::EINVAL,
+            "incompatible device-mapper interface version"
+        );
     }
     Ok(())
 }
@@ -4991,7 +5036,33 @@ mod tests {
     }
 
     #[ktest]
+    fn accepts_backward_compatible_interface_versions() {
+        for version in [[4, 0, 0], [4, 49, 0], [4, 50, u32::MAX]] {
+            let mut buffer = [0u8; 12];
+            for (index, value) in version.into_iter().enumerate() {
+                write_u32(&mut buffer, index * 4, value).unwrap();
+            }
+            validate_client_version(&buffer).unwrap();
+        }
+    }
+
+    #[ktest]
+    fn rejects_incompatible_interface_versions() {
+        for version in [[3, 0, 0], [5, 0, 0], [4, 51, 0], [4, u32::MAX, 0]] {
+            let mut buffer = [0u8; 12];
+            for (index, value) in version.into_iter().enumerate() {
+                write_u32(&mut buffer, index * 4, value).unwrap();
+            }
+            assert_eq!(
+                validate_client_version(&buffer).unwrap_err().error(),
+                Errno::EINVAL
+            );
+        }
+    }
+
+    #[ktest]
     fn validates_ioctl_encoding_and_alignment() {
+        assert_eq!(DM_IOCTL_HEADER_SIZE, 312);
         assert_eq!(decode_command(0xc138_fd00).unwrap(), DM_VERSION_CMD);
         assert_eq!(decode_command(0xc138_fd05).unwrap(), DM_DEV_RENAME_CMD);
         assert_eq!(decode_command(0xc138_fd08).unwrap(), DM_DEV_WAIT_CMD);
