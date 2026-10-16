@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+/* Raw DM ABI, node rollback, table modes, and event-lifecycle regressions.
+ * These tests exercise the control fd rather than a userspace DM wrapper.
+ */
 #define _GNU_SOURCE
 
 #include <errno.h>
@@ -11,9 +14,10 @@
 #include <stdint.h>
 #include <string.h>
 #include <signal.h>
-#include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/mman.h>
+#include <stddef.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
@@ -24,8 +28,7 @@
 #define DM_CONTROL_PATH "/dev/mapper/control"
 #define DM_IOCTL_ENVELOPE_SIZE 312
 #define DM_TABLE_BUFFER_SIZE 512
-/* DM_EXISTS_FLAG is a kernel-private ABI status bit, absent from Linux UAPI. */
-#define DM_EXISTS_FLAG (1U << 2)
+#define DM_IOCTL_FIXED_SIZE 305
 
 union dm_table_buffer {
 	struct dm_ioctl align;
@@ -51,6 +54,31 @@ static void init_named_ioctl(struct dm_ioctl *io, const char *name)
 static size_t align_to_u64(size_t value)
 {
 	return (value + sizeof(uint64_t) - 1) & ~(sizeof(uint64_t) - 1);
+}
+
+/* Raw readers avoid alignment assumptions for guard-page ioctl arguments. */
+static uint32_t raw_u32(const unsigned char *bytes)
+{
+	uint32_t value;
+	memcpy(&value, bytes, sizeof(value));
+	return value;
+}
+
+static uint64_t raw_u64(const unsigned char *bytes)
+{
+	uint64_t value;
+	memcpy(&value, bytes, sizeof(value));
+	return value;
+}
+
+static int bytes_are(const unsigned char *bytes, size_t len,
+		     unsigned char value)
+{
+	for (size_t i = 0; i < len; i++) {
+		if (bytes[i] != value)
+			return 0;
+	}
+	return 1;
 }
 
 static void init_linear_table(unsigned char *buffer, size_t buffer_size,
@@ -96,14 +124,14 @@ static void init_zero_table(unsigned char *buffer, size_t buffer_size,
 }
 
 static void init_rename_ioctl(unsigned char *buffer, size_t buffer_size,
-			      uint64_t dev, uint32_t flags, const char *value)
+			      const char *name, uint32_t flags,
+			      const char *value)
 {
 	struct dm_ioctl *io = (struct dm_ioctl *)buffer;
 	char *data;
 
 	memset(buffer, 0, buffer_size);
-	init_ioctl(io);
-	io->dev = dev;
+	init_named_ioctl(io, name);
 	io->flags = flags;
 	data = (char *)(buffer + io->data_start);
 	snprintf(data, buffer_size - io->data_start, "%s", value);
@@ -156,7 +184,9 @@ static pid_t spawn_waiter(uint64_t dev, uint32_t event_nr, int ready_pipe[2],
 	if (pid < 0)
 		return -1;
 	close(ready_pipe[1]);
+	ready_pipe[1] = -1;
 	close(result_pipe[1]);
+	result_pipe[1] = -1;
 	return pid;
 }
 
@@ -259,12 +289,56 @@ FN_TEST(device_mapper_reports_version_before_parameter_errors)
 			memset(io.name, 'x', sizeof(io.name));
 
 		/* Parameter rejection must not hide the earlier ABI handshake. */
-		TEST(ioctl(fd, DM_DEV_STATUS, &io), EINVAL, _ret == -1);
+		TEST(ioctl(fd, DM_DEV_STATUS, &io), i == 0 ? EINVAL : ENXIO,
+		     _ret == -1);
 		TEST_RES(io.version[0] == DM_VERSION_MAJOR, _ret == 1);
 		TEST_RES(io.version[1] == DM_VERSION_MINOR, _ret == 1);
 		TEST_RES(io.version[2] == DM_VERSION_PATCHLEVEL, _ret == 1);
 	}
 	TEST_SUCC(close(fd));
+}
+END_TEST()
+
+FN_TEST(device_mapper_persistent_minor_error_precedes_identity_collision)
+{
+	char name[DM_NAME_LEN], other[DM_NAME_LEN], uuid[DM_UUID_LEN];
+	struct dm_ioctl io;
+	uint64_t dev;
+	int fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+
+	snprintf(name, sizeof(name), "dm-create-order-%ld", (long)getpid());
+	snprintf(other, sizeof(other), "dm-create-other-%ld", (long)getpid());
+	snprintf(uuid, sizeof(uuid), "dm-create-uuid-%ld", (long)getpid());
+	init_named_ioctl(&io, name);
+	snprintf(io.uuid, sizeof(io.uuid), "%s", uuid);
+	if (TEST_RES(ioctl(fd, DM_DEV_CREATE, &io), _ret == 0) < 0)
+		goto close_control;
+	dev = io.dev;
+	for (int collision = 0; collision < 3; collision++) {
+		init_named_ioctl(&io, collision == 1 ? name : other);
+		if (collision == 2)
+			snprintf(io.uuid, sizeof(io.uuid), "%s", uuid);
+		io.flags = DM_PERSISTENT_DEV_FLAG;
+		io.dev = dev;
+		TEST(ioctl(fd, DM_DEV_CREATE, &io), ENXIO, _ret == -1);
+	}
+	/* Without a requested minor, identity collisions still return EEXIST. */
+	init_named_ioctl(&io, name);
+	TEST(ioctl(fd, DM_DEV_CREATE, &io), EEXIST, _ret == -1);
+	init_named_ioctl(&io, other);
+	snprintf(io.uuid, sizeof(io.uuid), "%s", uuid);
+	TEST(ioctl(fd, DM_DEV_CREATE, &io), EEXIST, _ret == -1);
+	init_named_ioctl(&io, name);
+	TEST_RES(ioctl(fd, DM_DEV_STATUS, &io), _ret == 0);
+	TEST_RES(io.dev, _ret == dev);
+	TEST_RES(memcmp(io.uuid, uuid, strlen(uuid) + 1), _ret == 0);
+	init_named_ioctl(&io, other);
+	TEST(ioctl(fd, DM_DEV_STATUS, &io), ENXIO, _ret == -1);
+	init_ioctl(&io);
+	io.dev = dev;
+	TEST_RES(ioctl(fd, DM_DEV_REMOVE, &io), _ret == 0);
+close_control:
+	TEST_RES(close(fd), _ret == 0);
 }
 END_TEST()
 
@@ -288,7 +362,7 @@ FN_TEST(device_mapper_tableless_status_is_linux_compatible)
 	init_ioctl(&io);
 	snprintf(io.name, sizeof(io.name), "dm-abi-%ld", (long)getpid());
 	TEST_SUCC(ioctl(fd, DM_DEV_CREATE, &io));
-	TEST_RES(io.flags & DM_EXISTS_FLAG, _ret != 0);
+	TEST_RES(io.flags & (1U << 2), _ret == 0);
 	TEST_RES(!(io.flags & DM_SUSPEND_FLAG), _ret == 1);
 	TEST_RES(io.target_count == 0, _ret == 1);
 	dev = io.dev;
@@ -296,14 +370,14 @@ FN_TEST(device_mapper_tableless_status_is_linux_compatible)
 	init_ioctl(&io);
 	io.dev = dev;
 	TEST_SUCC(ioctl(fd, DM_DEV_STATUS, &io));
-	TEST_RES(io.flags & DM_EXISTS_FLAG, _ret != 0);
+	TEST_RES(io.flags & (1U << 2), _ret == 0);
 	TEST_RES(!(io.flags & DM_SUSPEND_FLAG), _ret == 1);
 	TEST_RES(io.target_count == 0, _ret == 1);
 
 	init_ioctl(&io);
 	io.dev = dev;
 	TEST_SUCC(ioctl(fd, DM_TABLE_STATUS, &io));
-	TEST_RES(io.flags & DM_EXISTS_FLAG, _ret != 0);
+	TEST_RES(io.flags & (1U << 2), _ret == 0);
 	TEST_RES(io.target_count == 0, _ret == 1);
 
 	init_ioctl(&io);
@@ -549,6 +623,8 @@ FN_TEST(device_mapper_wait_restarts_after_signal)
 	struct dm_ioctl io;
 	struct dm_wait_result result = { 0 };
 	union dm_table_buffer rename;
+	union dm_table_buffer table;
+	uint32_t event_nr;
 	int child_reaped = 0;
 	int device_created = 0;
 
@@ -563,6 +639,14 @@ FN_TEST(device_mapper_wait_restarts_after_signal)
 		goto cleanup;
 	dev = io.dev;
 	device_created = 1;
+	/* Rename publishes a device event only while a live table exists. */
+	init_zero_table(table.bytes, sizeof(table.bytes), name, 8);
+	if (TEST_RES(ioctl(fd, DM_TABLE_LOAD, table.bytes), _ret == 0) < 0)
+		goto cleanup;
+	init_named_ioctl(&io, name);
+	if (TEST_RES(ioctl(fd, DM_DEV_SUSPEND, &io), _ret == 0) < 0)
+		goto cleanup;
+	event_nr = io.event_nr;
 
 	if (TEST_RES(pipe(ready_pipe), _ret == 0) < 0 ||
 	    TEST_RES(pipe(signal_pipe), _ret == 0) < 0 ||
@@ -573,7 +657,7 @@ FN_TEST(device_mapper_wait_restarts_after_signal)
 		close(ready_pipe[0]);
 		close(signal_pipe[0]);
 		close(result_pipe[0]);
-		run_restart_waiter(dev, 0, ready_pipe[1], signal_pipe[1],
+		run_restart_waiter(dev, event_nr, ready_pipe[1], signal_pipe[1],
 				   result_pipe[1]);
 	}
 	if (pid < 0)
@@ -613,7 +697,7 @@ FN_TEST(device_mapper_wait_restarts_after_signal)
 		TEST_RES(wait_fd_readable(result_pipe[0], 100), _ret == 0);
 	if (wait_result != 0)
 		goto cleanup;
-	init_rename_ioctl(rename.bytes, sizeof(rename.bytes), dev, 0, renamed);
+	init_rename_ioctl(rename.bytes, sizeof(rename.bytes), name, 0, renamed);
 	if (TEST_RES(ioctl(fd, DM_DEV_RENAME, rename.bytes), _ret == 0) < 0)
 		goto cleanup;
 	wait_result =
@@ -628,7 +712,7 @@ FN_TEST(device_mapper_wait_restarts_after_signal)
 			     WEXITSTATUS(status) == EXIT_SUCCESS) == pid)
 		child_reaped = 1;
 	TEST_RES(result.error, _ret == 0);
-	TEST_RES(result.header.event_nr, _ret == 1);
+	TEST_RES(result.header.event_nr, _ret == event_nr + 1);
 	TEST_RES(strcmp(result.header.name, renamed), _ret == 0);
 
 cleanup:
@@ -664,63 +748,565 @@ FN_TEST(device_mapper_wait_wakes_after_rename_and_setuuid)
 	char renamed[DM_NAME_LEN];
 	char uuid[DM_UUID_LEN];
 	char ready;
-	int ready_pipe[2];
-	int result_pipe[2];
+	int ready_pipe[2] = { -1, -1 };
+	int result_pipe[2] = { -1, -1 };
 	int status;
-	int fd;
-	pid_t pid;
-	uint64_t dev;
+	int fd = -1;
+	pid_t pid = -1;
+	uint64_t dev = 0;
+	uint32_t event_nr;
+	int device_created = 0;
 	struct dm_ioctl io;
-	struct dm_wait_result result;
+	struct dm_wait_result result = { 0 };
 	union dm_table_buffer rename;
+	union dm_table_buffer table;
 
 	snprintf(name, sizeof(name), "dm-wait-wake-%ld", (long)getpid());
 	snprintf(renamed, sizeof(renamed), "dm-wait-woke-%ld", (long)getpid());
 	snprintf(uuid, sizeof(uuid), "dm-wait-uuid-%ld", (long)getpid());
-	fd = TEST_SUCC(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+	fd = TEST_RES(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC), _ret >= 0);
+	if (fd < 0)
+		goto cleanup;
 	init_named_ioctl(&io, name);
-	TEST_SUCC(ioctl(fd, DM_DEV_CREATE, &io));
+	if (TEST_RES(ioctl(fd, DM_DEV_CREATE, &io), _ret == 0) < 0)
+		goto cleanup;
 	dev = io.dev;
+	device_created = 1;
+	init_zero_table(table.bytes, sizeof(table.bytes), name, 8);
+	if (TEST_RES(ioctl(fd, DM_TABLE_LOAD, table.bytes), _ret == 0) < 0)
+		goto cleanup;
+	init_named_ioctl(&io, name);
+	if (TEST_RES(ioctl(fd, DM_DEV_SUSPEND, &io), _ret == 0) < 0)
+		goto cleanup;
+	event_nr = io.event_nr;
 
-	pid = TEST_SUCC(spawn_waiter(dev, 0, ready_pipe, result_pipe));
-	TEST_RES(read(ready_pipe[0], &ready, sizeof(ready)),
-		 _ret == sizeof(ready));
-	TEST_SUCC(sched_yield());
-	init_rename_ioctl(rename.bytes, sizeof(rename.bytes), dev, 0, renamed);
-	TEST_SUCC(ioctl(fd, DM_DEV_RENAME, rename.bytes));
-	TEST_RES(read(result_pipe[0], &result, sizeof(result)),
-		 _ret == sizeof(result));
-	TEST_SUCC(close(ready_pipe[0]));
-	TEST_SUCC(close(result_pipe[0]));
-	TEST_RES(waitpid(pid, &status, 0),
-		 _ret == pid && WIFEXITED(status) &&
-			 WEXITSTATUS(status) == EXIT_SUCCESS);
-	TEST_RES(result.error, _ret == 0);
-	TEST_RES(result.header.event_nr, _ret == 1);
-	TEST_RES(strcmp(result.header.name, renamed), _ret == 0);
-	TEST_RES(strcmp(result.header.uuid, ""), _ret == 0);
+	for (int set_uuid = 0; set_uuid < 2; set_uuid++) {
+		pid = TEST_RES(spawn_waiter(dev, event_nr + set_uuid,
+					    ready_pipe, result_pipe),
+			       _ret >= 0);
+		if (pid < 0)
+			goto cleanup;
+		if (TEST_RES(wait_fd_readable(ready_pipe[0], 2000),
+			     _ret == 1) != 1)
+			goto cleanup;
+		if (TEST_RES(read(ready_pipe[0], &ready, sizeof(ready)),
+			     _ret == sizeof(ready)) != sizeof(ready))
+			goto cleanup;
+		/* Pending output does not prove that the kernel waiter is registered. */
+		if (TEST_RES(wait_fd_readable(result_pipe[0], 100),
+			     _ret == 0) != 0)
+			goto cleanup;
+		init_rename_ioctl(rename.bytes, sizeof(rename.bytes),
+				  set_uuid ? renamed : name,
+				  set_uuid ? DM_UUID_FLAG : 0,
+				  set_uuid ? uuid : renamed);
+		if (TEST_RES(ioctl(fd, DM_DEV_RENAME, rename.bytes),
+			     _ret == 0) < 0)
+			goto cleanup;
+		if (TEST_RES(wait_fd_readable(result_pipe[0], 2000),
+			     _ret == 1) != 1)
+			goto cleanup;
+		if (TEST_RES(read(result_pipe[0], &result, sizeof(result)),
+			     _ret == sizeof(result)) != sizeof(result))
+			goto cleanup;
+		if (TEST_RES(waitpid(pid, &status, 0),
+			     _ret == pid && WIFEXITED(status) &&
+				     WEXITSTATUS(status) == EXIT_SUCCESS) !=
+		    pid)
+			goto cleanup;
+		pid = -1;
+		TEST_RES(close(ready_pipe[0]), _ret == 0);
+		ready_pipe[0] = -1;
+		TEST_RES(close(result_pipe[0]), _ret == 0);
+		result_pipe[0] = -1;
+		TEST_RES(result.error, _ret == 0);
+		TEST_RES(result.header.event_nr,
+			 _ret == event_nr + set_uuid + 1);
+		TEST_RES(strcmp(result.header.name, renamed), _ret == 0);
+		TEST_RES(strcmp(result.header.uuid, set_uuid ? uuid : ""),
+			 _ret == 0);
+	}
 
-	pid = TEST_SUCC(spawn_waiter(dev, 1, ready_pipe, result_pipe));
-	TEST_RES(read(ready_pipe[0], &ready, sizeof(ready)),
-		 _ret == sizeof(ready));
-	TEST_SUCC(sched_yield());
-	init_rename_ioctl(rename.bytes, sizeof(rename.bytes), dev, DM_UUID_FLAG,
+cleanup:
+	if (pid > 0) {
+		kill(pid, SIGKILL);
+		waitpid(pid, NULL, 0);
+	}
+	for (int i = 0; i < 2; i++) {
+		if (ready_pipe[i] >= 0)
+			close(ready_pipe[i]);
+		if (result_pipe[i] >= 0)
+			close(result_pipe[i]);
+	}
+	if (device_created) {
+		init_ioctl(&io);
+		io.dev = dev;
+		TEST_RES(ioctl(fd, DM_DEV_REMOVE, &io), _ret == 0);
+	}
+	if (fd >= 0)
+		TEST_RES(close(fd), _ret == 0);
+}
+END_TEST()
+
+FN_TEST(device_mapper_fixed_prefix_and_no_params_guard_pages)
+{
+	const size_t sizes[] = { 305, 311, 312, 1024 * 1024 };
+	long page_size = CHECK_WITH(sysconf(_SC_PAGESIZE), _ret > 0);
+	unsigned char *pages =
+		CHECK_WITH(mmap(NULL, page_size * 2, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0),
+			   _ret != MAP_FAILED);
+	char name[DM_NAME_LEN];
+	struct dm_ioctl io;
+	int fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+
+	TEST_RES(offsetof(struct dm_ioctl, data), _ret == DM_IOCTL_FIXED_SIZE);
+	snprintf(name, sizeof(name), "dm-prefix-%ld", (long)getpid());
+	CHECK(mprotect(pages + page_size, page_size, PROT_NONE));
+	init_named_ioctl(&io, name);
+	CHECK(ioctl(fd, DM_DEV_CREATE, &io));
+	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+		size_t accessible = sizes[i] > 312 ? 305 : sizes[i];
+		unsigned char *arg = pages + page_size - accessible;
+
+		for (int secure = 0; secure < 2; secure++) {
+			init_named_ioctl(&io, name);
+			io.data_size = sizes[i];
+			io.data_start = UINT32_MAX;
+			io.flags = secure ? DM_SECURE_DATA_FLAG : 0;
+			memset(arg, 0xa5, accessible);
+			memcpy(arg, &io, DM_IOCTL_FIXED_SIZE);
+			/* Direction/size bits do not change the command's copy contract. */
+			TEST_RES(ioctl(fd, _IO(0xfd, DM_DEV_STATUS_CMD), arg),
+				 _ret == 0);
+			TEST_RES(raw_u32(arg + 12),
+				 _ret == DM_IOCTL_FIXED_SIZE);
+			TEST_RES(raw_u32(arg + 16), _ret == UINT32_MAX);
+			TEST_RES(raw_u32(arg + 28) & DM_SECURE_DATA_FLAG,
+				 _ret == 0);
+			TEST_RES(bytes_are(arg + 305, accessible - 305, 0xa5),
+				 _ret == 1);
+		}
+	}
+	init_named_ioctl(&io, name);
+	TEST_RES(ioctl(fd, DM_DEV_REMOVE, &io), _ret == 0);
+	TEST_SUCC(munmap(pages, page_size * 2));
+	TEST_SUCC(close(fd));
+}
+END_TEST()
+
+FN_TEST(device_mapper_failure_copyout_and_secure_clear_boundaries)
+{
+	union dm_table_buffer input, before;
+	char name[DM_NAME_LEN];
+	struct dm_ioctl io;
+	int fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+
+	snprintf(name, sizeof(name), "dm-secure-%ld", (long)getpid());
+	init_named_ioctl(&io, name);
+	CHECK(ioctl(fd, DM_DEV_CREATE, &io));
+	for (int secure = 0; secure < 2; secure++) {
+		memset(input.bytes, 0xa5, sizeof(input.bytes));
+		init_named_ioctl(&input.align, name);
+		input.align.version[1] = 0;
+		input.align.version[2] = UINT32_MAX;
+		input.align.data_size = sizeof(input.bytes);
+		input.align.flags = secure ? DM_SECURE_DATA_FLAG : 0;
+		/* An empty load is rejected after copying and clearing the request. */
+		memcpy(&before, &input, sizeof(before));
+		TEST(ioctl(fd, DM_TABLE_LOAD, input.bytes), EINVAL, _ret == -1);
+		if (secure) {
+			TEST_RES(bytes_are(input.bytes, sizeof(input.bytes), 0),
+				 _ret == 1);
+		} else {
+			TEST_RES(input.align.version[1],
+				 _ret == DM_VERSION_MINOR);
+			TEST_RES(memcmp(input.bytes + 12, before.bytes + 12,
+					sizeof(input.bytes) - 12),
+				 _ret == 0);
+		}
+	}
+
+	/* Secure success returns only the header, not the copied table payload. */
+	init_zero_table(input.bytes, sizeof(input.bytes), name, 8);
+	input.align.data_size = sizeof(input.bytes);
+	input.align.flags = DM_SECURE_DATA_FLAG;
+	TEST_RES(ioctl(fd, DM_TABLE_LOAD, input.bytes), _ret == 0);
+	TEST_RES(input.align.data_size, _ret == 305);
+	TEST_RES(bytes_are(input.bytes + 305, sizeof(input.bytes) - 305, 0),
+		 _ret == 1);
+	TEST_RES(input.align.flags & DM_SECURE_DATA_FLAG, _ret == 0);
+	init_named_ioctl(&io, name);
+	TEST_RES(ioctl(fd, DM_DEV_REMOVE, &io), _ret == 0);
+	TEST_SUCC(close(fd));
+}
+END_TEST()
+
+FN_TEST(device_mapper_secure_fault_prevents_dispatch)
+{
+	long page_size = CHECK_WITH(sysconf(_SC_PAGESIZE), _ret > 0);
+	unsigned char *pages =
+		CHECK_WITH(mmap(NULL, page_size * 2, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0),
+			   _ret != MAP_FAILED);
+	unsigned char *arg;
+	struct dm_ioctl io;
+	unsigned char before[DM_IOCTL_FIXED_SIZE];
+	char name[DM_NAME_LEN];
+	int fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+
+	snprintf(name, sizeof(name), "dm-clear-fault-%ld", (long)getpid());
+	/* Version and the fixed prefix are writable, but payload copyin faults. */
+	arg = pages + page_size - 312;
+	init_named_ioctl(&io, name);
+	io.data_size = 384;
+	io.flags = DM_SECURE_DATA_FLAG;
+	memcpy(arg, &io, sizeof(io));
+	memcpy(before, arg, sizeof(before));
+	CHECK(mprotect(pages + page_size, page_size, PROT_NONE));
+	TEST(ioctl(fd, DM_TABLE_LOAD, arg), EFAULT, _ret == -1);
+	TEST_RES(memcmp(arg + 12, before + 12, sizeof(before) - 12), _ret == 0);
+
+	/* A readable but read-only header tail fails secure clear before create. */
+	CHECK(mprotect(pages + page_size, page_size, PROT_READ | PROT_WRITE));
+	arg = pages + page_size - 64;
+	init_named_ioctl(&io, name);
+	io.flags = DM_SECURE_DATA_FLAG;
+	memcpy(arg, &io, sizeof(io));
+	memcpy(before, arg, sizeof(before));
+	CHECK(mprotect(pages + page_size, page_size, PROT_READ));
+	TEST(ioctl(fd, DM_DEV_CREATE, arg), EFAULT, _ret == -1);
+	TEST_RES(memcmp(arg + 64, before + 64, sizeof(before) - 64), _ret == 0);
+	init_named_ioctl(&io, name);
+	TEST(ioctl(fd, DM_DEV_STATUS, &io), ENXIO, _ret == -1);
+	TEST_SUCC(munmap(pages, page_size * 2));
+	TEST_SUCC(close(fd));
+}
+END_TEST()
+
+FN_TEST(device_mapper_selectors_and_query_flags)
+{
+	char name[DM_NAME_LEN], uuid[DM_UUID_LEN];
+	struct dm_ioctl io;
+	uint64_t dev;
+	int fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+	const uint32_t preserved = DM_SKIP_BDGET_FLAG | DM_SKIP_LOCKFS_FLAG |
+				   DM_NOFLUSH_FLAG | DM_STATUS_TABLE_FLAG |
+				   (1U << 31);
+	const uint32_t cleared = DM_BUFFER_FULL_FLAG |
+				 DM_UEVENT_GENERATED_FLAG |
+				 DM_SECURE_DATA_FLAG | DM_DATA_OUT_FLAG |
+				 DM_ACTIVE_PRESENT_FLAG |
+				 DM_INACTIVE_PRESENT_FLAG | DM_SUSPEND_FLAG;
+
+	snprintf(name, sizeof(name), "dm-select-%ld", (long)getpid());
+	snprintf(uuid, sizeof(uuid), "dm-select-uuid-%ld", (long)getpid());
+	init_named_ioctl(&io, name);
+	snprintf(io.uuid, sizeof(io.uuid), "%s", uuid);
+	CHECK(ioctl(fd, DM_DEV_CREATE, &io));
+	dev = io.dev;
+	for (unsigned mask = 0; mask < 8; mask++) {
+		int expected = mask == 3 || mask == 7 ? EINVAL : ENXIO;
+		init_ioctl(&io);
+		if (mask & 1)
+			snprintf(io.name, sizeof(io.name), "%s", name);
+		if (mask & 2)
+			snprintf(io.uuid, sizeof(io.uuid), "%s", uuid);
+		if (mask & 4)
+			io.dev = dev;
+		if (mask == 1 || mask == 2 || mask == 4) {
+			TEST_RES(ioctl(fd, DM_DEV_STATUS, &io), _ret == 0);
+			TEST_RES(io.dev, _ret == dev);
+		} else {
+			TEST(ioctl(fd, DM_DEV_STATUS, &io), expected,
+			     _ret == -1);
+		}
+	}
+	init_named_ioctl(&io, name);
+	io.flags = preserved | cleared;
+	TEST_RES(ioctl(fd, DM_DEV_STATUS, &io), _ret == 0);
+	TEST_RES(io.flags & preserved, _ret == preserved);
+	TEST_RES(io.flags & cleared, _ret == 0);
+	TEST_RES(io.flags & (1U << 2), _ret == 0);
+	init_named_ioctl(&io, name);
+	TEST_RES(ioctl(fd, DM_DEV_REMOVE, &io), _ret == 0);
+	TEST_SUCC(close(fd));
+}
+END_TEST()
+
+FN_TEST(device_mapper_name_list_raw_layout_and_empty_copyout)
+{
+	char name[DM_NAME_LEN], uuid[DM_UUID_LEN];
+	struct dm_ioctl io;
+	union dm_table_buffer output;
+	uint64_t dev;
+	int fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+	size_t extension, needed;
+
+	snprintf(name, sizeof(name), "dm-list-%ld", (long)getpid());
+	snprintf(uuid, sizeof(uuid), "dm-list-uuid-%ld", (long)getpid());
+	init_named_ioctl(&io, name);
+	snprintf(io.uuid, sizeof(io.uuid), "%s", uuid);
+	CHECK(ioctl(fd, DM_DEV_CREATE, &io));
+	dev = io.dev;
+	extension = align_to_u64(12 + strlen(name) + 1);
+	for (int with_uuid = 0; with_uuid < 2; with_uuid++) {
+		needed = align_to_u64(extension + 8 +
+				      (with_uuid ? strlen(uuid) + 1 : 0));
+		memset(output.bytes, 0xa5, sizeof(output.bytes));
+		init_named_ioctl(&output.align, name);
+		snprintf(output.align.uuid, sizeof(output.align.uuid), "%s",
+			 uuid);
+		output.align.data_size = sizeof(output.bytes);
+		output.align.flags = with_uuid ? DM_UUID_FLAG : 0;
+		TEST_RES(ioctl(fd, DM_LIST_DEVICES, output.bytes), _ret == 0);
+		TEST_RES(output.align.data_start, _ret == 312);
+		TEST_RES(output.align.data_size, _ret == 312 + needed);
+		TEST_RES(raw_u64(output.bytes + 312), _ret == dev);
+		TEST_RES(raw_u32(output.bytes + 320), _ret == 0);
+		TEST_RES(memcmp(output.bytes + 324, name, strlen(name) + 1),
+			 _ret == 0);
+		TEST_RES(raw_u32(output.bytes + 312 + extension), _ret == 0);
+		TEST_RES(raw_u32(output.bytes + 316 + extension),
+			 _ret == (unsigned)with_uuid);
+		if (with_uuid)
+			TEST_RES(memcmp(output.bytes + 320 + extension, uuid,
+					strlen(uuid) + 1),
+				 _ret == 0);
+		TEST_RES(bytes_are(output.bytes + 312 + needed,
+				   sizeof(output.bytes) - 312 - needed, 0xa5),
+			 _ret == 1);
+
+		memset(output.bytes, 0xa5, sizeof(output.bytes));
+		init_named_ioctl(&output.align, name);
+		output.align.flags = with_uuid ? DM_UUID_FLAG : 0;
+		output.align.data_size = 312 + needed - 1;
+		TEST_RES(ioctl(fd, DM_LIST_DEVICES, output.bytes), _ret == 0);
+		TEST_RES(output.align.flags & DM_BUFFER_FULL_FLAG, _ret != 0);
+		TEST_RES(output.align.data_size, _ret == 305);
+		TEST_RES(bytes_are(output.bytes + 312,
+				   sizeof(output.bytes) - 312, 0xa5),
+			 _ret == 1);
+	}
+
+	memset(output.bytes, 0xa5, sizeof(output.bytes));
+	init_named_ioctl(&output.align, name);
+	snprintf(output.align.uuid, sizeof(output.align.uuid), "no-such-uuid");
+	output.align.data_size = sizeof(output.bytes);
+	TEST_RES(ioctl(fd, DM_LIST_DEVICES, output.bytes), _ret == 0);
+	TEST_RES(output.align.data_size, _ret == 312);
+	/* Linux prepares a sentinel internally but does not include it in copyout. */
+	TEST_RES(bytes_are(output.bytes + 312, sizeof(output.bytes) - 312,
+			   0xa5),
+		 _ret == 1);
+	init_named_ioctl(&io, name);
+	TEST_RES(ioctl(fd, DM_DEV_REMOVE, &io), _ret == 0);
+	TEST_SUCC(close(fd));
+}
+END_TEST()
+
+FN_TEST(device_mapper_wait_returns_table_records)
+{
+	char name[DM_NAME_LEN];
+	struct dm_ioctl io;
+	union dm_table_buffer table;
+	uint32_t event_nr;
+	uint64_t dev;
+	int fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+
+	snprintf(name, sizeof(name), "dm-wait-records-%ld", (long)getpid());
+	init_named_ioctl(&io, name);
+	if (TEST_RES(ioctl(fd, DM_DEV_CREATE, &io), _ret == 0) < 0)
+		goto close_control;
+	dev = io.dev;
+	init_zero_table(table.bytes, sizeof(table.bytes), name, 8);
+	if (TEST_RES(ioctl(fd, DM_TABLE_LOAD, table.bytes), _ret == 0) < 0)
+		goto cleanup;
+	init_named_ioctl(&io, name);
+	if (TEST_RES(ioctl(fd, DM_DEV_SUSPEND, &io), _ret == 0) < 0)
+		goto cleanup;
+	event_nr = io.event_nr;
+	init_zero_table(table.bytes, sizeof(table.bytes), name, 16);
+	table.align.flags = DM_READONLY_FLAG;
+	if (TEST_RES(ioctl(fd, DM_TABLE_LOAD, table.bytes), _ret == 0) < 0)
+		goto cleanup;
+	for (int inactive = 0; inactive < 2; inactive++) {
+		for (int full = 0; full < 2; full++) {
+			uint32_t flags =
+				DM_STATUS_TABLE_FLAG | DM_NOFLUSH_FLAG |
+				(inactive ? DM_QUERY_INACTIVE_TABLE_FLAG : 0);
+			memset(table.bytes, 0xa5, sizeof(table.bytes));
+			init_named_ioctl(&table.align, name);
+			table.align.flags = flags;
+			table.align.event_nr = event_nr - 1;
+			table.align.data_size = full ? sizeof(table.bytes) :
+						       312;
+			TEST_RES(ioctl(fd, DM_DEV_WAIT, table.bytes),
+				 _ret == 0);
+			TEST_RES(table.align.target_count, _ret == 1);
+			TEST_RES(table.align.event_nr, _ret == event_nr);
+			TEST_RES(table.align.flags & flags, _ret == flags);
+			TEST_RES(!!(table.align.flags & DM_READONLY_FLAG),
+				 _ret == inactive);
+			if (full) {
+				TEST_RES(table.align.data_size, _ret == 353);
+				TEST_RES(raw_u64(table.bytes + 320),
+					 _ret == (inactive ? 16 : 8));
+				TEST_RES(raw_u32(table.bytes + 332),
+					 _ret == 48);
+				TEST_RES(memcmp(table.bytes + 336, "zero",
+						sizeof("zero")),
+					 _ret == 0);
+				TEST_RES(table.bytes[352], _ret == 0);
+				TEST_RES(table.bytes[353], _ret == 0xa5);
+			} else {
+				TEST_RES(table.align.flags &
+						 DM_BUFFER_FULL_FLAG,
+					 _ret != 0);
+				TEST_RES(table.align.data_size, _ret == 305);
+			}
+		}
+	}
+cleanup:
+	init_ioctl(&io);
+	io.dev = dev;
+	TEST_RES(ioctl(fd, DM_DEV_REMOVE, &io), _ret == 0);
+close_control:
+	TEST_SUCC(close(fd));
+}
+END_TEST()
+
+FN_TEST(device_mapper_relative_and_escaped_backing_paths)
+{
+	char name[DM_NAME_LEN], link_name[64], escaped[80];
+	union dm_table_buffer table;
+	struct dm_ioctl io;
+	int cwd = -1, fd = -1;
+	int link_created = 0, device_created = 0;
+	uint64_t dev = 0;
+
+	snprintf(name, sizeof(name), "dm-path-%ld", (long)getpid());
+	snprintf(link_name, sizeof(link_name), "dm backing-%ld",
+		 (long)getpid());
+	snprintf(escaped, sizeof(escaped), "dm\\ backing-%ld 0",
+		 (long)getpid());
+	cwd = TEST_RES(open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC),
+		       _ret >= 0);
+	if (cwd < 0)
+		goto cleanup;
+	fd = TEST_RES(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC), _ret >= 0);
+	if (fd < 0)
+		goto cleanup;
+	if (TEST_RES(chdir("/dev"), _ret == 0) < 0)
+		goto cleanup;
+	if (TEST_RES(symlink("vdc", link_name), _ret == 0) < 0)
+		goto cleanup;
+	link_created = 1;
+	init_named_ioctl(&io, name);
+	if (TEST_RES(ioctl(fd, DM_DEV_CREATE, &io), _ret == 0) < 0)
+		goto cleanup;
+	dev = io.dev;
+	device_created = 1;
+	for (int quote = 0; quote < 2; quote++) {
+		init_linear_table(table.bytes, sizeof(table.bytes), name, 8);
+		char *params = (char *)table.bytes + 312 + 40;
+		snprintf(params, sizeof(table.bytes) - 352, "%s",
+			 quote ? escaped : "vdc 0");
+		table.align.data_size =
+			312 + align_to_u64(40 + strlen(params) + 1);
+		TEST_RES(ioctl(fd, DM_TABLE_LOAD, table.bytes), _ret == 0);
+	}
+cleanup:
+	if (device_created) {
+		init_ioctl(&io);
+		io.dev = dev;
+		TEST_RES(ioctl(fd, DM_DEV_REMOVE, &io), _ret == 0);
+	}
+	if (link_created)
+		TEST_RES(unlink(link_name), _ret == 0);
+	if (cwd >= 0) {
+		/* Continuing in /dev would change the meaning of later relative paths. */
+		CHECK(fchdir(cwd));
+		TEST_RES(close(cwd), _ret == 0);
+	}
+	if (fd >= 0)
+		TEST_RES(close(fd), _ret == 0);
+}
+END_TEST()
+
+FN_TEST(device_mapper_rejected_identity_changes_preserve_state)
+{
+	char name[DM_NAME_LEN], uuid[DM_UUID_LEN];
+	char primary[64], alias[DM_NAME_LEN + 32], too_long[DM_UUID_LEN + 1];
+	struct dm_ioctl io;
+	union dm_table_buffer input;
+	struct stat before, after;
+	uint64_t dev;
+	uint32_t event_nr;
+	int fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+
+	snprintf(name, sizeof(name), "dm-identity-%ld", (long)getpid());
+	snprintf(uuid, sizeof(uuid), "dm-identity-uuid-%ld", (long)getpid());
+	init_named_ioctl(&io, name);
+	if (TEST_RES(ioctl(fd, DM_DEV_CREATE, &io), _ret == 0) < 0)
+		goto close_control;
+	dev = io.dev;
+	init_zero_table(input.bytes, sizeof(input.bytes), name, 8);
+	if (TEST_RES(ioctl(fd, DM_TABLE_LOAD, input.bytes), _ret == 0) < 0)
+		goto cleanup;
+	init_named_ioctl(&io, name);
+	if (TEST_RES(ioctl(fd, DM_DEV_SUSPEND, &io), _ret == 0) < 0)
+		goto cleanup;
+	mapper_paths(dev, name, primary, sizeof(primary), alias, sizeof(alias));
+	if (TEST_RES(stat(alias, &before), _ret == 0) < 0)
+		goto cleanup;
+	init_rename_ioctl(input.bytes, sizeof(input.bytes), name, DM_UUID_FLAG,
 			  uuid);
-	TEST_SUCC(ioctl(fd, DM_DEV_RENAME, rename.bytes));
-	TEST_RES(read(result_pipe[0], &result, sizeof(result)),
-		 _ret == sizeof(result));
-	TEST_SUCC(close(ready_pipe[0]));
-	TEST_SUCC(close(result_pipe[0]));
-	TEST_RES(waitpid(pid, &status, 0),
-		 _ret == pid && WIFEXITED(status) &&
-			 WEXITSTATUS(status) == EXIT_SUCCESS);
-	TEST_RES(result.error, _ret == 0);
-	TEST_RES(result.header.event_nr, _ret == 2);
-	TEST_RES(strcmp(result.header.name, renamed), _ret == 0);
-	TEST_RES(strcmp(result.header.uuid, uuid), _ret == 0);
-
-	init_named_ioctl(&io, renamed);
-	TEST_SUCC(ioctl(fd, DM_DEV_REMOVE, &io));
+	if (TEST_RES(ioctl(fd, DM_DEV_RENAME, input.bytes), _ret == 0) < 0)
+		goto cleanup;
+	event_nr = input.align.event_nr;
+	memset(too_long, 'x', sizeof(too_long) - 1);
+	too_long[sizeof(too_long) - 1] = '\0';
+	const struct {
+		uint32_t flags;
+		const char *value;
+		int error;
+	} cases[] = {
+		{ 0, "bad/name", EINVAL },
+		{ 0, too_long, EINVAL },
+		{ 0, name, EBUSY },
+		{ DM_UUID_FLAG, "", EINVAL },
+		{ DM_UUID_FLAG, too_long, EINVAL },
+		{ DM_UUID_FLAG, uuid, EBUSY },
+		{ DM_UUID_FLAG, "dm-another-uuid", EINVAL },
+	};
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		init_rename_ioctl(input.bytes, sizeof(input.bytes), name,
+				  cases[i].flags, cases[i].value);
+		TEST(ioctl(fd, DM_DEV_RENAME, input.bytes), cases[i].error,
+		     _ret == -1);
+		init_named_ioctl(&io, name);
+		TEST_RES(ioctl(fd, DM_DEV_STATUS, &io), _ret == 0);
+		TEST_RES(io.dev, _ret == dev);
+		TEST_RES(io.event_nr, _ret == event_nr);
+		TEST_RES(strcmp(io.uuid, uuid), _ret == 0);
+		init_ioctl(&io);
+		snprintf(io.uuid, sizeof(io.uuid), "%s", uuid);
+		TEST_RES(ioctl(fd, DM_DEV_STATUS, &io), _ret == 0);
+		TEST_RES(io.dev, _ret == dev);
+		if (TEST_RES(stat(alias, &after), _ret == 0) == 0) {
+			TEST_RES(after.st_rdev, _ret == before.st_rdev);
+			TEST_RES(after.st_ino, _ret == before.st_ino);
+		}
+	}
+	/* Creation rejects names containing a path separator as well. */
+	init_named_ioctl(&io, "bad/name");
+	TEST(ioctl(fd, DM_DEV_CREATE, &io), EINVAL, _ret == -1);
+cleanup:
+	init_ioctl(&io);
+	io.dev = dev;
+	TEST_RES(ioctl(fd, DM_DEV_REMOVE, &io), _ret == 0);
+close_control:
 	TEST_SUCC(close(fd));
 }
 END_TEST()
@@ -775,7 +1361,7 @@ FN_TEST(device_mapper_readonly_table_mode_transitions)
 	TEST_RES(io.flags & DM_ACTIVE_PRESENT_FLAG, _ret != 0);
 	TEST_RES(!(io.flags & DM_READONLY_FLAG), _ret == 1);
 
-	init_named_ioctl(&io, name);
+	init_ioctl(&io);
 	io.dev = dev;
 	TEST_SUCC(ioctl(fd, DM_DEV_REMOVE, &io));
 	TEST_SUCC(close(fd));

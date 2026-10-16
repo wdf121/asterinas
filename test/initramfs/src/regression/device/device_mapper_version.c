@@ -123,9 +123,19 @@ FN_TEST(device_mapper_version_only_accesses_version_bytes)
 
 	/* No read beyond version[3] is needed, despite the ioctl size encoding. */
 	CHECK(mprotect(pages + page_size, page_size, PROT_NONE));
-	TEST_RES(ioctl(fd, DM_VERSION, version), _ret == 0);
-	TEST_RES(memcmp(version, kernel_version, sizeof(kernel_version)),
-		 _ret == 0);
+	const unsigned long commands[] = {
+		DM_VERSION,
+		_IO(0xfd, DM_VERSION_CMD),
+		_IOC(_IOC_READ, 0xfd, DM_VERSION_CMD, 1),
+		_IOC(_IOC_WRITE, 0xfd, DM_VERSION_CMD, 0x3fff),
+	};
+	for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+		memcpy(version, client_version, sizeof(client_version));
+		TEST_RES(ioctl(fd, commands[i], version), _ret == 0);
+		TEST_RES(memcmp(version, kernel_version,
+				sizeof(kernel_version)),
+			 _ret == 0);
+	}
 
 	/* Nor may a successful handshake write the readable, read-only tail. */
 	CHECK(mprotect(pages + page_size, page_size, PROT_READ));
