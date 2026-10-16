@@ -16,6 +16,7 @@ use device_id::{DeviceId, MajorId, MinorId};
 use super::{
     DmTarget, DmTargetMetadata, DmTargetParseError, STRIPED_METADATA, TargetIoAction, TargetRange,
     TargetStatusMode,
+    args::{Argument, Arguments},
 };
 use crate::TableError;
 
@@ -58,7 +59,7 @@ impl StripedTargetParams {
         let mut stripes = Vec::new();
         for (dev, backing_start) in fields.stripes {
             stripes.push(StripedBacking {
-                id: parse_device_id(dev)?,
+                id: parse_device_id(&dev)?,
                 backing_start: Sid::new(backing_start),
             });
         }
@@ -231,7 +232,7 @@ impl StripedTarget {
 
         let mut stripes = Vec::new();
         for (dev, backing_start) in fields.stripes {
-            let id = parse_backing(dev).map_err(DmTargetParseError::ResolveBacking)?;
+            let id = parse_backing(&dev).map_err(DmTargetParseError::ResolveBacking)?;
             stripes.push(StripedBacking {
                 id,
                 backing_start: Sid::new(backing_start),
@@ -562,12 +563,12 @@ fn validate_striped_geometry(
 
 struct ParsedStripedFields<'a> {
     chunk_size: u64,
-    stripes: Vec<(&'a str, u64)>,
+    stripes: Vec<(Argument<'a>, u64)>,
 }
 
 /// Parses count, chunk size, backing token, and offset fields exactly once.
 fn parse_striped_fields(params: &str) -> Result<ParsedStripedFields<'_>, TableError> {
-    let mut fields = params.split_ascii_whitespace();
+    let mut fields = Arguments::new(params);
     let stripe_count = fields
         .next()
         .ok_or(TableError::InvalidTargetParams)?

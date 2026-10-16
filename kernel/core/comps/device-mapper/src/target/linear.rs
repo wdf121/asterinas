@@ -18,6 +18,7 @@ use crate::{
     target::{
         DmTarget, DmTargetMetadata, DmTargetParseError, LINEAR_METADATA, TargetIoAction,
         TargetRange, TargetStatusMode,
+        args::{Argument, Arguments},
     },
 };
 
@@ -46,7 +47,7 @@ impl LinearTarget {
         let (backing, backing_start) = parse_linear_params(params)?;
         let backing_start = Sid::new(backing_start);
         Self::validate_geometry(logical_start, length, backing_start)?;
-        let backing = parse_backing(backing).map_err(DmTargetParseError::ResolveBacking)?;
+        let backing = parse_backing(&backing).map_err(DmTargetParseError::ResolveBacking)?;
         let backing = resolve_backing(backing).map_err(DmTargetParseError::ResolveBacking)?;
         Self::new(logical_start, length, backing_start, backing).map_err(Into::into)
     }
@@ -181,8 +182,8 @@ impl DmTarget for LinearTarget {
 }
 
 /// Parses the two-field Linux `linear` parameter string without resolving the backing.
-fn parse_linear_params(params: &str) -> Result<(&str, u64), TableError> {
-    let mut fields = params.split_ascii_whitespace();
+fn parse_linear_params(params: &str) -> Result<(Argument<'_>, u64), TableError> {
+    let mut fields = Arguments::new(params);
     let backing = fields.next().ok_or(TableError::InvalidTargetParams)?;
     let backing_start = fields
         .next()

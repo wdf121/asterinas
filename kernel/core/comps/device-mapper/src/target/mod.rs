@@ -18,6 +18,7 @@ use device_id::DeviceId;
 use self::{error::ErrorTarget, linear::LinearTarget, striped::StripedTarget, zero::ZeroTarget};
 use crate::TableError;
 
+mod args;
 pub mod error;
 pub mod linear;
 pub mod striped;
