@@ -45,6 +45,8 @@ pub enum DmError {
     MajorExhausted,
     /// The current device state does not allow the operation.
     InvalidState,
+    /// A caller-supplied wait policy cancelled a lifecycle transition.
+    Interrupted,
     /// The mapping table is invalid.
     InvalidTable(TableError),
 }

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! Mapper identity indexes, runtime name reservations, and device-number ownership.
+//! Failed creation releases its temporary minor; removal retains the number until
+//! the final device reference is dropped.
+
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     string::String,
@@ -132,16 +136,6 @@ impl DmManager {
         requested_minor: Option<u32>,
     ) -> Result<Arc<DmDevice>, DmError> {
         let mut inner = self.inner.lock();
-        if inner.by_name.contains_key(&name) || inner.reserved_runtime_names.contains(&name) {
-            return Err(DmError::NameExists);
-        }
-        if uuid
-            .as_ref()
-            .is_some_and(|uuid| inner.name_by_uuid.contains_key(uuid))
-        {
-            return Err(DmError::UuidExists);
-        }
-
         let minor = {
             let mut minors = self.minors.lock();
             match requested_minor {
@@ -157,6 +151,17 @@ impl DmManager {
         };
         let id = DeviceId::new(self.major.get(), MinorId::new(minor as u32));
         let id_owner = DmDeviceIdOwner::new(id, self.major.clone(), self.minors.clone());
+        // Linux allocates the device number before inserting the identity. The
+        // owner returns this minor if a name or UUID collision rejects creation.
+        if inner.by_name.contains_key(&name) || inner.reserved_runtime_names.contains(&name) {
+            return Err(DmError::NameExists);
+        }
+        if uuid
+            .as_ref()
+            .is_some_and(|uuid| inner.name_by_uuid.contains_key(uuid))
+        {
+            return Err(DmError::UuidExists);
+        }
         let device = Arc::new(DmDevice::new(id_owner, name.clone(), uuid.clone()));
         inner.by_name.insert(name.clone(), device.clone());
         if let Some(uuid) = uuid {
@@ -268,22 +273,22 @@ impl DmManager {
         Ok(())
     }
 
-    /// Atomically updates the device UUID and UUID index.
+    /// Assigns a UUID once, checking destination conflicts before source identity.
+    ///
+    /// Like Linux `dm_hash_rename`, an existing destination (including the
+    /// device's own UUID) is a conflict; an established UUID is immutable.
     pub fn rename_uuid(&self, name: &str, new_uuid: String) -> Result<(), DmError> {
         let mut inner = self.inner.lock();
+        if inner.name_by_uuid.contains_key(&new_uuid) {
+            return Err(DmError::UuidExists);
+        }
         let device = inner
             .by_name
             .get(name)
             .cloned()
             .ok_or(DmError::DeviceNotFound)?;
-        if let Some(owner_name) = inner.name_by_uuid.get(&new_uuid) {
-            if owner_name != name {
-                return Err(DmError::UuidExists);
-            }
-            return Ok(());
-        }
-        if let Some(old_uuid) = device.uuid() {
-            inner.name_by_uuid.remove(&old_uuid);
+        if device.uuid().is_some() {
+            return Err(DmError::InvalidState);
         }
         inner
             .name_by_uuid
@@ -310,6 +315,49 @@ mod tests {
     use ostd::prelude::ktest;
 
     use super::*;
+
+    #[ktest]
+    fn creation_allocates_minor_before_identity_checks_and_releases_on_failure() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create(
+                "existing".to_string(),
+                Some("existing-uuid".to_string()),
+                Some(7),
+            )
+            .unwrap();
+        for (name, uuid, identity_error) in [
+            ("existing", None, DmError::NameExists),
+            ("other", Some("existing-uuid"), DmError::UuidExists),
+        ] {
+            assert_eq!(
+                manager
+                    .create(name.to_string(), uuid.map(ToString::to_string), Some(7))
+                    .unwrap_err(),
+                DmError::MinorBusy
+            );
+            assert_eq!(
+                manager
+                    .create(name.to_string(), uuid.map(ToString::to_string), Some(8))
+                    .unwrap_err(),
+                identity_error
+            );
+            assert_eq!(manager.devices().len(), 1);
+            assert!(Arc::ptr_eq(
+                &manager.lookup_name("existing").unwrap(),
+                &device
+            ));
+            assert!(Arc::ptr_eq(
+                &manager.lookup_uuid("existing-uuid").unwrap(),
+                &device
+            ));
+            assert!(manager.lookup_name("other").is_none());
+            let retry = manager.create("retry".to_string(), None, Some(8)).unwrap();
+            assert_eq!(retry.id().minor().get(), 8);
+            drop(manager.remove("retry").unwrap());
+            drop(retry);
+        }
+    }
 
     #[ktest]
     fn manages_indexes_and_requested_minors() {
@@ -438,7 +486,7 @@ mod tests {
     }
 
     #[ktest]
-    fn renames_uuid_index_without_touching_name_or_id() {
+    fn rejects_replacing_an_established_uuid() {
         let manager = DmManager::new().unwrap();
         let device = manager
             .create(
@@ -449,15 +497,19 @@ mod tests {
             .unwrap();
         let id = device.id();
 
-        manager
-            .rename_uuid("dm-uuid-device", "new-uuid".to_string())
-            .unwrap();
-
-        assert!(manager.lookup_uuid("old-uuid").is_none());
-        assert_eq!(manager.lookup_uuid("new-uuid").unwrap().id(), id);
+        assert_eq!(
+            manager.rename_uuid("dm-uuid-device", "new-uuid".to_string()),
+            Err(DmError::InvalidState)
+        );
+        assert_eq!(
+            manager.rename_uuid("dm-uuid-device", "old-uuid".to_string()),
+            Err(DmError::UuidExists)
+        );
+        assert_eq!(manager.lookup_uuid("old-uuid").unwrap().id(), id);
+        assert!(manager.lookup_uuid("new-uuid").is_none());
         assert_eq!(manager.lookup_name("dm-uuid-device").unwrap().id(), id);
         assert_eq!(device.mapper_name(), "dm-uuid-device");
-        assert_eq!(device.uuid().unwrap(), "new-uuid");
+        assert_eq!(device.uuid().unwrap(), "old-uuid");
     }
 
     #[ktest]
