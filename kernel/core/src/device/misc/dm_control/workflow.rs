@@ -14,7 +14,11 @@ use aster_device_mapper::{
 };
 use device_id::DeviceId;
 
-use super::{map_dm_error, map_table_error, runtime::MapperRuntimeCoordinator};
+use super::{
+    abi::{map_create_error, map_dm_error, map_rename_error, map_table_error},
+    commands::CurrentDevice,
+    runtime::MapperRuntimeCoordinator,
+};
 use crate::prelude::*;
 
 /// Decoded parameters for `DM_DEV_CREATE`.
@@ -24,15 +28,16 @@ pub(super) struct CreateRequest {
     pub(super) requested_minor: Option<u32>,
 }
 
-/// Decoded mutation requested by `DM_DEV_RENAME`.
-pub(super) enum RenameRequest {
+/// Decoded mutation borrowing the ioctl input until it is committed.
+/// Persistent identities are owned by the manager, not copied into the request.
+pub(super) enum RenameRequest<'a> {
     /// Replaces the mapper's user-visible name and, when published, its alias.
-    Name(String),
-    /// Replaces the mapper UUID without changing its name or alias.
-    Uuid(String),
+    Name(&'a str),
+    /// Sets the mapper UUID once without changing its name or alias.
+    Uuid(&'a str),
 }
 
-impl RenameRequest {
+impl RenameRequest<'_> {
     /// Returns the stable diagnostic label for this mutation kind.
     pub(super) fn kind(&self) -> &'static str {
         match self {
@@ -44,7 +49,7 @@ impl RenameRequest {
 
 /// Decoded action requested by `DM_DEV_SUSPEND`.
 pub(super) enum LifecycleRequest {
-    /// Stops new mapping I/O and optionally preserves assigned I/O in flight.
+    /// Stops new mapping and drains assigned I/O; NOFLUSH does not skip drain.
     Suspend { noflush: bool },
     /// Resumes a suspended mapper or activates its first loaded table.
     Resume,
@@ -52,7 +57,7 @@ pub(super) enum LifecycleRequest {
 
 /// Reports the lifecycle state transition committed by one workflow.
 pub(super) enum LifecycleOutcome {
-    /// A suspend transition committed using the requested drain policy.
+    /// A suspend transition committed using the requested NOFLUSH flag.
     Suspended { noflush: bool },
     /// A resume transition committed; `initial` means the mapper alias published.
     Resumed { initial: bool },
@@ -98,6 +103,7 @@ pub(super) struct DeviceSnapshot {
     pub(super) name: String,
     pub(super) uuid: Option<String>,
     pub(super) status: DmDeviceStatus,
+    pub(super) target_count: usize,
 }
 
 /// Immutable count-only state for one selected Device Mapper table.
@@ -221,6 +227,7 @@ impl QueryWorkflow {
                 name: device.mapper_name(),
                 uuid: device.uuid(),
                 status,
+                target_count: table.as_ref().map_or(0, |table| table.target_count()),
             },
             table,
         )
@@ -257,11 +264,29 @@ impl QueryWorkflow {
     }
 }
 
+/// Waits for assigned BIOs without depending on process state in the DM crate.
+/// Kernel-thread callers use the noninterruptible queue; user ioctls subscribe
+/// to pending POSIX signals, whose cancellation maps to ERESTARTSYS at the ABI.
+fn wait_for_drain(
+    queue: &ostd::sync::WaitQueue,
+    ready: &dyn Fn() -> bool,
+) -> core::result::Result<(), aster_device_mapper::DmError> {
+    use crate::process::posix_thread::AsPosixThread;
+    if current_thread!().as_posix_thread().is_some() {
+        queue
+            .pause_until(|| ready().then_some(()))
+            .map_err(|_| aster_device_mapper::DmError::Interrupted)
+    } else {
+        queue.wait_until(|| ready().then_some(()));
+        Ok(())
+    }
+}
+
 /// Coordinates typed control-plane mutations for one manager.
 ///
-/// Callers must hold the mapper lifecycle guard before invoking per-device
-/// methods. The ioctl façade retains that guard because it also owns response
-/// header encoding, which must observe the same current mapper instance.
+/// Per-device mutations require a `CurrentDevice` proof. The ioctl façade owns
+/// that context through response encoding, preserving both lifecycle exclusion
+/// and the checked current instance across the complete operation.
 pub(super) struct ControlWorkflow<'a> {
     manager: &'a DmManager,
 }
@@ -276,13 +301,13 @@ impl<'a> ControlWorkflow<'a> {
     pub(super) fn create(&self, request: CreateRequest) -> Result<Arc<DmDevice>> {
         self.manager
             .create(request.name, request.uuid, request.requested_minor)
-            .map_err(map_dm_error)
+            .map_err(map_create_error)
     }
 
     /// Publishes any missing primary runtime node and installs a validated table.
     pub(super) fn load_table(
         &self,
-        device: &Arc<DmDevice>,
+        device: &CurrentDevice<'_>,
         request: TableLoadRequest,
     ) -> Result<()> {
         let runtime = MapperRuntimeCoordinator::new(self.manager);
@@ -295,7 +320,7 @@ impl<'a> ControlWorkflow<'a> {
     /// captures `DM_READONLY_FLAG`, a publication failure also preserves the current
     /// active I/O mode and leaves the request retryable.
     pub(super) fn load_table_with_primary<F>(
-        device: &Arc<DmDevice>,
+        device: &CurrentDevice<'_>,
         request: TableLoadRequest,
         publish_primary: F,
     ) -> Result<()>
@@ -308,7 +333,7 @@ impl<'a> ControlWorkflow<'a> {
     }
 
     /// Unregisters one current mapper before detaching its domain state.
-    pub(super) fn remove(&self, device: &Arc<DmDevice>) -> Result<()> {
+    pub(super) fn remove(&self, device: &CurrentDevice<'_>) -> Result<()> {
         let runtime = MapperRuntimeCoordinator::new(self.manager);
         self.remove_with_unregistration(device, |device| runtime.unregister_if_registered(device))
     }
@@ -320,7 +345,7 @@ impl<'a> ControlWorkflow<'a> {
     /// and manager indexes untouched for retry or `Removing` isolation handling.
     pub(super) fn remove_with_unregistration<F>(
         &self,
-        device: &Arc<DmDevice>,
+        device: &CurrentDevice<'_>,
         unregister_runtime: F,
     ) -> Result<()>
     where
@@ -328,18 +353,22 @@ impl<'a> ControlWorkflow<'a> {
     {
         unregister_runtime(device)?;
         device.fail_postponed_bios();
-        device.notify_event();
+        // Linux detaches the pending table at hash removal but retains the live
+        // table for holders, including a WAIT already sleeping on this device.
+        device.clear_inactive_table().map_err(map_dm_error)?;
+        if device.active_table().is_some() {
+            device.notify_event();
+        }
         self.manager
             .remove(&device.mapper_name())
             .map_err(map_dm_error)?;
         Ok(())
     }
 
-    /// Runs best-effort removal for a mapper snapshot.
+    /// Runs best-effort removal, restarting the manager scan after each success.
     ///
-    /// The caller retains lifecycle-guard ownership and supplies one guarded remove
-    /// operation. Failures deliberately retain that mapper while the remaining
-    /// snapshot entries continue, matching Linux `DM_REMOVE_ALL` behavior.
+    /// The caller supplies lifecycle-protected removal. No manager lock spans
+    /// runtime teardown; new devices and newly unbusy devices are reconsidered.
     pub(super) fn remove_all<F>(
         &self,
         request: RemoveAllRequest,
@@ -348,17 +377,34 @@ impl<'a> ControlWorkflow<'a> {
     where
         F: FnMut(&Arc<DmDevice>) -> Result<()>,
     {
-        let attempted = request.devices.len();
-        let removed = request
-            .devices
-            .into_iter()
-            .filter(|device| remove_current(device).is_ok())
-            .count();
+        let mut attempted = 0;
+        let mut removed = 0;
+        let mut devices = request.devices;
+        loop {
+            let mut progress = false;
+            for device in devices {
+                attempted += 1;
+                if remove_current(&device).is_ok() {
+                    removed += 1;
+                    progress = true;
+                    // Linux restarts immediately after each successful removal.
+                    break;
+                }
+            }
+            if !progress {
+                break;
+            }
+            devices = self.manager.devices();
+        }
         RemoveAllOutcome { attempted, removed }
     }
 
     /// Commits a name or UUID mutation for a current mapper.
-    pub(super) fn rename(&self, device: &Arc<DmDevice>, request: &RenameRequest) -> Result<()> {
+    pub(super) fn rename(
+        &self,
+        device: &CurrentDevice<'_>,
+        request: &RenameRequest<'_>,
+    ) -> Result<()> {
         match request {
             RenameRequest::Uuid(uuid) => {
                 if uuid.is_empty() {
@@ -368,8 +414,8 @@ impl<'a> ControlWorkflow<'a> {
                     ));
                 }
                 self.manager
-                    .rename_uuid(&device.mapper_name(), uuid.clone())
-                    .map_err(map_dm_error)
+                    .rename_uuid(&device.mapper_name(), (*uuid).to_string())
+                    .map_err(map_rename_error)
             }
             RenameRequest::Name(new_name) => {
                 let runtime = MapperRuntimeCoordinator::new(self.manager);
@@ -380,32 +426,35 @@ impl<'a> ControlWorkflow<'a> {
                 } else {
                     self.manager
                         .rename(&device.mapper_name(), new_name)
-                        .map_err(map_dm_error)
+                        .map_err(map_rename_error)
                 }
             }
+        }?;
+        if device.active_table().is_some() {
+            device.notify_event();
         }
+        Ok(())
     }
 
     /// Commits one suspend or resume state transition for a current mapper.
     pub(super) fn transition(
         &self,
-        device: &Arc<DmDevice>,
+        device: &CurrentDevice<'_>,
         request: LifecycleRequest,
     ) -> Result<LifecycleOutcome> {
         match request {
             LifecycleRequest::Suspend { noflush } => {
-                (if noflush {
-                    device.suspend_no_flush()
-                } else {
-                    device.suspend()
-                })
-                .map_err(map_dm_error)?;
+                device.suspend_with(wait_for_drain).map_err(map_dm_error)?;
                 Ok(LifecycleOutcome::Suspended { noflush })
             }
             LifecycleRequest::Resume => {
+                let status = device.status();
+                if !status.suspended && !status.has_inactive_table {
+                    return Ok(LifecycleOutcome::Resumed { initial: false });
+                }
                 let runtime = MapperRuntimeCoordinator::new(self.manager);
                 if !runtime.is_registered(device) || runtime.is_alias_published(device)? {
-                    device.resume().map_err(map_dm_error)?;
+                    device.resume_with(wait_for_drain).map_err(map_dm_error)?;
                     Ok(LifecycleOutcome::Resumed { initial: false })
                 } else {
                     runtime.activate_initial(device)?;
@@ -416,7 +465,7 @@ impl<'a> ControlWorkflow<'a> {
     }
 
     /// Clears the current mapper's inactive table.
-    pub(super) fn clear_inactive_table(&self, device: &Arc<DmDevice>) -> Result<()> {
+    pub(super) fn clear_inactive_table(&self, device: &CurrentDevice<'_>) -> Result<()> {
         device.clear_inactive_table().map_err(map_dm_error)
     }
 }

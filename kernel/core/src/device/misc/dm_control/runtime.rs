@@ -13,7 +13,7 @@ use aster_block::BlockDevice;
 use aster_device_mapper::{DmDevice, DmManager};
 use device_id::DeviceId;
 
-use super::map_dm_error;
+use super::abi::{map_dm_error, map_rename_error};
 use crate::{
     device::{
         block_mapper_alias_is_published, block_open_count, publish_block_mapper_alias,
@@ -77,7 +77,10 @@ impl<'a> MapperRuntimeCoordinator<'a> {
         Ok(())
     }
 
-    /// Moves a published mapper alias and commits manager indexes atomically.
+    /// Moves a published alias, then commits the reserved manager name.
+    ///
+    /// VFS readers may observe the alias move before manager readers observe the
+    /// new name; this is not an atomic transaction across both namespaces.
     ///
     /// The manager reserves `new_name` while the alias moves without holding its
     /// global lock. A failed move drops the reservation and preserves the old
@@ -107,7 +110,7 @@ impl<'a> MapperRuntimeCoordinator<'a> {
         let reservation = self
             .manager
             .reserve_runtime_rename(device.clone(), &old_name, new_name)
-            .map_err(map_dm_error)?;
+            .map_err(map_rename_error)?;
         rename_alias(device.id(), &old_name, new_name)?;
         reservation.commit();
         Ok(())
