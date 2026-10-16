@@ -1,5 +1,11 @@
 # 生产代码修改后的验证命令与执行链路
 
+## 2026-10-16 入口校正
+
+控制面源码为 `kernel/core/src/device/misc/dm_control.rs` 与 `dm_control/`。OSDK 0.19 使用后缀匹配，裸模块 selector 零匹配不算通过；本页 DM 示例改为 crate-local 无 selector。core 全 crate 执行须先明确范围，本次已获批准并通过 265/265，不是完整 workspace ktest。
+
+本次 C 回归与用户完成的两项系统验收见[今日日志](../log/daily/2026-10-16.md)。编译成功、安装子步骤报错、suite PASS 是不同观察层；不把 users 激活错误概括为 `make nixos` 编译失败。根盘问题待定，不阻塞本次 DM 阶段收尾。
+
 ## 执行摘要
 
 本文记录写完生产代码后常用的验证命令，以及这些命令背后实际执行的链路。命令默认在 Docker 容器内、仓库根目录 `/root/asterinas` 下执行，因此所有示例都直接从仓库根目录开始。
@@ -143,7 +149,7 @@ git diff --check
 也可以限制范围：
 
 ```bash
-git diff --check -- "kernel/core/comps/device-mapper/src" "kernel/core/src/device/misc/device_mapper.rs"
+git diff --check -- "kernel/core/comps/device-mapper/src" "kernel/core/src/device/misc/dm_control.rs"
 ```
 
 使用时重点看两点：
@@ -184,15 +190,14 @@ git status --short
 
 ```bash
 cd kernel/core/comps/device-mapper
-cargo osdk test aster_device_mapper::table::tests
+cargo osdk test
 ```
 
 或：
 
 ```bash
 cd kernel/core
-cargo osdk test --kcmd-args=earlycon \
-  aster_core::device::misc::device_mapper::tests
+cargo osdk test --kcmd-args=earlycon
 ```
 
 `git status --short` 的作用是确认本轮留下的文件是否都在预期范围内。手动 ktest 虽从目标 crate 目录启动，但当前使用仓库根 OSDK manifest，因此日志应在仓库根目录查看：默认 `hvc0` 的 ktest UART 输出在 `qemu-serial.log`。仅在交互式排障时显式设置 `CONSOLE=ttyS0`，并查看 `qemu.log`；不要提交运行日志。
@@ -247,15 +252,14 @@ make ktest
 
 ```bash
 cd kernel/core/comps/device-mapper
-cargo osdk test aster_device_mapper::table::tests
+cargo osdk test
 ```
 
 ioctl 层测试：
 
 ```bash
 cd kernel/core
-cargo osdk test --kcmd-args=earlycon \
-  aster_core::device::misc::device_mapper::tests
+cargo osdk test --kcmd-args=earlycon
 ```
 
 先看总链路：
@@ -430,7 +434,7 @@ git diff --check -- "kernel/core/comps/device-mapper/src"
 
 ```bash
 cd kernel/core/comps/device-mapper
-cargo osdk test aster_device_mapper::table::tests
+cargo osdk test
 ```
 
 如果改动影响真实数据面边界：
@@ -444,15 +448,14 @@ GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \
 
 ```bash
 cargo fmt --all --check
-git diff --check -- "kernel/core/comps/device-mapper/src" "kernel/core/src/device/misc/device_mapper.rs"
+git diff --check -- "kernel/core/comps/device-mapper/src" "kernel/core/src/device/misc/dm_control.rs"
 ```
 
 定向 ioctl ktest：
 
 ```bash
 cd kernel/core
-cargo osdk test --kcmd-args=earlycon \
-  aster_core::device::misc::device_mapper::tests
+cargo osdk test --kcmd-args=earlycon
 ```
 
 如果改变用户可见 dmsetup 语义：

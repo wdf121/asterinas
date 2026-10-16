@@ -26,15 +26,15 @@
 
 | 当前核心功能 | 标准 Linux | Asterinas |
 |---|---|---|
-| ✅ **`/dev/mapper/control`**<br>用户态进入 DM 控制面 | Linux DM 提供 control character device。<br>`dmsetup`/libdevmapper 通过 `dm_ioctl` 管理 mapper。 | ✅ 注册 control device、解析 `dm_ioctl`、校验 version/flags/buffer，并实现当前命令白名单。<br><br>**生产文件：**<br>/root/github/asterinas/<br>kernel/core/src/device/misc/device_mapper.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/mod.rs |
-| ✅ **运行期 mapper 节点**<br>`/dev/dm-N`、`/dev/mapper/<name>` | Linux DM 提供 mapped block device 与 mapper name 路径。 | ✅ 首次 load 发布 primary；首次 resume 发布 alias；rename/remove 使用事务、回滚与隔离。<br><br>**生产文件：**<br>/root/github/asterinas/<br>kernel/core/src/device/registry/block.rs<br>/root/github/asterinas/<br>kernel/core/src/device/mod.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/device_mapper/runtime.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/device_mapper/control.rs<br>manager.rs |
-| ✅ **LVM2 显式创建、扩缩与恢复** | LVM2 计算 PV/VG/LV metadata，并通过 DM control ABI 创建或调整 table。 | ✅ 承接 linear、striped、mixed LV 的 create/extend/reduce，以及显式 scan/mknodes/activate。<br><br>**生产文件：**<br>/root/github/asterinas/<br>kernel/core/src/device/misc/device_mapper.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/device_mapper/control.rs<br>table.rs<br>target/linear.rs<br>target/striped.rs |
+| ✅ **`/dev/mapper/control`**<br>用户态进入 DM 控制面 | Linux DM 提供 control character device。<br>`dmsetup`/libdevmapper 通过 `dm_ioctl` 管理 mapper。 | ✅ 注册 control device、解析 `dm_ioctl`、校验 version/flags/buffer，并实现当前命令白名单。<br><br>**生产文件：**<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/mod.rs |
+| ✅ **运行期 mapper 节点**<br>`/dev/dm-N`、`/dev/mapper/<name>` | Linux DM 提供 mapped block device 与 mapper name 路径。 | ✅ 首次 load 发布 primary；首次 resume 发布 alias；rename/remove 使用事务、回滚与隔离。<br><br>**生产文件：**<br>/root/github/asterinas/<br>kernel/core/src/device/registry/block.rs<br>/root/github/asterinas/<br>kernel/core/src/device/mod.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/runtime.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/workflow.rs<br>manager.rs |
+| ✅ **LVM2 显式创建、扩缩与恢复** | LVM2 计算 PV/VG/LV metadata，并通过 DM control ABI 创建或调整 table。 | ✅ 承接 linear、striped、mixed LV 的 create/extend/reduce，以及显式 scan/mknodes/activate。<br><br>**生产文件：**<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/workflow.rs<br>table.rs<br>target/linear.rs<br>target/striped.rs |
 | ✅ **当前 table 与 target**<br>linear / striped / zero / error | Linux DM target table 描述逻辑 sector 到 backing device 的映射，并支持 target 扩展。 | ✅ 实现四个 target、连续 table、capacity、deps、status 和 target I/O action。<br><br>**生产文件：**<br>table.rs<br>target/mod.rs<br>target/linear.rs<br>target/striped.rs<br>target/zero.rs<br>target/error.rs |
-| ✅ **table-scoped readonly**<br>`DM_READONLY_FLAG` | Linux 将 readonly 作为 table mode：load 只暂存 inactive table；首次或 replacement resume 激活 table 后，live device 的可写性随其切换。 | ✅ readonly 存在 immutable `DmTable`，tableless create 不持久化 flag；load 不改变 active I/O mode；active/inactive 查询与 BIO 分派均从同一 table state snapshot 获取 mode。readonly active 在 suspend 中拒绝新 write-like BIO；已在 writable mode 接收的 postponed BIO 遇到 readonly replacement 时完成为 I/O error。<br><br>**生产文件：**<br>table.rs<br>device.rs<br>manager.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/device_mapper.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/device_mapper/control.rs |
+| ✅ **table-scoped readonly**<br>`DM_READONLY_FLAG` | Linux 将 readonly 作为 table mode：load 只暂存 inactive table；首次或 replacement resume 激活 table 后，live device 的可写性随其切换。 | ✅ readonly 存在 immutable `DmTable`，tableless create 不持久化 flag；load 不改变 active I/O mode；active/inactive 查询与 BIO 分派均从同一 table state snapshot 获取 mode。readonly active 在 suspend 中拒绝新 write-like BIO；已在 writable mode 接收的 postponed BIO 遇到 readonly replacement 时完成为 I/O error。<br><br>**生产文件：**<br>table.rs<br>device.rs<br>manager.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/workflow.rs |
 | ✅ **写入、跨 segment/chunk I/O 与 flush** | Linux block layer 支持 remap、split、completion 和 flush。 | ✅ BIO 保存 original/current range；DM 规划边界后一次 split，聚合子 BIO；flush 向唯一 backing fan-out。<br><br>**生产文件：**<br>/root/github/asterinas/<br>kernel/core/comps/block/src/bio.rs<br>/root/github/asterinas/<br>kernel/core/comps/block/src/request_queue.rs<br>/root/github/asterinas/<br>kernel/core/comps/block/src/partition.rs<br>table.rs<br>/root/github/asterinas/<br>kernel/core/comps/virtio/src/device/block/device.rs<br>/root/github/asterinas/<br>kernel/core/comps/nvme/src/device/block_device.rs |
 | ✅ **ext2 挂载与挂载 LV 的 remove 保护** | VFS 从 block device 解析 mount source。<br>已挂载或已打开设备不能直接删除；释放使用者后才允许删除。 | ✅ mount source 与 ext2 对象持有 tracked lease；registry 检查 lease 与 open。<br>**行为：**已挂载 LV 不可直接 remove，必须先 umount。<br><br>**生产文件：**<br>/root/github/asterinas/<br>kernel/core/src/fs/vfs/fs_apis/registry.rs<br>/root/github/asterinas/<br>kernel/core/src/fs/fs_impls/ext2/fs_type.rs<br>/root/github/asterinas/<br>kernel/core/src/fs/fs_impls/ext2/fs.rs<br>/root/github/asterinas/<br>kernel/core/comps/block/src/lib.rs<br>/root/github/asterinas/<br>kernel/core/src/device/registry/block.rs |
-| ✅ **suspend、reload、resume、即时 remove** | Linux DM 管理 active/inactive table、suspend/resume、table replacement 和 mapper remove。 | ✅ 实现 drain reload、`--noflush` postponed replay、即时 remove 和失败回滚/隔离。<br><br>**生产文件：**<br>device.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/device_mapper/control.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/device_mapper/runtime.rs<br>/root/github/asterinas/<br>kernel/core/src/device/registry/block.rs |
-| ✅ **显式恢复与受控重启恢复** | 恢复可分为 LVM scan/activation、文件系统重放、后端错误恢复，以及多副本/磁盘故障恢复等层次。 | ✅ 当前范围是显式 LVM scan/activation 与受控重启后的 mapper/LV 恢复。<br><br>**生产文件：**<br>device.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/device_mapper/control.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/device_mapper/runtime.rs |
+| ✅ **suspend、reload、resume、即时 remove** | Linux DM 管理 active/inactive table、suspend/resume、table replacement 和 mapper remove。 | ✅ 实现 drain reload、`--noflush` postponed replay、即时 remove 和失败回滚/隔离。<br><br>**生产文件：**<br>device.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/workflow.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/runtime.rs<br>/root/github/asterinas/<br>kernel/core/src/device/registry/block.rs |
+| ✅ **显式恢复与受控重启恢复** | 恢复可分为 LVM scan/activation、文件系统重放、后端错误恢复，以及多副本/磁盘故障恢复等层次。 | ✅ 当前范围是显式 LVM scan/activation 与受控重启后的 mapper/LV 恢复。<br><br>**生产文件：**<br>device.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/workflow.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/runtime.rs |
 
 ## 4. 依赖绕过与当前运行模式
 
@@ -51,16 +51,16 @@
 
 | 编号 | Linux 用户可见语义 | Asterinas 完成条件 | 最小验收层 | 状态 |
 |---|---|---|---|---|
-| P0.1 | `targets`、`create`、`info`、`table`、`deps`、`status` 能按 `dm_ioctl` header、selector 和 table slot 返回可消费结果。 | 当前 ioctl 白名单完成 ABI 编解码；active/inactive table、target count、dependency 与状态记录按选择的 slot 编码。 | core ioctl ktest、focused C、control-plane | ✅ 已完成 |
+| P0.1 | `targets`、`create`、`info`、`table`、`deps`、`status` 能按 `dm_ioctl` header、selector 和 table slot 返回可消费结果。 | 当前 ioctl 白名单完成 ABI 编解码；active/inactive table、target count、dependency 与状态记录按选择的 slot 编码。 | core ioctl ktest、focused C、control-plane | ⚠ 主链已有，V5 语义修复重新开放 |
 | P0.2 | `load` 后发布 primary，首次 `resume` 后发布 alias；节点冲突、发布失败和重试不留下半提交状态。 | primary/alias 发布分别由 workflow/runtime transaction 管理；失败时保留可重试的 table/identity 状态。 | core ioctl ktest、focused C、control-plane | ✅ 已完成 |
-| P0.3 | `suspend`、`reload`、`resume`、`clear` 保持 active/inactive generation、drain 与 postponed I/O 的 Linux 可见边界。 | flush/no-flush suspend、running replacement、postponed replay、clear 幂等与旧 table lease 生命周期均已实现。 | DM crate ktest、core ioctl ktest、control-plane | ✅ 已完成 |
+| P0.3 | `suspend`、`reload`、`resume`、`clear` 保持 active/inactive generation、drain 与 postponed I/O 的 Linux 可见边界。 | flush/no-flush suspend、running replacement、postponed replay、clear 幂等与旧 table lease 生命周期均已实现。 | DM crate ktest、core ioctl ktest、control-plane | ⚠ 主链已有，V5 语义修复重新开放 |
 | P0.4 | `linear`、`striped`、`zero`、`error` table 能正确承接读写、range、跨 segment/chunk BIO 与 flush。 | table 连续性、target 选择、BIO split/聚合、flush fan-out 和 target status/deps 均可用。 | DM crate ktest、focused C、dataplane/linear/striped/mixed suite | ✅ 已完成 |
-| P0.5 | `rename`、`remove`、`wait` 的身份、event、EINTR/SA_RESTART 与 current-instance 语义符合已核对的 Linux 实现。 | rename/setuuid/remove 仅在对应 workflow 成功提交后发布 event；wait 不持 control lock，醒来后重验 current instance。 | core ioctl ktest、focused C、control-plane | ✅ 已完成 |
+| P0.5 | `rename`、`remove`、`wait` 的身份、event、EINTR/SA_RESTART 与 current-instance 语义符合已核对的 Linux 实现。 | rename/setuuid/remove 仅在对应 workflow 成功提交后发布 event；wait 不持 control lock；已开始 WAIT 的引用保留和删除唤醒语义按 V5.L05 修复，不沿用 mutation 的 current-instance 检查。 | core ioctl ktest、focused C、control-plane | ⚠ 主链已有，V5 语义修复重新开放 |
 | P0.6 | `DM_READONLY_FLAG` 是 table mode：readonly load 不应提前改变 active I/O，writable replacement resume 后应恢复可写。 | readonly 随 immutable table 暂存；active/inactive 查询和 BIO admission 从同一 state snapshot 获取 mode；suspend/replay 保持 mode 边界。 | DM crate ktest、core ioctl ktest、focused C、control-plane | ✅ 已完成 |
 | P0.7 | 挂载或打开的 mapper 不能被错误 remove，释放使用者后可移除。 | ext2 mount source 与文件系统对象持有 tracked lease；runtime registry 同时检查 lease/open。 | core/registry ktest、focused C、control-plane | ✅ 已完成 |
 | P0.8 | LVM2 能显式创建、扩缩、`pvscan → vgscan --mknodes → vgchange -ay` 激活并在受控重启后恢复当前支持的 LV。 | linear、striped、mixed LV 的显式创建、扩缩、ext2 I/O 与跨启动恢复均已覆盖。 | LVM2 topology、linear/striped/mixed suite | ✅ 已完成 |
 
-**P0 退出条件：**P0.1～P0.8 全部勾选，且未将明确的非目标伪装为“主链收敛”缺口。下一工程优先级进入 P1 `dm-verity` 的设计确认。
+**P0 退出条件：**P0.1～P0.8 对应的现有主链语义完成验收。第五版源码复核重新开放了 P0.1、P0.3、P0.5；历史主链测试成功不等于这些细节已对齐 Linux。当前先执行第 10.1 节的现有功能修复，暂不进入新 target 或通用框架实现。
 
 **不属于 P0：**DM-on-DM/queue stacking、uevent/sysfs/udev/systemd、mount source 类型、真实 alias/VFS 深层恢复、ext4/exfat、deferred remove/完整 control ABI、VirtIO/NVMe 故障注入，以及新 target。这些项目保持各自的后续优先级或触发条件。
 
@@ -78,6 +78,17 @@
 | **P8** | DM-on-DM stacking<br>完整 queue stacking | **用户价值：**mapper 作为 backing、异构 queue limit/descriptor 组合。<br><br>**依赖：**依赖图、环检测、lease/flush/remove 级联、通用 block metadata 和 driver capability。<br><br>**排序原因：**`table.rs` 当前拒绝 DmDevice backing；对 DM 与通用 block 框架改动很大。 |
 | **P9** | uevent / sysfs / udev<br>systemd activation | **用户价值：**减少显式 scan、mknodes、activate 等运维操作。<br><br>**依赖：**事件分发、sysfs 属性、用户态规则与服务协同。<br><br>**排序原因：**外部生态依赖最强、非 DM 专属。 |
 | **P10** | 通用物理 block-device 热插拔<br>运行期 VirtIO/PCI 插盘与真实 USB mass-storage | **用户价值：**系统运行中发现、发布并安全移除物理存储设备。<br><br>**依赖：**总线 add/remove 与 driver probe/unbind、运行期 block registry/devtmpfs 主盘和分区节点事务、I/O worker 生命周期、in-flight I/O 失败收束、open/mount/lease/cache/DM backing 的移除协调；真实 USB 还需要 xHCI 与 mass-storage 驱动。完成上述内核链路后，可选接入 sysfs/NETLINK_KOBJECT_UEVENT/udev。<br><br>**排序原因：**当前启动期 VirtIO/NVMe 枚举和 DM runtime node 已可用，但缺少通用运行期 add/remove 链路；该能力跨总线、driver、VFS 和用户态生态，非 DM 主链所需，置于当前路线最低优先级。 |
+
+### 6.1 第五版暂缓的框架与能力
+
+2026-10-16 决策：先修当前支持功能，以下仅规划，不实施。
+
+| 来源 | 后续能力 | 具体依赖与当前边界 |
+|---|---|---|
+| V5.F01 | 默认 suspend 的文件系统 freeze/sync/thaw | 需要按 backing 定位文件系统、阻止新写入、同步及失败撤销；当前仅 BIO drain 不等于冻结。NOFLUSH 排空修复仍属当前工作，不随本项暂缓。 |
+| V5.B02 | DM 专属 sysfs、uevent/cookie、udev 同步 | 已有 block sysfs 接线与 netlink uevent 基础设施，缺 DM 属性和生命周期发送/用户态同步链；并入 P9，不称为整个框架不存在。 |
+| V5.B02 | 新控制命令、deferred remove、IMA、DM-on-DM | 分别沿 P7/P8 规划，不通过本轮 ABI 修复隐式开启。 |
+| V5.A06 部分 | 非 UTF-8 设备名称与路径 | 若需要改造通用 String/VFS 表示，单独设计；本轮仅修可独立完成的归一、无关字段校验，不宣称任意字节路径兼容。 |
 
 ## 7. 用户、运维、产品与架构决策视角
 
@@ -110,7 +121,50 @@
 
 ## 10. 修复日志
 
-> 仅记录已完成并验证的修复；完整命令、失败输出和排障过程见 [daily log](../log/daily/)。
+> 当前阶段：2026-10-16 V5 优化按用户确认收尾；验证证据见[当日日志](../log/daily/2026-10-16.md)。根盘问题待定，不阻塞本阶段，不新增通用文件系统修复目标。
+
+### 10.1 第五版：已批准的当前修复
+
+2026-10-16 用户确认：现有功能语义修复、输入容量策略和错误码细化可实施；新增框架/功能暂缓。批次完成后集中测试，不逐项启动整套测试，不自动提交或 push。本表已在阶段收尾时更新；已实现不代表完整 Linux DM 生态兼容。
+
+| 编号 | 修复目标 | 收尾状态 |
+|---|---|---|
+| V5.00 | 固定头单次快照 | 已实现并纳入本阶段验证，未提交 |
+| V5.A01 | 按 type/nr 解码命令 | 已实施，本阶段收尾 |
+| V5.A02 | 305 字节固定前缀、NO_PARAMS、命令布局 | 已实施，本阶段收尾 |
+| V5.A03 | 有效输出长度及失败回写 | 已实施，本阶段收尾 |
+| V5.A04 | flags 规范化与删除私有 EXISTS 位 | 已实施，本阶段收尾 |
+| V5.A05 | 互斥 selector 与校验顺序 | 已实施，本阶段收尾 |
+| V5.A06 | 固定字符串归一及诊断不干扰语义；字节路径扩展暂缓 | 已实施，本阶段收尾 |
+| V5.A07 | 名称列表事件字段、过滤及不足/空输出 | 已实施，本阶段收尾 |
+| V5.A08 | WAIT 状态记录与查询 flags | 已实施，本阶段收尾 |
+| V5.A09 | 公共状态 target_count | 已实施，本阶段收尾 |
+| V5.A10 | target-version 列表容量契约 | 已实施，本阶段收尾 |
+| V5.A11 | 末 target next 消费边界 | 已实施，本阶段收尾 |
+| V5.A12 | 参数转义及相对 backing 路径 | 已实施，本阶段收尾 |
+| V5.S01 | 清理用户安全输入且不回写原参数 | 已实施，本阶段收尾 |
+| V5.S02 | 错误路径及临时副本的安全清理 | 已实施，本阶段收尾 |
+| V5.L01 | NOFLUSH 仍排空已分配 BIO | 已实施，本阶段收尾 |
+| V5.L02 | 可中断 drain 与状态回滚 | 已实施，本阶段收尾 |
+| V5.L03 | UUID 只允许首次设置 | 已实施，本阶段收尾 |
+| V5.L04 | 名称/UUID 提交前校验 | 已实施，本阶段收尾 |
+| V5.L05 | 已开始 WAIT 的删除唤醒语义 | 已实施，本阶段收尾 |
+| V5.L06 | 按 live table 条件发布事件 | 已实施，本阶段收尾 |
+| V5.L07 | Running 空表 resume 幂等 | 已实施，本阶段收尾 |
+| V5.L08 | REMOVE_ALL 有进展时重扫 | 已实施，本阶段收尾 |
+| V5.B01 | 输入容量策略、可失败分配及边界 | 已实施，本阶段收尾 |
+| V5.B03 | 按命令细化 errno 与检查顺序 | 已实施，本阶段收尾 |
+| V5.M01 | 类型表达生命周期持锁/实例约束 | 已实施，本阶段收尾 |
+| V5.M02 | 统一 rename 事件责任，与 L06 同修 | 已实施，本阶段收尾 |
+| V5.M03 | 移除或落实无效字段标签参数 | 已实施，本阶段收尾 |
+| V5.D01 | 按最终实际能力补兼容文档/SCML | docs 能力边界本次更新；book/SCML 未修改，作为后续文档项保留 |
+| V5.D02 | 纠正 selector 注释 | 已实施，本阶段收尾 |
+| V5.D03 | 纠正列表布局注释 | 已实施，本阶段收尾 |
+| V5.D04 | 移除跨层 rename 原子性过度承诺 | 已实施，本阶段收尾 |
+
+### 10.2 已验证修复历史
+
+以下保留当时结果；涉及第五版重新发现的差异时，以新清单的收尾状态与暂缓边界为准，不抹除历史执行事实。
 
 | 日期 | 问题与影响 | 根因 | 修复 | 验证 | 提交状态 |
 |---|---|---|---|---|---|

@@ -50,7 +50,7 @@ kernel/core/comps/device-mapper/
 ```text
 kernel/core/
 ├── Cargo.toml
-└── src/device/misc/device_mapper.rs
+└── src/device/misc/dm_control.rs
 ```
 
 `device_mapper.rs` 没有自己的 `Cargo.toml`，但它是 `aster-core` crate 的一个 module source file。它同样可以定义 ktest；运行 `aster-core` 的 ktest 构建时，该文件会随 `aster-core` 一同参与编译。

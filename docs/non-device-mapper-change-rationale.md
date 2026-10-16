@@ -1,5 +1,7 @@
 # Device Mapper 项目文件改动说明
 
+> 2026-10-16 路径迁移说明：下文历史记录中的 `device_mapper.rs` / `device_mapper/` 已拆为 `dm_control.rs` / `dm_control/`，原 `control.rs` 为 `workflow.rs`。历史行号不再用于当前源码定位；当前入口与验证见[源码证据迁移说明](device-mapper-source-evidence.md#2026-10-16-迁移与适用边界)和[今日日志](../log/daily/2026-10-16.md)。
+
 ## 执行摘要
 
 本文从 review 和维护视角整理 `dm` 分支为了支持当前 Device Mapper 能力所涉及的主要改动。

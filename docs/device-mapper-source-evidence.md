@@ -8,6 +8,12 @@
 >
 > **目的**：让新窗口先以文件内容指纹确认既有源码结论是否仍适用；hash 一致时复用本表结论并定点阅读符号，不重新进行全局源码检索。
 
+## 2026-10-16 迁移与适用边界
+
+本文件下方 hash、行号和旧路径属于 2026-09-24 历史快照，不是 V5 当前源码指纹。旧 `device_mapper.rs` 已拆分为 `dm_control.rs`、`dm_control/abi.rs`、`ioctl.rs`、`commands.rs`；旧 `control.rs` 为 `dm_control/workflow.rs`，`runtime.rs` 位于同一新目录。不得用旧 hash 为拆分后的实现背书。
+
+当前入口：[dm_control.rs](../kernel/core/src/device/misc/dm_control.rs)、[ABI](../kernel/core/src/device/misc/dm_control/abi.rs)、[ioctl 复制与清理](../kernel/core/src/device/misc/dm_control/ioctl.rs)、[命令](../kernel/core/src/device/misc/dm_control/commands.rs)、[workflow](../kernel/core/src/device/misc/dm_control/workflow.rs)、[runtime](../kernel/core/src/device/misc/dm_control/runtime.rs)。V5 阶段已收尾，验证与暂缓边界见[今日日志](../log/daily/2026-10-16.md)及[V5 台账](../log/device-mapper-optimization-v5.md)。历史快照保持原样。
+
 ## 1. 使用规则
 
 本文件是“已核对源码 + 实际验证”的证据索引，不替代当前源码。

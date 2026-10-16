@@ -169,7 +169,7 @@ flowchart TB
 | **原有 device 框架：/root/github/asterinas/kernel/core/src/device** |  |
 | devtmpfs runtime node/symlink 创建、删除、rename，设备注册入口扩展 | [/root/github/asterinas/kernel/core/src/device/mod.rs](../kernel/core/src/device/mod.rs) |
 | misc 设备初始化接入 Device Mapper control device | [/root/github/asterinas/kernel/core/src/device/misc/mod.rs](../kernel/core/src/device/misc/mod.rs) |
-| `/dev/mapper/control` ioctl ABI、create/remove/rename/table/status/deps/list | [/root/github/asterinas/kernel/core/src/device/misc/device_mapper.rs](../kernel/core/src/device/misc/device_mapper.rs) |
+| `/dev/mapper/control` ioctl ABI、create/remove/rename/table/status/deps/list | [/root/github/asterinas/kernel/core/src/device/misc/dm_control.rs](../kernel/core/src/device/misc/dm_control.rs) |
 | block runtime registry、devtmpfs block node、mapper alias、open count | [/root/github/asterinas/kernel/core/src/device/registry/block.rs](../kernel/core/src/device/registry/block.rs) |
 | block registry 对外导出 `register_block_mapper` 等能力 | [/root/github/asterinas/kernel/core/src/device/registry/mod.rs](../kernel/core/src/device/registry/mod.rs) |
 | **原有 fs/VFS/page cache：/root/github/asterinas/kernel/core/src** |  |

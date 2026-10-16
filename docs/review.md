@@ -1,5 +1,7 @@
 # Asterinas Device Mapper 技术设计 DOCX 评审
 
+> 2026-10-16 路径迁移说明：下文历史记录中的 `device_mapper.rs` / `device_mapper/` 已拆为 `dm_control.rs` / `dm_control/`，原 `control.rs` 为 `workflow.rs`。历史行号不再用于当前源码定位；当前入口与验证见[源码证据迁移说明](device-mapper-source-evidence.md#2026-10-16-迁移与适用边界)和[今日日志](../log/daily/2026-10-16.md)。
+
 > 评审日期：2026-09-17
 >
 > 评审对象：`docs/Asterinas_DeviceMapper_技术设计与实现说明.docx`

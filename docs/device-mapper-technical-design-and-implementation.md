@@ -1,9 +1,15 @@
 # Asterinas Device Mapper 技术设计与实现说明
 
 > **文档定位**：面向代码评审、维护与后续 target 扩展的实现型技术文档。
-> **源码基线**：`dm` 分支当前工作区，核验日期：2026-09-17。
+> **源码基线**：`dm` 分支当前工作区，原始核验日期：2026-09-17；2026-10-16 定向更新 V5 控制面与路径，未重新全量审查数据面章节。
 > **事实来源**：本文关于当前行为的结论以源码为准；[non-device-mapper-change-rationale.md](non-device-mapper-change-rationale.md) 仅用于交叉核对改动文件范围，不替代源码。
 > **图示说明**：本文所有图均为 Mermaid 源码图，可随 Markdown 一同版本管理与 review。图中省略了与主路径无关的通用 VFS、调度和驱动细节。
+
+## V5 收尾与阅读边界
+
+2026-10-16 已批准的现有功能优化完成，约定验证通过；详见[今日日志](../log/daily/2026-10-16.md)。`dm_control.rs` 为设备入口，`abi.rs` 定义布局，`ioctl.rs` 负责复制/清理，`commands.rs` 负责命令处理，`workflow.rs` 编排生命周期，`runtime.rs` 协调节点事务。C 回归没有随 Rust 拆分。
+
+freeze/thaw、新设备生态能力及非 UTF-8 通用表示暂缓。根盘问题待定，不作为 V5 未完成项；临时诊断不属于 DM 修复。
 
 ## 执行摘要
 
@@ -13,11 +19,11 @@ Asterinas 当前的 Device Mapper（DM）实现将 Linux 用户态的 `/dev/mapp
 
 1. **控制面与数据面分层**：ioctl ABI、devtmpfs 节点和 VFS registry 留在 `aster-core`；mapper 状态机、table 和 target 留在独立 DM crate。
 2. **运行期发布事务**：首次 table load 发布 `/dev/dm-N`，首次 resume 再发布 `/dev/mapper/<name>` 并激活 table；失败时保留可重试状态。
-3. **I/O 代际隔离**：运行期 table replacement 会排空已分配 BIO；`--noflush` suspend 保留旧 BIO 的 table 引用，后续 BIO 延迟到 resume 后按新 table 重放。
+3. **I/O 代际隔离**：运行期 table replacement 会排空已分配 BIO；`--noflush` 同样排空已分配 BIO，后续 BIO 延迟到 resume 后按新 table 重放；这不等同于实现文件系统 freeze/thaw。
 4. **堆叠 I/O 语义**：BIO 同时保存提交时的原始 range 与当前 block layer 的 range；DM/partition 仅重映射当前 range，driver 使用重映射后的 range。
 5. **生命周期保护**：tracked `BlockDeviceLease` 被 table target 和已挂载文件系统长期持有，阻止 backing 或 mapper 在仍被使用时注销。
 
-当前实现不是完整 Linux DM 生态的宣称：不支持 DM-on-DM stacking、deferred remove、IMA measurement、snapshot/mirror/crypt 等复杂 target，也不覆盖 udev、sysfs 和完整 queue-stacking 语义。
+当前 block 设备模型已有 sysfs 目录和设备号链接；DM 专属属性、uevent/cookie 及用户态 udev 同步链尚未接通。当前实现不是完整 Linux DM 生态的宣称：不支持 DM-on-DM stacking、deferred remove、IMA measurement、snapshot/mirror/crypt 等复杂 target，也不覆盖 udev、sysfs 和完整 queue-stacking 语义。
 
 ---
 
@@ -135,8 +141,8 @@ flowchart TB
 
 | 层 | 主要模块 | 当前职责 | 不应承担的职责 |
 |---|---|---|---|
-| ioctl façade | [device_mapper.rs](../kernel/core/src/device/misc/device_mapper.rs) | 解析/校验 `dm_ioctl`，命令解码，errno 映射，输出编码 | 不持有 table 具体实现 |
-| typed workflow | [control.rs](../kernel/core/src/device/misc/device_mapper/control.rs) | 编排 create/load/remove/rename/transition/query | 不直接处理 raw 用户 buffer |
+| ioctl façade | [dm_control.rs](../kernel/core/src/device/misc/dm_control.rs) | 解析/校验 `dm_ioctl`，命令解码，errno 映射，输出编码 | 不持有 table 具体实现 |
+| typed workflow | [workflow.rs](../kernel/core/src/device/misc/dm_control/workflow.rs) | 编排 create/load/remove/rename/transition/query | 不直接处理 raw 用户 buffer |
 | runtime registry | [block.rs](../kernel/core/src/device/registry/block.rs) | `/dev/dm-N`、alias、open count、注册/注销回滚 | 不解释 target 映射 |
 | DM core | `manager.rs`、`device.rs`、`table.rs` | mapper 身份、状态机、table 生命周期、I/O 分派 | 不依赖 VFS 或 ioctl ABI |
 | target | `target/*` | 参数解析、几何校验、映射 action、deps/status | 不注册设备节点 |
@@ -157,7 +163,7 @@ flowchart TB
 | `dmsetup load name --table ...` | `DM_TABLE_LOAD` | 解析并写入 inactive table | 首次 load 发布 `/dev/dm-N` | primary 可打开，但无 active table 时 I/O 失败 |
 | `dmsetup resume name` | `DM_DEV_SUSPEND`，无 suspend flag | inactive 提交为 active，phase 进入 Running | 首次 resume 发布 alias | 新 BIO 使用 active generation |
 | `dmsetup suspend name` | `DM_DEV_SUSPEND`，带 suspend flag | 阻止新 BIO 绑定 table，等待已分配 BIO 排空 | 节点仍存在 | 后续 BIO postponed |
-| `dmsetup suspend --noflush name` | 同上并带 noflush 语义 | 不等旧 generation；立即 Suspended | 节点仍存在 | 旧 BIO 继续，新 BIO postponed |
+| `dmsetup suspend --noflush name` | 同上并带 noflush 语义 | 等待已分配 BIO 排空后 Suspended | 节点仍存在 | 旧 BIO 排空，新 BIO postponed |
 | running 状态下 `dmsetup load` | `DM_TABLE_LOAD` | 只更新 inactive table，不排空当前 I/O | 节点不变 | active generation 继续服务 |
 | running 状态下 `dmsetup resume` | `DM_DEV_SUSPEND`，无 suspend flag | 若存在 replacement inactive table，先 drain，再原子替换 active generation | 节点不变 | 替换完成后新 BIO 使用新 table |
 | `dmsetup rename` / `--setuuid` | `DM_DEV_RENAME` | 更新 name 或 UUID 索引 | name rename 事务移动 alias | sector 映射不变 |
@@ -271,7 +277,7 @@ classDiagram
 
 ### 5.1 ABI 入口
 
-`DmControlFile::ioctl()` 所在的 [device_mapper.rs](../kernel/core/src/device/misc/device_mapper.rs) 负责 Linux `dm_ioctl` buffer 的复制、结构校验、命令分派和结果写回；typed workflow 则位于 [control.rs](../kernel/core/src/device/misc/device_mapper/control.rs)。这一分离使 raw ABI 边界与领域状态机边界不混杂。
+`DmControlFile::ioctl()` 所在的 [dm_control.rs](../kernel/core/src/device/misc/dm_control.rs) 负责 Linux `dm_ioctl` buffer 的复制、结构校验、命令分派和结果写回；typed workflow 则位于 [workflow.rs](../kernel/core/src/device/misc/dm_control/workflow.rs)。这一分离使 raw ABI 边界与领域状态机边界不混杂。
 
 ```mermaid
 sequenceDiagram
@@ -298,9 +304,9 @@ sequenceDiagram
 
 ### 5.2 ABI 固定边界与 selector 规则
 
-当前 façade 只接受完整的 312 字节对齐 header，`dm_ioctl` 的 `data_start` 必须不小于 header、位于 `data_size` 内且按 8 字节对齐；单次 ioctl buffer 上限为 1 MiB。ABI 版本检查使用 `[4, 48, 0]`，不是把 target 版本数组误当成 DM ABI 版本。未知 command 返回 `ENOTTY`，未知或不适用 flag 则在命令级校验中返回相应参数错误，见 [device_mapper.rs:65-131](../kernel/core/src/device/misc/device_mapper.rs#L65-L131)、[device_mapper.rs:309-340](../kernel/core/src/device/misc/device_mapper.rs#L309-L340)。
+当前 ioctl 入口先检查权限并执行独立 12 字节版本握手，报告 ABI `[4, 50, 0]`；普通参数固定前缀为 305 字节，C 布局 header 为 312 字节。固定头只捕获一次，NO_PARAMS 命令不读取额外 payload；保留 1 MiB 本地资源上限及可失败分配。命令按 type/nr 解码，输出只复制有效长度，secure-data 在输入、错误与释放路径中清理。具体边界见 [abi.rs](../kernel/core/src/device/misc/dm_control/abi.rs) 与 [ioctl.rs](../kernel/core/src/device/misc/dm_control/ioctl.rs)。
 
-设备查找遵循 UUID → name → `dev` 的优先级；多个 selector 同时出现时，不应按“任意字段都参与匹配”理解。输出 record 还必须满足 8 字节对齐和 `next` 链约束；容量不足时不写半条 record，保留已经写入的完整记录并设置 `DM_BUFFER_FULL_FLAG`。
+设备 selector 按命令检查互斥组合，不按 UUID → name → dev 优先级接受冗余字段。输出 flags、列表扩展、target_count 和容量处理由 [commands.rs](../kernel/core/src/device/misc/dm_control/commands.rs) 负责。table status 最后一个参数字符串 NUL 后仍需 spare capacity；返回 data_size 不包含该 spare byte，测试不能用精确长度 buffer 误判末项缺失。
 
 ### 5.3 已实现命令语义矩阵
 
@@ -323,11 +329,11 @@ sequenceDiagram
 
 #### create：只建立控制面对象
 
-`ControlWorkflow::create()` 调用 `DmManager::create_with_readonly()`，见 [control.rs:273-283](../kernel/core/src/device/misc/device_mapper/control.rs#L273-L283)。此时 mapper 有 name/UUID/minor 和 manager 索引，但没有 table、没有 `/dev/dm-N`、没有 mapper alias。这样 table 解析失败不会产生半注册设备。
+`ControlWorkflow::create()` 调用 `DmManager::create()`，见 [workflow.rs](../kernel/core/src/device/misc/dm_control/workflow.rs)。此时 mapper 有 name/UUID/minor 和 manager 索引，但没有 table、没有 `/dev/dm-N`、没有 mapper alias。这样 table 解析失败不会产生半注册设备。
 
 #### load：先发布 primary，再改变不可逆状态
 
-table load 在 ioctl 层完成 target 解析与 table 全量校验后，调用 workflow。`load_table_with_primary()` 先执行 `publish_primary`，成功后才按请求将 readonly **单向置位**并写入 inactive slot，见 [control.rs:285-314](../kernel/core/src/device/misc/device_mapper/control.rs#L285-L314)。因此 primary 注册失败不会改变 readonly 或 inactive table，调用者可以修复环境后重试；后续不带 readonly flag 的 load 不会清除已经置位的 readonly。
+table load 完成 target 解析后，`load_table_with_primary()` 先发布 primary，再安装 inactive table。readonly 属于 table mode，create 不持久化 readonly；load 不改变 active table 的模式，resume 后由新 active table 决定 I/O 的只读行为。见 [workflow.rs](../kernel/core/src/device/misc/dm_control/workflow.rs)。
 
 #### first resume：alias 与 active table 的提交边界
 
@@ -376,7 +382,7 @@ stateDiagram-v2
 | 操作 | 当前实现行为 |
 |---|---|
 | 普通 suspend | `Running → Suspending`，等待 `in_flight == 0` 后进入 `Suspended`，见 [device.rs:320-343](../kernel/core/comps/device-mapper/src/device.rs#L320-L343)。 |
-| `--noflush` suspend | 不等待旧 BIO；旧 BIO 持有原 table，后续 BIO 进入 `postponed`，见 [device.rs:345-365](../kernel/core/comps/device-mapper/src/device.rs#L345-L365)。 |
+| `--noflush` suspend | 同样等待已分配 BIO 排空，后续 BIO 进入 postponed；可中断等待失败时回滚状态。当前没有 freeze/thaw 协议。 |
 | running 状态 load | 仅替换 inactive slot；当前 active table 和已分派 BIO 不变，不在 load 阶段执行 drain。 |
 | running 状态激活 replacement | 后续无 suspend flag 的 resume 先置 `Suspending`，排空旧 generation，再将 inactive 原子替换为 active 并恢复 Running，见 [device.rs:393-447](../kernel/core/comps/device-mapper/src/device.rs#L393-L447)。 |
 | suspended 状态 resume | 将 inactive 替换为 active，然后按提交顺序重放 `postponed`。 |
@@ -398,19 +404,19 @@ stateDiagram-v2
 3. 增加 event number 并唤醒 waiters；
 4. 从 manager 索引移除。
 
-实现见 [control.rs:316-340](../kernel/core/src/device/misc/device_mapper/control.rs#L316-L340)。因此 runtime 注销失败时，postponed BIO、event 和 manager 索引都保持不变，操作可重试。
+实现见 [workflow.rs](../kernel/core/src/device/misc/dm_control/workflow.rs)。因此 runtime 注销失败时，postponed BIO、event 和 manager 索引都保持不变，操作可重试。
 
-`DM_REMOVE_ALL` 不复用“一个失败即整体失败”的事务模型。workflow 对调用时取得的 mapper 快照逐个执行上述 guarded remove；某个设备因 open、lease 或 runtime 节点故障删除失败时，该设备保持原状或处于既定隔离状态，但遍历继续处理其余设备，并统计成功数量，见 [control.rs:342-362](../kernel/core/src/device/misc/device_mapper/control.rs#L342-L362)。
+`DM_REMOVE_ALL` 对当前快照尝试 guarded remove；每次成功删除后立即重新获取设备快照，从头扫描；一轮没有进展才结束。单个 busy 或节点失败不终止其余候选的处理。见 [workflow.rs](../kernel/core/src/device/misc/dm_control/workflow.rs)。
 
 #### rename 的两类事务
 
-- **UUID rename**：仅更新 manager UUID 反向索引和 device UUID，不移动节点。
+- **UUID rename**：仅允许首次设置非空 UUID，已有 UUID 不可覆盖；更新索引而不移动节点。
 - **name rename，未发布 runtime**：直接更新 manager 索引和 device name。
 - **name rename，已发布 alias**：先 reservation 新名称，移动 alias，最后提交索引和 device name；alias 移动失败时 reservation 的 `Drop` 只释放新名字，旧状态不变，见 [manager.rs:57-97](../kernel/core/comps/device-mapper/src/manager.rs#L57-L97) 与 [manager.rs:219-245](../kernel/core/comps/device-mapper/src/manager.rs#L219-L245)。
 
 #### event wait 的边界
 
-`wait_event()` 的满足条件严格为 `event_nr != input`，event 从 0 开始并以 wrapping addition 推进，见 [device.rs:460-488](../kernel/core/comps/device-mapper/src/device.rs#L460-L488)。当前 event 由 rename/remove workflow 发布；table load/clear、suspend 和 resume 不会推进 event number。因此它不是“所有生命周期变化”的完整通知机制。remove 唤醒 waiter 后，ioctl 层还会检查 manager 是否仍拥有同一 mapper 实例；若同名对象已被重建，旧 waiter 可返回 `ENXIO`，避免 ABA 混淆。当前 wait 响应只回写 header，`target_count = 0`；它不是 table/status record 查询。设置与当前值相同的 UUID 虽可能没有身份变化，仍可能由外层成功 workflow 发布 event，调用者不应把 event number 当成字段差异计数器。
+WAIT 持有已选 mapper 引用，等待 event_nr 改变；已开始的 waiter 不因 remove 后 manager 已无当前实例而被额外拒绝。响应包含所选表状态记录及正确 target_count，而不只是固定头。rename/remove 的事件发布按 live table 条件处理；事件计数不是所有生命周期变化的通知总线，也不等于 DM uevent/udev cookie。见 [commands.rs](../kernel/core/src/device/misc/dm_control/commands.rs) 与 [workflow.rs](../kernel/core/src/device/misc/dm_control/workflow.rs)。
 
 ---
 
@@ -560,7 +566,7 @@ W = \operatorname{stripe\_count} \times \operatorname{chunk\_size}
 ### 7.7 table 查询语义
 
 - `backing_ids()` 按首次出现顺序去重，用于 `DM_TABLE_DEPS`，见 [table.rs:127-139](../kernel/core/comps/device-mapper/src/table.rs#L127-L139)。
-- table/status 查询按 active 或 inactive slot 选择 table；target record 在 ABI encoder 需要时按 cursor 延迟格式化，见 [control.rs:117-155](../kernel/core/src/device/misc/device_mapper/control.rs#L117-L155)。linear 的 runtime status 参数为空；striped runtime status 中生成的 `A` 是固定格式字段，不代表已经实现 backing 健康监控。
+- table/status 查询按 active 或 inactive slot 选择 table；target record 在 ABI encoder 需要时按 cursor 延迟格式化，见 [workflow.rs](../kernel/core/src/device/misc/dm_control/workflow.rs)。linear 的 runtime status 参数为空；striped runtime status 中生成的 `A` 是固定格式字段，不代表已经实现 backing 健康监控。
 - `metadata()` 用 table 长度作为容量，并取所有 backing 的最小 `max_nr_segments_per_bio`；当前不会按后端的最大扇区数或 descriptor 限制进一步拆 BIO，见 [table.rs:99-115](../kernel/core/comps/device-mapper/src/table.rs#L99-L115)。
 
 ---
@@ -786,7 +792,7 @@ request queue 按 **current range** 合并相邻且同类型的 BIO，driver 接
 ### 12.3 suspend --noflush 后的 table replacement
 
 1. 已分配到旧 active table 的 BIO 保持其 table `Arc` 并继续完成；
-2. mapper 立即进入 Suspended；之后的 BIO 进入 postponed，不绑定旧 table；
+2. 等待已分配旧 BIO 排空后进入 Suspended；阻止新分派期间到达的 BIO 进入 postponed；
 3. load 新 inactive table；
 4. resume 把新 table 设为 active，并在 state 锁内预留 postponed 的 `in_flight` 计数；
 5. postponed BIO 依提交顺序通过新 table 重放。
@@ -822,7 +828,7 @@ request queue 按 **current range** 合并相邻且同类型的 BIO，driver 接
 | striped 参数、容量、chunk mapping | `target/striped.rs` ktest |
 | zero/error、flush fan-out、child completion 错误聚合 | `table.rs` ktest |
 | suspend drain、postponed replay、readonly | `device.rs` ktest |
-| control ioctl façade的 buffer、flag、selector、命令 helper 与领域行为 | `kernel/core/.../device_mapper.rs` ktest；部分测试直接调用内部 handler，不能替代完整 userspace ioctl copy/dispatch 入口验证 |
+| control ioctl façade的 buffer、flag、selector、命令 helper 与领域行为 | `kernel/core/.../dm_control.rs` ktest；部分测试直接调用内部 handler，不能替代完整 userspace ioctl copy/dispatch 入口验证 |
 | original/current BIO range、range-only split | `block/src/bio.rs` ktest |
 | lease 阻止注销和 Removing 阶段 | `block/src/lib.rs` ktest |
 | focused DM 用户 ABI | `test/initramfs/src/regression/device/device_mapper.c` |
@@ -835,7 +841,7 @@ request queue 按 **current range** 合并相邻且同类型的 BIO，driver 接
 | 能力 | 实现状态 | 当前可追溯证据 | 明确边界 |
 |---|---|---|---|
 | create/load/status/deps/rename/remove | 已实现 | ioctl façade 源码、command helper ktest、对应 system suite | helper 级测试不等同于完整 userspace ioctl 往返 |
-| `DM_DEV_WAIT` 当前 header 回写与特殊分流 | 已实现 | ioctl helper/模块 ktest，以及 focused C 的 rename/setuuid waiter | helper 证据与用户态 ABI 证据分层记录 |
+| `DM_DEV_WAIT` 状态记录回写与特殊分流 | 已实现 | ioctl helper/模块 ktest，以及 focused C 的 rename/setuuid waiter | helper 证据与用户态 ABI 证据分层记录 |
 | `DM_DEV_WAIT` 的中断与 restart 语义 | 已实现并通过 focused guest 回归 | 无 `SA_RESTART` 时返回 `EINTR`；带 `SA_RESTART` 时 signal handler 已执行、原 ioctl 在事件前不返回，并在 rename 后成功回填 header | focused C 为单一 DM ELF，不代表完整 initramfs regression |
 | `dmsetup wait` stale/current event 语义 | system suite 覆盖 | control-plane suite 的测试范围 | 本文不将历史 suite 视为本轮执行结果 |
 | deferred remove、IMA measurement | 明确不支持 | 控制面实现与限制说明 | 不承诺 Linux 完整兼容 |
@@ -886,7 +892,7 @@ QEMU、ktest 和 NixOS system test 必须串行，避免镜像和测试盘锁冲
 3. table target 查找是线性扫描；
 4. DM 不按 backing max I/O size、queue descriptor 上限自动再拆 BIO；
 5. `DM_DEV_WAIT` event 仅由 rename/remove 推进，不是完整 table/lifecycle 变更订阅；
-6. readonly 当前为单向置位；
+6. readonly 按 active/inactive table mode 区分，不是设备级单向置位；
 7. NVMe discard/write-zeroes 当前为显式不支持；
 8. primary 注册与首次 alias 发布是不同阶段，因此 load 后、首次 resume 前 primary 可打开但没有 active table。
 
@@ -897,7 +903,7 @@ QEMU、ktest 和 NixOS system test 必须串行，避免镜像和测试盘锁冲
 | 数据正确性 | logical range 连续性、linear offset、striped row/chunk 计算、split 覆盖完整性 |
 | 完成正确性 | 已成功接收的 BIO 任意 child error 的聚合、父 BIO 仅完成一次、延迟重放不会遗失完成；同步 enqueue 失败与 replay × split × enqueue-error 组合另行验证 |
 | 生命周期 | pending/commit/abort 顺序，primary/alias 所有权校验，Removing 隔离 |
-| 并发 | lifecycle/state 锁顺序、reload drain、noflush 旧/新 generation 分离、wait ABA 检查 |
+| 并发 | lifecycle/state 锁顺序、reload drain、noflush 旧/新 generation 分离、已开始 WAIT 的删除唤醒语义 |
 | 用户可见语义 | node/alias 时机、open count、lease busy、status/event/errno |
 | 后端能力 | range I/O 不支持是否显式向上传播，而非被错误地报告成功 |
 
@@ -950,9 +956,9 @@ Asterinas Device Mapper 的当前实现以独立 DM core 承接 mapper/table/tar
 | device | [device.rs](../kernel/core/comps/device-mapper/src/device.rs) | phase、table slots、in-flight、postponed、readonly、event |
 | table | [table.rs](../kernel/core/comps/device-mapper/src/table.rs) | 连续性、split、action、flush、聚合 |
 | targets | [target/](../kernel/core/comps/device-mapper/src/target/) | target catalog、parse、几何、status/deps |
-| ioctl ABI | [device_mapper.rs](../kernel/core/src/device/misc/device_mapper.rs) | raw buffer、命令解析、selector、response |
-| workflow | [control.rs](../kernel/core/src/device/misc/device_mapper/control.rs) | typed lifecycle/query workflow |
-| runtime coordinator | [runtime.rs](../kernel/core/src/device/misc/device_mapper/runtime.rs) | primary/alias 的发布、rename、注销编排 |
+| ioctl ABI | [dm_control.rs](../kernel/core/src/device/misc/dm_control.rs) | raw buffer、命令解析、selector、response |
+| workflow | [workflow.rs](../kernel/core/src/device/misc/dm_control/workflow.rs) | typed lifecycle/query workflow |
+| runtime coordinator | [runtime.rs](../kernel/core/src/device/misc/dm_control/runtime.rs) | primary/alias 的发布、rename、注销编排 |
 | block registry | [registry/block.rs](../kernel/core/src/device/registry/block.rs) | node、alias、open、pending/Removing、回滚 |
 | BIO | [bio.rs](../kernel/core/comps/block/src/bio.rs) | current range、remap、split、completion |
 | block registry/lease | [block lib.rs](../kernel/core/comps/block/src/lib.rs) | pending/live/removing 与 lease count |

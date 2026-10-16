@@ -10,6 +10,12 @@
 
 命令默认在项目容器 `fork_Asterinas` 的仓库根目录 `/root/asterinas` 执行，只有标明的 crate-local 命令切换目录。修改先通过静态准入；随后从最能定位问题的运行时层开始，不以更高层测试替代更低层的定点断言。
 
+## 2026-10-16 V5 阶段验收
+
+`make check`、release 构建通过；core ktest 265/265，C 回归 `device_mapper` 457/0、`device_mapper_version` 55/0。用户随后完成 control-plane（48 秒 PASS）及完整 linear-integration（三轮 guest，88 秒 PASS），日志已核对，见[今日日志](../log/daily/2026-10-16.md)。本阶段收尾，不等于今日重跑全部六套。
+
+`make nixos` 编译结果、安装命令退出状态、激活脚本诊断及 suite 断言必须分别记录。此前 users 激活报错未导致外层安装失败，不能写成编译失败；根盘问题待定，不阻塞本次已通过的 DM 验收，也不意味着已证明根盘问题修复。
+
 ## 1. 三个运行时测试层的分工
 
 | 层 | 如何运行 | 主要回答的问题 | 何时继续向上验证 |
@@ -42,7 +48,7 @@
 记录 HEAD、相关未提交源码差异、实际命令与独立保存的本轮日志；没有直接测试覆盖的改动应标明缺口，不能以邻近模块通过代替。
 
 上游同步默认保留 `make check`、`make kernel`，并按影响范围选取定向 ktest；范围包括新增、冲突解决及受接口、依赖或语义变化影响的代码，不能只看文本冲突。
-候选 `main` 在干净独立 worktree 中先验证上游适用的范围，集成后的 `dm` 追加 DM 专属回归；详见 [同步规则](upstream-sync.md#8-后续同步规则)。
+候选 `main` 在主工作区容器内先验证上游适用的范围，不使用嵌套 worktree，集成后的 `dm` 追加 DM 专属回归；详见 [同步规则](upstream-sync.md#8-后续同步规则)。
 
 只有经讨论需要扩大范围时，才在仓库根目录执行完整 `make ktest`，由当前 `default-members` 决定范围。
 它自动依赖 initramfs，并在根 Makefile 中指定 `CONSOLE=ttyS0`，与下表手动命令的默认 `hvc0` 日志路径不同；完整结果须看整次命令输出与退出码，不能仅统计最后一次覆盖的 `qemu.log`。
@@ -50,27 +56,27 @@
 该日完整 ktest 早于后续 lint 源码修复；10 月 8—9 日又对修复后工作区完成 DM component 87/0、core DM ioctl 81/0、devtmpfs 6/0、runtime registry 8/0、VMCS 1/0 的定向回归，各命令 exit 0。
 本轮结果与覆盖缺口见 [回归收尾日志](../log/daily/2026-10-9.md)，不代表 C/NixOS 回归或全仓验证通过。
 
-**默认回归清单**：DM、block 各运行一次 crate 全量，core 运行以下三个模块。
+**按影响选择 crate 回归**：OSDK 0.19 的裸模块 selector 会零匹配；以下 core 模块属于同一 crate，批准 core 全量后只执行一次无 selector 命令，不重复跑三次。
 
 | 测试范围 | 执行目录 | 直接命令 | 覆盖范围 / 文件 |
 |---|---|---|---|
 | `aster-device-mapper` 全量 | `kernel/core/comps/device-mapper` | `cargo osdk test` | `device.rs`、`manager.rs`、`table.rs`、`target/**`。 |
-| core：DM ioctl / runtime 模块 | `kernel/core` | `cargo osdk test --kcmd-args=earlycon aster_core::device::misc::device_mapper::tests` | `kernel/core/src/device/misc/device_mapper.rs`。 |
-| core：runtime block registry 模块 | `kernel/core` | `cargo osdk test --kcmd-args=earlycon aster_core::device::registry::block::tests` | `kernel/core/src/device/registry/block.rs`。 |
+| core：DM ioctl / runtime 模块 | `kernel/core` | `cargo osdk test --kcmd-args=earlycon` | `kernel/core/src/device/misc/dm_control.rs`。 |
+| core：runtime block registry 模块 | `kernel/core` | `cargo osdk test --kcmd-args=earlycon` | `kernel/core/src/device/registry/block.rs`。 |
 | `aster-block` 全量 | `kernel/core/comps/block` | `cargo osdk test` | BIO、注册/注销与 lease、device ID、partition、request queue。 |
-| core：devtmpfs 模块 | `kernel/core` | `cargo osdk test --kcmd-args=earlycon aster_core::fs::fs_impls::devtmpfs::tests` | `kernel/core/src/fs/fs_impls/devtmpfs/**`：运行期节点与 identity 路径。 |
+| core：devtmpfs 模块 | `kernel/core` | `cargo osdk test --kcmd-args=earlycon` | `kernel/core/src/fs/fs_impls/devtmpfs/**`：运行期节点与 identity 路径。 |
 
-**定向排障入口**：以下模块已包含在对应 crate 全量中；仅在定位失败或局部复测时使用，不需要在全量通过后逐条重复执行。
+**定向排障入口**：以下模块已包含在对应 crate 全量中；列出的命令运行所属 crate 全量，不是模块过滤；全量通过后不逐条重复执行。
 
 | 测试范围 | 执行目录 | 直接命令 | 覆盖范围 / 文件 |
 |---|---|---|---|
-| DM component：table 模块 | `kernel/core/comps/device-mapper` | `cargo osdk test aster_device_mapper::table::tests` | `kernel/core/comps/device-mapper/src/table.rs`。 |
-| DM component：manager 模块 | `kernel/core/comps/device-mapper` | `cargo osdk test aster_device_mapper::manager::tests` | `kernel/core/comps/device-mapper/src/manager.rs`。 |
-| block component：BIO 模块 | `kernel/core/comps/block` | `cargo osdk test aster_block::bio::tests` | `kernel/core/comps/block/src/bio.rs`。 |
-| block component：注册与 lease | `kernel/core/comps/block` | `cargo osdk test aster_block::tests` | `kernel/core/comps/block/src/lib.rs`：注册、注销、lease 与事务回滚。 |
-| block component：device ID 模块 | `kernel/core/comps/block` | `cargo osdk test aster_block::device_id::tests` | `kernel/core/comps/block/src/device_id.rs`：major 快照与持有期。 |
-| block component：partition 模块 | `kernel/core/comps/block` | `cargo osdk test aster_block::partition::tests` | `kernel/core/comps/block/src/partition.rs`：range BIO 偏移与溢出。 |
-| block component：request queue 模块 | `kernel/core/comps/block` | `cargo osdk test aster_block::request_queue::tests` | `kernel/core/comps/block/src/request_queue.rs`：range 合并与 segment 上限。 |
+| DM component：table 模块 | `kernel/core/comps/device-mapper` | `cargo osdk test` | `kernel/core/comps/device-mapper/src/table.rs`。 |
+| DM component：manager 模块 | `kernel/core/comps/device-mapper` | `cargo osdk test` | `kernel/core/comps/device-mapper/src/manager.rs`。 |
+| block component：BIO 模块 | `kernel/core/comps/block` | `cargo osdk test` | `kernel/core/comps/block/src/bio.rs`。 |
+| block component：注册与 lease | `kernel/core/comps/block` | `cargo osdk test` | `kernel/core/comps/block/src/lib.rs`：注册、注销、lease 与事务回滚。 |
+| block component：device ID 模块 | `kernel/core/comps/block` | `cargo osdk test` | `kernel/core/comps/block/src/device_id.rs`：major 快照与持有期。 |
+| block component：partition 模块 | `kernel/core/comps/block` | `cargo osdk test` | `kernel/core/comps/block/src/partition.rs`：range BIO 偏移与溢出。 |
+| block component：request queue 模块 | `kernel/core/comps/block` | `cargo osdk test` | `kernel/core/comps/block/src/request_queue.rs`：range 合并与 segment 上限。 |
 
 下表只说明上述手动 crate-local 命令在默认 x86_64、非 TDX 配置下的 console/日志行为；根 `make ktest` 默认指定 `CONSOLE=ttyS0`，不适用表中的默认 `hvc0` 路径。
 ktest 结果经 early serial 输出，不能与普通内核的 `/dev/console` 选择混为一谈。
@@ -79,7 +85,7 @@ ktest 结果经 early serial 输出，不能与普通内核的 `/dev/console` �
 |---|---|---|---|
 | `CONSOLE=hvc0` | 未显式设置 `CONSOLE` 时默认。 | virtconsole 接终端；ktest UART 结果写入独立日志，不在终端显示。 | `less qemu-serial.log` |
 | `CONSOLE=ttyS0` | 仅交互式排障时显式设置，不属于默认命令。 | UART 接终端；ktest 结果同时显示在终端并写入 `qemu.log`。 | `less qemu.log` |
-| 模块 selector | `crate::...::tests` | 一次选择该模块中的全部 `#[ktest]`；不需要逐个填写函数名。 | 默认查看 `qemu-serial.log`；排障时按显式 console 设置查看。 |
+| 模块 selector | `crate::...::tests` | OSDK 0.19 下裸模块路径会零匹配，不作为有效验证入口。 | 默认查看 `qemu-serial.log`；排障时按显式 console 设置查看。 |
 | 无 selector | 上表 DM、block crate 全量命令。 | 执行当前目录所选 crate 在当前构建配置下的全部 ktest；不代表 core 或 workspace 全量已验证。 | 同上。 |
 | 离线依赖 | `CARGO_NET_OFFLINE=true` 仅用于网络或依赖问题的排障/恢复。 | 仅使用本地缓存；缓存缺失时报错。标准验证不设置该变量。 | 命令终端输出。 |
 | core early console | `--kcmd-args=earlycon` | 启用 core 的早期串口；它是 core ktest 输出的必要内核参数，不等同于 host 的 `CONSOLE` 覆盖。 | 默认写入根目录 `qemu-serial.log`。 |
@@ -107,7 +113,7 @@ AUTO_TEST=regression \
   REGRESSION_TESTS=device/device_mapper make run_kernel
 ```
 
-`AUTO_TEST=regression` 构建回归 ELF 并让 guest 启动后进入 regression runner；`REGRESSION_TESTS=device/device_mapper` 让 runner 只执行 `/test/device/device_mapper`，省略时运行全量。可选参数：`RELEASE=1`（release 内核，默认 0）、`CARGO_NET_OFFLINE=true`（仅用本地 Cargo 缓存）、`INTEL_TDX=0`（默认值即 0，显式写出只为防环境覆盖）。
+`AUTO_TEST=regression` 构建回归 ELF 并让 guest 启动后进入 regression runner；`REGRESSION_TESTS=device/device_mapper` 让 runner 只执行 `/test/device/device_mapper`，省略时运行全量。可选参数：`RELEASE=1`（release 内核，默认 1）、`CARGO_NET_OFFLINE=true`（仅用本地 Cargo 缓存）、`INTEL_TDX=0`（默认值即 0，显式写出只为防环境覆盖）。
 
 独立版本握手回归入口为 `make run_kernel AUTO_TEST=regression REGRESSION_TESTS=device/device_mapper_version`，对应 `device_mapper_version.c`，覆盖 major/minor/patch 兼容矩阵、未知命令握手顺序、仅访问 12 字节、保护页及 copyout 错误优先级、持有 fd 后移除 `CAP_SYS_ADMIN` 的拒绝行为。完整 device 目录回归也通过 `run_test.sh` 接入该程序。
 

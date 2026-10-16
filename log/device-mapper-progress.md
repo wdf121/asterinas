@@ -1,15 +1,17 @@
 # Device Mapper 当前项目状态
 
-> **更新日期**：2026-10-15。
+> **更新日期**：2026-10-16。
 >
 > **事实来源**：实现以当前源码为准，验证以对应源码版本和实际命令输出为准；历史日志不自动证明当前工作区通过。
 
 ## 当前停点摘要
 
+- 2026-10-16：V5 已批准的现有功能优化及 Rust 控制面拆分完成，本阶段按用户确认收尾；`make check`、release 构建通过，core ktest 265/265，C 回归 457/0 与 55/0。用户运行的 control-plane（48 秒）和完整 linear-integration（三轮 guest，88 秒）均 PASS，Claude 已核对日志。
+- 根盘 ESTALE/EUCLEAN 问题待定，专项排查终止；不能写成 `make nixos` 编译失败，也不再阻塞本次 DM 优化收尾。临时同步诊断仍在工作树，不是正式修复；是否为上游问题尚未定性。不追加实验，不自动清理或提交。
 - 本地 main 为 `77ee3b196`（v0.19.0）；本轮 dm 改动基于 `b5e91dad1`，按握手修复、终端应答、测试日志和文档分点收口，仅本地提交，不 push。0.19.0 同步已完成（2026-10-13，154 提交线性重放，无 merge commit）。
-- 2026-10-15：dm 第一阶段 ABI 修复完成：逐 ioctl 检查 initial user namespace 的 `CAP_SYS_ADMIN`，独立 12 字节版本握手，major/minor 兼容检查与版本 copyout `EFAULT` 优先级；check/kernel exit 0，core ktest 242/0（DM 83），两个 focused C 回归 49/0、195/0。普通命令的快照、结果回写与 secure-data 问题仍待第二阶段。
+- 2026-10-15：dm 第一阶段 ABI 修复完成：逐 ioctl 检查 initial user namespace 的 `CAP_SYS_ADMIN`，独立 12 字节版本握手，major/minor 兼容检查与版本 copyout `EFAULT` 优先级；check/kernel exit 0，core ktest 242/0（DM 83），两个 focused C 回归 49/0、195/0。普通命令的快照、结果回写与 secure-data 后续由 10-16 V5 修复承接。
 - 六套系统测试共 11 轮 guest 串行通过；终端查询旁路应答已接入，精简日志及六套测试意图已实测。linear 默认最终容量改为 768 MiB。最后的单轮 `guest_ready_after` 名称修正仅做静态检查，按用户要求不重跑系统测试。
-- Linux 主语义基线固定为 `v6.18.56`，首次新版差异对照为 `v7.2.10`，两者 DM ABI 均为 4.50.0；这不代表完整 Linux DM 兼容性已验收。
+- 10-15 握手复核使用 `v6.18.56` / `v7.2.10`；V5 主对照使用用户指定的本机 Linux 树（openEuler 6.6.0-132.0.0，UAPI 4.48.0），当前 DM 报告 ABI 4.50.0；这不代表完整 Linux DM 兼容性已验收。
 - PR 1（mapped BIO ranges，分支 mapped-bio-ranges）：本地重放至 `716a1161b`；远端 #3937 分支仍为旧历史，重推待定。
 - PR 2（dm-linear-io-path）：`d0088c2c9`（6 文件、421 行）；2026-10-14 清除 6 条中文注释洗史并 force-with-lease 重推，ls-remote 实证远端一致；改史后 gate 全绿（check/kernel exit 0，block 6/0，dm 8/0）；PR 未创建，编号待回填。
 - PR 3（dm-control-interface，基于 PR 2）：仍为 `d539b725b`，未推送、未同步本轮 dm 修复。10-14 的 160/0 是该旧树的测试记录，不证明握手契约正确；10-15 对固定 Linux 标签的核对已否定“major-only 与 Linux 一致”等旧结论，独立 12 字节握手、minor 校验、错误优先级及相关注释待单独同步验证。PR 1 在审期间不抢推 PR 3。
@@ -18,7 +20,7 @@
 - PR 在新 PR 分支最终验证；同步在 rebase 后 dm 最终验证，候选 main 先做干净基线。两边均采用 make check、make kernel 与按影响范围的定向 ktest，不默认全量。
 - 校验取舍已归入 PR 规范：当前保留局部范围检查，全局不变量与统一校验入口留待 dm 讨论，不扩大 PR 范围。
 
-证据见 [10 月 15 日](daily/2026-10-15.md) 日志（更早阶段见 10 月 13、14 日）；接手入口见 [正式交接](../docs/device-mapper-handoff.md)。
+最新收尾与证据见 [10 月 16 日](daily/2026-10-16.md)；历史证据见 [10 月 15 日](daily/2026-10-15.md) 日志（更早阶段见 10 月 13、14 日）；接手入口见 [正式交接](../docs/device-mapper-handoff.md)。
 
 ## 1. 当前方向
 

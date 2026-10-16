@@ -1,14 +1,16 @@
 # Device Mapper 对话交接
 
-> **最后更新**：2026-10-15。
+> **最后更新**：2026-10-16。
 > 本文件是唯一维护的交接入口；PR 技术档案见 [log/PR](../log/PR/)，实际操作见 [daily](../log/daily/)。
 
 ## 当前停点
 
+- 2026-10-16：V5 已批准的现有功能优化及 Rust 控制面拆分完成，本阶段按用户确认收尾；`make check`、release 构建通过，core ktest 265/265，C 回归 457/0 与 55/0。用户运行的 control-plane（48 秒）和完整 linear-integration（三轮 guest，88 秒）均 PASS，Claude 已核对日志。
+- 根盘 ESTALE/EUCLEAN 问题待定，专项排查终止；不能写成 `make nixos` 编译失败，也不再阻塞本次 DM 优化收尾。临时同步诊断仍在工作树，不是正式修复；是否为上游问题尚未定性。不追加实验，不自动清理或提交。
 - 2026-10-15：dm 第一阶段权限与版本握手修复已验证：check/kernel exit 0、core ktest 242/0（DM 83）、版本 C 回归 49/0、成熟 DM C 回归 195/0。按授权分点本地提交，不 push；具体内容和证据见 [当日日志](../log/daily/2026-10-15.md)。
 - PR 3 仍为 `d539b725b`，未同步 dm 修复、未推送。固定 Linux `v6.18.56` / `v7.2.10` 复核已否定旧的 major-only 说明；10-14 的 160/0 不能证明用户 ABI 握手正确。等用户安排后单独同步最小修复并在 PR 分支验证，不因 dm 通过而宣称 PR 3 通过。
 - 六套系统测试共 11 轮 guest 全通过；terminal helper 旁路应答消除本次终端查询等待，日志已精简并补齐测试意图，linear 最终默认容量为 768 MiB。最后 `guest_guest_ready_after` 改名仅静态验证，未重跑系统测试。
-- 普通 ioctl 快照/输出长度/失败回写/secure-data 第二阶段、通用 Jiffies 异常和根盘 fsck 闭环均未完成。分钟粒度日志目录碰撞也未修，避免同套同分钟重复启动。
+- 普通 ioctl 快照/输出长度/失败回写/secure-data 第二阶段已在 V5 收尾；通用 Jiffies 异常和根盘问题保留待定，不扩为本次任务。分钟粒度日志目录碰撞也未修，避免同套同分钟重复启动。
 - 已授权清除 20 个旧系统运行目录和临时 linear 日志目录；六套各留最新完整运行及 `latest`。旧日志路径仅为历史索引，不能再当作现存证据；时钟/终端排障目录、C 回归证据、根镜像与排障快照均保留。
 - 2026-10-14：PR 2（`dm-linear-io-path`）清除 6 条中文注释洗史至 `d0088c2c9` 并 force-with-lease 重推，ls-remote 实证远端一致；改史后 gate 全绿（check/kernel exit 0，block 6/0，dm 8/0）。PR 未创建，编号待回填。PR 1 本地重放至 `716a1161b`，远端 #3937 分支仍为旧历史，重推待定。
 - 2026-10-13：完成上游 0.19.0 同步，main 快进至 `77ee3b196`，dm 154 提交线性重放（无 merge commit）；dm 的 force push 挂起，待用户统一执行；同步策略已固化进 CLAUDE.md/AGENTS.md。
@@ -39,7 +41,7 @@
 - **PR：在新 PR 分支最终验证。** 顺序为 make check、make kernel、相关定向 ktest；dm 成功结果不能代替 PR 分支。最终提交源码树必须与实际验证树一致。
 - **上游同步：在 rebase 后的权威 dm 最终验证。** 同步入口固定：fetch 上游 → main 快进 → 侦察增量 → 按影响面做基线。基线（make check、make kernel）在检出 main 的主工作区容器内直接执行，不用嵌套 worktree（向上解析撞主 workspace 根，checkout 时间戳触发 cargo-osdk 重装）；main 与 dm 均默认定向，不运行完整 ktest。
 - 定向覆盖新增、冲突解决与接口/语义影响链；用户 ABI 或真实工具流程按影响补 C/系统测试。影响难以限定时先讨论，不自动扩大范围。
-- make check 已包含格式检查，不重复列必跑格式命令；make kernel 默认 dev。系统 suite 启动已有镜像，必须确认镜像来源和 profile。
+- make check 已包含格式检查，不重复列必跑格式命令；make kernel 默认 release（`RELEASE ?= 1`）。系统 suite 启动已有镜像，必须确认镜像来源和 profile。
 - **DM 系统 suite 日志**：每次运行写入 `/tmp/dm-test/<slug>/<日期-时间>/` 运行目录（`latest` 指向最新），验收以该目录的 `summary.log`/`console.clean.log` 为准；详见[测试手册 5.2.3](test.md#523-通过判定与日志)。
 - 具体规则以 [PR 规范](pull_request.md#13-每个-pr-的最终验证)、[上游同步](upstream-sync.md#8-后续同步规则) 为准；测试入口见 [测试手册](test.md)。
 
@@ -69,7 +71,7 @@ dm 在 main（`77ee3b196`）之上的提交序列（SHA 为 0.19.0 线性重放�
 → 本交接
 → [项目状态](../log/device-mapper-progress.md)
 → [PR 规范](pull_request.md) / [上游同步](upstream-sync.md)
-→ [当日日志](../log/daily/2026-10-15.md)。
+→ [当日日志](../log/daily/2026-10-16.md)。
 
 QEMU、ktest、C 回归和 NixOS 测试必须串行；遇失败、环境阻塞或未预期 warning 先报告并讨论。
 不覆盖来源不明改动，不自动提交或 push。
