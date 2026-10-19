@@ -1,30 +1,29 @@
 # Device Mapper 当前项目状态
 
-> **更新日期**：2026-10-16。
+> **更新日期**：2026-10-19。
 >
 > **事实来源**：实现以当前源码为准，验证以对应源码版本和实际命令输出为准；历史日志不自动证明当前工作区通过。
 
 ## 当前停点摘要
 
-- 2026-10-16：V5 已批准的现有功能优化及 Rust 控制面拆分完成，本阶段按用户确认收尾；`make check`、release 构建通过，core ktest 265/265，C 回归 457/0 与 55/0。用户运行的 control-plane（48 秒）和完整 linear-integration（三轮 guest，88 秒）均 PASS，Claude 已核对日志。
-- 根盘 ESTALE/EUCLEAN 问题待定，专项排查终止；不能写成 `make nixos` 编译失败，也不再阻塞本次 DM 优化收尾。临时同步诊断仍在工作树，不是正式修复；是否为上游问题尚未定性。不追加实验，不自动清理或提交。
-- 本地 main 为 `77ee3b196`（v0.19.0）；本轮 dm 改动基于 `b5e91dad1`，按握手修复、终端应答、测试日志和文档分点收口，仅本地提交，不 push。0.19.0 同步已完成（2026-10-13，154 提交线性重放，无 merge commit）。
-- 2026-10-15：dm 第一阶段 ABI 修复完成：逐 ioctl 检查 initial user namespace 的 `CAP_SYS_ADMIN`，独立 12 字节版本握手，major/minor 兼容检查与版本 copyout `EFAULT` 优先级；check/kernel exit 0，core ktest 242/0（DM 83），两个 focused C 回归 49/0、195/0。普通命令的快照、结果回写与 secure-data 后续由 10-16 V5 修复承接。
-- 六套系统测试共 11 轮 guest 串行通过；终端查询旁路应答已接入，精简日志及六套测试意图已实测。linear 默认最终容量改为 768 MiB。最后的单轮 `guest_ready_after` 名称修正仅做静态检查，按用户要求不重跑系统测试。
-- 10-15 握手复核使用 `v6.18.56` / `v7.2.10`；V5 主对照使用用户指定的本机 Linux 树（openEuler 6.6.0-132.0.0，UAPI 4.48.0），当前 DM 报告 ABI 4.50.0；这不代表完整 Linux DM 兼容性已验收。
-- PR 1（mapped BIO ranges，分支 mapped-bio-ranges）：本地重放至 `716a1161b`；远端 #3937 分支仍为旧历史，重推待定。
-- PR 2（dm-linear-io-path）：`d0088c2c9`（6 文件、421 行）；2026-10-14 清除 6 条中文注释洗史并 force-with-lease 重推，ls-remote 实证远端一致；改史后 gate 全绿（check/kernel exit 0，block 6/0，dm 8/0）；PR 未创建，编号待回填。
-- PR 3（dm-control-interface，基于 PR 2）：仍为 `d539b725b`，未推送、未同步本轮 dm 修复。10-14 的 160/0 是该旧树的测试记录，不证明握手契约正确；10-15 对固定 Linux 标签的核对已否定“major-only 与 Linux 一致”等旧结论，独立 12 字节握手、minor 校验、错误优先级及相关注释待单独同步验证。PR 1 在审期间不抢推 PR 3。
-- OSDK 0.19.0 ktest selector 为后缀 trie：裸模块路径选择器必匹配空集（EXIT=0 假绿）；定向入口为无 selector 的 crate 全量加串口逐行取证；10-13 日志集成层 81/159 记录已勘误作废。
-- 普通 VFS rename、完整 mount source 路径及 procfs 的直接覆盖缺口保留；不能以邻近模块通过替代。
-- PR 在新 PR 分支最终验证；同步在 rebase 后 dm 最终验证，候选 main 先做干净基线。两边均采用 make check、make kernel 与按影响范围的定向 ktest，不默认全量。
-- 校验取舍已归入 PR 规范：当前保留局部范围检查，全局不变量与统一校验入口留待 dm 讨论，不扩大 PR 范围。
+- 2026-10-19：完成 PR1–PR3 审阅、复核和单提交整理；dm 回补 poll 虚假就绪修复、BIO 边界与队列顺序测试、公开提交契约测试。验证基线为 `93159d132` 加本轮修改；代码已分点提交为 `7740a5281`、`64adad1c0`、`981294ef5`，文档随本次收口提交更新，均未推送。
+- Claude 独立运行完整 `make check` 通过；五组定向 ktest 为 BIO 13/0、queue 5/0、device 20/0、table 36/0、control ioctl 24/0，共 98/0，各命令退出 0。不是全仓验证。用户反馈 `make check`、`make kernel`、guest ABI 回归通过，后两项本轮未独立核验日志。
+- C ABI 测试按 control/lifecycle/table 职责拆为三个程序；原 24 个场景保留，新增 poll 后为 13/7/5，共 25 个场景，不是断言数量。
+- 控制 fd 不再恒报 IN/OUT；全局事件计数、等待队列、每打开文件事件基准及 ARM_POLL 尚未实现。单设备 `DM_DEV_WAIT` 不等于完整全局 poll。
+- PR1（`mapped-bio-ranges`，#3937）当前本地 `2f4fdc9a7`；今日曾推送中间版本 `e7e221993`，随后重放形成的当前历史未再次推送。
+- PR2（`dm-linear-io-path`）当前本地 `fd97f023f`，依赖新版 PR1，已 amend，未推送；本轮没有最终 PR2 ktest 运行计数，不以 dm 测试替代。
+- PR3（`dm-control-interface`）当前本地 `f662bdc2d`，依赖新版 PR2，握手/权限/解码/poll/测试修复已并入原提交，未推送。完整 check 通过，用户反馈单项 ABI 成功；没有本轮最终 PR3 kernel/core ktest 独立证据。
+- 当前 OSDK `test_matches_whitelist` 已支持模块路径与函数路径，本日实际非零计数验证了模块筛选；此前“裸模块路径必匹配空集”的说明不再适用于当前源码，历史零匹配仍不算通过。
+- 后续以单 PR 为边界，用户主导手写，Claude 基于源码事实分析审查，仅在明确授权后实现，不自主大幅优化 DM。回补前核对完整 dm 的调用链和能力边界。
+- 2026-10-16 V5 收尾及系统套件结果属于历史验证，今日未重跑 dmsetup/LVM/NixOS 系统套件。主要 Linux 语义依据仍为指定 openEuler 源码基线，报告 ABI 4.50.0 不代表完整 Linux DM 兼容。
+- 根盘问题继续待定，不重启排查。用户反馈与上游一致的 main 也出现 users activation EUCLEAN；不能据此确定根因，也不能归咎于 DM 或写成 NixOS 编译失败。
+- 普通 VFS rename、完整 mount source 路径及 procfs 的直接覆盖缺口保留。最终验证采用 check/kernel/相关定向 ktest，涉及 ABI 加 C 回归，不默认完整 ktest。
 
-最新收尾与证据见 [10 月 16 日](daily/2026-10-16.md)；历史证据见 [10 月 15 日](daily/2026-10-15.md) 日志（更早阶段见 10 月 13、14 日）；接手入口见 [正式交接](../docs/device-mapper-handoff.md)。
+最新证据见 [10 月 19 日](daily/2026-10-19.md)，历史 V5 收尾见 [10 月 16 日](daily/2026-10-16.md)。旧交接文档中的提交号与入口可能滞后，以当前源码、实际结果和本页为准。
 
 ## 1. 当前方向
 
-当前方向是稳固已实现的 Device Mapper 主链，不主动扩大通用框架：
+当前以单 PR 为边界审查、复核并按授权实现，稳固已实现主链，不主动扩大通用框架：
 
 ```text
 DM control ABI
@@ -73,23 +72,35 @@ cargo osdk test
 cargo osdk test aster_device_mapper::table::tests
 ```
 
-跨到 core 的 aster_core ktest 时(OSDK 0.19.0 的 selector 为后缀 trie,自函数名段反向匹配,裸模块路径选择器必匹配空集,故不传 selector,以串口聚合计数与逐测试行取证):
+本轮五组定向入口（容器内串行执行）：
 
 ```bash
-cd kernel/core
-cargo osdk test --kcmd-args=earlycon
+cd /root/asterinas/kernel/core/comps/block
+cargo osdk test aster_block::bio::tests
+cargo osdk test aster_block::request_queue::tests
+cd /root/asterinas/kernel/core/comps/device-mapper
+cargo osdk test aster_device_mapper::device::tests
+cargo osdk test aster_device_mapper::table::tests
+cd /root/asterinas/kernel/core
+cargo osdk test --kcmd-args=earlycon aster_core::device::misc::dm_control::tests::ioctl
 ```
 
-### 3.2 Initramfs C ABI 回归
+每次立即核对并保存根目录 `qemu-serial.log`，记录实际 passed/failed/filtered 与退出码；下一次运行会覆盖，零匹配不算通过。
 
-`REGRESSION_TESTS` 可选择目录或单个 C ELF。DM focused C 回归入口：
+### 3.2 Initramfs C 用户态 ABI 回归
 
 ```bash
-RELEASE=1 AUTO_TEST=regression INTEL_TDX=0 \
-  REGRESSION_TESTS=device/device_mapper make run_kernel
+cd /root/asterinas
+make run_kernel AUTO_TEST=regression REGRESSION_TESTS="device/device_mapper_control device/device_mapper_lifecycle device/device_mapper_table"
 ```
 
-它覆盖 raw ioctl、runtime node/alias rollback、ext2 mount lease、zero target range ioctl、table-scoped readonly mode，以及无 `SA_RESTART` 的 `EINTR` 对照和带 `SA_RESTART` 的 WAIT 重启；完整 regression 仍可能被无关目录中的失败提前中止，因此 focused selector 是当前 DM ABI 的最小入口。
+| 程序 | 职责 | 场景数 |
+|---|---|---:|
+| `device_mapper_control` | 版本、权限、参数/内存边界、选择器、回写、无事件 poll | 13 |
+| `device_mapper_lifecycle` | 身份、节点回滚、挂载占用、WAIT 信号与事件 | 7 |
+| `device_mapper_table` | 表查询、backing 路径、只读转换、范围 ioctl | 5 |
+
+原 `device_mapper`、`device_mapper_version` 不再是当前源码构建/runner 入口；旧构建目录即使残留二进制也不能用于本轮验收。按职责而非命令分文件，原 24 个场景保留，新增后共 25 个，不是断言数量。这些是真实系统调用的用户态 ABI 测试，不替代 dmsetup/LVM 集成。
 
 ### 3.3 NixOS DM system suite
 
@@ -133,7 +144,7 @@ release 验收须确认镜像来自目标源码的显式 release 构建，不能
 
 - uevent / sysfs / udev / systemd 自动发现和自动激活；
 - DM-on-DM stacking；
-- deferred remove、完整 control ABI 扩展；
+- deferred remove、完整 control ABI 扩展及全局控制事件 poll/ARM_POLL；
 - 完整 queue stacking、后端限制自动再拆；
 - ext4 / exfat 作为当前核心验收；
 - MlsDisk 生命周期、virtio/NVMe fault injection 等框架专项工作。
@@ -147,7 +158,7 @@ CLAUDE.md / AGENTS.md
 → docs/device-mapper-handoff.md
 → 本项目状态
 → docs/pull_request.md / docs/upstream-sync.md
-→ log/daily/2026-10-15.md（更早日志按需回溯）
+→ log/daily/2026-10-19.md（更早日志按需回溯）
 → 按任务阅读源码证据、设计或测试手册
 → 核对当前工作区与实际任务的比较基线
 ```

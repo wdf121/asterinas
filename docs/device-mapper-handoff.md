@@ -1,77 +1,87 @@
 # Device Mapper 对话交接
 
-> **最后更新**：2026-10-16。
-> 本文件是唯一维护的交接入口；PR 技术档案见 [log/PR](../log/PR/)，实际操作见 [daily](../log/daily/)。
+> **最后更新**：2026-10-19。
+> 本文件是交接入口；当前状态见 [项目进度](../log/device-mapper-progress.md)，实际命令、失败及复盘见 [今日日志](../log/daily/2026-10-19.md)。PR 历史档案见 [log/PR](../log/PR/)，其中旧 SHA/测试入口不能覆盖当前源码事实。
 
-## 当前停点
+## 1. 当前停点
 
-- 2026-10-16：V5 已批准的现有功能优化及 Rust 控制面拆分完成，本阶段按用户确认收尾；`make check`、release 构建通过，core ktest 265/265，C 回归 457/0 与 55/0。用户运行的 control-plane（48 秒）和完整 linear-integration（三轮 guest，88 秒）均 PASS，Claude 已核对日志。
-- 根盘 ESTALE/EUCLEAN 问题待定，专项排查终止；不能写成 `make nixos` 编译失败，也不再阻塞本次 DM 优化收尾。临时同步诊断仍在工作树，不是正式修复；是否为上游问题尚未定性。不追加实验，不自动清理或提交。
-- 2026-10-15：dm 第一阶段权限与版本握手修复已验证：check/kernel exit 0、core ktest 242/0（DM 83）、版本 C 回归 49/0、成熟 DM C 回归 195/0。按授权分点本地提交，不 push；具体内容和证据见 [当日日志](../log/daily/2026-10-15.md)。
-- PR 3 仍为 `d539b725b`，未同步 dm 修复、未推送。固定 Linux `v6.18.56` / `v7.2.10` 复核已否定旧的 major-only 说明；10-14 的 160/0 不能证明用户 ABI 握手正确。等用户安排后单独同步最小修复并在 PR 分支验证，不因 dm 通过而宣称 PR 3 通过。
-- 六套系统测试共 11 轮 guest 全通过；terminal helper 旁路应答消除本次终端查询等待，日志已精简并补齐测试意图，linear 最终默认容量为 768 MiB。最后 `guest_guest_ready_after` 改名仅静态验证，未重跑系统测试。
-- 普通 ioctl 快照/输出长度/失败回写/secure-data 第二阶段已在 V5 收尾；通用 Jiffies 异常和根盘问题保留待定，不扩为本次任务。分钟粒度日志目录碰撞也未修，避免同套同分钟重复启动。
-- 已授权清除 20 个旧系统运行目录和临时 linear 日志目录；六套各留最新完整运行及 `latest`。旧日志路径仅为历史索引，不能再当作现存证据；时钟/终端排障目录、C 回归证据、根镜像与排障快照均保留。
-- 2026-10-14：PR 2（`dm-linear-io-path`）清除 6 条中文注释洗史至 `d0088c2c9` 并 force-with-lease 重推，ls-remote 实证远端一致；改史后 gate 全绿（check/kernel exit 0，block 6/0，dm 8/0）。PR 未创建，编号待回填。PR 1 本地重放至 `716a1161b`，远端 #3937 分支仍为旧历史，重推待定。
-- 2026-10-13：完成上游 0.19.0 同步，main 快进至 `77ee3b196`，dm 154 提交线性重放（无 merge commit）；dm 的 force push 挂起，待用户统一执行；同步策略已固化进 CLAUDE.md/AGENTS.md。
-- OSDK 0.19.0 ktest selector 为后缀 trie：裸模块路径选择器必匹配空集（EXIT=0 假绿）；定向入口为无 selector 的 crate 全量加串口逐行取证；10-13 日志集成层 81/159 记录已勘误作废。
-- 此前结论仍有效（10-12/10-13 早段）：`--linear-integration` 两层根因闭环、五套件结构化日志串行全绿、C 回归 focused 182/0（cgroup 全量失败定性为环境限制）、文档按授权更新；细节见各日日志。
+- 今天完成 PR1–PR3 的审阅、复核、修改和单提交整理；随后在 dm 小范围回补已确认收益，没有开展完整 DM 重构。
+- dm 本轮基于 `93159d132`：BIO 不变量局部简化、边界与队列顺序测试；DM 公开提交契约测试；控制 fd poll 虚假就绪修复；C ABI 测试按职责拆分；验证规则和文档更新。用户已授权分点本地提交，不 push，提交结果见项目进度及今日日志。
+- 控制 fd 当前不再恒报 IN/OUT，但全局事件计数、等待队列、每打开文件事件基准及 `DM_DEV_ARM_POLL` **仍未实现**。已有单设备 `DM_DEV_WAIT` 不等于完整全局 poll。
+- 主要 Linux 语义依据为 `/root/Linux-tree-code/kernel` 的 openEuler 基线 `5078a3a23a1e1825ec136485173ec98668cdd640`；每次新核对仍需确认 HEAD/本地修改，不能把学习改动当作上游事实。DM ABI 报告 4.50.0 不代表完整 Linux 兼容。
+- 根盘 ESTALE/EUCLEAN 问题继续待定，不重启排查。用户反馈与上游一致的 main 也出现 users activation EUCLEAN；该反馈不证明根因，但不能归咎于 DM，不能写成 `make nixos` 编译失败。
 
-## PR 状态
+## 2. PR 状态与工作方式
 
-- PR 逐项状态、分支 SHA 与下一步以 [PR 规范](pull_request.md) 和 [log/PR](../log/PR/) 档案为准，本文件不再复述具体 SHA、stash 或分支。
-- PR 1/2/3 档案均在 [log/PR](../log/PR/)（PR-1、PR-2、PR-3-control-interface）；PR 2 与 PR 3 尚未创建，编号与 PR 3 的 base 取向待用户创建时回填。
-- 通用规则不变：每份 PR 在其 PR 分支最终验证（make check、make kernel、定向 ktest），dm 成功结果不能代替；后续 PR 基于上一份 PR + 最新已核对 main；共有缺陷仍先修 dm。
+| 分支 | 当前本地提交 | 状态 |
+|---|---|---|
+| `mapped-bio-ranges` | `2f4fdc9a7` | PR1 #3937；今日曾推送中间提交 `e7e221993`，随后重放的当前历史未再次推送。 |
+| `dm-linear-io-path` | `fd97f023f` | 基于新版 PR1，修改已 amend；当前历史未推送。本轮没有最终 PR2 ktest 运行计数。 |
+| `dm-control-interface` | `f662bdc2d` | 基于新版 PR2，修复已并入原提交；未推送。完整 check 通过，用户反馈单项 ABI 成功；没有本轮最终 PR3 kernel/core ktest 独立证据。 |
 
-## 已有验证与边界
+- 后续全部以单 PR 为边界，用户尽可能手写，Claude 基于源码事实分析审查；审查不等于实现授权，不自主扩大 DM 优化。
+- 每项判断区分实际缺陷、覆盖缺口、维护性建议和可选设计；不因 Linux/Rust 内部表示不同就要求重构。
+- PR 修正回补 dm 前核对完整调用链和能力边界；例如 dm 当前拒绝 DmDevice backing，不能直接移植 PR2 双层映射测试并顺带开放堆叠。
+- PR 在自身最终源码树验证；dm 通过不能替代 PR 验证。当前 PR 保持各自单提交，新增修改如何并入历史按用户指示处理，不自动重推。
 
-| 已执行事项 | 结果与覆盖边界 |
-|---|---|
-| 2026-10-10 静态与构建 gate | 容器 `make check` 退出 0、无警告（cargo-udeps 修补版）；`make kernel` 退出 0 并生成 ISO；仅构建验证，未做运行时测试。 |
-| 2026-10-10 ext2 落盘计数修复 | 新增 ktest 用例先红后绿；ext2 模块 15/0；release 根盘端到端复验，启动前后 `e2fsck -fn` 均 0；`--control-plane` 套件复验通过。 |
-| 2026-10-12 两层根因修复验证 | core DM ioctl ktest 81/0；`--linear-integration` 五次真实运行全部 PASS（87-91s，含 legacy 日志对照）。 |
-| 2026-10-12 五套件结构化日志推广 | control-plane/dataplane/lvm2-topology/striped/mixed 串行全绿（47-117s）、TEST_FAIL=0、退出码全 0；运行目录产物齐全，clean.log 字符级 CLEAN。 |
-| 2026-10-12 C 回归接线恢复 | `REGRESSION_TESTS=device/device_mapper` focused 182/0、退出码 0，qemu.log 仅含单一 selector。 |
-| 未覆盖 | `test/registration.rs` 新增用例未单独运行 ktest（由同 crate ioctl ktest 间接覆盖编译与调用链）；cgroup 环境限制未做 upstream 对照；ESTALE 删除失败未定性；五套件与 C 回归验证时的内核/脚本内容与提交后 HEAD 一致（仅文档标注有差异），提交序列本身未重跑运行时测试。 |
+## 3. 本轮验证与证据
 
-各日命令、源码快照与原始输出索引见 [daily log](../log/daily/)。
+测试源码为 dm `93159d132` 加本日代码/测试修改；提交组织和后续文档不改变已验证的生产/测试源码。
 
-## 验证位置与规则
+| 范围 | passed | failed | filtered | 命令退出码 |
+|---|---:|---:|---:|---:|
+| block BIO | 13 | 0 | 20 | 0 |
+| block queue | 5 | 0 | 28 | 0 |
+| DM device | 20 | 0 | 74 | 0 |
+| DM table | 36 | 0 | 58 | 0 |
+| core control ioctl | 24 | 0 | 242 | 0 |
 
-- **PR：在新 PR 分支最终验证。** 顺序为 make check、make kernel、相关定向 ktest；dm 成功结果不能代替 PR 分支。最终提交源码树必须与实际验证树一致。
-- **上游同步：在 rebase 后的权威 dm 最终验证。** 同步入口固定：fetch 上游 → main 快进 → 侦察增量 → 按影响面做基线。基线（make check、make kernel）在检出 main 的主工作区容器内直接执行，不用嵌套 worktree（向上解析撞主 workspace 根，checkout 时间戳触发 cargo-osdk 重装）；main 与 dm 均默认定向，不运行完整 ktest。
-- 定向覆盖新增、冲突解决与接口/语义影响链；用户 ABI 或真实工具流程按影响补 C/系统测试。影响难以限定时先讨论，不自动扩大范围。
-- make check 已包含格式检查，不重复列必跑格式命令；make kernel 默认 release（`RELEASE ?= 1`）。系统 suite 启动已有镜像，必须确认镜像来源和 profile。
-- **DM 系统 suite 日志**：每次运行写入 `/tmp/dm-test/<slug>/<日期-时间>/` 运行目录（`latest` 指向最新），验收以该目录的 `summary.log`/`console.clean.log` 为准；详见[测试手册 5.2.3](test.md#523-通过判定与日志)。
-- 具体规则以 [PR 规范](pull_request.md#13-每个-pr-的最终验证)、[上游同步](upstream-sync.md#8-后续同步规则) 为准；测试入口见 [测试手册](test.md)。
+- Claude 独立核验：完整 `make check`、以上 98 个定向 ktest、C 程序编译/格式和 shell 语法。不是全仓 ktest。
+- 用户反馈：`make check`、`make kernel`、guest ABI 回归已运行通过；后两项本轮未独立核验日志，不虚构断言数量或退出码。
+- 证据目录：`/tmp/dm-ktest-20261019.u8QPBZ/`，各组有独立 command/serial 日志；临时目录不保证永久保存。`tracked.patch` 不包含当时未跟踪的新 C 文件。
+- 本轮导入遗漏（Vec、DmControlFile、IoEvents、Pollable）已修复后通过 check。文档更新后未重跑完整 check，不把早先结果说成覆盖最后文档。
+- 2026-10-16 V5 core 265/265、C 回归及系统套件结果仅为历史证据，见 [10 月 16 日](../log/daily/2026-10-16.md)。今天没有重跑 dmsetup/LVM/NixOS 全套集成，也没有运行完整 `make ktest`。
 
-## 工作区边界
+## 4. 当前测试入口
 
-dm 在 main（`77ee3b196`）之上的提交序列（SHA 为 0.19.0 线性重放后的现值；原 `6b1b24026` 起的序列已随重放改写）：
+全部在 `fork_Asterinas` 容器内串行执行。
 
-| commit | 内容 |
-|---|---|
-| `d20886cf0` | ext2 落盘空闲块计数一致性修复。 |
-| `f1e4a3fb1` | `DM_LIST_DEVICES` 支持 `DM_UUID_FLAG`。 |
-| `427bc8784` | 块设备经 `CREATES_DEVNODE` opt-out 接入设备模型。 |
-| `aea2bc12e` | `install_osdk` 显式选取活动工具链。 |
-| `74cd7e56c` | `REGRESSION_TESTS` 定向回归接线恢复。 |
-| `e33417f58` | 内核默认构建 release（`RELEASE ?= 1`）。 |
-| `71c00a91d` | DM 系统 suite 结构化运行目录日志。 |
-| `358a5d6d5` | cargo-udeps 补丁归档与历史日志拼写修正。 |
-| `e741a6042` | CLAUDE.md 文档更新时机规则。 |
-| `8e95d775d` / `be418c5dc` / `f787680ed` / `726398086` | 文档与锁文件收尾：指南与日志同步、PR 2 描述归档、Cargo.lock 归一、10-13 日志与同步策略固化。 |
+```bash
+cd /root/asterinas/kernel/core/comps/block
+cargo osdk test aster_block::bio::tests
+cargo osdk test aster_block::request_queue::tests
 
-- 未跟踪的构建产物、其他文档和来源不明改动不删除、不格式化、不暂存。
-- 保留物不删除：`target/nixos/asterinas.img`、`target/nixos/failed-root-MdBL2F/`、`target/nixos/pre-ext2-fix-OEsCVh/`、`/tmp/dm-nixos-recovery-M7gkiV/`、`/tmp/lvmsrc-dl/`。
+cd /root/asterinas/kernel/core/comps/device-mapper
+cargo osdk test aster_device_mapper::device::tests
+cargo osdk test aster_device_mapper::table::tests
 
-## 阅读顺序
+cd /root/asterinas/kernel/core
+cargo osdk test --kcmd-args=earlycon aster_core::device::misc::dm_control::tests::ioctl
+
+cd /root/asterinas
+make run_kernel AUTO_TEST=regression REGRESSION_TESTS="device/device_mapper_control device/device_mapper_lifecycle device/device_mapper_table"
+```
+
+- 当前 OSDK `test_matches_whitelist` 已支持模块路径；旧“模块 selector 必匹配空集”说明不适用于当前树。仍必须核对非零实际匹配数，每次立即保存根目录 `qemu-serial.log`，下一次运行会覆盖。
+- ABI 三个程序分别为 control 13、lifecycle 7、table 5 个场景。原 24 个场景保留，新增 poll 后共 25 个；场景数不是断言数量。旧 `device_mapper`/`device_mapper_version` 即使残留二进制也不是当前验收入口。
+- 最终验收为 `make check`、`make kernel`、相关定向 ktest；涉及 ABI 加 C 回归，工具流程按影响选择系统套件，不默认完整 ktest。
+- 区分编译失败、guest 启动失败、测试失败。已观察到且未阻止测试完成的 ermsb/GRUB/CPU/video/IOMMU 环境提示留作备注，不仅凭 warning/error 字样中断；真实失败、阻塞或影响不明的新问题仍如实报告，不隐瞒。
+
+## 5. 后续边界
+
+- 不自动扩大到全局 poll、DM-on-DM、deferred remove、queue stacking、udev/sysfs 自动化或新 target；分别核对缺失依赖后由用户决定。
+- Book/SCML 兼容性说明仍是后续文档项，本轮没有更新。旧 PR 档案和其他手册可能滞后，不能把历史验证当作当前通过。
+- 普通 VFS rename、完整 mount source 路径和 procfs 的直接覆盖缺口保留，不以相邻模块通过替代。
+- 不修改 KVM、RELEASE、QEMU、NixOS 启动协议或 `myshell/br.sh`，除非用户明确要求。系统 suite 启动已有镜像，不自动重建内核，须确认来源与 profile。
+- 上游同步继续遵守 AGENTS.md：main 纯快进、按影响做基线、dm 安全引用与线性 rebase，不创建 merge；已推送未合并 PR 不随 dm 自动重放。
+- 未知改动和构建产物不清理。历史根盘/排障保留物（包括 `target/nixos/asterinas.img`、`target/nixos/failed-root-MdBL2F/`、`target/nixos/pre-ext2-fix-OEsCVh/`、`/tmp/dm-nixos-recovery-M7gkiV/`、`/tmp/lvmsrc-dl/`）不因本次交接自动删除；是否仍存在须实查。
+
+## 6. 接手顺序与记录规则
 
 [CLAUDE.md](../CLAUDE.md) / [AGENTS.md](../AGENTS.md)
 → 本交接
 → [项目状态](../log/device-mapper-progress.md)
-→ [PR 规范](pull_request.md) / [上游同步](upstream-sync.md)
-→ [当日日志](../log/daily/2026-10-16.md)。
+→ [今日日志](../log/daily/2026-10-19.md)
+→ 按任务阅读源码与历史 PR 档案。
 
-QEMU、ktest、C 回归和 NixOS 测试必须串行；遇失败、环境阻塞或未预期 warning 先报告并讨论。
-不覆盖来源不明改动，不自动提交或 push。
+接手先核对分支、HEAD 和工作区，不自动切分支、提交或 push。阶段中只汇报进度，验证完成后经授权集中更新文档。每日新增“协作复盘与心得”，记录得到验证的判断、需纠正的认识与下次改进，不重复清单、不虚构经验。

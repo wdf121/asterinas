@@ -36,6 +36,8 @@
 | ✅ **suspend、reload、resume、即时 remove** | Linux DM 管理 active/inactive table、suspend/resume、table replacement 和 mapper remove。 | ✅ 实现 drain reload、`--noflush` postponed replay、即时 remove 和失败回滚/隔离。<br><br>**生产文件：**<br>device.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/workflow.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/runtime.rs<br>/root/github/asterinas/<br>kernel/core/src/device/registry/block.rs |
 | ✅ **显式恢复与受控重启恢复** | 恢复可分为 LVM scan/activation、文件系统重放、后端错误恢复，以及多副本/磁盘故障恢复等层次。 | ✅ 当前范围是显式 LVM scan/activation 与受控重启后的 mapper/LV 恢复。<br><br>**生产文件：**<br>device.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/workflow.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/runtime.rs |
 
+**控制事件边界（2026-10-19）：**控制 fd 的 `poll` 当前返回空，不再恒报 IN/OUT；完整 Linux 机制仍需要全局事件计数、等待队列、每打开文件事件基准及 `DM_DEV_ARM_POLL`，属于 P7 未实现能力。已有单设备 `DM_DEV_WAIT` 不等于全局 poll。
+
 ## 4. 依赖绕过与当前运行模式
 
 | 依赖或运行模式 | 标准 Linux / 发行版职责 | Asterinas 当前做法与定位 |
@@ -106,10 +108,10 @@
 | 层级 | 验证方向与边界 |
 |---|---|
 | **Rust ktest** | **验证方向：**target/table/state/BIO 等内核内部不变量。<br><br>**代表入口：**在 `kernel/core/comps/device-mapper` 执行 `cargo osdk test`。<br><br>**不负责：**raw ioctl ABI、devtmpfs path、LVM2 编排、文件系统用户态行为。 |
-| **Initramfs C 回归** | **验证方向：**raw `open/ioctl/mount/devtmpfs/errno` 用户态 ABI。<br><br>**代表入口：**`REGRESSION_TESTS=device/device_mapper`。<br><br>**不负责：**Rust 内部并发组合、target 数据面、LVM2 编排。 |
+| **Initramfs C 回归** | **验证方向：**raw `open/ioctl/mount/devtmpfs/errno` 用户态 ABI。<br><br>**代表入口：**`REGRESSION_TESTS="device/device_mapper_control device/device_mapper_lifecycle device/device_mapper_table"`。<br><br>**不负责：**Rust 内部并发组合、target 数据面、LVM2 编排。 |
 | **NixOS DM suite** | **验证方向：**dmsetup/LVM2、实盘 I/O、PV/VG/LV、文件系统和恢复。<br><br>**代表入口：**`myshell/run_dm_system_tests.sh --<suite>`。<br><br>**不负责：**内核内部失败分支、每个 ioctl buffer 边界、driver fault injection。 |
 
-默认选择规则：DM crate 改动先运行完整 DM ktest，再按观察面追加 C 回归或 NixOS suite。为承接现有 DM 功能而改动框架时，不默认新增框架专项测试；只有框架问题造成 DM 可见失败、数据风险或阻塞新 target 时，才确认最小所有者范围并补定向测试或用户态回归。
+默认选择规则：最终验收以 `make check`、`make kernel` 与相关定向 ktest 为基础，不默认完整 `make ktest`；涉及用户态 ABI 加 C 回归，涉及工具流程再按影响选择系统套件。影响面难以限定时先讨论扩大范围。记录实际匹配数与退出码，零匹配不算通过。“回归”是测试目的，不是另一种执行位置。
 
 ## 9. 维护规则
 
@@ -121,7 +123,7 @@
 
 ## 10. 修复日志
 
-> 当前阶段：2026-10-16 V5 优化按用户确认收尾；验证证据见[当日日志](../log/daily/2026-10-16.md)。根盘问题待定，不阻塞本阶段，不新增通用文件系统修复目标。
+> 当前阶段：2026-10-19 完成 PR 审查收益的局部 dm 回补与定向验证，代码已分点本地提交，未推送；证据见[当日日志](../log/daily/2026-10-19.md)。V5 历史收尾见 [10 月 16 日](../log/daily/2026-10-16.md)。根盘问题继续待定，不重启通用文件系统排障。
 
 ### 10.1 第五版：已批准的当前修复
 
@@ -177,3 +179,4 @@
 | 2026-10-10 | LVM2 的 `dmsetup ls --uuid` 类查询被拒，`--linear-integration` 首层失败。 | `DM_UUID_FLAG` 仅允许 `DM_DEV_RENAME_CMD` 携带，`DM_LIST_DEVICES_CMD` 返回 `EINVAL`，且不输出扩展记录布局。 | 放宽为 rename 与 list 均可携带该标志；`DM_LIST_DEVICES_CMD` 按标志输出紧凑/扩展两种记录布局。 | 当日套件仍因 sysfs 第二层根因失败；修复正确性由 2026-10-12 `--linear-integration` 全套通过覆盖验证。 | `3615118bb` |
 | 2026-10-10 | 新建 release NixOS 根盘有序关机后 `e2fsck -fn` 返回 4：块组 0 空闲块计数与位图统计不一致。 | ext2 `sync_all` 逐组同步后立即持久化计数，其后的 inode 写回仍可能改变其它组的分配状态，落盘计数与位图脱节。 | 最终元数据遍历持有超级块写锁冻结分配，锁内刷新各组位图与描述符快照后统一持久化计数；新增 4 个确定性 ktest 用例先复现失败再转绿。 | ext2 模块 ktest 15/0；release 根盘端到端复验（启动前后 `e2fsck -fn` 均 0）；`--control-plane` 套件复验通过。 | `65c650435` |
 | 2026-10-12 | upstream 设备模型创建空 `/sys/dev/block`，LVM2 sysfs filter 拒绝一切块设备，`--linear-integration` 第二层失败。 | 块设备从未注册进设备模型；块类 `/dev` 节点由 registry 自行发布，设备模型无法感知。 | 引入 `CREATES_DEVNODE` 类属性 opt-out，`SelfPublishingBlock` 将块设备接入设备模型：opt-out 设备仍获 `/sys/dev/<kind>/<major>:<minor>` 索引项，模型不创建、不在 teardown 时删除其节点。 | core DM ioctl ktest 81/0；`--linear-integration` 完整套件五次真实运行全部 PASS。 | `535727967` |
+| 2026-10-19 | 控制 fd 无事件时恒报 IN/OUT，可能让用户态事件循环持续立即返回。 | poll 直接返回请求 mask 中的 IN/OUT，未关联事件状态。 | 暂无全局事件支持时返回空，补内核及 C ABI 测试；不宣称完整 Linux poll/ARM_POLL 支持。 | 完整 check、control ioctl 定向 ktest 通过，新增 poll 实际执行；用户反馈 kernel/guest ABI 通过，后两项未独立核验日志。详见当日日志。 | `981294ef5`，未推送 |

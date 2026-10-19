@@ -118,6 +118,21 @@ git diff --check
 git status --short
 ```
 
+### 最终验证标准
+
+- 每个改动的最终验收以 `make check`、`make kernel` 和相关定向 ktest 为基础；
+  局部格式检查、静态检查或单个测试通过不能替代最终验收。
+- 定向 ktest 应覆盖新增或修改的内核行为及受影响调用链。执行前说明改动与
+  测试入口的对应关系；无现成测试或不适用的项目须明确记录覆盖缺口或原因。
+- 涉及用户态 ABI 的改动还需运行相应 C 用户态 ABI 回归；涉及 dmsetup/LVM
+  等完整用户空间流程时，按影响范围补充用户工具集成测试。
+- 完整 `make ktest` 提供更广覆盖，但不默认每次执行；影响面难以限定或需要
+  更广验收时，先与用户确认范围，再运行。
+- 测试串行执行，记录源码快照、实际命令、匹配数量、结果和退出码；零匹配
+  不算通过。区分用户反馈与独立日志核验，未执行或未完成的项目不得标记为通过。
+- “内核内部测试（ktest）”“C 用户态 ABI 测试”“用户工具集成测试”按执行位置
+  和验证边界区分；“回归”表示测试目的，不是另一种执行位置。
+
 Run targeted ktests from the target Cargo crate directory. Use the module `::tests`
 selector to run all tests in that module:
 
@@ -281,6 +296,9 @@ Project logging rules:
 - Restart stage numbering from 1 each day.
 - Log by small stage in this order: background, changes, tests.
 - Do not split logs by “production code / ktest”.
+- 每日日志增加“协作复盘与心得”：由 Claude 基于当天实际工作总结得到验证的
+  判断、需要纠正的认识，以及下次可执行的改进；区分事实与反思，不重复工作
+  清单、不虚构经验，没有新认识时简写，不为固定篇幅凑内容。
 - Record actual engineering, learning, analysis/review, validation, failures, and
   conclusions. Do not present discussion or unexecuted plans as completed work.
 - After every verified bug fix, append one factual row to the `修复日志` table
