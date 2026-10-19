@@ -53,6 +53,10 @@ impl Bio {
     /// The `segments` describes the memory segments.
     /// The `complete_fn` is the optional callback function that will be invoked
     /// when the I/O is completed, receiving the final `BioStatus`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the total sector count or the end sector overflows `u64`.
     pub fn new(
         type_: BioType,
         start_sid: Sid,
@@ -265,6 +269,7 @@ impl From<BioEnqueueError> for Error {
 /// The request queue of a block device only accepts `SubmittedBio`s into the queue.
 pub struct SubmittedBio {
     metadata: Arc<BioMetadata>,
+    /// The current mapped range, with the same length as this BIO's range in `metadata`.
     mapped_sid_range: Range<Sid>,
     complete_fn: Option<BioCompleteFn>,
     segments: Vec<BioSegment>,
@@ -287,12 +292,7 @@ impl SubmittedBio {
     ///
     /// Returns `Refused` without changing the mapping if the new end overflows.
     pub fn remap_sid_start(&mut self, new_start: Sid) -> Result<(), BioEnqueueError> {
-        let length = self
-            .mapped_sid_range
-            .end
-            .to_raw()
-            .checked_sub(self.mapped_sid_range.start.to_raw())
-            .ok_or(BioEnqueueError::Refused)?;
+        let length = self.mapped_sid_range.end.to_raw() - self.mapped_sid_range.start.to_raw();
         let new_end = new_start
             .to_raw()
             .checked_add(length)
@@ -929,6 +929,42 @@ mod tests {
             segments: Vec::new(),
             completes_as_io_error_on_drop: false,
         }
+    }
+
+    #[ktest]
+    fn offset_mapped_sid_range_uses_remapped_start() {
+        let mut bio = submitted_bio(10, 18);
+
+        bio.remap_sid_start(Sid::new(100)).unwrap();
+        bio.offset_mapped_sid_range(1_000).unwrap();
+
+        assert_eq!(bio.sid_range(), &(Sid::new(1_100)..Sid::new(1_108)));
+        assert_eq!(bio.metadata.sid_range(), &(Sid::new(10)..Sid::new(18)));
+    }
+
+    #[ktest]
+    fn offset_mapped_sid_range_rejects_end_overflow_without_changing_range() {
+        let mut bio = submitted_bio(u64::MAX - 8, u64::MAX);
+        let original = bio.sid_range().clone();
+
+        assert_eq!(
+            bio.offset_mapped_sid_range(1),
+            Err(BioEnqueueError::Refused)
+        );
+        assert_eq!(bio.sid_range(), &original);
+    }
+
+    #[ktest]
+    fn remap_sid_start_accepts_max_end() {
+        let mut bio = submitted_bio(10, 18);
+
+        bio.remap_sid_start(Sid::new(u64::MAX - 8)).unwrap();
+
+        assert_eq!(
+            bio.sid_range(),
+            &(Sid::new(u64::MAX - 8)..Sid::new(u64::MAX))
+        );
+        assert_eq!(bio.metadata.sid_range(), &(Sid::new(10)..Sid::new(18)));
     }
 
     #[ktest]

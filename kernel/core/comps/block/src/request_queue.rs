@@ -263,6 +263,54 @@ mod tests {
     }
 
     #[ktest]
+    fn merges_remapped_data_bio_at_front() {
+        let queue = BioRequestSingleQueue::new();
+        let mut first = write_bio(10);
+        let mut second = write_bio(20);
+        first.remap_sid_start(Sid::new(101)).unwrap();
+        second.remap_sid_start(Sid::new(100)).unwrap();
+
+        queue.enqueue(first).unwrap();
+        queue.enqueue(second).unwrap();
+
+        assert_eq!(queue.num_requests(), 1);
+        let request = queue.dequeue();
+        assert_eq!(request.sid_range(), &(Sid::new(100)..Sid::new(102)));
+
+        let mut bios = request.bios();
+        assert_eq!(
+            bios.next().unwrap().sid_range(),
+            &(Sid::new(100)..Sid::new(101))
+        );
+        assert_eq!(
+            bios.next().unwrap().sid_range(),
+            &(Sid::new(101)..Sid::new(102))
+        );
+        assert!(bios.next().is_none());
+    }
+
+    #[ktest]
+    fn does_not_merge_noncontiguous_remapped_data_bios() {
+        let queue = BioRequestSingleQueue::new();
+        let mut first = write_bio(10);
+        let mut second = write_bio(11);
+        first.remap_sid_start(Sid::new(100)).unwrap();
+        second.remap_sid_start(Sid::new(200)).unwrap();
+
+        queue.enqueue(first).unwrap();
+        queue.enqueue(second).unwrap();
+
+        assert_eq!(queue.num_requests(), 2);
+        let first_request = queue.dequeue();
+        assert_eq!(first_request.sid_range(), &(Sid::new(100)..Sid::new(101)));
+        assert_eq!(first_request.bios().count(), 1);
+        let second_request = queue.dequeue();
+        assert_eq!(second_request.sid_range(), &(Sid::new(200)..Sid::new(201)));
+        assert_eq!(second_request.bios().count(), 1);
+        assert_eq!(queue.num_requests(), 0);
+    }
+
+    #[ktest]
     fn merges_contiguous_range_bios_without_segments() {
         let queue = BioRequestSingleQueue::with_max_nr_segments_per_bio(0);
         queue
@@ -294,7 +342,17 @@ mod tests {
         assert_eq!(queue.num_requests(), 1);
         let request = queue.dequeue();
         assert_eq!(request.sid_range(), &(Sid::new(100)..Sid::new(102)));
-        assert_eq!(request.bios().count(), 2);
+
+        let mut bios = request.bios();
+        assert_eq!(
+            bios.next().unwrap().sid_range(),
+            &(Sid::new(100)..Sid::new(101))
+        );
+        assert_eq!(
+            bios.next().unwrap().sid_range(),
+            &(Sid::new(101)..Sid::new(102))
+        );
+        assert!(bios.next().is_none());
     }
 
     #[ktest]
