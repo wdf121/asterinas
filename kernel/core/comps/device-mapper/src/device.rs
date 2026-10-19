@@ -623,7 +623,7 @@ impl Debug for DmDevice {
 
 #[cfg(ktest)]
 mod tests {
-    use alloc::{boxed::Box, string::ToString, vec};
+    use alloc::{boxed::Box, string::ToString, vec, vec::Vec};
 
     use aster_block::{
         BlockDeviceLease, allocate_major,
@@ -669,11 +669,15 @@ mod tests {
         }
 
         fn complete(&self) {
+            self.complete_with(BioStatus::Complete);
+        }
+
+        fn complete_with(&self, status: BioStatus) {
             self.submitted
                 .lock()
                 .take()
                 .expect("deferred backing has no submitted BIO")
-                .complete(BioStatus::Complete);
+                .complete(status);
         }
     }
 
@@ -760,6 +764,115 @@ mod tests {
             .unwrap(),
         );
         (device, table)
+    }
+
+    /// Constructs a four-sector read and records each user completion.
+    fn recorded_read(start: u64, completions: &Arc<Mutex<Vec<BioStatus>>>) -> Bio {
+        let completions = completions.clone();
+        Bio::new(
+            BioType::Read,
+            Sid::new(start),
+            vec![BioSegment::alloc_exact(
+                1,
+                4 * aster_block::SECTOR_SIZE,
+                BioDirection::FromDevice,
+            )],
+            Some(Box::new(move |status| completions.lock().push(status))),
+        )
+    }
+
+    #[ktest]
+    fn public_submission_maps_and_completes_once() {
+        for status in [BioStatus::Complete, BioStatus::IoError] {
+            let (device, _) = create_device_and_table();
+            let backing = DeferredBlockDevice::new();
+            let table = Arc::new(
+                DmTable::new_single_linear(
+                    Sid::new(0),
+                    128,
+                    Sid::new(16),
+                    BlockDeviceLease::new_untracked(backing.clone() as Arc<dyn BlockDevice>),
+                )
+                .unwrap(),
+            );
+            device.load_table(table);
+            device.resume().unwrap();
+            let completions = Arc::new(Mutex::new(Vec::new()));
+            let mut batch = io_util::batch::IoBatch::with_capacity(1);
+
+            recorded_read(7, &completions)
+                .submit(device.as_ref(), &mut batch)
+                .unwrap();
+            assert_eq!(batch.len(), 1);
+            assert!(completions.lock().is_empty());
+            assert_eq!(device.io.in_flight.load(Ordering::Acquire), 1);
+            {
+                let submitted = backing.submitted.lock();
+                let bio = submitted.as_ref().unwrap();
+                assert_eq!(bio.sid_range(), &(Sid::new(23)..Sid::new(27)));
+                assert_eq!(bio.segments().len(), 1);
+            }
+
+            backing.complete_with(status);
+            assert_eq!(*completions.lock(), vec![status]);
+            assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
+            assert_eq!(batch.wait_all().is_ok(), status == BioStatus::Complete);
+            assert_eq!(*completions.lock(), vec![status]);
+        }
+    }
+
+    #[ktest]
+    fn public_submission_rejection_does_not_complete() {
+        let (device, _) = create_device_and_table();
+        let table = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(16),
+                BlockDeviceLease::new_untracked(Arc::new(RejectingBlockDevice)),
+            )
+            .unwrap(),
+        );
+        device.load_table(table);
+        device.resume().unwrap();
+        let completions = Arc::new(Mutex::new(Vec::new()));
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+
+        assert_eq!(
+            recorded_read(7, &completions).submit(device.as_ref(), &mut batch),
+            Err(BioEnqueueError::Refused)
+        );
+        assert!(batch.is_empty());
+        assert!(completions.lock().is_empty());
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[ktest]
+    fn public_submission_out_of_range_never_reaches_backing() {
+        let (device, _) = create_device_and_table();
+        let backing = DeferredBlockDevice::new();
+        let table = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(16),
+                BlockDeviceLease::new_untracked(backing.clone() as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+        );
+        device.load_table(table);
+        device.resume().unwrap();
+        let completions = Arc::new(Mutex::new(Vec::new()));
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+
+        assert_eq!(
+            recorded_read(125, &completions).submit(device.as_ref(), &mut batch),
+            Err(BioEnqueueError::Refused)
+        );
+        assert!(!backing.has_submitted_bio());
+        assert!(batch.is_empty());
+        assert!(completions.lock().is_empty());
+        assert_eq!(device.io.in_flight.load(Ordering::Acquire), 0);
     }
 
     #[ktest]
