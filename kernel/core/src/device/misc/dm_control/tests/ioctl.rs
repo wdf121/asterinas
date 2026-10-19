@@ -3,6 +3,20 @@
 //! Ioctl envelope, identity selectors, flags, and user-copy failure contracts.
 
 use super::*;
+use crate::{device::misc::dm_control::DmControlFile, events::IoEvents, process::signal::Pollable};
+
+#[ktest]
+fn control_without_events_is_not_ready() {
+    let file = DmControlFile;
+    for mask in [
+        IoEvents::empty(),
+        IoEvents::IN,
+        IoEvents::OUT,
+        IoEvents::IN | IoEvents::OUT,
+    ] {
+        assert_eq!(file.poll(mask, None), IoEvents::empty());
+    }
+}
 
 #[ktest]
 fn rejects_invalid_names_before_identity_changes() {

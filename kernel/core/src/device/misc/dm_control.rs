@@ -103,8 +103,9 @@ impl Device for DmControlDevice {
 struct DmControlFile;
 
 impl Pollable for DmControlFile {
-    fn poll(&self, mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
-        mask & (IoEvents::IN | IoEvents::OUT)
+    fn poll(&self, _mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
+        // Global control events are not implemented; do not report spurious readiness.
+        IoEvents::empty()
     }
 }
 
