@@ -4,7 +4,7 @@
 >
 > **职责边界**：每个已实际制备的 PR 的技术细节、Git 元数据、验证证据和英文 maintainer 描述记录在 [`log/PR/`](../log/PR/)；日报只记录当天发生的操作与结论。
 >
-> **最后更新**：2026-10-09。
+> **最后更新**：2026-10-20（PR3 更新为 `5b08f9a0a`；PR4 仅重建分支，暂不推进；历史章节保留当时记录）。
 
 ## 1. 规范
 
@@ -45,9 +45,10 @@
 
 | 顺序 | 验证方法 | 要求 |
 |---|---|---|
-| 1 | `make check` | 包含格式、lint、依赖和拼写等静态检查，不另列重复的格式检查步骤。 |
-| 2 | `make kernel` | 确认裁剪后的 PR 可独立构建普通内核；默认 dev，不称为 release 验收。 |
-| 3 | 目标 crate 中的 `cargo osdk test …` | 定向覆盖 PR 新增、修改及受接口/语义变化影响的路径；selector 按该分支实际测试模块选择。 |
+| 1 | `make format` | 固定前置步骤；检查格式化 diff，不混入范围外改动。它会修改文件，不是测试通过证据。 |
+| 2 | `make check` | 格式、lint、依赖和拼写等静态检查。 |
+| 3 | `make kernel` | 确认裁剪后的 PR 可独立构建普通内核；记录实际 profile，不凭命令名断言 dev/release。 |
+| 4 | 目标 crate 中的 `cargo osdk test` | 进入含目标 Cargo.toml 的目录，默认无函数筛选跑该 crate 全部 ktest，至少覆盖相关文件；core 加 `--kcmd-args=earlycon`。 |
 | 按需 | C ABI 或系统测试 | 涉及 syscall/ioctl、用户工具工作流时补对应层，不要求每个 PR 全部运行。 |
 
 例如，仅含 block BIO 映射的 PR 验证相关 block 测试，不要求运行尚未进入该 PR 的 DM 测试。
@@ -56,7 +57,7 @@
 完成要求：
 
 - 构建与测试串行；选定检查全部成功，定向测试实际匹配并执行，零匹配或内部跳过不能证明目标路径通过。没有直接测试的改动明确记录覆盖缺口。
-- 格式失败先按授权范围修复，再运行 `make check`；失败、环境阻塞或未预期 warning 出现时先停止并讨论，不扩大验证范围。
+- 格式失败先按授权范围修复，再运行 `make check`；真实失败、阻塞或影响不明的问题须报告。已确认不影响构建/测试的环境提示留作备注，不仅凭 warning/error 字样中断。
 - 测试实际读取的源码必须与候选 tree 一致，不得依靠未暂存或未跟踪的辅助实现；提交后确认 `HEAD^{tree}` 与已验证候选 tree 相同。
 - PR 简化或适配特有的问题在 PR 分支修复并验证；完整 dm 也存在的共有生产问题先在 dm 修复并验证，再迁移。不得要求将简化版本反向移入 dm，也不得把未验证的适配表述为已由 dm 验证。
 - 记录分支、base、候选 tree、最终 SHA、配置、实际命令、匹配/通过/失败数量、退出码与日志；后续源码或 base 改变时重新判断影响并补跑相应验证。
@@ -87,63 +88,142 @@
 
 PR 1 的当前 Git branch 为 `mapped-bio-ranges`；文档中的稳定编号统一为 **PR 1**。
 
-## 3. PR 2—4：最小 Device Mapper 交付路线
+## 3. PR 2–8：渐进交付路线
 
-本路线取代此前通用 lease、runtime/VFS、完整 DM 生命周期的九份 PR 规划。目标是尽量沿用 Asterinas 既有框架，先交付简单且正确的 DM；不按完整 dm 的文件布局直接拆包。不为 PR 4 之后的能力预分编号。
+> 2026-10-19 初步规划。PR1–PR3 为已实际制备的本地提交；PR4–PR8 是待逐份源码核对和复审的方向，不是已经实现、验证或固定不变的承诺。本节只规划交付边界，不是 PR4 执行计划。第 5 节及历史档案保留当时事实，不能替代当前状态；最新验证见 [今日日志](../log/daily/2026-10-19.md)。
+
+旧路线把创建与表加载放在 PR3；实际 PR3 交付公共控制入口，以 `DM_VERSION` 为首个命令，普通配置命令仍未实现。2026-10-20 已补齐“先版本握手、后拒绝未知命令”的公共入口约束，不能再把 VERSION 成功作为入口的唯一验收标准。因此由 PR4 补齐最小控制配置，首次激活目标移至 PR5；不沿用不存在的前置能力。最新 PR3 证据见 [10 月 20 日日志](../log/daily/2026-10-20.md)。
 
 ```text
-最新已核对 main + PR 1 mapped BIO ranges
-  → PR 2 最小单段 linear 数据面
-  → PR 3 最小控制设备与配置接口
-  → PR 4 首次激活与用户态块设备读写闭环
+PR1 mapped BIO ranges
+  → PR2 固定单段 linear 数据面
+  → PR3 控制设备与版本握手
+  → PR4 创建、单段 linear 配置与未激活清理
+  → PR5 首次激活与用户态块设备读写
+  → PR6 已激活设备的安全删除
+  → PR7 挂起、排空与在线换表
+  → PR8 查询、身份与单设备事件管理
 ```
 
-各阶段先线性更新前置链，再制备下一份 PR。PR 1 历史 SHA 与验证不因路线更新而改变；是否合入、更新或重新验证以实际操作为准。
+**路线原则：**
 
-### 3.1 PR 2：最小 linear 数据面
+- 每份有独立可观察结果与失败路径测试；按职责拆，不按完整 dm 的文件布局拆包。
+- 编号表示推荐交付顺序，不证明依赖已满足。若某项是前一份正确性的必要条件，必须前移或调整拆分，不能为守编号而延迟保护。
+- 本轮不启动 main 同步、前置 PR 重放或推送。实际制备时核对 main/前置 SHA，是否更新按授权及既有同步规则处理，不自动重放已推送未合并 PR。
+- 计划中的命令/flags 均需制备时对照指定 Linux 源码确定；不预先承诺所有 errno、顺序或 dmsetup/LVM 兼容。
+- 当前本地前置链为 `77ee3b196` → `2f4fdc9a7` → `fd97f023f` → `5b08f9a0a`。本次未推送；PR1 在 10 月 19 日曾推送中间版本，不等于当前整条链已推送。
 
-建议标题：`dm: add a minimal linear mapping component`；建议分支：`dm-linear-io-path`。
+### 3.1 PR2：固定单段 linear 数据面（已制备）
 
-- 新增独立 DM component，实现单个 backing、固定偏移和长度、创建后不可变的单段 linear 映射及 BlockDevice 接口。
-- 支持 read/write/flush，检查零长度、算术溢出、backing 容量和请求越界；正确传播提交失败与完成状态。
-- 复用 PR 1 的 mapped BIO range；单段路径优先直接转发原 SubmittedBio，不引入拆分、子 BIO 聚合或通用 target 插件框架。
-- 使用既有块设备引用机制，不引入通用 BlockDeviceLease。必须核对 mapper/backing/在途请求的所有权；Arc 仅保证对象存活，不是注册保护、热拔插保护或 I/O 成功保证。
-- 不接 ioctl、设备节点、动态注册管理、在线换表、删除、多段映射、striped、zero/error、discard/zeroout。
-- 验收：偏移读写、容量与请求边界、flush、后端拒绝/错误、延迟完成及必要生命周期测试；make check、make kernel 和相关 block/DM 定向 ktest。在内核测试中可构造 mapper，不宣称用户态可创建。
+分支 `dm-linear-io-path`，当前本地 `fd97f023f`。
 
-### 3.2 PR 3：最小控制与配置
+- 单 backing、固定偏移和扇区数量、不可变单段 linear；`DmDevice` 提供 BlockDevice 接口。
+- 复用 PR1 mapped BIO range，直接转发原 SubmittedBio；支持 read/write/flush，校验容量、请求范围和溢出。
+- 没有控制对象管理、节点发布、动态表、BIO 拆分或通用 lease。
+- 已补公开提交契约测试；测试源码存在不等于已运行，PR 分支最终验证证据单独记录。
 
-建议标题：`dm: add the initial device-mapper control interface`。
+### 3.2 PR3：控制设备与版本握手（已制备）
 
-- 复用既有字符设备机制接入 /dev/mapper/control，采用 Linux DM ABI 的明确子集，不另造临时协议。
-- 提供必要的版本查询、无表对象创建、单段 linear 表加载、状态查询及未激活对象清理；具体 ioctl/flags 清单在制备时确认。
-- 校验用户内存、头部长度、偏移、字符串、权限与名称冲突；加载失败不得破坏既有有效配置。
-- 不发布可读写 mapper 节点，不提供已激活设备删除、rename、WAIT 或完整 dmsetup/LVM2 兼容声明。协议版本与 flags 不照搬完整 dm 的承诺。
-- 验收：控制路径定向 ktest 和 C ABI 创建/加载/查询/清理及非法输入测试；仍执行 check/kernel。
+分支 `dm-control-interface`，当前本地 `5b08f9a0a`，替代 `f662bdc2d`，本次未推送。
 
-### 3.3 PR 4：首次激活与用户态访问
+- 注册 `/dev/mapper/control`，提供公共权限/type/版本/分派入口，以 `DM_VERSION` 为首个命令；逐次检查 initial user namespace 的 CAP_SYS_ADMIN。
+- 版本只访问 12 字节，major/minor 兼容规则及 copyout 优先级保持；正确 DM type 的未知命令也先握手，再返回 ENOTTY。
+- 控制文件统一命名 `dm_control.rs`，与完整 dm 命名一致，但不提前复制其子模块；poll 不伪报就绪。
+- 不具备创建、加载、查询、激活或删除，尚不实现普通参数复制及全局控制事件。入口通用不等于已实现完整 DM。
+- Rust 共 5 个 ktest，C 共 7 个 FN_TEST；用户反馈 C 回归已跑完，本次最终 check/kernel/ktest 的日志、计数未归档，不能沿用旧树通过结论。
+- 详见 [PR3 档案](../log/PR/PR-3-control-interface.md) 与 [控制面 ABI](control_ABI.md)。
 
-建议标题：`dm: activate linear mappings and expose block devices`。
+### 3.3 PR4：最小创建与 linear 配置（拟制备）
 
-- 将已加载表首次激活，通过既有 block registry 注册 mapper，完成用户态打开、读写和 flush。
-- 优先核实已有设备节点机制或用户态 mknod 是否足够；此接入方式尚未确认，不宣称已有实现可直接满足。不为自动维护 /dev/mapper/<name> 别名预先引入通用节点事务。
-- 激活失败必须可清理或重试，不能留下错误注册。成功激活设备暂按长期存在对象管理，明确拒绝尚不支持的在线换表、挂起和删除。
-- 不要求完整 udev/uevent、LVM2、多 PV 或多 target。先以 C 程序验证 ABI，再实测 dmsetup 最小命令的额外要求，不为工具兼容盲目扩展范围。
-- 验收：真实 backing 上创建/加载/激活/读写/flush，核对对应偏移数据和映射外数据不变；覆盖重复激活、失败回滚和后端错误。执行 check/kernel、定向 ktest 和用户态回归。
+建议标题：`Add Device Mapper creation and linear table configuration`。
+建议分支：`dm-linear-configuration`。2026-10-20 已删除无独有提交的旧同名分支，并从 `5b08f9a0a` 重建；目前与 PR3 无差异，用户要求先记录 PR3，暂不推进实现。
+
+**目标闭环：**打开控制 fd → 创建无表对象 → 加载单段 linear 待激活配置 → 查询状态 → 清理未激活对象。
+
+- 候选命令：`DM_DEV_CREATE`、`DM_TABLE_LOAD`、`DM_DEV_STATUS`、未激活对象的 `DM_DEV_REMOVE`；沿用版本握手。
+- 区分控制对象与 PR2 已具备固定 target 的数据面设备；不能强迫无表对象提前拥有有效 target。选择满足本阶段且可承接首次激活的最小结构，不复制完整状态机。
+- 只加入实际命令所需的用户内存、固定头/载荷、字符串、flags、权限、身份冲突与表边界处理。加载失败不得破坏已有有效配置；待激活表替换和清理的语义制备时明确。
+- backing 查找方式、身份分配、引用持有与释放必须追清现有框架；Arc 不等于注册/移除保护。尚未支持的 backing/flags 必须明确处理，不静默接受无法实现的行为。
+- **不包含：**可读写 mapper 发布、激活、在线换表、挂起、已激活删除、rename、WAIT、多 target、完整 dmsetup/LVM。
+- **验收：**内部对象/表测试，C create/load/status/remove 及非法参数、权限、加载失败保留状态测试；不宣称用户态能打开 mapper 做 I/O。
+
+### 3.4 PR5：首次激活与用户态读写
+
+建议标题：`Activate linear mappings and expose block devices`。
+建议分支：`dm-linear-activation`。
+
+**目标闭环：**PR4 已加载配置 → 首次激活 → 获得块设备访问路径 → 用户态读写与 flush。
+
+- 接入 `DM_DEV_SUSPEND` 的首次 resume/激活语义，不因命令名而同时承诺 suspend 和 replacement。
+- 先核对 block registry、设备号、节点发布及 VFS open 的实际机制；判断既有节点机制或用户态 mknod 是否足够。不为自动 `/dev/mapper/<name>` 别名预先引入通用事务。
+- 激活失败必须回滚或可重试；不得出现无有效表却可接收 I/O 的已发布设备。名称、设备号、backing 引用和在途 BIO 的所有权应明确。
+- 成功激活的对象在此阶段按长期存在管理，明确拒绝未支持的删除、挂起和在线换表；禁止删除能力并不替代 backing 安全性核对。
+- **验收：**真实 backing 上偏移读写、映射外数据不变、容量/边界、flush、重复激活、发布失败和后端错误；先 C ABI，再探测 dmsetup 最小命令额外需求，不为工具便利盲目扩展。
+
+### 3.5 PR6：已激活设备的安全删除
+
+建议标题：`Support safe removal of active Device Mapper devices`。
+建议分支：`dm-safe-removal`。
+
+**目标闭环：**已激活设备 → 拒绝仍被使用的删除 → 释放使用者 → 删除成功 → 不再能通过旧身份打开或提交新 I/O。
+
+- 核对 manager、block registry、VFS 打开文件、挂载引用和在途 BIO 的实际责任，设计删除 admission 与注销顺序。
+- 已打开/已挂载对象的保护不能只看 Arc 强引用数。若既有框架没有可靠的使用者保护，应报告最小前置依赖；不能照搬完整 dm 的通用 lease/VFS 改动，也不能为缩小 PR 提供不安全删除。
+- 并发 open/remove、失败恢复、重复删除、设备号复用和陈旧引用必须纳入审查。支持何种“忙”拒绝及 drain 规则以 Linux 与框架证据确定。
+- **不包含：**deferred remove、remove-all、自动 udev 同步、通用物理热拔插。
+- **验收：**打开占用、关闭后删除、挂载占用（若当前可挂载路径成立）、并发边界、注销故障和资源释放；无覆盖条件的路径明确记为缺口。
+
+### 3.6 PR7：挂起、排空与在线换表
+
+建议标题：`Support Device Mapper suspension and linear table replacement`。
+建议分支：`dm-linear-table-reload`。
+
+**目标闭环：**运行中的单段 linear → 暂存新配置 → suspend/drain → resume 切换 → 新请求访问新映射，旧请求按旧表完成。
+
+- 引入本阶段必要的 active/inactive 表与运行状态，处理 `DM_TABLE_LOAD`、`DM_TABLE_CLEAR`、suspend/resume 的相互作用。
+- 明确新 I/O admission、在途计数、旧表/backing 生命周期、postponed I/O 接收/重放及完成责任，避免丢请求、重复完成或换表期间访问错误地址。
+- 中断、失败回滚、只读表模式及 noflush 等 flags 逐项核对；不把 BIO drain 等同于文件系统 freeze/sync/thaw，也不静默把不同语义合并成一个路径。若所需 freeze 支持缺失，先明确可交付边界再实施。
+- **不包含：**多 target、striped、DM-on-DM；不为了换表先引入 BIO 拆分框架。
+- **验收：**延迟完成、旧请求排空、替换前后数据归属、失败/中断恢复、只读边界，以及对应 C ABI 状态转换。仅 inline completion 不足以证明并发生命周期。
+
+### 3.7 PR8：查询、身份与单设备事件管理
+
+建议主题：补齐已有单段 linear 设备的管理可观察性，支撑有边界的用户工具操作。
+建议分支：`dm-management-queries-events`。
+
+**候选交付：**设备/target 枚举、table/dependency/status 查询，rename/UUID 身份管理，以及 `DM_DEV_WAIT` 单设备事件。
+
+- 查询编码区分 active/inactive 表、长度、对齐、buffer-full 和失败回写；不能用命令存在代替输出布局正确。
+- 身份变更需与已有节点、索引及并发删除保持一致；UUID 支持范围与首次设置规则逐项核对。
+- WAIT 的事件发布点、信号中断/重启、等待期间删除与持有引用应独立审查，不能把单设备 WAIT 写成全局控制 fd poll。
+- **体量检查点：**此项是五份初步路线中最可能再拆的部分。查询与身份/事件没有必须同 PR 的耦合；制备时若无法保持单一可审查主题，优先交付查询，身份/事件另行拆分，不为编号硬塞。
+- **依赖前移规则：**若 PR5–PR7 的正确 ABI 或必要验收要求某条查询/身份能力，应把最小所需部分前移，不能用“规划在 PR8”阻断前置验收。
+- **验收：**原始 C ABI 的布局、容量和状态矩阵；身份/事件并发 ktest；再核对并实测选定 dmsetup 命令。不据此承诺完整 LVM2/udev 生态。
+
+### 3.8 PR4–PR8 的共同验收与非目标
+
+每份按第 1.3 节在自身最终源码树执行 `make check`、`make kernel`、相关定向 ktest；涉及 ABI 必须有 C 测试，工具流程按实际范围补集成。不复用 dm 结果冒充 PR 验证。
+
+测试按职责组织并复用已有框架：控制 ABI 在 control 测试中扩展，随着生命周期或数据路径出现再按职责拆分，不为每个 ioctl 新建文件。每次新增能力同时测试拒绝/失败后的可见状态。
+
+PR8 之后不预分编号：多段 linear、BIO 拆分、striped、zero/error、discard/zeroout、DM-on-DM、全局 poll/ARM_POLL、udev/uevent 自动化、完整 LVM2 及新 target 均不由本路线隐式承诺。
 
 ## 4. 文件归属与范围控制
 
 | 范围 | 归属与边界 |
 |---|---|
-| block BIO 映射 | 已有 PR 1；PR 2 依赖它，不重复算作 PR 2 独有修改。 |
-| DM component 与必要 Cargo 接入 | PR 2 起按最小功能提取；不能整目录复制完整 dm。 |
-| control 字符设备、管理与 ABI | PR 3；仅配置阶段必要能力。 |
-| 首次激活、registry 与设备访问适配 | PR 4；仅补当前框架实际缺口。 |
-| 通用 lease、ext2/exfat/rootfs 迁移、分区事务 | 暂缓，不作为本路线前置。 |
-| runtime rename/remove、复杂 target、range BIO 后端扩展 | 暂缓，不预排后续编号。 |
+| block BIO 映射 | PR1；后续复用，不重复算作独有修改。 |
+| 固定单段 linear 数据面 | PR2；后续演进只引入本阶段必需结构，不整目录复制完整 dm。 |
+| control 节点与版本握手 | PR3 已制备；普通命令配置从 PR4 开始。 |
+| 控制对象与待激活表 | PR4；实际参数/身份语义在执行计划中逐项确认。 |
+| 首次激活、registry 与设备访问 | PR5；只补现有框架真实缺口。 |
+| 活跃设备删除与使用者保护 | PR6；通用前置能力如确有必要，先报告再决定拆分。 |
+| suspend/drain/reload | PR7；严格区分块层排空与文件系统冻结。 |
+| 查询、身份与单设备事件 | PR8 候选；必要依赖前移，体量过大再拆。 |
+| 通用 lease、rootfs/文件系统迁移、物理热拔插 | 不预设整套搬入；仅在证明具体阻塞后另行决定。 |
 | docs/log/patches、本地镜像与构建便利项 | 不进入 upstream 源码 diff。 |
 
-能用现有机制完成的，不新增通用框架。必须修改框架时，先说明具体阻塞、最小变更和为何不能放在 DM 内部，反馈用户后决定。限制功能不等于忽略正确性：尚未保护的设备生命周期必须明确，不允许静默提供不安全操作。
+能用现有机制完成的，不新增通用框架。必须修改框架时，说明具体阻塞、最小变更和为何不能放在 DM 内部，由用户确认。功能受限不等于可以忽略生命周期和并发正确性。
 
 ## 5. PR 2 制备状态与设计取舍
 

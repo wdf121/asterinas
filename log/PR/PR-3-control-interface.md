@@ -1,122 +1,158 @@
-# PR 3:control device skeleton / `Add the Device Mapper control device with \`DM_VERSION\` support`
+# PR 3：公共 DM 控制入口与首个 VERSION 命令
 
-## 2026-10-15 复核勘误与当前停点
+> 更新：2026-10-20。当前事实以 `5b08f9a0a` 源码为准；旧提交的测试结果仅作为历史记录。
+> 协议及结构体解释见 [控制面 ABI](../../docs/control_ABI.md)，本次操作见 [10 月 20 日日志](../daily/2026-10-20.md)。
 
-以下第 1–5 节保留 10-14 分支快照及验证历史，不再作为 Linux 握手语义正确的结论。对固定标签 Linux `v6.18.56`、`v7.2.10` 的复核确认：两者均要求 major 相等且客户端 minor 不高于内核 minor，忽略 patch；`DM_VERSION` 仅访问 12 字节版本，不校验其他字段；版本 copyout 失败的 `EFAULT` 优先于版本不兼容的 `EINVAL`。因此，原文“major-only 与 Linux 一致”“两段全量复制对齐 Linux copy_params”及版本查询通用信封校验的兼容性描述均不成立。
+## 1. 状态与 Git 标识
 
-成熟 dm 已实现第一阶段修复及真实 ioctl 回归，详见 [10-15 日志](../daily/2026-10-15.md)。**本 PR 分支仍为 `d539b725b`，未同步修复、未重新验证、未推送。** 旧树 ktest 160/0 仅说明原有测试通过，不能证明实际用户内存边界、权限或握手时序正确。后续需单独同步最小握手修复、修正源码注释并在 PR 分支验证；本次不切分支、不推进 PR 发布。
-
-## 1. 状态与标识
-
-| 项目 | 事实 |
+| 项目 | 当前事实 |
 |---|---|
-| 状态 | 本地已提交,gate 全绿;未推送,PR 尚未创建,由用户在网页自行创建。 |
-| 实际 Git branch | `dm-control-interface` |
-| 当前本地 base / HEAD | `d0088c2c9`(PR 2)/ `d539b725b` |
-| 远端事件 | 未推送。推送时建议直接使用分支名 `dm-control-interface`;PR 的 base 取向(stacked 指向 PR 2 分支,或待 PR 2 合并后重放)待用户创建时确定。 |
-| 提交主题 | `Add the Device Mapper control device with \`DM_VERSION\` support` |
-| 提交内容 | 2 文件、517 行:新增 `kernel/core/src/device/misc/device_mapper.rs`(控制设备 + `DM_VERSION` 握手 + flags 校验 + 19 个 ktest)+ `misc/mod.rs` 接入(3 行)。 |
-| 依赖 PR | PR 2(`dm-linear-io-path`,已推送,PR 尚未创建)。 |
+| 分支 | `dm-control-interface` |
+| base | PR2 `fd97f023f`，分支 `dm-linear-io-path` |
+| HEAD | `5b08f9a0a801871c8b6b2670f72d0310611a88bc` |
+| 被替代的 PR3 提交 | `f662bdc2d68d6bd94335f4172be2c8f0a9e6a4b0` |
+| 提交主题 | Add the Device Mapper control device with `DM_VERSION` support |
+| 提交组织 | PR3 仍为 base 上的单提交，本次通过 amend 纳入修正 |
+| 推送 | 本次未推送；没有重新查询远端状态，不据本地分支推断远端最新 SHA |
+| PR4 分支 | `dm-linear-configuration` 已从新 PR3 重建，仍指向 `5b08f9a0a`，无独有提交；用户要求暂缓推进 |
+| 文档归属 | 本档案及 docs/log 在 dm 保存，不加入 upstream 源码 PR |
 
-本文档使用稳定编号 **PR 3**;当前分支名为 `dm-control-interface`。
+## 2. 目标与边界
 
-## 2. Git 与本地历史
+PR3 的目标是建立**通用 DM 控制入口**，VERSION 是第一个接入的命令，不是公共入口的全部验收边界。没有实现 CREATE 等命令，不代表可以忽略公共权限、版本协商和未支持命令的失败顺序。
 
-| 日期 | 事件 | base | HEAD | 结论 |
-|---|---|---|---|---|
-| 2026-10-14 | 基于 PR 2 的 `d0088c2c9` 创建分支;学习式手敲 Stage 1(点 11-12 用户手敲,点 13 与 17 个 ktest 由助手代写),clippy `needless_range_loop` 修正后 amend | `d0088c2c9` | `3977e321e` | 单提交,未推送 |
-| 2026-10-14 | 六条外部 review 评判与修复(ioctl 重构 capture→stamp→write-back、注释三连、测试字面量锚定、新增 2 个 ktest),amend 收口 | 同上 | `d539b725b` | 单提交,未推送;gate 复验全绿 |
+已实现：
 
-review 评判结论:#1 失败路径回写 version(**接受**,UAPI 契约 + façade 实证);#2 minor 校验(**拒绝**,Linux 与 façade 均 major-only,更严会弹掉新版 libdm);#3 data_start 收紧(**接受**,仅注释);#4 ktest 自证恒等式(**接受**,硬编码上游字面量);#5 两段拷贝注释(**接受**,措辞修正为"后续只消费快照 B 字节,界以快照 A 为准");#6 1MiB 上限(**部分接受**,保留并注明理由,拒绝 16KiB——数字未证实且与 TABLE_LOAD 路线冲突)。修复前后 gate 证据见第 5 节。
+- 注册 `/dev/mapper/control`，字符设备 major 10、minor 236。
+- 每次 ioctl 检查当前调用者在 initial user namespace 的 CAP_SYS_ADMIN；能力不足返回 EACCES。
+- 检查 DM type，提取命令号；不按 direction/size 额外拒绝。
+- 所有 DM type 请求先进行 12 字节版本握手，再分派命令；VERSION 成功，其余暂时 ENOTTY。
+- major 相同、客户端 minor 不高于服务端 minor，忽略 patch；无论兼容与否回写服务端版本，写故障优先于不兼容错误。
+- 普通 read/write 不支持，seek 不支持；无控制事件时 poll 不虚报就绪。
+- Rust 内部测试、C 用户态回归，以及指定单项回归入口。
 
-## 3. 问题、目标与非目标
+未实现：普通 dm_ioctl 参数复制、CREATE/LOAD/STATUS/REMOVE、active/inactive 管理、块设备发布、动态生命周期、全局控制事件和 ARM_POLL、完整 dmsetup/LVM2 兼容。
 
-### 目标
+报告接口版本 4.50.0 不是完整功能声明。指定 openEuler 基线 UAPI 报告 4.48.0；本次没有修改版本号或宣称两者具备相同命令集合。
 
-- 以 Linux 兼容 misc 字符设备(major 10, minor 236)提供 `/dev/mapper/control`。
-- 实现 `dm-ioctl` ABI 子集的首个命令 `DM_VERSION`:校验客户端主版本、内核版本原位盖章、回写(失败路径亦回写)。
-- 信封进入门槛:`data_size`/`data_start` 几何校验;flags 校验(未知位 EINVAL,`DM_DEFERRED_REMOVE`/IMA 等已知未实现位 EOPNOTSUPP)。
+## 3. 本次修正（2026-10-20）
 
-### 非目标
+### 3.1 入口顺序
 
-- 不实现 `DM_VERSION` 之外的任何命令(DEV_CREATE/TABLE_LOAD/...),运行时注册表与 target 生命周期属后续阶段。
-- 不实现 per-command flag 规则(随命令加入时补)。
-- uevent/sysfs/udev 仍属项目级边界(见进度总账第 4 节)。
+旧提交把 type 检查与命令支持检查放在同一个 `decode_command()` 中，导致未知 DM 命令在版本握手前返回 ENOTTY。
 
-## 4. 技术设计与范围
+现在分为：
 
-ioctl 四步流水线:`decode_command`(非本子集命令 ENOTTY)→ 读 312 字节固定头定量(快照 A)→ `validate_ioctl_buffer_layout` → 按快照 A 的 `data_size` 全量再拷(快照 B)。两段拷贝对齐 Linux `copy_params`:界/校验/分配全出自快照 A,处理内容全出自快照 B,用户竞态只伤语义不破内存安全。
+```text
+权限检查 → type 检查/提取 nr → 版本读取 → 版本回写
+→ 传播版本不兼容错误 → 命令分派
+```
 
-`DM_VERSION` 处理为 capture→stamp→write-back:先捕获主版本校验结果,无条件盖章 `[4, 50, 0]`,无条件回写,捕获结果单独决定返回值——对齐 dm-ioctl UAPI 契约("recognised 命令即使失败也填 version")且防自证(校验读的是盖章前的客户端原文)。major-only 校验与 Linux 一致,新版 libdm 依赖回写的 minor/patch 探测特性。
+具体影响：有权限且 DM type 正确时，未知命令搭配 NULL 返回 EFAULT，搭配不兼容的可读写版本返回 EINVAL 并回写版本，搭配兼容版本才在握手后返回 ENOTTY。错误 type 仍在用户内存访问前返回 ENOTTY。
 
-flags:19 个已知位(永久空洞 bit 7)与 `DM_KNOWN_FLAGS` 总掩码;未知位 EINVAL,已知未实现位 EOPNOTSUPP。
+该问题在源码中曾被标注为限制，但“限制已记录”不能代替对 PR3 公共入口目标的验收。完整 dm 已有先握手后查命令的顺序，本次修正没有把完整 dm 降级或引入新命令。
 
-- `device_mapper.rs`:设备注册、文件语义(read/write EINVAL、ESPIPE、poll 恒就绪)、上述流水线与校验、19 个 ktest(decode 四态、layout 六态含上边界、flags 四态、握手两态加失败回写契约、u32 LE 往返、ioctl 编号硬编码上游字面量 312/0xc138_fd00 锚定)。
+### 3.2 文件命名与测试
 
-审阅重点:失败路径回写与 capture 顺序(UAPI 契约一致性);两段拷贝的内存安全论证(界出自快照 A);major-only 版本语义;data_start ≥ 312 的有意收紧。
+- `misc/device_mapper.rs` → `misc/dm_control.rs`，同步模块声明及初始化调用。
+- 不提前复制完整 dm 的 abi/commands/runtime/workflow 子模块。
+- 将旧解码拒绝测试替换为 `decodes_command_number_only_for_dm_type`；文件共 5 个 ktest，数量未增加。
+- C 新增 `negotiates_before_command_lookup`；使用未知 nr 0xff，避免在 Linux 上误执行真实状态变更命令。
+- 覆盖未知命令的版本回写、版本不兼容、NULL、页末版本、只读页回写故障及错误 type；继承 fd 测试追加权限先于未知命令及地址访问的断言。
+- C 文件现在有 7 个 FN_TEST，不含 setup/cleanup；这不是断言数或实测通过计数。
 
-## 5. 验证证据
+### 3.3 提交说明与分支
 
-容器内执行,真实退出码;ktest 均为无 selector 的 aster-core 全量(OSDK 0.19.0 selector 为后缀 trie,模块路径选择器必匹配空集,勘误详见 [2026-10-14](../daily/2026-10-14.md) 第 4 节):
+amend 同时修正旧提交说明中“先固定头再完整缓冲复制”的过时描述，改为公共入口和仅 12 字节 VERSION 的真实行为。
 
-| 时点 | 门 | 结果 |
+旧 PR4 `dm-linear-configuration` 与旧 PR3 完全相同，无独有提交。amend 后普通 `git branch -d` 因旧提交不再是新提交祖先而拒绝；再次确认旧 SHA 后按用户授权删除并重建。新 PR4 与新 PR3 相同，工作区当时干净，未推送。
+
+## 4. 最终 PR 独有 diff
+
+`fd97f023f..5b08f9a0a` 共 **6 文件，514 insertions、10 deletions**：
+
+| 文件 | 职责 |
+|---|---|
+| Makefile | REGRESSION_TESTS 选择器透传 |
+| kernel/core/src/device/misc/dm_control.rs | 控制设备、公共入口、VERSION、5 个 ktest |
+| kernel/core/src/device/misc/mod.rs | 控制设备模块接入及初始化 |
+| test/initramfs/src/regression/device/device_mapper_control.c | 真实用户态 ABI 回归 |
+| test/initramfs/src/regression/device/run_test.sh | 加入 control 测试程序 |
+| test/initramfs/src/regression/scripts/run_regression_test.sh | 校验并执行目录/可执行文件选择器；无选择器仍走原全量路径 |
+
+本次相对旧 PR3 的修订为 **3 个逻辑文件，67 insertions、15 deletions**，其中控制文件重命名被 Git 识别。不能把这组增量统计与完整 PR diff 混为一谈。
+
+## 5. 验证记录与证据边界
+
+| 项目 | 本次可确认事实 |
+|---|---|
+| C 语法 | Claude 在容器执行 `gcc -Wall -Wextra -Werror -D__asterinas__ -fsyntax-only .../device_mapper_control.c`，通过 |
+| C 格式 | 容器内 `clang-format --dry-run --Werror` 通过 |
+| diff 空白 | 修订暂存内容 `git diff --cached --check` 通过 |
+| C 用户态运行 | 用户明确反馈“C回归我跑完了”；没有归档该次输出、计数、退出码或精确源码 tree，不补写独立核验通过 |
+| 最终 make format/check/kernel | 本次未独立运行或收集最终输出；先前提交结果不替代当前 SHA |
+| aster-core ktest | 已提供所属 crate 内无 selector 的运行命令；当前对话没有最终运行计数/退出码，不填入旧树的 160/0 或 dm 的 98/0 |
+| amend/重命名后重跑 | 未由 Claude 执行，不声称新 SHA 的所有最终 gate 已独立验证 |
+
+用户随后表示 PR3 可以收口并明确授权 amend；这构成提交授权，不等于产生缺失的测试日志。
+
+后续复验在容器内、PR3 自身源码树串行执行：
+
+```bash
+cd /root/asterinas
+make format
+# 检查格式化是否带来范围外修改。
+make check
+make kernel
+
+cd /root/asterinas/kernel/core
+cargo osdk test --kcmd-args=earlycon
+
+cd /root/asterinas
+make run_kernel AUTO_TEST=regression REGRESSION_TESTS=device/device_mapper_control
+```
+
+定向最小覆盖单位为相关文件；默认进入其所属 Cargo crate 跑全部 ktest，不逐函数循环。这里是 aster-core 范围，不是全仓 make ktest。实际子命令是 `test`，不是 `cargo osdk ktest`。记录测试名、非零计数、失败数、退出码及日志；当前 PR3 OSDK 不支持直接用模块路径代替函数路径筛选，不套用完整 dm 的实现。
+
+## 6. 历史及已撤回的结论
+
+| 日期 | 提交/事件 | 历史事实与限制 |
 |---|---|---|
-| review 修复前(`3977e321e`) | make check / make kernel | exit 0 / exit 0 |
-| 同上 | ktest(aster-core 全量) | 158 passed / 0 failed / 0 filtered(含 17 个 DM ktest) |
-| review 修复后(`d539b725b`) | cargo fmt(-p aster-core) | 通过 |
-| 同上 | clippy 双变体(-Dwarnings;普通 + `--ktests`) | 均通过 |
-| 同上 | ktest(aster-core 全量) | 160 passed / 0 failed / 0 filtered(= 158 + 2 新;新用例串口逐行确认 ok) |
-| 同上 | make check / make kernel | exit 0 / exit 0 |
+| 2026-10-14 | `3977e321e` | 从 PR2 `d0088c2c9` 制备；当时 check/kernel exit 0，aster-core 158/0 |
+| 2026-10-14 | `d539b725b` | 当时 review 后 amend；格式/clippy/check/kernel 通过，aster-core 160/0（19 个旧 DM 测试） |
+| 2026-10-15 | 握手复核 | 撤回 major-only、VERSION 必须复制完整头/信封等结论；旧测试成功没有证明 Linux ABI 语义正确 |
+| 2026-10-19 | `f662bdc2d` | 基于新版 PR2，已缩为 12 字节握手、能力检查、poll 与直接测试；未知命令提前拒绝仍作为限制存在 |
+| 2026-10-20 | `5b08f9a0a` | 公共入口顺序修正、控制文件改名、测试更新并 amend；PR4 空分支重建 |
 
-未覆盖:`make ktest` 全量、C regression、NixOS 系统套件——Stage 1 无用户态客户端,系统级验证随控制面命令补齐后的阶段进行。
+不再沿用的旧设计结论：
 
-## 6. 已知边界与后续动作
+- “Linux 只检查 major”：错误；也要求 client minor ≤ server minor。
+- “VERSION 校验 data_size/data_start/flags 并回写整个 envelope”：错误；VERSION 只访问 version 三个字。
+- “两遍读整头/整块就是 Linux copy_params”：错误；固定头快照应复用，不能重读用户头替代已验证内容。
+- “未知 flags 一律拒绝即可称 Linux 兼容”：错误；取决于命令及位语义。
+- “poll 恒就绪”：不符合无事件状态；PR3 当前返回空，但不代表全局事件功能已经实现。
+- “首个命令成功即可验收公共入口”：不足；未支持命令也受公共检查顺序约束。
 
-1. 推送与 PR 创建由用户执行;创建后回填 PR 编号与 base 取向。
-2. Stage 2(`DM_DEV_CREATE` 与运行时注册表)按学习节奏推进;flags 的 per-command 规则随命令加入补上。
-3. 若维护者要求全量 `make ktest`,再补跑并回填本档案。
+旧原始文档内容可从 dm 文档历史追溯；上表保留对应提交与实测历史，不将旧错误解释继续列为当前维护者说明。
 
-## 7. Upstream maintainer description
+## 7. Upstream maintainer description（当前草稿）
 
 ### Title
 
-```text
 Add the Device Mapper control device with `DM_VERSION` support
-```
 
 ### Summary
 
-- Introduce `/dev/mapper/control` as a Linux-compatible misc character device (major 10, minor 236) that speaks a subset of the `dm-ioctl` ABI from the Linux UAPI header `include/uapi/linux/dm-ioctl.h`.
-- Implement the `DM_VERSION` handshake: validate the client's interface major version, stamp the kernel's version `[4, 50, 0]` into the envelope, and write the envelope back even when validation fails, as the dm-ioctl contract requires.
-- Gate every ioctl behind envelope validation (`data_size`/`data_start` geometry) and flag validation (unknown bits are rejected with EINVAL; known but not-yet-supported bits with EOPNOTSUPP).
+Introduce `/dev/mapper/control` as a misc character device (major 10, minor 236) and establish the common Device Mapper ioctl entry path. Check the current caller's capability and ioctl type before exchanging the interface version, then dispatch the command. `DM_VERSION` is the first supported command; unsupported DM commands are rejected after a successful version handshake.
 
-### Design
+The handshake accesses only three native-endian version words. It requires an equal major and a client minor no newer than the server minor, ignores the patch, and writes back the server version even on incompatibility. A copyout fault takes precedence over the compatibility error. The file is nonseekable, does not support ordinary reads or writes, and reports no poll readiness while control events are unsupported.
 
-The control device is registered from the first kernel thread at init. Its ioctl follows the same shape as Linux `copy_params`: peek the fixed 312-byte header to size the envelope, then copy it whole. All bounds and validation decisions come from the first snapshot only, so a user racing the buffer between the two copies cannot break memory safety.
+### Scope and tests
 
-`DM_VERSION` validation results are captured instead of propagated: the envelope is always stamped and written back, and only the captured result decides the ioctl return value. Stamping after the version check keeps the check reading the client's bytes rather than the kernel's own stamp. Like Linux, only the major version is checked; the write-back reports the exact kernel version, which is how newer `libdm` releases probe for optional features.
+The change includes kernel tests for decoding, version rules, and poll behavior, plus userspace regression tests for memory boundaries, failure ordering, unsupported commands, and per-call capability checks. Regression selectors allow running the control test without the full device suite.
 
-### Scope
+Ordinary command envelopes, device creation, table loading, activation, removal, and global control events are outside this change. Reporting interface version 4.50.0 does not imply support for the complete DM command set.
 
-Included:
+Userspace execution was reported by the author. Final build and aster-core ktest output for this amended revision have not been archived in this record; no final pass count is claimed here. Fill in verified results before publishing a validation claim.
 
-- `kernel/core/src/device/misc/device_mapper.rs` (new: control device, `DM_VERSION`, envelope and flag validation, ktests)
-- registration in `kernel/core/src/device/misc/mod.rs`
-
-Excluded: every command beyond `DM_VERSION`, the runtime device registry, per-command flag rules, and uevent/sysfs integration.
-
-### Testing
-
-Validated on final PR HEAD `d539b725b`:
-
-```text
-make check
-make kernel
-cd kernel/core && cargo osdk test --kcmd-args=earlycon
-```
-
-`make check` and `make kernel` pass. The aster-core ktest suite completes with 160 passed and 0 failed, including the 19 new control-device tests (command decoding, envelope geometry including the maximum-size boundary, flag handling, the version handshake including write-back on a rejected handshake, and the ioctl number anchored to upstream `dm-ioctl.h` literals). The full project ktest suite was not re-run for this PR; block and device-mapper crate coverage comes from the preceding PRs.
-
-### Review notes
-
-Please focus review on the failure-path write-back ordering (the captured-result-then-stamp sequence and its contract implications), the two-phase copy memory-safety argument, and the major-only version semantics. Please let me know if any part of the design or scope needs clarification. I'm happy to discuss it and will respond promptly.
+🤖 Generated with [Claude Code](https://claude.com/claude-code)

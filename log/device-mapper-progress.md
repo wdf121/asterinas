@@ -1,6 +1,10 @@
 # Device Mapper 当前项目状态
 
-> **更新日期**：2026-10-19。
+> **更新日期**：2026-10-20。
+>
+> 最新 PR3：`5b08f9a0a`，公共入口改为先版本握手、后命令支持检查，文件统一为 `dm_control.rs`。新增 C 顺序回归并调整内部测试；用户反馈 C 回归已跑完，最终 check/kernel/ktest 输出和计数未归档，不宣称最终 gate 全绿。PR4 空分支已重建到该提交，暂缓实现。详见 [PR3 档案](PR/PR-3-control-interface.md)、[10 月 20 日日志](daily/2026-10-20.md) 与 [控制面 ABI](../docs/control_ABI.md)。
+>
+> 验证流程固定先 `make format` 再 `make check`；ktest 进入目标 Cargo crate，默认运行 crate 全部测试，至少覆盖相关文件，不逐函数枚举。下面的 10 月 19 日计数为历史 dm 验证，不证明最新 PR3。
 >
 > **事实来源**：实现以当前源码为准，验证以对应源码版本和实际命令输出为准；历史日志不自动证明当前工作区通过。
 
@@ -12,7 +16,7 @@
 - 控制 fd 不再恒报 IN/OUT；全局事件计数、等待队列、每打开文件事件基准及 ARM_POLL 尚未实现。单设备 `DM_DEV_WAIT` 不等于完整全局 poll。
 - PR1（`mapped-bio-ranges`，#3937）当前本地 `2f4fdc9a7`；今日曾推送中间版本 `e7e221993`，随后重放形成的当前历史未再次推送。
 - PR2（`dm-linear-io-path`）当前本地 `fd97f023f`，依赖新版 PR1，已 amend，未推送；本轮没有最终 PR2 ktest 运行计数，不以 dm 测试替代。
-- PR3（`dm-control-interface`）当前本地 `f662bdc2d`，依赖新版 PR2，握手/权限/解码/poll/测试修复已并入原提交，未推送。完整 check 通过，用户反馈单项 ABI 成功；没有本轮最终 PR3 kernel/core ktest 独立证据。
+- PR3（`dm-control-interface`）当前本地 `5b08f9a0a`，依赖新版 PR2；10 月 20 日已 amend 公共入口顺序、命名与测试，未推送。10 月 19 日的旧提交检查结果不能替代新 SHA 验收，详见顶部最新记录。
 - 当前 OSDK `test_matches_whitelist` 已支持模块路径与函数路径，本日实际非零计数验证了模块筛选；此前“裸模块路径必匹配空集”的说明不再适用于当前源码，历史零匹配仍不算通过。
 - 后续以单 PR 为边界，用户主导手写，Claude 基于源码事实分析审查，仅在明确授权后实现，不自主大幅优化 DM。回补前核对完整 dm 的调用链和能力边界。
 - 2026-10-16 V5 收尾及系统套件结果属于历史验证，今日未重跑 dmsetup/LVM/NixOS 系统套件。主要 Linux 语义依据仍为指定 openEuler 源码基线，报告 ABI 4.50.0 不代表完整 Linux DM 兼容。

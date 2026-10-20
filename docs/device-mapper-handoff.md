@@ -1,6 +1,7 @@
 # Device Mapper 对话交接
 
-> **最后更新**：2026-10-19。
+> **最后更新**：2026-10-20。
+> **最新停点**：PR3 已 amend 为 `5b08f9a0a`，公共入口先握手后拒绝未知命令，文件改名 `dm_control.rs`；PR4 空分支重建后暂缓推进。本轮在 dm 记录文档，不改生产代码；用户已授权整理并本地提交文档，不推送。协议说明见 [控制面 ABI](control_ABI.md)，最新证据见 [10 月 20 日日志](../log/daily/2026-10-20.md) 及 [PR3 档案](../log/PR/PR-3-control-interface.md)。下列 dm 的 98 项测试属于 10 月 19 日历史，不能证明本次 PR3。
 > 本文件是交接入口；当前状态见 [项目进度](../log/device-mapper-progress.md)，实际命令、失败及复盘见 [今日日志](../log/daily/2026-10-19.md)。PR 历史档案见 [log/PR](../log/PR/)，其中旧 SHA/测试入口不能覆盖当前源码事实。
 
 ## 1. 当前停点
@@ -17,7 +18,8 @@
 |---|---|---|
 | `mapped-bio-ranges` | `2f4fdc9a7` | PR1 #3937；今日曾推送中间提交 `e7e221993`，随后重放的当前历史未再次推送。 |
 | `dm-linear-io-path` | `fd97f023f` | 基于新版 PR1，修改已 amend；当前历史未推送。本轮没有最终 PR2 ktest 运行计数。 |
-| `dm-control-interface` | `f662bdc2d` | 基于新版 PR2，修复已并入原提交；未推送。完整 check 通过，用户反馈单项 ABI 成功；没有本轮最终 PR3 kernel/core ktest 独立证据。 |
+| `dm-control-interface` | `5b08f9a0a` | 已 amend 公共入口顺序、命名和测试，未推送；用户反馈 C 回归已跑完，最终 check/kernel/ktest 输出和计数未归档。 |
+| `dm-linear-configuration` | `5b08f9a0a` | 从新 PR3 重建，无独有提交，暂缓实现。 |
 
 - 后续全部以单 PR 为边界，用户尽可能手写，Claude 基于源码事实分析审查；审查不等于实现授权，不自主扩大 DM 优化。
 - 每项判断区分实际缺陷、覆盖缺口、维护性建议和可选设计；不因 Linux/Rust 内部表示不同就要求重构。
@@ -44,25 +46,27 @@
 
 ## 4. 当前测试入口
 
-全部在 `fork_Asterinas` 容器内串行执行。
+全部在 `fork_Asterinas` 容器内串行执行。先在目标分支根目录运行 `make format`，核对 diff，再执行 `make check`、`make kernel`。定向测试进入相关 Cargo crate，默认覆盖该 crate 全部 ktest，不逐函数循环：
 
 ```bash
 cd /root/asterinas/kernel/core/comps/block
-cargo osdk test aster_block::bio::tests
-cargo osdk test aster_block::request_queue::tests
+cargo osdk test
 
 cd /root/asterinas/kernel/core/comps/device-mapper
-cargo osdk test aster_device_mapper::device::tests
-cargo osdk test aster_device_mapper::table::tests
+cargo osdk test
 
 cd /root/asterinas/kernel/core
-cargo osdk test --kcmd-args=earlycon aster_core::device::misc::dm_control::tests::ioctl
+cargo osdk test --kcmd-args=earlycon
 
+# 完整 dm 的 C 测试入口：
 cd /root/asterinas
 make run_kernel AUTO_TEST=regression REGRESSION_TESTS="device/device_mapper_control device/device_mapper_lifecycle device/device_mapper_table"
+
+# PR3 只有 control 程序，不执行尚不存在的 lifecycle/table：
+# make run_kernel AUTO_TEST=regression REGRESSION_TESTS=device/device_mapper_control
 ```
 
-- 当前 OSDK `test_matches_whitelist` 已支持模块路径；旧“模块 selector 必匹配空集”说明不适用于当前树。仍必须核对非零实际匹配数，每次立即保存根目录 `qemu-serial.log`，下一次运行会覆盖。
+- 当前完整 dm 的 OSDK 支持模块筛选，但 PR3 基线不同；不跨分支照搬 selector。每次核对非零实际计数并及时保存串口日志，下一次运行可能覆盖。上述全 crate 命令避免模块筛选差异，并不是全仓 make ktest。
 - ABI 三个程序分别为 control 13、lifecycle 7、table 5 个场景。原 24 个场景保留，新增 poll 后共 25 个；场景数不是断言数量。旧 `device_mapper`/`device_mapper_version` 即使残留二进制也不是当前验收入口。
 - 最终验收为 `make check`、`make kernel`、相关定向 ktest；涉及 ABI 加 C 回归，工具流程按影响选择系统套件，不默认完整 ktest。
 - 区分编译失败、guest 启动失败、测试失败。已观察到且未阻止测试完成的 ermsb/GRUB/CPU/video/IOMMU 环境提示留作备注，不仅凭 warning/error 字样中断；真实失败、阻塞或影响不明的新问题仍如实报告，不隐瞒。

@@ -180,3 +180,9 @@
 | 2026-10-10 | 新建 release NixOS 根盘有序关机后 `e2fsck -fn` 返回 4：块组 0 空闲块计数与位图统计不一致。 | ext2 `sync_all` 逐组同步后立即持久化计数，其后的 inode 写回仍可能改变其它组的分配状态，落盘计数与位图脱节。 | 最终元数据遍历持有超级块写锁冻结分配，锁内刷新各组位图与描述符快照后统一持久化计数；新增 4 个确定性 ktest 用例先复现失败再转绿。 | ext2 模块 ktest 15/0；release 根盘端到端复验（启动前后 `e2fsck -fn` 均 0）；`--control-plane` 套件复验通过。 | `65c650435` |
 | 2026-10-12 | upstream 设备模型创建空 `/sys/dev/block`，LVM2 sysfs filter 拒绝一切块设备，`--linear-integration` 第二层失败。 | 块设备从未注册进设备模型；块类 `/dev` 节点由 registry 自行发布，设备模型无法感知。 | 引入 `CREATES_DEVNODE` 类属性 opt-out，`SelfPublishingBlock` 将块设备接入设备模型：opt-out 设备仍获 `/sys/dev/<kind>/<major>:<minor>` 索引项，模型不创建、不在 teardown 时删除其节点。 | core DM ioctl ktest 81/0；`--linear-integration` 完整套件五次真实运行全部 PASS。 | `535727967` |
 | 2026-10-19 | 控制 fd 无事件时恒报 IN/OUT，可能让用户态事件循环持续立即返回。 | poll 直接返回请求 mask 中的 IN/OUT，未关联事件状态。 | 暂无全局事件支持时返回空，补内核及 C ABI 测试；不宣称完整 Linux poll/ARM_POLL 支持。 | 完整 check、control ioctl 定向 ktest 通过，新增 poll 实际执行；用户反馈 kernel/guest ABI 通过，后两项未独立核验日志。详见当日日志。 | `981294ef5`，未推送 |
+
+### 10.3 PR3 公共入口修正（源码核实，最终运行证据待归档）
+
+| 日期 | 问题与影响 | 根因 | 修复 | 验证边界 | 提交状态 |
+|---|---|---|---|---|---|
+| 2026-10-20 | PR3 未支持命令在版本握手前返回 ENOTTY，与 Linux 公共入口顺序不同；无效地址/不兼容版本的 errno 和回写行为被提前拒绝遮蔽。 | decode_command 将 type 识别与命令支持检查合在握手前。 | 解码只检查 type 并提取 nr，握手后分派；统一文件名 dm_control.rs，补 C 顺序回归并调整内部测试。完整 dm 已有该顺序，本次不改其生产代码。 | 固定 Linux/PR3 源码核实，C 语法/格式和 diff 检查通过；用户反馈 C 回归已跑完，无最终运行日志/计数，不将新 SHA 全部 gate 标为通过。 | PR3 amend 为 `5b08f9a0a`，未推送；详见 [档案](../log/PR/PR-3-control-interface.md) 和 [ABI 说明](control_ABI.md) |
