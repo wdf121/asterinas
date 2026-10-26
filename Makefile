@@ -483,12 +483,15 @@ docs: $(CARGO_OSDK)
 
 .PHONY: format
 format:
-	@# Trim trailing whitespace from all git-tracked, non-patch files
+	@# Trim trailing spaces from tracked working-tree text files, excluding patches.
 	@# NOTE: `--git-dir` will suppress "detected dubious ownership in repository" errors
-	@git --git-dir=$$PWD/.git ls-files --no-directory | \
-		grep -v '[.]patch$$' | \
-		grep -v '^.claude/skills/aster-code-review$$' `# This is a symbolic link` | \
-		xargs sed -i 's/ *$$//'
+	@set -o pipefail; \
+		{ git --git-dir="$$PWD/.git" grep -I -l -z ' $$' -- ':!*.patch' || [ $$? -eq 1 ]; } | \
+		while IFS= read -r -d '' file; do \
+			if [ -f "$$file" ] && [ ! -L "$$file" ]; then \
+				sed -i 's/ *$$//' -- "./$$file" || exit $$?; \
+			fi; \
+		done
 	@
 	@# Format the code using various tools
 	@./tools/format_all.sh
