@@ -366,41 +366,46 @@ else ifeq ($(AUTO_TEST), vsock)
 endif
 
 # Build the Asterinas NixOS ISO installer image
+.PHONY: iso
 iso: BOOT_PROTOCOL = linux-efi-handover64
 iso:
 	@make kernel
 	@if [ -n "$(NIXOS_TEST_SUITE)" ]; then \
-        $(MAKE) --no-print-directory -C test/nixos iso; \
-    else \
-        ./tools/nixos/build_iso.sh; \
-    fi
+		$(MAKE) --no-print-directory -C test/nixos iso; \
+	else \
+		./tools/nixos/build_iso.sh; \
+	fi
 
 # Build the Asterinas NixOS ISO installer image and then do installation
+.PHONY: run_iso
 run_iso: OVMF = off
 run_iso:
 	@./tools/nixos/run.sh iso
 
 # Create an Asterinas NixOS installation on host
+.PHONY: nixos
 nixos: BOOT_PROTOCOL = linux-efi-handover64
 nixos:
 	@make kernel
 	@if [ -n "$(NIXOS_TEST_SUITE)" ]; then \
-        $(MAKE) --no-print-directory -C test/nixos nixos; \
-    else \
-        ./tools/nixos/build_nixos.sh; \
-    fi
+		$(MAKE) --no-print-directory -C test/nixos nixos; \
+	else \
+		./tools/nixos/build_nixos.sh; \
+	fi
 
 # After creating a Asterinas NixOS installation (via either the `run_iso` or `nixos` target),
 # run the NixOS
+.PHONY: run_nixos
 run_nixos: OVMF = off
 run_nixos:
 	@if [ -n "$(NIXOS_TEST_SUITE)" ]; then \
-        $(MAKE) --no-print-directory -C test/nixos run_nixos; \
-    else \
-        ./tools/nixos/run.sh nixos; \
-    fi
+		$(MAKE) --no-print-directory -C test/nixos run_nixos; \
+	else \
+		./tools/nixos/run.sh nixos; \
+	fi
 
 # Build the Asterinas NixOS patched packages
+.PHONY: cachix
 cachix:
 	@nix-build distro/cachix \
 		--option extra-substituters "${RELEASE_SUBSTITUTER} ${DEV_SUBSTITUTER}" \
@@ -436,9 +441,9 @@ profile_client: initramfs $(CARGO_OSDK)
 
 .PHONY: test
 test: NON_DEFAULT_PACKAGE_NAMES = \
-    $(shell ./tools/print_workspace_members.sh --non-default-ones --package-names)
+	$(shell ./tools/print_workspace_members.sh --non-default-ones --package-names)
 test: TEST_PACKAGE_NAMES = \
-    $(filter-out linux-bzimage-setup,$(NON_DEFAULT_PACKAGE_NAMES))
+	$(filter-out linux-bzimage-setup,$(NON_DEFAULT_PACKAGE_NAMES))
 test:
 	@if [ -n "$(TEST_PACKAGE_NAMES)" ]; then \
 		cargo test $(addprefix -p ,$(TEST_PACKAGE_NAMES)); \
@@ -454,13 +459,13 @@ ktest: initramfs $(CARGO_OSDK)
 
 .PHONY: docs
 docs: private DEFAULT_PACKAGE_NAMES = \
-    $(shell ./tools/print_workspace_members.sh --default-ones --package-names)
+	$(shell ./tools/print_workspace_members.sh --default-ones --package-names)
 docs: private DEFAULT_NON_CORE_PACKAGE_NAMES = \
-    $(filter-out aster-core,$(DEFAULT_PACKAGE_NAMES))
+	$(filter-out aster-core,$(DEFAULT_PACKAGE_NAMES))
 docs: private NON_DEFAULT_PACKAGE_NAMES = \
-    $(shell ./tools/print_workspace_members.sh --non-default-ones --package-names)
+	$(shell ./tools/print_workspace_members.sh --non-default-ones --package-names)
 docs: private DOC_NON_DEFAULT_PACKAGE_NAMES = \
-    $(filter-out linux-bzimage-setup,$(NON_DEFAULT_PACKAGE_NAMES))
+	$(filter-out linux-bzimage-setup,$(NON_DEFAULT_PACKAGE_NAMES))
 docs: $(CARGO_OSDK)
 	@if [ -n "$(DEFAULT_NON_CORE_PACKAGE_NAMES)" ]; then \
 		RUSTDOCFLAGS="-Dwarnings" cargo osdk doc $(addprefix -p ,$(DEFAULT_NON_CORE_PACKAGE_NAMES)) --no-deps; \
@@ -493,7 +498,7 @@ format:
 
 .PHONY: check
 check: private WORKSPACE_MEMBER_DIRS = \
-    $(shell ./tools/print_workspace_members.sh)
+	$(shell ./tools/print_workspace_members.sh)
 check: $(CARGO_OSDK)
 	@# Check if any git-tracked, non-patch files contain trailing whitespace
 	@# NOTE: `--git-dir` will suppress "detected dubious ownership in repository" errors

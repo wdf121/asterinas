@@ -100,6 +100,7 @@ test_ext2 "/ext2" "test_file.txt"
 ./ext2/shared_block_device
 ./ext2/short_rw
 ./ext2/sparse
+./ext2/sticky
 ./ext2/symlink
 ./ext2/unix_socket
 ./ext2/xattr
@@ -132,6 +133,7 @@ TEST_TMPDIR=/ext2 TEST_DIRECT=1 ./empty_write/empty_write
 
 ./mount/listmount
 ./mount/mount_api
+./mount/mount_capability
 ./mount/mount_move
 ./mount/mount_propagation
 
