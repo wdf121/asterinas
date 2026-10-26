@@ -34,7 +34,7 @@ pub(super) const DM_TABLE_STATUS_CMD: u8 = 12;
 pub(super) const DM_LIST_VERSIONS_CMD: u8 = 13;
 pub(super) const DM_GET_TARGET_VERSION_CMD: u8 = 17;
 
-pub(super) const DM_VERSION: [u32; 3] = [4, 50, 0];
+pub(super) const DM_VERSION: [u32; 3] = [4, 48, 0];
 
 pub(super) const DM_READONLY_FLAG: u32 = 1 << 0;
 pub(super) const DM_SUSPEND_FLAG: u32 = 1 << 1;

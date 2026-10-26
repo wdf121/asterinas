@@ -26,8 +26,8 @@ static int bytes_are(const unsigned char *bytes, size_t len,
 	return 1;
 }
 
-/* This implementation advertises the ABI shared by Linux 6.18.56 and 7.2.10. */
-static const uint32_t kernel_version[3] = { 4, 50, 0 };
+/* Match the DM ABI of the pinned Linux 6.6 baseline (5078a3a23a1e). */
+static const uint32_t kernel_version[3] = { 4, 48, 0 };
 static const uint32_t client_version[3] = { 4, 0, UINT32_MAX };
 
 FN_TEST(device_mapper_control_without_events_is_not_ready)
@@ -55,13 +55,10 @@ FN_TEST(device_mapper_version_compatibility)
 		uint32_t version[3];
 		int error;
 	} cases[] = {
-		{ { 4, 0, 0 }, 0 },
-		{ { 4, 49, 0 }, 0 },
-		{ { 4, 50, UINT32_MAX }, 0 },
-		{ { 3, 0, 0 }, EINVAL },
-		{ { 5, 0, 0 }, EINVAL },
-		{ { 4, 51, 0 }, EINVAL },
-		{ { 4, UINT32_MAX, 0 }, EINVAL },
+		{ { 4, 0, 0 }, 0 },	      { { 4, 48, 0 }, 0 },
+		{ { 4, 48, UINT32_MAX }, 0 }, { { 3, 0, 0 }, EINVAL },
+		{ { 5, 0, 0 }, EINVAL },      { { 4, 49, 0 }, EINVAL },
+		{ { 4, 50, 0 }, EINVAL },     { { 4, UINT32_MAX, 0 }, EINVAL },
 	};
 	int fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
 

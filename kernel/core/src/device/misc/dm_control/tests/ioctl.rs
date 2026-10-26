@@ -292,7 +292,7 @@ fn normalizes_output_flags_and_rejects_only_active_unsupported_features() {
 
 #[ktest]
 fn accepts_backward_compatible_interface_versions() {
-    for version in [[4, 0, 0], [4, 49, 0], [4, 50, u32::MAX]] {
+    for version in [[4, 0, 0], [4, 48, 0], [4, 48, u32::MAX]] {
         let mut buffer = [0u8; 12];
         for (index, value) in version.into_iter().enumerate() {
             write_u32(&mut buffer, index * 4, value).unwrap();
@@ -303,7 +303,13 @@ fn accepts_backward_compatible_interface_versions() {
 
 #[ktest]
 fn rejects_incompatible_interface_versions() {
-    for version in [[3, 0, 0], [5, 0, 0], [4, 51, 0], [4, u32::MAX, 0]] {
+    for version in [
+        [3, 0, 0],
+        [5, 0, 0],
+        [4, 49, 0],
+        [4, 50, 0],
+        [4, u32::MAX, 0],
+    ] {
         let mut buffer = [0u8; 12];
         for (index, value) in version.into_iter().enumerate() {
             write_u32(&mut buffer, index * 4, value).unwrap();
