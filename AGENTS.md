@@ -61,11 +61,19 @@ Local environment:
 - Name the branch after the concise PR title in kebab-case, such as `mapped-bio-ranges`; do not use generic names such as `pr` or `pr1`.
 - Move only the verified minimal production diff from `dm` onto that branch. Run the final validation, commit, and push directly on the PR branch; do not create a separate PR worktree.
 
+PR user-space validation must follow the official `test/initramfs` (C ABI
+regressions) and `test/nixos` (user-tool and system workflows) infrastructure.
+Select coverage by PR impact and validate on the PR branch; private runner
+results do not replace official-entry validation.
+
 ### Upstream Sync Workflow
 
 - Sync entry point: fetch upstream, fast-forward local `main` to `upstream/main`
-  (pure fast-forward, never conflicts), scout the delta, then rebase `dm`
-  linearly. Never merge; confirm `git log --merges main..dm` is empty.
+  (pure fast-forward, never conflicts), scout the delta, then merge the latest
+  `main` into `dm`. Merge commits are allowed on `dm`; confirm `main` is an
+  ancestor of `dm` after integration. PR branches must instead rebase onto the
+  latest `main` and remain linear, without importing dm merge history. Do not
+  automatically rebase open PRs when syncing `dm`.
 - Scout before spending build time: grade the upstream blast radius from the
   commit range. A docs/test-only delta may skip the baseline; changes to kernel
   core, the build system, dependency manifests, or the CI image require it.
@@ -76,7 +84,7 @@ Local environment:
   checkout's workspace root, and fresh checkout timestamps force a cargo-osdk
   reinstall.
 - Create a safety ref (`dm-backup-YYYYMMDD`) and keep rerere enabled before the
-  rebase; delete the ref after targeted verification passes.
+  integration; delete the ref after targeted verification passes.
 - Conflict adjudication: local workflow facts (`AGENTS.md` blocks, `log/`) keep
   the dm side; lockfiles and dependency versions take the upstream side, then
   normalize with one online cargo run in the container as a separate sync
