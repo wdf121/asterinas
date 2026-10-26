@@ -1,14 +1,21 @@
 # Device Mapper 当前项目状态
 
-> **更新日期**：2026-10-20。
+> **更新日期**：2026-10-26。当前 dm 为 `37ddb9245` 加恢复的未提交改动，最新 main 为 `ceb65e3f8`，未 push。
 >
-> 最新 PR3：`5b08f9a0a`，公共入口改为先版本握手、后命令支持检查，文件统一为 `dm_control.rs`。新增 C 顺序回归并调整内部测试；用户反馈 C 回归已跑完，最终 check/kernel/ktest 输出和计数未归档，不宣称最终 gate 全绿。PR4 空分支已重建到该提交，暂缓实现。详见 [PR3 档案](PR/PR-3-control-interface.md)、[10 月 20 日日志](daily/2026-10-20.md) 与 [控制面 ABI](../docs/control_ABI.md)。
->
-> 验证流程固定先 `make format` 再 `make check`；ktest 进入目标 Cargo crate，默认运行 crate 全部测试，至少覆盖相关文件，不逐函数枚举。下面的 10 月 19 日计数为历史 dm 验证，不证明最新 PR3。
->
-> **事实来源**：实现以当前源码为准，验证以对应源码版本和实际命令输出为准；历史日志不自动证明当前工作区通过。
+> 实现以源码为准，验证区分助手实际执行、用户反馈及历史证据。今日明细见 [日报](daily/2026-10-26.md)。
 
 ## 当前停点摘要
+
+- 上游新增 23 个提交已 merge；原研发改动恢复，唯一 stash 冲突 test/nixos/Makefile 已解决，保留上游缩进和套件 runner。安全引用和 stash 保留。
+- 用户反馈合并后 make check 与控制面集成测试通过；无独立输出/计数/镜像来源记录。本次同步按用户决定跳过 make kernel，未运行合并后 ktest/C 全量回归。
+- 控制面 13 例恢复薄 main.rs + cases.sh，删除实验性四个 Rust 模块及辅助层 7 项单测；run.sh/runner.py 保留，日志为 CST。同步前恢复运行 13/13、62 秒，用户随后反馈 45 秒；不是同步后性能数据。
+- extra_config.nix 显式声明工具并保留基础包，复用 dm overlay 的 aster-test-disk-locator；格式/语法检查通过，未重建镜像，上游需另行解决 locator 依赖。
+- ABI 4.48.0、测试与文档改动仍未提交；旧 PR 档案及 Word 删除保持用户原状态。
+- PR1 不改实现；新 PR2 为 ea1a9639c，后续 PR2～PR11 框架路线见 [规划](../docs/pull_request.md)，框架后接最小 linear 终验。当前只批准记录规划，不自动授权实现缺口。
+
+## 历史停点（2026-10-19 至 2026-10-20）
+
+以下内容保留当时的分支、授权和测试事实；不作为当前分支清单或当前工作区的验收依据。
 
 - 2026-10-19：完成 PR1–PR3 审阅、复核和单提交整理；dm 回补 poll 虚假就绪修复、BIO 边界与队列顺序测试、公开提交契约测试。验证基线为 `93159d132` 加本轮修改；代码已分点提交为 `7740a5281`、`64adad1c0`、`981294ef5`，文档随本次收口提交更新，均未推送。
 - Claude 独立运行完整 `make check` 通过；五组定向 ktest 为 BIO 13/0、queue 5/0、device 20/0、table 36/0、control ioctl 24/0，共 98/0，各命令退出 0。不是全仓验证。用户反馈 `make check`、`make kernel`、guest ABI 回归通过，后两项本轮未独立核验日志。
@@ -27,7 +34,7 @@
 
 ## 1. 当前方向
 
-当前以单 PR 为边界审查、复核并按授权实现，稳固已实现主链，不主动扩大通用框架：
+当前从 PR2 起规划通用 DM 框架，按单 PR 审查、复核并另行授权实现；最后以最小 linear 终验。下列主链用于依赖分析，不代表框架缺口已补齐：
 
 ```text
 DM control ABI
@@ -108,7 +115,7 @@ make run_kernel AUTO_TEST=regression REGRESSION_TESTS="device/device_mapper_cont
 
 ### 3.3 NixOS DM system suite
 
-当前只保留六个 canonical suite：
+控制面优先使用官方 `make run_nixos NIXOS_TEST_SUITE=device-mapper-control-plane`；以下为原六套本地脚本的历史/辅助入口，不是后续 PR 的交付模板：
 
 ```bash
 GUEST_READY_TIMEOUT=40 GUEST_QEMU_TIMEOUT=180 \

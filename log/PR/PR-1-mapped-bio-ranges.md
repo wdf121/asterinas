@@ -2,6 +2,10 @@
 
 ## 1. 状态与标识
 
+> **2026-10-26 核对**：本地 HEAD 为 `2f4fdc9a7`，main 基线为 `77ee3b196`，仅三个 block 文件；尚未 rebase 到最新 `ceb65e3f8`。PR1 实现本次不动。历史关联 #3937，远端最新状态未核查。10 月 19 日记录 block 11/0 及用户静态检查反馈，但最终重放 SHA 的证据不能从旧结果移用。后续为新 PR2 控制入口，不再是旧 linear-first 路线。完整系列见 [PR 规划](../../docs/pull_request.md)。
+
+以下旧 SHA 表格及验证章节为历史记录，不是当前状态：
+
 | 项目 | 事实 |
 |---|---|
 | 状态 | 本地已重放到新 main；用户反馈新基线验证通过，原始输出未归档。旧 c14d68c93 曾完成验证与推送。 |
@@ -124,7 +128,7 @@ Bio ──submit──> SubmittedBio ──queue/driver──> complete
 ## 6. 已知边界与后续动作
 
 1. 若 `mapped-bio-ranges` 的 base、HEAD 或三文件范围变化，先同步 `main` 到当前 upstream，再直接在该分支完成 rebase 与完整 PR gate；不得复用本次结果。
-2. PR 2 现为最小单段 linear 数据面，基于更新后的 PR 1；通用 tracked lease 路线已暂缓。
+2. 当前新 PR2 为控制入口，基于 PR1；最小 linear 移至框架完成后的终验阶段，旧 linear-first 路线不再适用。
 3. 下方英文维护者描述保留旧 SHA 的历史验证事实；实际再次发布前，须按新 SHA 的证据更新，不能当作 67ed6c70f 的完整验收描述直接发布。
 
 ## 7. Upstream maintainer description

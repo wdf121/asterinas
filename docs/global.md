@@ -1,5 +1,10 @@
 # Asterinas Device Mapper 全局规划
 
+> **2026-10-26 当前方向**：PR1 保持实现不动，从 PR2～PR11 交付通用 DM 框架，再接最小 linear 完成真实用户态验收。详细依赖、验收和待审定缺口以 [PR 路线](pull_request.md) 为准。下文 P0/P1～P10 是历史工程能力分类，不是当前 PR 顺序；verity 等新 target 不先于框架闭环。规划不等于实现授权。
+>
+> dm 已 merge main 至 `37ddb9245`，用户反馈合并后 check 与控制面集成通过；未独立归档输出，本次同步跳过 kernel。今日事实见 [日报](../log/daily/2026-10-26.md)。
+
+
 > **定位**：Device Mapper 项目的唯一全局路线图。
 >
 > **事实口径**：当前能力依据当前源码和已确认项目决策；无法确认的内容必须先向项目负责人询问。
@@ -62,7 +67,7 @@
 | P0.7 | 挂载或打开的 mapper 不能被错误 remove，释放使用者后可移除。 | ext2 mount source 与文件系统对象持有 tracked lease；runtime registry 同时检查 lease/open。 | core/registry ktest、focused C、control-plane | ✅ 已完成 |
 | P0.8 | LVM2 能显式创建、扩缩、`pvscan → vgscan --mknodes → vgchange -ay` 激活并在受控重启后恢复当前支持的 LV。 | linear、striped、mixed LV 的显式创建、扩缩、ext2 I/O 与跨启动恢复均已覆盖。 | LVM2 topology、linear/striped/mixed suite | ✅ 已完成 |
 
-**P0 退出条件：**P0.1～P0.8 对应的现有主链语义完成验收。第五版源码复核重新开放了 P0.1、P0.3、P0.5；历史主链测试成功不等于这些细节已对齐 Linux。当前先执行第 10.1 节的现有功能修复，暂不进入新 target 或通用框架实现。
+**P0 退出条件：**P0.1～P0.8 对应的现有主链语义完成验收。第五版源码复核重新开放了 P0.1、P0.3、P0.5；历史主链测试成功不等于这些细节已对齐 Linux。这是 10 月 16 日的历史优先级；当前规划按顶部 10 月 26 日路线推进，具体缺口实现仍须逐项审定。
 
 **不属于 P0：**DM-on-DM/queue stacking、uevent/sysfs/udev/systemd、mount source 类型、真实 alias/VFS 深层恢复、ext4/exfat、deferred remove/完整 control ABI、VirtIO/NVMe 故障注入，以及新 target。这些项目保持各自的后续优先级或触发条件。
 
@@ -123,7 +128,7 @@
 
 ## 10. 修复日志
 
-> 当前阶段：2026-10-19 完成 PR 审查收益的局部 dm 回补与定向验证，代码已分点本地提交，未推送；证据见[当日日志](../log/daily/2026-10-19.md)。V5 历史收尾见 [10 月 16 日](../log/daily/2026-10-16.md)。根盘问题继续待定，不重启通用文件系统排障。
+> 历史阶段：2026-10-19 完成 PR 审查收益的局部 dm 回补与定向验证，代码已分点本地提交，未推送；证据见[当日日志](../log/daily/2026-10-19.md)。V5 历史收尾见 [10 月 16 日](../log/daily/2026-10-16.md)。根盘问题继续待定，不重启通用文件系统排障。
 
 ### 10.1 第五版：已批准的当前修复
 
@@ -185,4 +190,4 @@
 
 | 日期 | 问题与影响 | 根因 | 修复 | 验证边界 | 提交状态 |
 |---|---|---|---|---|---|
-| 2026-10-20 | PR3 未支持命令在版本握手前返回 ENOTTY，与 Linux 公共入口顺序不同；无效地址/不兼容版本的 errno 和回写行为被提前拒绝遮蔽。 | decode_command 将 type 识别与命令支持检查合在握手前。 | 解码只检查 type 并提取 nr，握手后分派；统一文件名 dm_control.rs，补 C 顺序回归并调整内部测试。完整 dm 已有该顺序，本次不改其生产代码。 | 固定 Linux/PR3 源码核实，C 语法/格式和 diff 检查通过；用户反馈 C 回归已跑完，无最终运行日志/计数，不将新 SHA 全部 gate 标为通过。 | PR3 amend 为 `5b08f9a0a`，未推送；详见 [档案](../log/PR/PR-3-control-interface.md) 和 [ABI 说明](control_ABI.md) |
+| 2026-10-20 | PR3 未支持命令在版本握手前返回 ENOTTY，与 Linux 公共入口顺序不同；无效地址/不兼容版本的 errno 和回写行为被提前拒绝遮蔽。 | decode_command 将 type 识别与命令支持检查合在握手前。 | 解码只检查 type 并提取 nr，握手后分派；统一文件名 dm_control.rs，补 C 顺序回归并调整内部测试。完整 dm 已有该顺序，本次不改其生产代码。 | 固定 Linux/PR3 源码核实，C 语法/格式和 diff 检查通过；用户反馈 C 回归已跑完，无最终运行日志/计数，不将新 SHA 全部 gate 标为通过。 | PR3 amend 为 `5b08f9a0a`，未推送；详见 [当日日志](../log/daily/2026-10-20.md) 和 [ABI 说明](control_ABI.md) |

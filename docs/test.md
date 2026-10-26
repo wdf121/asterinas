@@ -1,5 +1,8 @@
 # Asterinas 开发测试手册
 
+> **2026-10-26 更新**：后续 PR 用户态验证参考官方 `test/initramfs`、`test/nixos` 入口，在对应 PR 分支执行；不以完整 dm 或私有脚本结果替代。框架阶段保留直接 ktest/可用 ABI 测试，完成后以最小 linear 接入真实 dmsetup/I/O 生命周期终验，详见 [PR 规划](pull_request.md#34-分层验证与最小-linear-终验)。
+
+
 各验证阶段的底层执行链见 [生产代码验证链路](production-code-validation-chain.md)。
 
 本文用于把**改动位置或行为**转换为可执行的测试动作：
@@ -177,7 +180,44 @@ Device Mapper 系统测试启动完整 NixOS guest，通过真实 `dmsetup`、LV
 
 “端到端”必须注明链路边界：control-plane、dataplane 和 LVM2 topology 只分别贯通控制面、裸块数据面和 LVM2 拓扑；验证“LVM2 → DM → ext2 → 文件读写 → 扩缩容 → 跨启动恢复”的完整存储闭环，必须运行 integration selector。
 
-#### 5.2.1 测试分层与验收清单
+#### 5.2.1 官方控制面套件（2026-10-23）
+
+控制面已接入官方 `test/nixos/` 框架；在 `fork_Asterinas:/root/asterinas` 串行执行：
+
+```bash
+make run_nixos NIXOS_TEST_SUITE=device-mapper-control-plane
+# 单例诊断不替代完整 13 例验收：
+make run_nixos NIXOS_TEST_SUITE=device-mapper-control-plane NIXOS_TEST_CASE=tableless_create
+```
+
+- Rust 入口注册 13 个用例，guest `cases.sh` 执行 dmsetup 操作和断言；runner 负责临时双盘、QEMU 监督和清理。范围限于控制面，不证明数据面、LVM2 或文件系统完整闭环通过。
+- runner 在 `target/nixos/dm-control-plane.<随机后缀>/` 创建两块 512 MiB 测试盘，结束后清理。无需手动准备或设置旧脚本的测试盘变量；不删除或重装 `target/nixos/asterinas.img`，也不重建其中的内核。
+- `GUEST_READY_TIMEOUT=40` 限制等待 shell 就绪；`GUEST_QEMU_TIMEOUT=180` 限制单次 guest 完整生命周期，两者从同一起点计时。正常结束立即收尾，`elapsed` 为实际耗时；`NIXOS_TEST_TIMEOUT` 是框架的命令/交互等待上限，不是 Cargo 构建或整套运行的总超时。
+- 终端显示等待登录、带时间戳的每次 BOOT 启动/就绪/结束、用例大纲与结果、Passed/Failed、最终 HOST 总结；不展示上传脚本的命令回显。
+- 本轮目录 `/tmp/dm-test/dm-control-plane/<日期-时间>[-序号]/` 只生成 `summary.log`，包括主机里程碑、guest 断言记录、构建/启动/监督进程诊断及保留的 QEMU 错误。`latest` 指向本轮目录；同分钟重复运行使用序号避让，不覆盖旧目录。
+- 完整验收需核对实际命令退出码为 0、终端 `Passed: 13 / Failed: 0`、guest 正常退出、本轮日志无失败标记及最终 `HOST_PASS_DM_CONTROL_PLANE`。不能只看 HOST_PASS；不要套用旧 shell 入口的 `HOST_PASS_DM_SYSTEM_TESTS` 聚合标记。
+
+```bash
+GUEST_READY_TIMEOUT=60 GUEST_QEMU_TIMEOUT=240 \
+  make run_nixos NIXOS_TEST_SUITE=device-mapper-control-plane
+run=/tmp/dm-test/dm-control-plane/latest
+# 先核对本轮目录，再查看断言与生命周期信息：
+readlink -f "$run"
+grep -aE 'DM-TEST|^CASE_|^CHECK_PASS_|^STATUS_|^OBSERVE_GAP_|^TEST_FAIL_|^Traceback|^error:' \
+  "$run/summary.log"
+```
+
+以下 5.2.2–5.2.5 保留旧 `myshell` 六套件说明；其多文件日志、固定测试盘配置和聚合标记仅适用于旧脚本入口，不适用于上述官方控制面套件。其余五套本次未迁移。新旧控制面入口共用日志根路径，检查 `latest` 前须确认实际运行入口和目录时间。
+
+**2026-10-26 实现与验证补充：**
+
+- 当前为单个薄 `src/main.rs` 上传并注册 13 例，`cases.sh` 执行断言和清理；`run.sh` 与 `runner.py` 仍负责实际启动、临时盘、监督与日志，不可删除。
+- 细粒度 Rust/PTY 交互迁移曾造成性能回退；批处理实验已撤销，四个 Rust 场景/支持模块及全部 7 项辅助单测已删除，不作为当前架构。
+- runner 固定 UTC+8 CST 生成目录及墙钟时间；超时仍为上限，不是每个命令固定等待。三个无新事件 WAIT 场景预期等满 3 秒并返回 124，不能将所有失败都接受为超时。
+- 恢复后助手实际运行 13/13、guest 62 秒；用户随后反馈 45 秒。合并上游后用户另反馈 check 与控制面集成通过，未提供独立计数与耗时，不混用两次证据。
+- 新增 `extra_config.nix`：dmsetup/lvm2、util-linux 和脚本工具，保留 hello-asterinas/gitMinimal，因为当前配置合并替换包列表。aster-test-disk-locator 仍依赖 dm overlay，上游交付须单独核对。仅 Nix 格式、parse 与 diff 检查通过，未构建应用该配置的新镜像。
+
+#### 5.2.2 旧 shell 套件：测试分层与验收清单
 
 **基础系统回归**：三项均为真实用户工具到内核的系统测试，但不能单独或合并视为完整存储闭环。
 
@@ -206,7 +246,7 @@ Device Mapper 系统测试启动完整 NixOS guest，通过真实 `dmsetup`、LV
 
 统一入口一次只接受一个 selector，没有 `--all`。六项必须逐项串行运行，每项结束并确认 QEMU 已退出后再运行下一项。
 
-#### 5.2.2 运行环境与测试盘
+#### 5.2.3 旧 shell 套件：运行环境与测试盘
 
 | 准备项 | 命令或默认值 | 判定与说明 |
 |---|---|---|
@@ -247,7 +287,7 @@ fallocate -l 512M target/nixos/dm-test/disk4.img
 
 正式命令只需传入专用路径；默认重置会重新创建镜像。设置 `RESET_DM_TEST_IMAGES=0` 并不把测试变为只读，也不保护已有数据。
 
-#### 5.2.3 通过判定与日志
+#### 5.2.4 旧 shell 套件：通过判定与日志
 
 六套默认启用 `DM_COMPACT_LOG=1`（需同时启用 `DM_STRUCT_LOG=1`）：准备阶段展示测试盘路径、容量、超时边界和测试意图；仅首轮显示 `BOOT starting`，每轮保留就绪耗时、`BOOT finished` 和通过标记，去掉重复绝对时间。最后一轮 PASS 在详细输出之前展示，但仍须通过退出码、失败标记和 guest PASS 三项检查。`DM_COMPACT_LOG=0` 恢复非精简生命周期展示。
 
@@ -288,7 +328,7 @@ grep -aE '^(TEST_|HOST_|SUMMARY_GAP_|OBSERVE_|TEST_DISK|DEV[0-9]*=|Kernel panic|
 
 `run_dm_system_tests.sh` 只提供统一 selector 和最终聚合标记；实际测试逻辑由六个子脚本执行。使用 `./myshell/run_dm_system_tests.sh --help` 查看当前 selector，使用具体子脚本的 `--help` 查看参数。
 
-#### 5.2.4 超时与失败定位
+#### 5.2.5 旧 shell 套件：超时与失败定位
 
 仅在当前机器确实需要时临时放宽每次 guest 的超时，例如：
 
