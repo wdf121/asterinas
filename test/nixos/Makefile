@@ -23,6 +23,10 @@ RUN_SCRIPT := $(ASTERINAS_ROOT)/tools/nixos/run.sh
 # Test directory structure
 TEST_DIR := tests/$(NIXOS_TEST_SUITE)
 EXTRA_CONFIG := $(TEST_DIR)/extra_config.nix
+# A suite may provide a launcher to attach its own disposable test devices.
+ifneq ($(wildcard $(TEST_DIR)/run.sh),)
+RUN_SCRIPT := $(abspath $(TEST_DIR)/run.sh)
+endif
 
 .PHONY: check-test-name
 check-test-name:
@@ -83,7 +87,11 @@ run_nixos: check-test-name
 		TEST_CASE_ARG="--test $(NIXOS_TEST_CASE)"; \
 	fi; \
 	QEMU_CMD="bash $(RUN_SCRIPT) nixos"; \
-	cargo run -- --qemu-cmd "$$QEMU_CMD" $$TEST_CASE_ARG || exit 1
+	if [ -f runner.py ]; then \
+		python3 runner.py cargo run -- --qemu-cmd "$$QEMU_CMD" $$TEST_CASE_ARG; \
+	else \
+		cargo run -- --qemu-cmd "$$QEMU_CMD" $$TEST_CASE_ARG; \
+	fi || exit 1
 
 .PHONY: check
 check:
