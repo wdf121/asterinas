@@ -2,7 +2,9 @@
 
 ## 1. 状态与标识
 
-> **2026-10-26 核对**：本地 HEAD 为 `2f4fdc9a7`，main 基线为 `77ee3b196`，仅三个 block 文件；尚未 rebase 到最新 `ceb65e3f8`。PR1 实现本次不动。历史关联 #3937，远端最新状态未核查。10 月 19 日记录 block 11/0 及用户静态检查反馈，但最终重放 SHA 的证据不能从旧结果移用。后续为新 PR2 控制入口，不再是旧 linear-first 路线。完整系列见 [PR 规划](../../docs/pull_request.md)。
+> **2026-10-26 最新状态**：已从 `2f4fdc9a7` 无冲突 rebase 到 main `ceb65e3f8`，新 HEAD 为 `2dd1bcac5e41cdce3475dc08422bc3a09adff0b8`。range-diff 为 `=`，仍仅三个 block 文件，无 merge commit，空白检查通过。用户随后反馈格式、check、kernel 与 block crate 测试全部成功；未归档原始运行计数，源码的 11 个 ktest 不冒充实测计数。
+>
+> 已经授权使用精确 lease 将 fork `mapped-bio-ranges` 从 `e7e221993` 更新到 `2dd1bcac5`，push 退出 0，随后 ls-remote 核验远端与本地一致。历史关联 #3937；本轮未检查网页审阅/合并状态。安全分支 `mapped-bio-ranges-backup-20261026` 保留。后续为新 PR2 控制入口，完整路线见 [PR 规划](../../docs/pull_request.md)。
 
 以下旧 SHA 表格及验证章节为历史记录，不是当前状态：
 
