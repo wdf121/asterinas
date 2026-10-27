@@ -4,9 +4,11 @@
 >
 > **职责边界**：每个已实际制备的 PR 的技术细节、Git 元数据、验证证据和英文 maintainer 描述记录在 [`log/PR/`](../log/PR/)；日报只记录当天发生的操作与结论。
 >
-> **最后更新**：2026-10-26。
+> **最后更新**：2026-10-27。
 >
-> **当前说明**：PR1 不改实现；从现有 PR2 开始规划至通用 DM 框架闭环，再以一个最简单的 linear target 完成真实用户态终验。PR2～PR11 为候选拆分，不代表已实现。dm 已 merge 最新 main，PR 链未随之重放；远端 PR 状态本次未复核。
+> **PR3 制备进展**：完整 dm 的已批准语义修复已写入工作区，用户反馈验证通过；尚未提交和提取。`dm-device-management` 仍为 `808d36daf`，与 PR2 相同。所有已修/待修项、状态和卡点统一维护在 [global.md §10.4](global.md#104-pr3-制备前修复与待办总账2026-10-27)；[今日日志](../log/daily/2026-10-27.md) 区分用户反馈和独立证据。PR3 仍限定无表管理，不自动前移 table/BIO、runtime、rename、REMOVE_ALL；命名 major 前置及全局事件拆分待审定。dm 验证不能替代 PR3 验证。
+>
+> **当前说明**：PR1 不改实现；从现有 PR2 开始规划至通用 DM 框架闭环，再以一个最简单的 linear target 完成真实用户态终验。PR2～PR11 为候选拆分，不代表已实现。dm 已 merge 最新 main；随后经单独授权，PR1/PR2 已线性更新至 main `ceb65e3f8`。PR1 已推送，PR2 清理后为 `808d36daf`、未推送；网页审阅状态未复核。
 
 ## 1. 规范
 
@@ -79,10 +81,10 @@
 
 | PR | 主题 | 本地状态（2026-10-26 核对） | 直接 base | HEAD | 档案 |
 |---|---|---|---|---|---|
-| PR1 | mapped BIO ranges | 保留现有实现；历史关联 #3937，远端最新状态未复核 | `77ee3b196` | `2f4fdc9a7` | [PR1](../log/PR/PR-1-mapped-bio-ranges.md) |
-| 新 PR2 | 控制设备与 DM_VERSION | 已有本地提交；最终 SHA 验收证据待补 | `2f4fdc9a7` | `ea1a9639c` | [PR2](../log/PR/PR-2-control-interface.md) |
+| PR1 | mapped BIO ranges | 用户反馈检查及 block 测试成功；已推送并核对远端 SHA，历史关联 #3937 | `ceb65e3f8` | `2dd1bcac5` | [PR1](../log/PR/PR-1-mapped-bio-ranges.md) |
+| 新 PR2 | 控制设备与 DM_VERSION | 六文件单提交，已移除公共筛选扩展；本轮未推送 | `2dd1bcac5` | `808d36daf` | [PR2](../log/PR/PR-2-control-interface.md) |
 
-两者共同 main 基线仍为 `77ee3b196`，尚未更新到最新 `ceb65e3f8`；两条分支均保持线性。dm 上的测试不替代 PR 验收。
+两者共同 main 基线现为 `ceb65e3f8`，保持 `main → PR1 → PR2` 线性链。PR2 的格式/静态/构建/core 测试成功为用户反馈，最终清理后未重跑；官方全量回归在 cgroup 断言处失败，main 同环境复现，不能写为全量通过。具体命令与边界见 PR2 档案；dm 测试不替代 PR 验收。
 
 | 日期 | PR | 事件 | 事实 |
 |---|---|---|---|
@@ -90,6 +92,8 @@
 | 2026-09-28 | PR 1 | 最终 SHA 验证 | 在 `fork_Asterinas:/root/pr-tree` 验证 `c14d68c93`：`make check`、block crate ktest（6/0）、`make ktest`（245/0）与 `make kernel` 均通过；验证后工作树已删除。 |
 | 2026-09-28 | PR 1 | 语义化分支迁移 | fork 分支从 `pr` 改为 `mapped-bio-ranges`，保持 `c14d68c93` 不变并删除旧远端引用。 |
 | 2026-10-09 | PR 1 | 线性更新本地基线 | 在 mapped-bio-ranges 执行 git rebase main，无冲突；c14d68c93 → 67ed6c70f，base 为 10a241870。range-diff 为 =，三文件范围不变，无 merge commit，diff --check 通过。未推送新 SHA；用户随后反馈验证通过，未提供命令输出与计数。 |
+| 2026-10-26 | PR1 | rebase 与推送 | `2f4fdc9a7` → `2dd1bcac5`，range-diff 为 `=`；用户反馈验证成功，精确 lease 推送后远端 SHA 核验一致。 |
+| 2026-10-26 | PR2 | rebase 与范围收口 | `ea1a9639c` → `fabadd3cb` → `808d36daf`；移除回归参数扩展，代理前缀撤销，保留六文件；未推送。 |
 
 PR 1 的当前 Git branch 为 `mapped-bio-ranges`；文档中的稳定编号统一为 **PR 1**。
 

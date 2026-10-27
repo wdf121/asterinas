@@ -1,14 +1,24 @@
 # Device Mapper 对话交接
 
-> **更新日期：2026-10-26。** dm 已 merge 最新 main `ceb65e3f8`，合并提交 `37ddb9245`；原未提交内容已恢复，未 push。stash 恢复时仅 `test/nixos/Makefile` 冲突，采用上游排版并保留 runner 分支及失败传播，修复尚未提交。
+> **更新日期：2026-10-27。** 当前仍在 `dm`，HEAD `7c46b2ee8` 加未提交生产/测试修复。用户在最新两处 lint 修正后确认验证全部通过；助手未独立取得最终日志、计数及镜像来源。当前阶段已获授权集中更新文档，不继续修改生产代码。
+>
+> **接手重点**：PR3 制备前已修 CREATE errno、dev 低 32 位、C ABI 4.48.0、1 GiB 校验上限、UUID bytes、全局 poll/ARM_POLL、REMOVE 控制引用与 BIO 排空、minor 一次性释放及旧实例保护。逐项状态与全部卡点见 [global.md §10.4](global.md#104-pr3-制备前修复与待办总账2026-10-27)，实际过程见 [10 月 27 日日志](../log/daily/2026-10-27.md)。
+>
+> **未完成/禁止默认为完成**：deferred REMOVE 与 DM uevent 因缺跨子系统接口暂缓，非 UTF-8 名称仍不支持；精确事件提交点、极限分配证据、PR3 前置及裁剪待处理。`dm-device-management` 仍与 PR2 同为 `808d36daf`，尚未提取、验证、提交或推送。PR3 只含无表管理，不另造模型、不自动修改 PR1/PR2。
+>
+> 以下 10 月 26 日同步摘要及第 1–3 节保留历史事实，不代表本轮已提交或当前 poll/ABI 状态。
+
+> **2026-10-26 同步摘要。** dm 已 merge 最新 main `ceb65e3f8`，合并提交 `37ddb9245`；后续五点提交收口至 `7c46b2ee8` 并普通推送，远端 SHA 已核验。stash 恢复的 Makefile 冲突修复已纳入测试套件提交；原研发内容与已确认删除项已提交。当前在 dm 进行经授权的文档更新，不修改 PR 生产实现。
 >
 > 用户反馈合并后 `make check` 和控制面集成测试通过，原始输出、计数和镜像来源未独立归档；本次同步明确跳过 `make kernel`。无文本冲突不等于无语义回归。
 >
 > 控制面恢复为薄 `main.rs` 注册/上传 + `cases.sh` 断言 + `run.sh`/`runner.py` 监督，保留 13 例、单份 summary.log 与 CST 时间；新增 extra_config.nix 仅格式/语法检查，未重建镜像。用户在同步前反馈重跑 45 秒；不混为同步后性能证据。
 >
-> 下一阶段从新 PR2 开始，PR1 不改实现；PR2～PR11 完成框架，随后最小 linear 终验。路线与前置缺口见 [PR 规划](pull_request.md)，今日过程见 [日报](../log/daily/2026-10-26.md)。PR 分支仍为 `2f4fdc9a7`、`ea1a9639c`，未随 dm 更新。
+> 下一阶段从新 PR2 开始，PR1 不改实现；PR2～PR11 完成框架，随后最小 linear 终验。路线与前置缺口见 [PR 规划](pull_request.md)，今日过程见 [日报](../log/daily/2026-10-26.md)。PR 链经单独授权更新为 `ceb65e3f8 → 2dd1bcac5 → 808d36daf`；PR1 已推送，PR2 未推送。PR2 六文件，不含公共 REGRESSION_TESTS 扩展或代理前缀；原 commit 描述保留，英文页面草稿见 [PR2 档案](../log/PR/PR-2-control-interface.md)。
 >
-> 安全引用 `dm-backup-20261026-before-sync` 和 stash `1b60fbd99901a77bbcd91f4773aedcb970433a6b` 保留；不要清理旧研发改动、删除项或其他 stash。
+> 安全引用 `dm-backup-20261026-before-sync` 和 stash `1b60fbd99901a77bbcd91f4773aedcb970433a6b` 保留；另有 PR1/PR2 的 `*-backup-20261026` 分支，均未删除；不要擅自清理备份或其他 stash。
+
+> **PR2 验证边界**：用户反馈 format/check/kernel/core 测试成功；core 入口为 `cd kernel/core && cargo osdk test`，不记未提供的运行计数。官方全量回归在 cgroup CPU 记账阈值处失败，main 同命令复现；用户表示已确认上游 bug 并停止排查，未提供链接。最终清理后未重跑，不列定向 C 回归通过。对照日志保存在 `/tmp/pr2-main-cgroup-20261026-7l3yamjc/`。临时 DCAP 代理修改已撤销，main 未改写。
 
 ## 1. 历史停点（2026-10-19 至 2026-10-20）
 
@@ -70,18 +80,18 @@ cargo osdk test --kcmd-args=earlycon
 cd /root/asterinas
 make run_kernel AUTO_TEST=regression REGRESSION_TESTS="device/device_mapper_control device/device_mapper_lifecycle device/device_mapper_table"
 
-# 新 PR2 只有 control 程序，不执行尚不存在的 lifecycle/table：
-# make run_kernel AUTO_TEST=regression REGRESSION_TESTS=device/device_mapper_control
+# 新 PR2 已移除 REGRESSION_TESTS 扩展，使用官方全量入口：
+# make run_kernel AUTO_TEST=regression
 ```
 
 - 当前完整 dm 的 OSDK 支持模块筛选，但新 PR2 基线不同；不跨分支照搬 selector。每次核对非零实际计数并及时保存串口日志，下一次运行可能覆盖。上述全 crate 命令避免模块筛选差异，并不是全仓 make ktest。
-- ABI 三个程序分别为 control 13、lifecycle 7、table 5 个场景。原 24 个场景保留，新增 poll 后共 25 个；场景数不是断言数量。旧 `device_mapper`/`device_mapper_version` 即使残留二进制也不是当前验收入口。
+- 当前 C 测试源码为 control 15、lifecycle 7、table 5 个 `FN_TEST` 场景，共 27 个；新增事件/ARM 与 opaque UUID 场景。源码场景数不是实际执行数或断言数，最终运行计数未独立取得。旧 `device_mapper`/`device_mapper_version` 即使残留二进制也不是当前验收入口。
 - 最终验收为 `make check`、`make kernel`、相关定向 ktest；涉及 ABI 加 C 回归，工具流程按影响选择系统套件，不默认完整 ktest。
 - 区分编译失败、guest 启动失败、测试失败。已观察到且未阻止测试完成的 ermsb/GRUB/CPU/video/IOMMU 环境提示留作备注，不仅凭 warning/error 字样中断；真实失败、阻塞或影响不明的新问题仍如实报告，不隐瞒。
 
 ## 5. 后续边界
 
-- 不自动扩大到全局 poll、DM-on-DM、deferred remove、queue stacking、udev/sysfs 自动化或新 target；分别核对缺失依赖后由用户决定。
+- 全局 control poll/ARM_POLL 已在完整 dm 实现；不自动扩大到 DM-on-DM、deferred remove、queue stacking、udev/sysfs 自动化或新 target。需要修改其他子系统或新增子系统的工作本轮不做，卡点逐项保存在 global.md。
 - Book/SCML 兼容性说明仍是后续文档项，本轮没有更新。旧 PR 档案和其他手册可能滞后，不能把历史验证当作当前通过。
 - 普通 VFS rename、完整 mount source 路径和 procfs 的直接覆盖缺口保留，不以相邻模块通过替代。
 - 不修改 KVM、RELEASE、QEMU、NixOS 启动协议或 `myshell/br.sh`，除非用户明确要求。系统 suite 启动已有镜像，不自动重建内核，须确认来源与 profile。
@@ -93,7 +103,7 @@ make run_kernel AUTO_TEST=regression REGRESSION_TESTS="device/device_mapper_cont
 [CLAUDE.md](../CLAUDE.md) / [AGENTS.md](../AGENTS.md)
 → 本交接
 → [项目状态](../log/device-mapper-progress.md)
-→ [最新日志（2026-10-23）](../log/daily/2026-10-23.md)
+→ [最新日志（2026-10-27）](../log/daily/2026-10-27.md)
 → 按任务阅读源码与历史 PR 档案。
 
 接手先核对分支、HEAD 和工作区，不自动切分支、提交或 push。阶段中只汇报进度，验证完成后经授权集中更新文档。每日新增“协作复盘与心得”，记录得到验证的判断、需纠正的认识与下次改进，不重复清单、不虚构经验。

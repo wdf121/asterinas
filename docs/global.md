@@ -1,6 +1,8 @@
 # Asterinas Device Mapper 全局规划
 
-> **2026-10-26 当前方向**：PR1 保持实现不动，从 PR2～PR11 交付通用 DM 框架，再接最小 linear 完成真实用户态验收。详细依赖、验收和待审定缺口以 [PR 路线](pull_request.md) 为准。下文 P0/P1～P10 是历史工程能力分类，不是当前 PR 顺序；verity 等新 target 不先于框架闭环。规划不等于实现授权。
+> **2026-10-27 修复状态**：PR3 制备前的 DM 内语义修复已落在 `dm` 工作区，用户反馈验证全部通过；尚未提交、尚未提取到 `dm-device-management`。完整逐项台账（含待修复状态、卡点与后续条件）见 [10.4 节](#104-pr3-制备前修复与待办总账2026-10-27)，过程与证据边界见 [今日日志](../log/daily/2026-10-27.md)。不将 dm 验证等同于 PR3 验收。
+>
+> **2026-10-26 路线决策**：PR1 保持实现不动，从 PR2～PR11 交付通用 DM 框架，再接最小 linear 完成真实用户态验收。详细依赖、验收和待审定缺口以 [PR 路线](pull_request.md) 为准。下文 P0/P1～P10 是历史工程能力分类，不是当前 PR 顺序；verity 等新 target 不先于框架闭环。规划不等于实现授权。
 >
 > dm 已 merge main 至 `37ddb9245`，用户反馈合并后 check 与控制面集成通过；未独立归档输出，本次同步跳过 kernel。今日事实见 [日报](../log/daily/2026-10-26.md)。
 
@@ -41,7 +43,7 @@
 | ✅ **suspend、reload、resume、即时 remove** | Linux DM 管理 active/inactive table、suspend/resume、table replacement 和 mapper remove。 | ✅ 实现 drain reload、`--noflush` postponed replay、即时 remove 和失败回滚/隔离。<br><br>**生产文件：**<br>device.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/workflow.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/runtime.rs<br>/root/github/asterinas/<br>kernel/core/src/device/registry/block.rs |
 | ✅ **显式恢复与受控重启恢复** | 恢复可分为 LVM scan/activation、文件系统重放、后端错误恢复，以及多副本/磁盘故障恢复等层次。 | ✅ 当前范围是显式 LVM scan/activation 与受控重启后的 mapper/LV 恢复。<br><br>**生产文件：**<br>device.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/workflow.rs<br>/root/github/asterinas/<br>kernel/core/src/device/misc/dm_control/runtime.rs |
 
-**控制事件边界（2026-10-19）：**控制 fd 的 `poll` 当前返回空，不再恒报 IN/OUT；完整 Linux 机制仍需要全局事件计数、等待队列、每打开文件事件基准及 `DM_DEV_ARM_POLL`，属于 P7 未实现能力。已有单设备 `DM_DEV_WAIT` 不等于全局 poll。
+**控制事件边界（2026-10-27）：**已实现全局事件计数、poll 等待通知、每次 open 的事件基准及 `DM_DEV_ARM_POLL`，dup 共享同一文件状态；成功命令事件在结果 copyout 前提交。单设备 `DM_DEV_WAIT`、全局 control poll 与设备 uevent 是三套不同机制：前两者已有实现，DM uevent/cookie 与 udev 同步仍未实现，详见 10.4 节。
 
 ## 4. 依赖绕过与当前运行模式
 
@@ -81,7 +83,7 @@
 | **P4** | `dm-mirror` | **用户价值：**多副本、故障策略和重同步。<br><br>**依赖：**副本状态、重同步和后台工作。<br><br>**排序原因：**位于 snapshot 后；通用框架和并发/生命周期侵入最大。 |
 | **P5** | ext4 / exfat 等<br>块设备文件系统兼容范围 | **用户价值：**扩大用户把 LV 用作常见块设备文件系统的场景。<br><br>**依赖：**ext4 需要 ext4 兼容能力；exfat 是否列为 DM 核心验收尚未确认；tmpfs 不以 LV/mapper 为数据 backing。<br><br>**排序原因：**不扩展 DM table/控制 ABI；ext4 需要较大文件系统能力扩展。 |
 | **P6** | 后端 I/O 错误<br>断电/crash 与磁盘故障恢复 | **用户价值：**真实故障时的错误传播、可恢复性和数据可靠性。<br><br>**依赖：**真实设备错误、文件系统 crash recovery、磁盘故障与恢复策略。<br><br>**排序原因：**预计需要 driver fault-injection seam、错误处理和文件系统/持久状态改动；若确认仅需 DM 内部逻辑，应按实际改动量前移。 |
-| **P7** | deferred remove<br>完整 control ABI | **用户价值：**扩大 Linux 命令和生命周期兼容面。<br><br>**依赖：**`DM_TARGET_MSG`、`DM_DEV_SET_GEOMETRY`、`DM_DEV_ARM_POLL`、IMA。<br><br>**排序原因：**需要延迟 node/manager 生命周期或额外 ABI 语义。 |
+| **P7** | deferred remove<br>完整 control ABI | **用户价值：**扩大 Linux 命令和生命周期兼容面。<br><br>**依赖：**`DM_TARGET_MSG`、`DM_DEV_SET_GEOMETRY`、IMA 及延迟删除通知；`DM_DEV_ARM_POLL` 已实现，不再计入未实现项。<br><br>**排序原因：**需要延迟 node/manager 生命周期或额外 ABI 语义。 |
 | **P8** | DM-on-DM stacking<br>完整 queue stacking | **用户价值：**mapper 作为 backing、异构 queue limit/descriptor 组合。<br><br>**依赖：**依赖图、环检测、lease/flush/remove 级联、通用 block metadata 和 driver capability。<br><br>**排序原因：**`table.rs` 当前拒绝 DmDevice backing；对 DM 与通用 block 框架改动很大。 |
 | **P9** | uevent / sysfs / udev<br>systemd activation | **用户价值：**减少显式 scan、mknodes、activate 等运维操作。<br><br>**依赖：**事件分发、sysfs 属性、用户态规则与服务协同。<br><br>**排序原因：**外部生态依赖最强、非 DM 专属。 |
 | **P10** | 通用物理 block-device 热插拔<br>运行期 VirtIO/PCI 插盘与真实 USB mass-storage | **用户价值：**系统运行中发现、发布并安全移除物理存储设备。<br><br>**依赖：**总线 add/remove 与 driver probe/unbind、运行期 block registry/devtmpfs 主盘和分区节点事务、I/O worker 生命周期、in-flight I/O 失败收束、open/mount/lease/cache/DM backing 的移除协调；真实 USB 还需要 xHCI 与 mass-storage 驱动。完成上述内核链路后，可选接入 sysfs/NETLINK_KOBJECT_UEVENT/udev。<br><br>**排序原因：**当前启动期 VirtIO/NVMe 枚举和 DM runtime node 已可用，但缺少通用运行期 add/remove 链路；该能力跨总线、driver、VFS 和用户态生态，非 DM 主链所需，置于当前路线最低优先级。 |
@@ -120,7 +122,7 @@
 
 ## 9. 维护规则
 
-1. 本文只维护功能、依赖、实现方式、未实现原因和优先级；不记录测试次数、通过结果或每日命令输出。
+1. 本文维护功能、依赖、实现方式、未实现原因和优先级；PR3 制备发现的每项修复和待办必须登记在修复总账，记录当前状态、卡点、验证证据类别和提交状态，详细命令与输出保留在日报。
 2. 测试命令和结果维护在 `docs/test.md`、`docs/review.md` 和 `log/daily/YYYY-M-D.md`。
 3. 新 target 或重新开启框架专项工作前，先说明原来行为、目标行为、示例差异、依赖和验收；未经确认不开始实现。
 4. 任何无法由源码或已确认项目决策支撑的内容，先询问项目负责人。
@@ -186,7 +188,48 @@
 | 2026-10-12 | upstream 设备模型创建空 `/sys/dev/block`，LVM2 sysfs filter 拒绝一切块设备，`--linear-integration` 第二层失败。 | 块设备从未注册进设备模型；块类 `/dev` 节点由 registry 自行发布，设备模型无法感知。 | 引入 `CREATES_DEVNODE` 类属性 opt-out，`SelfPublishingBlock` 将块设备接入设备模型：opt-out 设备仍获 `/sys/dev/<kind>/<major>:<minor>` 索引项，模型不创建、不在 teardown 时删除其节点。 | core DM ioctl ktest 81/0；`--linear-integration` 完整套件五次真实运行全部 PASS。 | `535727967` |
 | 2026-10-19 | 控制 fd 无事件时恒报 IN/OUT，可能让用户态事件循环持续立即返回。 | poll 直接返回请求 mask 中的 IN/OUT，未关联事件状态。 | 暂无全局事件支持时返回空，补内核及 C ABI 测试；不宣称完整 Linux poll/ARM_POLL 支持。 | 完整 check、control ioctl 定向 ktest 通过，新增 poll 实际执行；用户反馈 kernel/guest ABI 通过，后两项未独立核验日志。详见当日日志。 | `981294ef5`，未推送 |
 
-### 10.3 PR3 公共入口修正（源码核实，最终运行证据待归档）
+### 10.4 PR3 制备前修复与待办总账（2026-10-27）
+
+这里的 PR3 指当前 `dm-device-management`（无表设备管理），不是 10.3 节历史编号中的控制入口 PR。范围为 CREATE、STATUS、LIST_DEVICES、单设备无表 REMOVE、必要参数与 manager 接线；不包含 table/target/BIO、runtime 发布、rename、REMOVE_ALL。为保持唯一实现来源，先修完整 dm；下表的完整 dm 修复不意味着全部进入 PR3。
+
+**证据与状态规则：**源码为 `dm` 的 `7c46b2ee8` 加未提交修改；Linux 固定提交为 `5078a3a23a1e1825ec136485173ec98668cdd640`，读取 Git 版本，避开本地学习修改。用户在 lint 修正后确认“验证都通过了”；助手未独立取得最终完整日志、计数、退出码或镜像来源。下表“已修复”均指完整 dm 工作区，未提交、未提取；不表示全部 Linux 语义均已验证。完整命令证据边界见 [日报](../log/daily/2026-10-27.md)。
+
+#### 已修复项
+
+| 编号 | 原问题与影响 | 修复与当前源码证据 | 验证及 PR3 关系 |
+|---|---|---|---|
+| PR3-F01 | CREATE 重复 name/UUID 返回 EEXIST，固定 Linux 为 EBUSY。 | [abi.rs](../kernel/core/src/device/misc/dm_control/abi.rs) 的 `map_create_error` 专用映射；保留 minor 分配优先及失败释放。 | 用户反馈通过；Rust/C 冲突与优先级测试；PR3 直接相关。 |
+| PR3-F02 | ioctl dev 使用通用扩展 64 位解码，未忽略高 32 位。 | 同文件 `decode_ioctl_device` 在 DM ABI 内实现低 32 位解码；CREATE 只取 minor，未修改通用 DeviceId。 | 用户反馈通过；高位扰动和 persistent minor 回归；PR3 直接相关。 |
+| PR3-F03 | C 请求依赖 Nix 新头文件的 4.50.0，与固定 ABI 4.48.0 不一致。 | [device_mapper_common.h](../test/initramfs/src/regression/device/device_mapper_common.h) 固定请求和返回版本断言，三个 C 程序统一使用。 | 用户反馈 C 回归通过；PR3 提取时保留固定基线，不能依宿主头文件漂移。 |
+| PR3-F04 | 1 MiB 策略错误拒绝 Linux 可接受的 data_size，包括 NO_PARAMS 声明。 | `DM_IOCTL_MAX_SIZE` 改为 1 GiB；[ioctl.rs](../kernel/core/src/device/misc/dm_control/ioctl.rs) 保持 NO_PARAMS 仅处理 305 字节固定前缀。 | 用户反馈通过；边界测试不等于实际成功分配 1 GiB，资源限制见 T05。 |
+| PR3-F05 | UUID 被当作 UTF-8，合法非 UTF-8 身份无法 roundtrip。 | [abi.rs](../kernel/core/src/device/misc/dm_control/abi.rs) `optional_uuid/c_bytes_until`、manager/device 的 `Vec<u8>`、查询/设置 UUID/LIST 输出与前缀过滤按 bytes；name 仍 String。 | 用户反馈通过；opaque UUID Rust/C 测试。PR3 提取身份部分，不引入 rename。 |
+| PR3-F06 | 全局 control poll/ARM_POLL 缺失；已有 WAIT 不足以覆盖。 | [dm_control.rs](../kernel/core/src/device/misc/dm_control.rs) 全局 generation、Pollee、per-open 基准、dup 共享；ARM_POLL 确认事件。 | 用户反馈通过；Rust/C 事件与 ARM 测试。完整 dm 已实现，PR3 如何拆分见 T06。 |
+| PR3-F07 | 成功命令与 copyout 失败的全局事件边界缺少实现/覆盖。 | 成功 CREATE/REMOVE/RENAME/REMOVE_ALL 在 copyout 前通知；ARM 即使结果回写 EFAULT，确认仍已生效。活表 rename/remove、激活接事件。 | 用户反馈通过；新增 ARM copyout 故障测试。精确 bind 提交点专项证据见 T07；不等同 uevent。 |
+| PR3-F08 | REMOVE 返回时未显式等待已准入控制操作，活动表释放边界依赖 Arc。 | [manager.rs](../kernel/core/comps/device-mapper/src/manager.rs) `acquire_control/create_control` 与索引锁配合；[device.rs](../kernel/core/comps/device-mapper/src/device.rs) `DmControlRef/drain_removed`；删除在 lifecycle 锁外等待控制引用和已分配 BIO。 | 用户反馈通过；WAIT/remove 保留旧表与排空测试；PR3 保留控制引用原则，不搬入 BIO。 |
+| PR3-F09 | 排空初稿仍可能经旧 raw Arc 接收新 BIO，导致删除边界不闭合。 | `stop_removed_io` 在成功 runtime 注销后永久关闭 admission，失败 postponed BIO，保留已分配 BIO 正常完成；失败注销不执行该提交。 | 用户反馈通过；新增拒绝新 BIO、等待 holder/BIO 测试。属于完整 dm 修复，不进入无表 PR3 数据面。 |
+| PR3-F10 | REMOVE 成功后结构性旧 Arc 仍占 minor，立即指定同 minor 创建可能失败。 | `DmDeviceIdOwner` 的编号占用与不可变 ID 分离；drain 后显式一次性 release，Drop 保留兜底。旧对象再次清理/析构不得释放新分配。 | 用户反馈通过；同名同 minor 复用、旧实例拒绝准入、重复清理测试；PR3 直接相关。 |
+| PR3-F11 | minor 提前复用后，CREATE/LIST/查询若只保留 raw Arc，可能按旧 ID 读取新注册对象。 | CREATE 发布前获得控制引用；LIST 在查询注册状态及快照期间持引用；selector 的注册状态检查持引用；mutation 仍按实例复核，非仅按 name/id。 | 用户反馈通过；旧实例/编号复用回归。不是允许旧引用继续操作新设备。 |
+| PR3-F12 | 最新 make check 因测试辅助函数 dead-code 和泛型实参多余借用失败。 | [workflow.rs](../kernel/core/src/device/misc/dm_control/workflow.rs) `QueryWorkflow::devices` 标为 `cfg(ktest)`；[commands.rs](../kernel/core/src/device/misc/dm_control/commands.rs) 去掉临时 mapper_name 的多余借用；未压制 lint。 | 失败实际输出为 Error 101；修复后用户确认全部验证通过。测试内另三处同类借用仅只读检查，未擅自修改。 |
+
+#### 待修复、暂缓与待核实项
+
+以下逐项保留，不以主链测试通过销项；“本轮不做”不是永久不支持。需要其他子系统改动或新增子系统的项目，按用户决定止步，后续必须重新授权。
+
+| 编号 | 项目与当前状态 | 卡点、影响与当前证据 | 后续条件及验证方向 |
+|---|---|---|---|
+| PR3-T01 | deferred REMOVE：未实现，本轮因跨子系统边界暂缓。 | REMOVE/REMOVE_ALL 的 DEFERRED flag 仍返回 EOPNOTSUPP。Linux 空闲设备可立即删除，忙设备标记后最后关闭触发工作；当前 [block registry](../kernel/core/src/device/registry/block.rs) 的 OpenBlockFile Drop 和 [block component](../kernel/core/comps/block/src/lib.rs) 的 lease Drop 只递减计数，缺 DM 可用的最后释放通知。 | 另行审定通知、后台执行、重新阻止打开、标记/取消与 REMOVE_ALL 语义；不能只加 flag 或用 DM 轮询伪装支持。 |
+| PR3-T02 | DM uevent/cookie、udev 同步：未实现，本轮暂缓。 | 已有 block sysfs 接线和 netlink 组播基础；[UeventMessage](../kernel/core/src/net/socket/netlink/kobject_uevent/message/mod.rs) 构造接口私有，缺 DM 可用的设备生命周期发送接口。控制 poll 不是 uevent，不设置虚假的 UEVENT_GENERATED。 | 另行批准 netlink/设备模型接口后核对 action、环境字段、cookie 和发送失败；用户态 udev 规则/同步另外验收，不能说整个 sysfs 不存在。 |
+| PR3-T03 | 非 UTF-8 设备名称/路径：仍不支持；UUID 已独立修复。 | mapper name、runtime alias 与 VFS/devtmpfs 路径使用字符串；任意字节路径需要跨层表示审定。当前仍可能对 Linux 合法字节名称返回 EINVAL。 | 不在 PR3 另造 byte-name 模型；若重启工作，先追踪 manager→节点→VFS 全链与错误/输出语义。 |
+| PR3-T04 | 通用 DeviceId major 截断旁支：未修，非 DM 新引入。 | 原审查发现通用解码器在转 u16 后检查 major，可能丢高位；DM 已在 ABI 边界绕开该解码契约，不代表通用问题修复。 | 独立核实其他调用方和影响后另立任务，不混入 PR3。 |
+| PR3-T05 | 1 GiB 实际分配/失败承接：待专项核实，不承诺容量可用。 | F04 对齐的是协议校验上限；NO_PARAMS 不分配声明大小。大 payload 仍受 heap/内存资源限制，allocator 大块失败链路及极限压力证据未完整归档。 | 不为此修改全局 allocator；后续先读清失败路径，再单独决定安全的故障注入/压力验收。不能写“已验证能分配 1 GiB”。 |
+| PR3-T06 | PR3 提取与前置依赖：尚未实施。 | `dm-device-management` 仍为 `808d36daf`、与 PR2 相同。完整 DmDevice 耦合 table/BIO；PR3 基线缺 `allocate_major_with_name`；全局事件已在完整 dm 实现但超出原 PR3 约定边界。 | 先逐文件审定身份裁剪、命名 major/工具发现前置及事件拆分，不另造设备模型，不静默扩大 PR3；目标分支须独立验证。 |
+| PR3-T07 | 事件精确提交点与 blocking poll 专项证据：仍待核实。 | 现有 workflow 在 resume 成功返回后发全局事件；是否需前移到精确 bind 提交点，及阻塞 poll 唤醒的直接专项覆盖，本轮未形成完整结论。已有 readiness/ARM 测试不替代所有调度交错证明。 | 对固定 Linux `__bind/event_callback` 和当前 replay/通知顺序逐项比较；确认可见差异后再决定修改，不能因套件通过宣称逐指令等价。 |
+| PR3-T08 | 测试辅助代码三处泛型多余借用：已发现，未修改。 | `tests/lifecycle.rs` 的 duplicate/empty UUID rename 请求、`tests/ioctl.rs` 的 selector 请求仍借用临时 mapper_name；本次仅获准修复生产报错并只读检查其余调用。 | 不视为运行时缺陷；后续获准清理时按 ktest 构建/lint 检查，不把当前用户验收结果否定为失败。 |
+| PR3-T09 | PR3 最终证据与文档移植：未完成。 | 当前通过来自完整 dm 用户反馈，缺助手独立完整运行记录；未执行 PR3 提取、目标分支验证、提交或推送。Book/SCML 能力说明本轮未修改。 | PR3 制备后保存目标源码、命令、非零计数、退出码；仅移植直接代码/测试和英文说明，本地 docs/log 不进入 upstream diff。 |
+
+上述为本次 PR3 制备审查发现的全部已登记项；其他历史框架路线（freeze/thaw、target hooks、stacking 等）继续按第 6 节及 PR 规划管理，不能误记为本次已实施或无表 PR3 的新增交付。
+
+### 10.3 历史 PR3 公共入口修正（源码核实，最终运行证据待归档）
 
 | 日期 | 问题与影响 | 根因 | 修复 | 验证边界 | 提交状态 |
 |---|---|---|---|---|---|

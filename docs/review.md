@@ -1,469 +1,186 @@
-# Asterinas Device Mapper 技术设计 DOCX 评审
+# PR3 无表设备管理提取边界分析
 
-> 2026-10-16 路径迁移说明：下文历史记录中的 `device_mapper.rs` / `device_mapper/` 已拆为 `dm_control.rs` / `dm_control/`，原 `control.rs` 为 `workflow.rs`。历史行号不再用于当前源码定位；当前入口与验证见[源码证据迁移说明](device-mapper-source-evidence.md#2026-10-16-迁移与适用边界)和[今日日志](../log/daily/2026-10-16.md)。
-
-> 评审日期：2026-09-17
+> **2026-10-27 收尾更新**：下方第 1–6 节是 2026-10-26 的原始边界分析，保留问题发现过程，不再代表当前实现状态。CREATE errno、低 32 位 dev 解码、1 GiB 校验上限、UUID bytes、全局 poll/ARM_POLL、REMOVE 控制引用排空及 minor 释放已在完整 dm 工作区修正；用户反馈最新验证全部通过，助手未独立取得完整日志/计数。代码未提交，PR3 尚未提取。
 >
-> 评审对象：`docs/Asterinas_DeviceMapper_技术设计与实现说明.docx`
+> **当前权威台账**：[global.md §10.4](global.md#104-pr3-制备前修复与待办总账2026-10-27)，逐项列出 F01–F12 修复及 T01–T09 待办/卡点；过程见 [今日日志](../log/daily/2026-10-27.md)。deferred REMOVE、DM uevent、非 UTF-8 名称因跨子系统边界暂缓；参数容量资源证据、事件精确提交点及 PR3 前置/裁剪仍待核实。
 >
-> 评审方式：检查 DOCX 的 OOXML 包结构、正文、样式、编号、目录域、表格、图片、公式、外部关系、页眉页脚和分页设置；当前环境没有 Word、WPS、LibreOffice 或 PDF 渲染工具，本轮未进行逐页视觉检查
+> **原分析中的过期结论修正**：UUID 已不要求 UTF-8；control poll 不再固定为空；minor 在删除排空后释放，不再等待所有结构性 Arc 析构，但旧实例不能取得新设备的使用权；1 GiB 是 ABI 校验上限，不是保证分配容量。PR3 仍仅为无表管理，不因完整 dm 补齐事件而自动扩大范围。
+>
+> **以下为 2026-10-26 原始只读分析。** “尚未实施”“待审定”“本轮未执行”等表述仅指当时；旧源码行号可能随后续修改移动，以当前符号和上方台账为准。
 
-## 1. 执行结论
+### 1. 阶段目标与固定快照
 
-该 DOCX 的技术内容主体与 `docs/device-mapper-technical-design-and-implementation.md` 基本一致，图片、表格、公式、页眉页脚等对象也已实际写入 Word 结构。但是，当前排版不能判定为符合预期，仍存在三项明确的格式问题：
-
-1. 正文大量使用 Word 编号或项目符号，编号范围明显超过真正需要表达顺序的步骤和列表，破坏了连续技术正文的阅读结构；
-2. 69 处文件和源码路径被制作成外部超链接，但本项目只要求路径文本本身正确，不需要创建可点击链接；
-3. 标题层级不规范：“目录”使用 `Heading1`，正文一级章节从 `Heading2` 开始，可能导致 Word 导航层级偏移，并使自动目录收录“目录”自身。
-
-| 严重程度 | 数量 | 结论 |
-|---|---:|---|
-| P0 | 0 | 未发现 DOCX 包损坏或正文主体缺失 |
-| P1 | 0 | 未发现导致技术内容不可用的事实级问题 |
-| P2 | 3 | 正文编号、外部超链接和标题/目录层级需要修正 |
-
-总体判定：**技术内容基本可用，但当前 Word 格式尚未达到定稿要求。** 修正正文编号、移除外部超链接、调整标题层级并在 Word/WPS 中刷新目录后，才适合作为最终正式版本。
-
-## 2. P2：正文编号使用过度
-
-文档包含 115 个真实 Word 列表段落，其中：
-
-- 63 个编号列表段落；
-- 52 个项目符号列表段落。
-
-这些段落确实使用了 Word numbering 结构，而不是残留的 Markdown `1.` 或 `-` 文本；但“使用了正式 Word 编号”不等于“编号位置合理”。当前正文大量呈现为带编号或项目符号的段落，使普通解释性内容也呈现为列表，版式不符合连续技术设计文档的阅读习惯。
-
-### 期望格式
-
-- 章节标题保留 `1`、`1.1`、`1.1.1` 等章节编号；
-- 有严格先后关系的操作步骤、事务顺序和流程可以使用编号列表；
-- 无顺序的少量并列事项可以使用项目符号；
-- 背景、设计说明、约束、原因、结论和普通解释应使用无编号正文；
-- 图注、表格说明、公式、代码和路径不应继承正文列表编号。
-
-修正时不能简单删除全部列表。应按段落语义逐项判断，仅保留真正的步骤和并列清单。
-
-## 3. P2：文件路径不应制作成外部超链接
-
-DOCX 中检测到 69 个 hyperlink，主要指向项目内 Markdown 文档、源码文件、目录和带行号的相对路径。
-
-本项目对这些引用的要求是：
-
-- 文件路径文本正确；
-- 文件名、目录和必要的行号信息正确；
-- 读者可以复制或搜索路径定位源码。
-
-不要求路径在 Word 中可点击，也不需要依赖 Word/WPS 对本地相对路径和安全策略的处理。因此，这些路径应保留为普通文本或等宽样式文本，并移除：
-
-- `w:hyperlink` 包装；
-- 对应的 external hyperlink relationships；
-- 超链接颜色和下划线等交互样式。
-
-移除链接时必须保留原始显示文本，不应删除或改写路径本身。
-
-## 4. P2：标题层级和自动目录结构不规范
-
-当前标题样式结构为：
-
-- 文档名称：`Title`；
-- “目录”：`Heading1`；
-- “执行摘要”、第 1～15 章和附录：`Heading2`；
-- 章节下一级：`Heading3`；
-- 更细一级：`Heading4`。
-
-这会造成两个问题：
-
-1. 正文一级章节在 Word 导航窗格和文档语义中被错误地视为二级标题；
-2. 自动目录域为 `TOC \\o "1-3" \\h \\z \\u`，“目录”自身使用 `Heading1`，刷新目录后可能被收录进目录。
-
-### 期望格式
-
-- 文档名称继续使用 `Title`；
-- “目录”使用独立的目录标题样式或不进入 TOC 的普通标题样式；
-- “执行摘要”、正文各章和附录使用 `Heading1`；
-- 下一层依次使用 `Heading2`、`Heading3`；
-- 调整样式后，在 Word/WPS 中更新整个目录并检查层级与页码。
-
-当前只能确认 TOC 域存在，不能确认目录已经刷新，也不能证明最终页码和层级正确。
-
-## 5. 内容与对象检查
-
-### 5.1 技术内容
-
-DOCX 已包含最终 Markdown 中的主要内容：
-
-- 执行摘要与阅读导览；
-- 用户动作到内核对象的动作地图；
-- DM 专属实现与通用内核框架边界；
-- ioctl 命令语义矩阵；
-- linear 和 striped 数学模型；
-- 两级 BIO 边界规划与完成聚合；
-- lease、open count 和 in-flight 生命周期；
-- Linux 能力与验证证据矩阵；
-- 新 target 接入模板；
-- 附录与评审清单。
-
-此前 Markdown 评审指出的 name、UUID、minor 一致性问题，已在 DOCX 中限定为 rename/remove 事务之外的稳定提交态。没有发现 Mermaid 源码或 Markdown 分隔符作为普通正文残留。
-
-### 5.2 图片
-
-文档包含：
-
-- 9 个图片资源；
-- 9 个正文 drawing；
-- 9 个图注。
-
-图片与架构边界、核心对象、ioctl 工作流、首次 table 发布、mapper phase、primary 注册事务、BIO 分派、split completion 和 mount lease 等主题对应。
-
-静态结构检查不能确认图片在最终页面中的缩放比例、文字清晰度和跨页位置。
-
-### 5.3 表格
-
-文档包含 30 个表格。OOXML 结构显示：
-
-- 表格具有边框；
-- 具有 grid 列宽；
-- 首行设置为重复表头；
-- 表格行设置为禁止拆分。
-
-这些结构设置存在，但尚未通过页面渲染确认五列表格是否过密、是否超出版心或是否产生不自然分页。
-
-### 5.4 公式
-
-文档包含 3 个 `Equation` 样式段落及对应 OMML 数学节点，公式不是 Markdown 源码或普通文本占位符。
-
-### 5.5 页眉、页脚与页面设置
-
-静态检查确认：
-
-- 页面尺寸接近 A4；
-- 已设置页边距、页眉距和页脚距；
-- 页眉包含文档名称；
-- 页脚包含 `PAGE` 域，预期显示为“第 N 页”；
-- 没有 `NUMPAGES` 域，因此不是“第 N 页 / 共 M 页”；
-- 文档包含 19 个显式分页符。
-
-## 6. 验证边界
-
-当前环境没有可用的 Word、WPS、LibreOffice、PDF 转换或逐页截图工具。本轮结论来自 OOXML 静态检查和正文抽取，因此没有验证：
-
-- 自动目录刷新后的实际条目与页码；
-- “目录”是否确实被收录进目录；
-- 图片的实际清晰度、比例和分页位置；
-- 宽表格是否拥挤或超出版心；
-- 是否存在孤立标题、孤行或不自然留白；
-- 页眉页脚的最终视觉位置；
-- Word 与 WPS 之间的页面渲染差异。
-
-这些项目必须在修正格式后，通过 Word/WPS 打开文档、更新全部域并逐页检查。
-
-## 7. 最终判定
-
-| 检查项 | 判定 |
+| 项目 | 本轮核实结果 |
 |---|---|
-| 技术内容主体 | 基本符合预期 |
-| Markdown 内容转换 | 基本完整，未发现 Mermaid 或分隔符残留 |
-| 正文编号 | 不符合预期，编号和项目符号使用过度 |
-| 文件路径 | 文本应保留，但不应制作成超链接 |
-| 标题层级 | 不符合规范，正文层级整体偏移 |
-| 自动目录 | 域存在，但有自引用风险且尚未刷新验证 |
-| 图片与图注 | 对象和数量基本符合，页面效果待验证 |
-| 表格 | 结构属性基本齐全，页面效果待验证 |
-| 公式 | 符合 OMML 结构预期 |
-| 页眉页脚和页码 | 结构存在，视觉效果待验证 |
+| 完整 dm | `7c46b2ee8cfb1c3dc3db7cc32ecd799bff15adcb`；实际检出分支为 `dm` |
+| PR2 `dm-control-interface` | `808d36daf07344c27291adccb74e8e59671871d3` |
+| PR3 `dm-device-management` | 分支已存在，同为 `808d36daf07344c27291adccb74e8e59671871d3`，尚无独有提交 |
+| Linux 主基线 | 本机 `/root/Linux-tree-code/kernel`，openEuler `6.6.0-132.0.0`，commit `5078a3a23a1e1825ec136485173ec98668cdd640` |
+| Linux 来源 | `https://gitee.com/openeuler/kernel.git`；Makefile 版本为 6.6.0，不称为未经修改的 kernel.org v6.6 |
+| Linux 工作树 | `drivers/md/dm.c`、`dm-core.h`、`dm-linear.c` 有本地修改，另有未跟踪构建文件；生命周期与宏定义证据读取 Git HEAD 中的版本，不把本地修改当上游事实 |
 
-最终结论：**该 DOCX 的内容主体基本正确，但格式不符合最终交付预期。当前版本不应直接定稿；至少应先收敛正文编号、移除所有文件路径超链接、修正标题层级，并在 Word/WPS 中刷新目录和完成逐页视觉检查。**
+| 行为 | 本阶段边界 |
+|---|---|
+| 原来 | PR2 仅提供控制节点和 VERSION；其他命令在版本握手后返回 `ENOTTY` |
+| 目标 | 无表 DM 设备的创建、身份查找、基本状态查询、列表及单设备删除 |
+| 示例 | 创建名称为 `test` 的设备 → 分别按 name/UUID/dev 查询 → 列表可见 → 删除；不能装表或读写映射设备 |
+| 包含 | CREATE、STATUS、LIST_DEVICES、单个无表设备 REMOVE，以及必要的参数处理与 manager 接线 |
+| 不包含 | target、映射表、BIO、运行时块设备发布、rename、批量删除；不自动扩展 deferred remove 或全局事件机制 |
 
-## 8. 非 Device Mapper 框架改动与测试覆盖审查
+`dm` 是唯一生产实现来源。若现有实现无法安全裁剪，先报告依赖；不为缩小 PR 单独创造设备模型，不只在 PR3 修复完整 dm 的语义问题。不修改 PR1/PR2，不自动提交或推送。
 
-> 审查日期：2026-09-18
->
-> 审查范围：`docs/non-device-mapper-change-rationale.md` 所列的 block/BIO、`aster-core` registry/VFS/procfs、文件系统、后端驱动与启动支撑改动；不重复评审 DM core crate 内部实现。
->
-> 证据口径：以 `e31b265a3 → 当前工作区` 的源码与测试基础设施 diff 为主；daily log 仅作交叉来源。区分生产语义、`#[cfg(ktest)]` 测试增量和构建/回归入口改动。
+### 2. 无表阶段与可观察状态矩阵
 
-### 8.1 执行结论
-
-当前 diff 中唯一改变 DM 用户可见生产语义的代码是 `DM_DEV_WAIT`：`device_mapper.rs` 直接进入 wait 处理，不再落入通用命令分派的不可达路径；内核将等待中断转换为 restart 语义，最终用户态结果由 signal action 决定：无 `SA_RESTART` 时得到 `EINTR`，带 `SA_RESTART` 时原 ioctl 自动重启并继续等待。该段对应的后续 focused guest 证据见 9.10。`device.rs` 的 major:minor 日志格式变化不改变主链语义。
-
-其余 Rust diff 主要位于 `#[cfg(ktest)]`：block/BIO、table child completion、minor 生命周期和 registry rollback 的覆盖补强，不应写成新的框架生产能力。回归基础设施则改为目标 crate 目录直接运行 `cargo osdk test`、支持 `REGRESSION_TESTS` selector，并让非 TDX regression 不构建 TDX attestation。当前不应扩大为无目标的全量框架测试；exfat lease、MlsDisk 生命周期和后端 fault injection 保持触发式边界。
-
-| 范围 | 当前 diff 结论 | 文档定位 |
-|---|---|---|
-| DM wait ABI | 直接分派、event wait、restart 中断处理属于生产语义改动 | global/progress/review |
-| block/BIO、table、manager、registry | 当前增量主要为 `#[cfg(ktest)]` 覆盖 | review/test，不扩写 global 生产能力 |
-| initramfs C 回归 | 覆盖 raw control ABI、node/alias rollback、ext2 mount lease、range ioctl、wait errno、`SA_RESTART` 与 rename/setuuid 唤醒 | test/review |
-| 测试入口 | crate-local `cargo osdk test`、`REGRESSION_TESTS`、非 TDX gate | AGENTS/test/progress |
-| exfat / MlsDisk / driver fault | 当前未作为主线生产修复 | 保持触发式边界 |
-
-### 8.2 已有直接测试证据
-
-#### block/BIO
-
-`aster-block` 的当前增量补充 split BIO 多错误乱序完成、partition remap/overflow、request queue range merge/segment 上限等 `#[cfg(ktest)]` 覆盖。它们用于保护内部不变量，不应表述为新增 block 框架生产语义。
-
-该层测试选择正确：上述行为属于 `BlockDevice`/BIO/queue 内部不变量，使用 DM 系统 suite 间接覆盖会降低失败定位能力，也不能完整覆盖 overflow 原子性。
-
-#### registry、VFS 与 DM 控制 ABI
-
-新增的 initramfs `device_mapper.c` 已覆盖：
-
-- primary 或 alias 路径碰撞时，table load/suspend 失败后 mapper 状态与节点回滚；
-- 删除碰撞文件后能够重试；
-- alias 为指向 primary block node 的 symlink；
-- ext2 mount 存活时 `DM_DEV_REMOVE` 返回 `EBUSY`，umount 后可删除；
-- `BLKDISCARD`/`BLKZEROOUT` 覆盖合法、未对齐、溢出、越界以及合法/非法零长度 byte range；
-- `DM_DEV_WAIT` 被不可重启信号打断时返回 `EINTR`，等待不存在 mapper 返回 `ENXIO`；
-- 带 `SA_RESTART` 的 signal handler 确实执行后，原 ioctl 在事件前不提前返回，并在 rename 后自动重启、成功返回和回填 header；
-- fork waiter 由 rename 或 setuuid 成功唤醒，并回填新的 header/event。
-
-这类验证必须从用户态经由 `open`/`ioctl`/`mount` 进入内核；ktest 无法单独证明 ioctl buffer ABI、VFS 节点状态与 errno 的最终组合语义。
-
-#### procfs
-
-新增的 `/proc/devices` C 回归以短读方式验证 offset 续读，并检查 `virtblk` 与 `device-mapper` 条目唯一、major 非零且格式可解析。该测试直接保护用户态设备发现接口，不能由 DM NixOS suite 替代。
-
-### 8.3 C 回归实现与实际执行证据
-
-本轮对 `test/initramfs/src/regression/device/device_mapper.c` 的实际改动为：
-
-- 用 raw `dm_ioctl` 构造 linear table；预建 `/dev/dm-N` 或 `/dev/mapper/<name>` 路径，以 `EEXIST` 验证 primary/alias 发布失败后 inactive table、alias 和重试语义；成功 resume 后以 `lstat/stat` 验证 alias 与 primary 的设备 identity；
-- 映射完整 512MiB ext2 backing，验证 mount 存活时 `DM_DEV_REMOVE` 为 `EBUSY`，umount 后 remove 成功；
-- 对 zero target 执行 `BLKDISCARD`/`BLKZEROOUT`，验证合法、未对齐、溢出、越界和零长度 byte range 的 ioctl/errno 边界；
-- 用 `SIGALRM` 中断当前 event 的 `DM_DEV_WAIT`，验证无 `SA_RESTART` 时用户态得到 `EINTR`，并验证未知 mapper 的 `ENXIO`；
-- 通过 ready、signal 与 result pipe 验证带 `SA_RESTART` 的 handler 已执行、事件前 ioctl 未返回，并在 rename 后由同一 ioctl 成功返回；
-- fork waiter 由 rename 或 setuuid 成功唤醒，并回填新的 header/event；
-- 修正既有 tableless 回归对 `DM_EXISTS_FLAG` 的位掩码比较：应判断非零而不是等于 1。
-
-完整 initramfs regression 仍可能被无关 network/VT 子回归提前阻断，因此新增 `REGRESSION_TESTS`：空值保持全量；`device` 运行目录脚本；`device/device_mapper` 只运行该已打包二进制，且 runner 拒绝绝对路径和路径穿越。非 TDX 构建通过 `enableTdxAttest` 跳过运行时本会跳过的 TDX attestation package，避免 DCAP GitHub 下载。
-
-实际命令与结果：
-
-```bash
-NIX_CONFIG="substitute = false" RELEASE=1 AUTO_TEST=regression \
-  INTEL_TDX=0 REGRESSION_TESTS=device/device_mapper make run_kernel
-```
-
-focused 命令使用 `REGRESSION_TESTS=device/device_mapper` 选择单一已打包 C ELF；该回归覆盖 raw control ABI、linear table load、node/alias rollback、ext2 lease、range ioctl、无 `SA_RESTART` 的 `EINTR` 对照、真实 `SA_RESTART` 自动重启与 rename/setuuid 唤醒。对应 core wait/registry 模块测试从 `kernel/core` 使用 `cargo osdk test --kcmd-args=earlycon <module>::tests`；DM component 测试则从目标 crate 目录运行，不应混用入口。
-
-### 8.4 必要补强与不应伪造的覆盖
-
-#### exfat lease 生命周期
-
-ext2 与 exfat 均修改为持有 `BlockDeviceLease`，但当前用户态回归只验证 ext2。exfat 等价场景作为框架边界暂停：只有 DM 文件系统路径出现可见失败、数据风险或后续 target 明确依赖时，才恢复以下回归：
+**Linux 源码事实：CREATE 不执行 `add_disk()`。**
 
 ```text
-exfat mount → DM_DEV_REMOVE 返回 EBUSY → umount → DM_DEV_REMOVE 成功
+CREATE
+  → check_name
+  → dm_create / alloc_dev：分配 minor 和内部设备对象
+  → dm_hash_insert：发布 name / UUID 身份索引
+  → 返回无表状态
+
+后续首次装表
+  → dm_setup_md_queue
+  → add_disk
 ```
 
-此项验证文件系统对象、VFS mount 生命周期、lease 与 registry remove 的端到端拼接，不宜仅以 core ktest 代替。
+固定基线证据：`drivers/md/dm-ioctl.c:882–919`、`drivers/md/dm.c:2038–2152`、`drivers/md/dm.c:2330–2369`，以及 `dm-ioctl.c` 中 TABLE_LOAD 对 `dm_setup_md_queue` 的调用。
 
-#### MlsDisk tracked lease
+因此，不提前发布运行时块设备的阶段可以独立成立，不是为缩小补丁虚构的模型。但“内核未发布磁盘”不等于“用户工具绝不创建节点路径”；用户空间节点编排本轮未调查，不从内部对象状态推断。
 
-探索性 ktest 已表明 MlsDisk facade drop 后 backing unregister 仍返回 Busy。该结果说明当前问题不在测试缺失，而在 production 释放语义：MlsDisk drop 仅改变状态标志，未释放 RawDisk 持有的 tracked backing lease。
+| 操作 | 身份与状态 | 节点、open、I/O | 锁、失败和回滚边界 |
+|---|---|---|---|
+| CREATE | 分配设备号，登记 name/可选 UUID；无 active/inactive table，初始 event/target/open count 为 0；READONLY 不成为无表身份属性 | PR3 不发布 primary/alias，不提供映射 I/O | minor 分配先于重复身份检查；身份插入失败释放临时 minor |
+| STATUS | 按 name、UUID 或 dev 查找，返回身份与无表状态 | 不改变注册表或节点 | name+UUID 为 `EINVAL`；文本标识+dev、缺失/不存在标识为 `ENXIO`；成功 lookup 的引用保护对象生命周期 |
+| LIST_DEVICES | 名称有序列表、name/UUID 前缀过滤、event 字段及可选 UUID 扩展 | 不发布节点 | 容量按整个过滤后列表判断，不足设置 `DM_BUFFER_FULL_FLAG`，不输出部分列表；空列表仍要求 sentinel 空间 |
+| REMOVE | name/UUID 索引删除后，新 lookup 不可见 | 无表且未发布的设备没有 runtime 注销工作；不能据此宣称已支持打开设备的删除保护 | lifecycle 串行化并复核实例，防止旧 lookup 删除同名新对象；旧引用存活期间不得复用 minor |
 
-按当前范围，记录该缺口及其所有权关系即可；不修改 production 释放语义，也不保留会失败的探索性 ktest。若未来重新进入该主题，应先明确 backing lease 的预期所有权与 release 时机，再设计修复与回归。
+#### 参数处理与结果写回顺序
 
-#### 后端故障路径
+Linux `ctl_ioctl/copy_params/validate_params` 顺序为：权限 → ioctl type → 版本读写及兼容检查 → 命令查找 → 固定参数复制和大小检查 → 必要 payload 复制/secure 清理 → 参数规范化 → 命令执行 → 成功时结果写回。
 
-VirtIO 的正常数据路径已有 DM NixOS suite 证据。NVMe 对未支持 range I/O 的错误 completion 当前没有可信的 test-only transport/CQ 注入点；在没有可重复故障注入基础时，不应为了覆盖率编写脱离真实驱动路径的伪测试。
+- CREATE/STATUS/REMOVE 为 NO_PARAMS：输入固定前缀为 305 字节，不应机械要求整个 312 字节对齐结构都可读，也不应把 TABLE_LOAD 的 data_start 校验引入这些命令。
+- 未支持命令应继续在版本握手之后、参数处理之前返回 `ENOTTY`。
+- **命令执行成功后的 copyout `EFAULT` 不回滚已完成的 CREATE/REMOVE。** 创建已提交但结果页不可写时，设备仍存在；删除同理。不得将这种情况与身份插入失败混为同一种事务回滚。
+- Linux 成功 CREATE/REMOVE 还触发全局控制事件；当前 dm/PR2 没有完整全局 poll/event 机制。本阶段不将此能力伪装为已实现，控制文件继续不能报告虚假就绪。
 
-### 8.5 文档一致性状态
+对应 dm 参数入口见 [ioctl.rs](../kernel/core/src/device/misc/dm_control/ioctl.rs)，Linux 证据为 `dm-ioctl.c:1960–2128`。
 
-本轮已同步以下入口：
+### 3. 已确认差异与待审定决策
 
-- 已删除的 maintenance Markdown、旧 DOCX、`kernel/comps/README.md` 和旧 wrapper 不再作为当前资料入口；
-- 构建/NixOS 用户工具职责以当前配置、overlay、`tools/nixos/run.sh` 与 `tools/qemu_args.sh` 的实际分工描述；
-- 当前通用分层与 selector 说明以 `docs/test.md` 为准；core ktest 从 `kernel/core` 运行并带 `--kcmd-args=earlycon`，DM component ktest 从目标 crate 目录运行。六个 canonical NixOS suite、超时、release 与串行边界以 `AGENTS.md`、`log/device-mapper-progress.md` 和实际脚本为准。
-- 2026-09-22 的系统验收已串行通过 control-plane、dataplane、LVM2 topology、linear integration、striped integration 和 mixed integration。LVM2 topology 中 `lvs` 请求 `segtype` 对跨 PV 的双 linear segment 产生重复汇总行，已将该条断言改为 LV 汇总的 `seg_count=2`；DM table 与 dependency 的两 backing 验证保留，复跑通过。
+以下结论均来自双方源码；本轮未运行外部 VM 实验或内核测试。差异成立不等于已获准修复。
 
-后续文档同步必须先比较 `e31b265a3 → 当前工作区` 的实际 diff，不从固定日期 daily log 推导当前状态。
+#### 3.1 CREATE 重复名称/UUID：EBUSY 与 EEXIST
 
-### 8.6 最终判定
+- **Linux**：`dm_hash_insert` 在名称或 UUID 冲突时清理 cell 并返回 `-EBUSY`，见 `dm-ioctl.c:262–305`。
+- **dm**：`map_create_error` 将身份冲突交给 `map_dm_error`，返回 `EEXIST`，见 [abi.rs:412–435](../kernel/core/src/device/misc/dm_control/abi.rs#L412-L435)。现有 Rust/C 测试也固定了 `EEXIST` 预期。
+- **示例**：已有名称 `test`，不指定 persistent minor 再次 CREATE `test`；Linux 为 `EBUSY`，dm 为 `EEXIST`。
+- **分类/影响**：实际用户可见 ABI 错误码差异，阻止将当前代码称为无差异提取；不是内部表示差异。
+- **建议**：先在 dm 修正 CREATE 专用错误映射和直接测试，再提取。不要为了 CREATE 顺手改变所有 `map_dm_error` 调用方。
+- **验证要求**：重复 name、重复 UUID；与已占用 persistent minor 同时出现时检查错误优先级；失败后验证索引不变、临时 minor 可重新分配。
 
-| 项目 | 判定 |
-|---|---|
-| `DM_DEV_WAIT` direct dispatch | 当前生产语义改动；应作为 DM control ABI 主链维护。 |
-| block / table / manager / registry ktest 增量 | `#[cfg(ktest)]` 覆盖补强，不表述为新增框架生产能力。 |
-| initramfs C 回归 | 覆盖 raw control ABI、linear table load、node/alias rollback、ext2 lease、range ioctl、WAIT errno、`SA_RESTART` 和 rename/setuuid waiter 唤醒。 |
-| 非 TDX regression 构建图门控 | `INTEL_TDX=0` 不构建无关 TDX attestation。 |
-| crate-local/core ktest 与 regression selector | 当前测试入口；分层和 selector 见 test，canonical DM suite 边界见 AGENTS/progress 与实际脚本。 |
-| exfat lease / MlsDisk / driver fault | 触发式框架边界；当前不主动扩展。 |
+minor 分配优先于身份冲突这一点两侧基本一致。Linux `specific_minor` 的内部错误经过 `alloc_dev → dm_create` 对外成为 `ENXIO`，不能只看内部 `EBUSY` 就修改对外 errno；dm 已采用该顺序与映射。
 
-最终结论：**提交基线之后的主链生产语义改动集中于 DM wait dispatch 与中断处理。其余 Rust 增量主要是测试覆盖，构建/脚本增量主要服务于定向回归与非 TDX 构建图。文档应按当前入口同步，不将历史 wrapper、已删除 suite 或旧 maintenance 文档继续作为现行资料。**
+#### 3.2 参数大小：本地 1 MiB 策略与 Linux 1 GiB 上限
 
-## 9. Device Mapper 第四版优化文档审核
+- **Linux**：固定基线 `DM_MAX_TARGETS=1048576`、`DM_MAX_TARGET_PARAMS=1024`，`copy_params` 上限为 1 GiB。
+- **dm**：[validate_ioctl_size](../kernel/core/src/device/misc/dm_control/abi.rs#L80-L86) 限制为 1 MiB，注释明确这是本地资源政策。
+- **示例**：有效 CREATE 固定头声明 `data_size=2 MiB`；Linux NO_PARAMS 路径可继续只使用固定前缀，dm 在此之前返回 `EINVAL`。
+- **分类/影响**：显式兼容范围与资源策略差异；不只影响 LIST 的实际大缓冲区分配。
+- **待审定**：保留并披露当前上限，还是调整包括 NO_PARAMS 在内的校验策略。不能未讨论就把实际可分配缓冲区提高到 1 GiB。
+- **验证要求**：304/305/311/312 字节、上限及上限加一；分别覆盖 header-only 和 LIST 路径，以及 payload/secure 清理失败优先级。
 
-> 审核日期：2026-09-21
->
-> 审核对象：[log/device-mapper-optimization-v4.md](../log/device-mapper-optimization-v4.md)
->
-> 审核方式：本节 9.1～9.9 保留 2026-09-21 首轮只读审核的历史结论；当时未修改生产代码、未构建或运行测试。后续修订、实施与动态验证结果见 9.10，不倒改首轮审核事实。
+#### 3.3 身份字符串：字节串与 UTF-8
 
-### 9.1 执行结论
+- **Linux**：CREATE/STATUS/REMOVE 的固定字符串末尾被强制补 NUL，然后按 C 字节串处理，不做 UTF-8 校验。名称禁止 `/`、`control`、`.`、`..`，CREATE 还要求非空。
+- **dm**：同样先补末尾 NUL，但 [optional_c_string](../kernel/core/src/device/misc/dm_control/abi.rs#L301-L320) 额外要求 UTF-8；manager 索引使用 `String`。
+- **示例**：名称包含非 UTF-8 的 `0xff`、且无其他非法字符，Linux 可以接受，dm 返回 `EINVAL`。
+- **分类/影响**：身份输入域差异，不是仅缺一个校验用例。改为字节串会涉及 manager 存储以及后续节点路径接口。
+- **待审定**：先在完整 dm 调整表示，或明确保留 UTF-8 支持边界；不能只在 PR3 换一种身份模型。
+- **验证要求**：空名称、保留名称、斜杠、127/128 字节边界、UUID 128/129 字节边界、字段无 NUL、非 UTF-8；LIST 的过滤仍应按有界字节前缀而不是 UTF-8 字符串处理。
 
-第四版文档“从分支行为差异反查直接断言，并区分 ktest、用户 ABI、系统测试和间接触达”的总体方向正确，git 基线、193 项 ktest 统计以及多数生产行为描述可以由当前代码和既有运行记录支持。但文档目前还不能直接作为完整实施与验收清单，存在 1 项 P1 和 5 项 P2：
+#### 3.4 dev 编码：高 32 位行为不同
 
-| 严重程度 | 数量 | 结论 |
-|---|---:|---|
-| P0 | 0 | 未发现会立即导致文档整体不可用的问题。 |
-| P1 | 1 | VirtIO GET_ID 将不同层次的异常错误合并成并不存在的统一容错契约，可能导向错误验收或生产语义改动。 |
-| P2 | 5 | 已有 tracked lease 断言分类不准，并遗漏 WAIT、真实节点恢复和 MlsDisk 边界；部分计划还与当前触发式实施范围冲突。 |
+- **Linux**：`include/linux/kdev_t.h:39–60` 的 `huge_decode_dev(u64)` 调用 `new_decode_dev(u32)`，高 32 位被截断。CREATE persistent 模式只取解码后的 minor，不用输入 major 决定 DM major。
+- **dm**：CREATE 和 dev lookup 使用通用 [DeviceId::from_encoded_u64](../kernel/libs/device-id/src/lib.rs#L62-L85)，按扩展 64 位设备号格式解码。
+- **示例**：有效设备编码 OR `(1ULL << 32)`，Linux 按低 32 位查找；dm 解出超范围 minor 后返回 `EINVAL`。persistent CREATE 也受影响。
+- **分类/影响**：ABI 解码和错误顺序差异；正常低 32 位编码的设备号输出没有因此被判为错误。
+- **建议**：若批准对齐，在完整 dm 的 ioctl ABI 边界实现 Linux 解码语义；不为 DM 改变全局设备号编码契约，再提取到 PR3。
+- **验证要求**：高 32 位扰动、不同输入 major、minor 边界、零 dev、与 name/UUID 组合的歧义优先级。
 
-总体判定：**文档框架可保留，但应先修正 GET_ID 契约，重新分类已有 lease 断言，并补齐 WAIT、真实 runtime 恢复及 MlsDisk/范围决策，之后再开始 V4 补测。**
+**基线旁支问题，未修改：** 通用解码器把 major 转为 `u16` 后才做范围检查，可能截掉超范围 major 高位；该实现已存在于 PR2 基线，不是 DM 新引入。全局修复的必要性和影响须单独审查，不将其混入 PR3 或静默当作 dm 专属缺陷修复。
 
-### 9.2 P1：GET_ID 异常被写成并不存在的统一“继续初始化”契约
+#### 3.5 REMOVE 完成时机与引用释放
 
-文档在 [V4 第 158 行](../log/device-mapper-optimization-v4.md#L158)要求 status、token、used_len 异常时“不保存错误 ID，初始化按现有容错契约继续”。该结论只适用于已经被队列接受并返回给调用者、且 `query_host_id` 能够解析的一部分异常，不适用于队列层过滤的非法完成项或设备不完成。
+- **Linux**：`dev_remove → dm_destroy → __dm_destroy` 等待内部 holder 归零，再释放设备及 minor，见已提交 `dm.c:2459–2518`、`dm.c:2157–2170`。
+- **dm**：从索引中移除后可以返回；minor 由 `DmDeviceIdOwner` 在最后一个设备引用销毁时归还，见 [manager.rs:27–50](../kernel/core/comps/device-mapper/src/manager.rs#L27-L50) 和 [workflow.rs:346–365](../kernel/core/src/device/misc/dm_control/workflow.rs#L346-L365)。
+- **示例**：并发 STATUS/LIST 保有旧对象引用时，dm 的 REMOVE 已返回，紧接着指定同一 minor 的 CREATE 仍可能得到 `ENXIO`；Linux 的删除完成会等待旧 holder。
+- **分类/影响**：潜在用户可观察的并发生命周期差异；双方都防止旧引用期间复用 minor，但等待边界不同，不能仅归为 Rust RAII 的内部差异。
+- **证据边界**：已确认源码控制流，尚未运行可控并发复现，不把该情景写为实测失败。
+- **待审定**：保留并披露返回时机差异，或先在完整 dm 处理同步语义。不能通过提前释放 minor 消除报错，那会破坏旧对象的设备号所有权。
+- **验证要求**：控制旧查询引用存活，覆盖 remove、同名重建、指定 minor 重建和引用释放后的复用；证明旧 lookup 不会修改新对象。
 
-证据如下：
+#### 3.6 DEFERRED_REMOVE 与事件支持边界
 
-- [`query_host_id`](../kernel/core/comps/virtio/src/device/block/device.rs#L348-L375)循环调用 `pop_used_with_min_bytes()`，任何错误都只执行 `spin_loop()`，没有退出或超时分支；
-- [virtqueue used-ring 处理](../kernel/core/comps/virtio/src/queue.rs#L415-L449)会跳过非法 token 或 used length；没有可返回的合法完成项时返回 `NotReady`；
-- [GET_ID 查询](../kernel/core/comps/virtio/src/device/block/device.rs#L298-L305)发生在正常 queue IRQ callback 注册之前，并同步阻塞设备初始化。
+- dm 的 [validate_input_flags](../kernel/core/src/device/misc/dm_control/abi.rs#L197-L208) 对 REMOVE 的 `DM_DEFERRED_REMOVE` 返回 `EOPNOTSUPP`。
+- Linux 的 `dm_lock_for_deletion` 对未打开的无表设备即使带该 flag 也可立即完成删除；忙设备才涉及延迟删除状态。
+- 本阶段已明确不实现完整 deferred remove，需如实说明该 flag 的限制，不称为所有 REMOVE 参数都兼容。全局事件和 uevent 输出同样不能凭普通身份删除成功推定已经支持。
 
-具体影响：若按文档把所有异常都制作成“返回 `None` 并继续初始化”的验收用例，局部解析 mock 可以通过，但真实 queue 路径可能永远不结束；若为满足该验收而修改生产代码，则已经超出“补契约测试”的范围。
+### 4. 提取依赖与安全裁剪边界
 
-修订建议：把行为拆为三类：
+#### 4.1 可沿用的身份管理机制
 
-1. query 层实际可返回的错误响应：按当前实现验证不保存错误 ID；
-2. queue 层过滤的非法 token/used length：明确当前会继续等待，不能写成已实现的容错返回；
-3. 设备不完成：标为尚未界定的初始化超时/故障策略，若要改变行为应另立生产设计事项。
+[manager.rs](../kernel/core/comps/device-mapper/src/manager.rs) 已有以下机制，适合构成本阶段基础：
 
-### 9.3 P2：V4.3 漏认了已存在且纳入 80 项基线的 tracked lease 清理断言
+- 动态 major、minor 分配及 `DmDeviceIdOwner` 所有权；
+- name/UUID 索引与 dev lookup；
+- 分配 minor 后检查身份冲突，失败由 owner 释放；
+- 返回独立 `Arc` 的查询，manager 列表快照；
+- `is_current()` 按对象实例而非名称复核；
+- 删除身份索引，但旧对象存活期间继续保留设备号。
 
-[V4 第 129～135 行](../log/device-mapper-optimization-v4.md#L129-L135)把 inactive clear 和 table 解析/构造部分失败后的 tracked lease 释放整体列为缺口，与文档自己的“已有断言/未找到断言”分类不一致。
+**不能裁掉删除路径中的 `lookup → lifecycle lock → is_current → remove`。** 若退化为 `lookup(name)` 后无实例复核地 `remove(name)`，旧引用可能删除并发创建的同名新对象。现有包装见 [commands.rs:735–809](../kernel/core/src/device/misc/dm_control/commands.rs#L735-L809)。
 
-当前已有直接证据：
+锁关系：manager 查询在持有内部锁时克隆 `Arc`，随后释放 manager 锁；生命周期操作再取得设备锁并复核当前实例。不能持有全局 manager 锁等待设备生命周期锁，不能仅凭 `Arc` 保活就认定对象仍在当前索引中。
 
-- [`rejects_missing_striped_backing_without_setting_readonly_or_table`](../kernel/core/src/device/misc/device_mapper.rs#L4242-L4269)真实注册第一个 backing，在第二个 backing 缺失时断言请求失败、状态与 readonly 不变，随后成功注销第一个 backing；
-- 该用例经过[生产 table parser 与 `lookup_lease`](../kernel/core/src/device/misc/device_mapper.rs#L605-L647)，不是 untracked 解析替身；striped target 会按顺序[取得 backing lease](../kernel/core/comps/device-mapper/src/target/striped.rs#L245-L251)；
-- [inactive table clear 用例](../kernel/core/src/device/misc/device_mapper.rs#L3740-L3780)真实注册两个 backing、加载 inactive striped table、清除 inactive table，随后成功注销两个 backing；
-- [容量失败](../kernel/core/src/device/misc/device_mapper.rs#L4306-L4338)和[表连续性失败](../kernel/core/src/device/misc/device_mapper.rs#L4370-L4409)后也检查 backing 可注销；
-- 这些 core DM ioctl 用例已包含在 [80 项通过记录](../log/daily/2026-9-21.md#L19-L24)中。
+#### 4.2 不能直接整文件搬入的三处耦合
 
-具体影响：文档会把已能发现 lease 泄漏的清理用例重新算作“无断言”，安排重复建设，并模糊真正缺失的窄边界。
-
-修订建议：将 V4.3 拆为“已有 tracked 清理断言且已纳入基线”和“仍需新增的保护期/状态断言”。后者应集中于 holder 存活时 `Busy`、换表后的旧 in-flight BIO、已有非空 active/inactive table 的失败保留，以及新旧 backing 保护关系。现有用例不能证明消费者生命周期全部覆盖，但也不能继续整体归类为缺口。
-
-### 9.4 P2：承接 V3 的计划遗漏 DM_DEV_WAIT / SA_RESTART 用户 ABI 缺口
-
-V4 在[范围说明](../log/device-mapper-optimization-v4.md#L9)中明确承接 V3，并把新增成功、错误和并发路径作为目标，但 [V4.1～V4.7](../log/device-mapper-optimization-v4.md#L72-L80)及三批实施安排没有保留 V3 已明确登记的真实用户态 `SA_RESTART` 验收缺口。
-
-证据如下：
-
-- [V3 记录](../log/device-mapper-optimization-v3.md#L430-L436)已说明 `EINTR → ERESTARTSYS` 修复完成，但真实用户态 `SA_RESTART` 回归没有 guest 执行证据，对应用例已删除；
-- [生产 WAIT 路径](../kernel/core/src/device/misc/device_mapper.rs#L508-L518)执行 restart 错误转换；
-- [现有 ktest](../kernel/core/src/device/misc/device_mapper.rs#L3255-L3264)只验证错误枚举转换，没有经过用户信号现场、寄存器恢复和 syscall 重启；
-- [现有 C 用例](../test/initramfs/src/regression/device/device_mapper.c#L319-L326)没有设置 `SA_RESTART`，只断言不可重启信号得到 `EINTR`；
-- [`SA_RESTART` 处理](../kernel/core/src/process/signal/mod.rs#L145-L157)还会经过用户寄存器和指令指针恢复分支。
-
-具体影响：即使 V4.1～V4.7 全部完成，现有矩阵仍不能证明 WAIT 遇到可重启信号后会继续等待并最终返回事件，而不是提前返回 `EINTR`。
-
-修订建议：至少把该项显式保留为既有未覆盖边界；若纳入 V4，应分别定义可重启和不可重启信号的用户 ABI 结果，并以真实用户态 syscall 重启链路验收，不能用错误映射 helper 通过代替。
-
-### 9.5 P2：“真实 runtime 节点补偿”目标没有覆盖实际恢复分支
-
-[V4.2 场景表](../log/device-mapper-optimization-v4.md#L113-L119)正确指出 closure 注入不能证明真实 Path/inode 恢复，但所列场景主要覆盖身份删除、目录清理、外来节点以及发布/rename 所有权，没有明确安排“alias 已删除、primary 删除失败后，真实 alias 恢复成功或失败”这两条核心补偿路径。
-
-生产顺序和状态差异如下：
-
-- [runtime remove](../kernel/core/src/device/registry/block.rs#L604-L623)先删除 alias，随后 primary 删除失败时才进入 `recover_primary_removal_failure`；
-- [删除辅助逻辑](../kernel/core/src/device/registry/block.rs#L708-L715)把 `ENOENT`/`ESTALE` 当作清理成功，因此单纯替换 alias/primary 通常不会触发补偿；
-- [真实恢复成功](../kernel/core/src/device/registry/block.rs#L750-L771)会恢复 live/open 状态，[恢复失败](../kernel/core/src/device/registry/block.rs#L774-L804)则保留 `Removing` 隔离，两者验收结果不同；
-- [现有恢复成功/失败用例](../kernel/core/src/device/registry/block.rs#L985-L1061)只注入 closure 结果，没有实际创建并验证恢复后的 alias。
-
-具体影响：执行 V4.2 当前表格内全部场景后，仍可能完全没有调用真实 `restore_mapper_alias()`；恢复链接目标、设备 identity、open gate、隔离和重试语义仍无直接证据，却可能被错误记为 V4.2 完成。
-
-修订建议：单列两项：
-
-1. primary 删除失败后，真实 alias 恢复成功，验证链接目标、identity、registry 状态和 open 行为；
-2. 恢复时路径冲突或恢复失败，验证保持 `Removing` 隔离、外来对象不被覆盖且后续可重试。
-
-测试设计应先证明 primary 删除失败分支可达，或采用仍保留真实 VFS 恢复操作的局部故障注入；不能只分析更晚的最终 commit 失败。
-
-### 9.6 P2：RawDisk 补测不能替代已记录的 MlsDisk facade 释放问题
-
-[V4 第 129、139～143 行](../log/device-mapper-optimization-v4.md#L129-L143)把该区域主要表述为 fixture/断言缺失，并把计划限定为 RawDisk/subset/clone，但没有承接本评审已经登记的 MlsDisk facade 释放阻断。
-
-- [现有评审](#84-必要补强与不应伪造的覆盖)记录：探索性 ktest 观察到 facade drop 后 backing 仍为 `Busy`，应先明确 ownership/release 时机，不能只归类为测试缺失；
-- [`RawDisk`](../kernel/core/comps/mlsdisk/src/lib.rs#L67-L79)直接持有 lease，并会为 subset/clone [克隆 lease](../kernel/core/comps/mlsdisk/src/lib.rs#L118-L129)，适合独立验证末个 holder 释放；
-- [`MlsDisk` facade](../kernel/core/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs#L47-L68)持有 `Arc<DiskInner<D>>`，其 [`Drop`](../kernel/core/comps/mlsdisk/src/layers/5-disk/mlsdisk.rs#L628-L631)只设置 `is_dropped`，不能据此证明内层所有权和 tracked backing 已释放。
-
-具体影响：RawDisk 单元测试全部通过后，真实 MlsDisk 消费者的已知 `Busy` 问题仍可能存在；若把 facade drop 直接纳入“末个 holder 释放后放行”验收，会重新遇到既有失败并误判为新发现。
-
-修订建议：保留两条独立结论：
-
-- RawDisk/subset/clone 的 tracked lease 适配可以补直接测试；
-- MlsDisk facade 的所有权释放问题仍未解决，本阶段不能承诺 facade drop 后 backing 可立即注销。
-
-本轮没有重新运行探索性测试，因此这里只引用既有审核证据，不把具体泄漏根因表述为本轮动态确认结果。
-
-### 9.7 P2：exfat、RawDisk 和驱动专项计划与当前触发式边界冲突
-
-V4 把 exfat 生命周期、RawDisk 以及 VirtIO/NVMe mock/受控集成列入[待实施总览](../log/device-mapper-optimization-v4.md#L70-L80)和[第二、三批计划](../log/device-mapper-optimization-v4.md#L223-L225)，但没有说明这是否要替代当前评审和交接文档规定的触发式边界。
-
-现行边界为：
-
-- [本评审第 8.4～8.6 节](#84-必要补强与不应伪造的覆盖)将 exfat、MlsDisk 与后端故障路径保留为触发式范围；
-- [交接文档](device-mapper-handoff.md#L39-L56)规定，只有出现 DM 用户可见失败、数据风险或阻塞新 target 时才重新开启这些专项；
-- [V4 第 167 行](../log/device-mapper-optimization-v4.md#L167)只要求调整 QEMU feature/设备配置前另行授权，没有解决测试范围决策冲突。
-
-具体影响：后续执行者会同时面对“进入第二/三批实施”和“当前不主动扩展”两个相反入口，可能未经范围确认直接扩围，也可能据旧边界拒绝执行 V4 清单。
-
-修订建议：明确 V4 是否提出范围变更。若要重新开启，应记录替代旧边界所需的确认、动因和退出条件；否则把这些项目改为条件性候选，而不是无条件批次内容。该冲突与 diff 基线选择无关，不能因 V4 使用 `main → 工作区` 就推定旧实施决策自动失效。
-
-### 9.8 已核实且不应误报的内容
-
-以下内容与当前源码或既有执行记录一致，不列为问题：
-
-- `main` 为 `604948581512d83734377974d4c34adb4530f2d7`，HEAD 为 `e31b265a3`；V4 对 `main → 当前工作区` 的基线描述正确；
-- 85＋20＋80＋7＋1＝193，且各组通过数可由 [2026-09-20](../log/daily/2026-9-20.md)和[2026-09-21](../log/daily/2026-9-21.md)日志支持；文档没有把历史静默运行或依赖编译误算成测试通过；
-- range ABI 对零长度仍先执行对齐、溢出和容量校验，再跳过下发，V4 对该边界的描述正确；
-- 四个 range wrapper、NVMe range 拒绝、host-ID ioctl errno、TSC 来源优先级以及 test-kernel 的构建时 `OSDK_LOCAL_DEV` 门槛，整体描述与当前源码一致；
-- 禁止 DmDevice backing 的生产分支存在，本轮未找到直接拒绝用例。实施时需要让 inner DmDevice 先具有合法容量，避免在 target 容量校验阶段提前失败；这是 fixture 约束，不单列为文档事实错误；
-- 引用路径和绝大多数行号仍有效，没有发现确定的已删除文件链接或指向无关符号的引用。
-
-另有一项需要在后续覆盖矩阵中谨慎表述：现有 WAIT 唤醒测试使用 ready 标记加单次 `sched_yield`，尚不能严格证明 waiter 已经进入阻塞阶段。V4 要求使用可观察阶段屏障的方向正确；在补齐该屏障前，不应把现有用例强化表述为已经证明“阻塞后唤醒”。
-
-### 9.9 最终判定
-
-| 审核项 | 判定 |
-|---|---|
-| 文档目标与证据分层 | 方向正确，可保留。 |
-| git 基线与 193 项统计 | 与当前仓库及日志一致。 |
-| GET_ID 异常契约 | 不准确，必须在实施前修正。 |
-| tracked lease 缺口分类 | 不准确，应先扣除已有直接断言。 |
-| WAIT 用户 ABI | 遗漏 V3 已登记的 `SA_RESTART` 缺口。 |
-| runtime 节点补偿 | 未覆盖真实 alias 恢复成功/失败分支。 |
-| RawDisk/MlsDisk | 必须区分可补测的 RawDisk 与未解决的 facade 所有权问题。 |
-| exfat/驱动等实施范围 | 与现行触发式边界冲突，需明确是否重新授权扩围。 |
-
-最终结论（首轮审核时）：**第四版文档不是无效方案，但当时版本仍存在会误导测试设计和完成判定的关键问题，应先修订上述 6 项再实施。后续状态不得由本段历史结论推断，见 9.10。**
-
-### 9.10 后续修订、实施与验证结果
-
-首轮提出的契约与范围问题已按代码事实修订，并在用户授权范围内完成直接断言与动态验证。原 V4.5（CPUID/TSC）和 V4.6（test-kernel selector）因属于通用平台/测试基础设施、与 DM 功能无直接调用关系，从 V4 方案移除；这是范围收敛，不是测试通过。
-
-| 首轮问题 / 实施项 | 当前状态 | 证据与边界 |
+| 耦合点 | 当前源码事实 | PR3 提取约束 |
 |---|---|---|
-| GET_ID 异常契约混写 | **文档已修订** | 已区分 query 可返回异常、queue 过滤异常和设备不完成；未改变 timeout、轮询或降级生产语义。 |
-| tracked lease 误分类及缺口 | **核心子项完成** | 新增 table 存活/替换、旧 in-flight BIO、failed table-load 状态保持断言；DM 86/0，core DM ioctl 82/0。mount source 类型仍未实施。 |
-| WAIT / `SA_RESTART` | **完成** | C 用例以 signal handler pipe 证明信号送达，事件前结果 pipe 未就绪，rename 后原 ioctl 成功返回并回填；无 `SA_RESTART` 的 `EINTR` 对照保留。 |
-| 真实 runtime alias 恢复 | **计划已准确列出，测试未实施** | closure 注入和既有路径碰撞回滚仍不能替代真实 `restore_mapper_alias()` 成功/失败路径。 |
-| RawDisk 与 MlsDisk facade 混淆 | **文档已拆分，生产边界未解决** | RawDisk 为条件性候选；不承诺 facade drop 后 backing 立即可注销。 |
-| 条件性专项与范围冲突 | **文档冲突已关闭** | exfat、RawDisk、VirtIO/NVMe 保持触发式候选，本轮未执行。 |
-| block range wrapper | **完成** | 3 个 ktest 覆盖四个 wrapper 的构造、同步/异步完成、enqueue/completion 错误通道、batch/callback；block 23/0。 |
-| raw range ioctl | **完成** | `BLKDISCARD`/`BLKZEROOUT` 覆盖合法、未对齐、溢出、越界和零长度 byte range；不外推真实硬件内容语义。 |
-| DmDevice backing 拒绝 | **直接分支完成** | 有合法容量的实际 DmDevice 作为 linear/striped backing 均返回 `UnsupportedBackingDevice`；未实现 stacking。 |
+| DmDevice 与 table/BIO | [device.rs:144–170](../kernel/core/comps/device-mapper/src/device.rs#L144-L170) 包含表状态、BIO 队列、in-flight、事件队列，并实现 `BlockDevice` | 不能整文件搬入，也不能伪造空 table/BIO 实现；需明确身份和无表状态如何从现有对象裁剪，不另造平行模型 |
+| STATUS/REMOVE 与 workflow | STATUS 经过 table snapshot；REMOVE 经过 runtime 注销、排队 BIO 清理及 inactive table 清理 | 无表不变量下这些工作不参与，但必须保留身份、状态、lookup 引用、生命周期串行化与实例复核语义 |
+| manager 与公共 major API | 完整 dm 使用 `allocate_major_with_name("device-mapper")`，PR3 基线只有 `allocate_major()` | 真正的前置缺口；需审定前移 dm 已有命名 major 支持，或明确批准更窄接线；不得假定 API 已存在或静默删掉名称语义 |
 
-动态结果：
+完整 dm 的无表 REMOVE 中，runtime 未注册时 `unregister_if_registered` 返回成功；无排队 BIO、无 inactive/active table 时相关清理没有实际工作。但这种运行时事实不等于编译依赖自然消失，仍须设计明确的裁剪清单。
 
-- DM crate 全量：86 passed，0 failed，0 filtered out；
-- block crate 全量：23 passed，0 failed，0 filtered out；
-- core DM ioctl 模块：82 passed，0 failed，123 filtered out；
-- focused `device/device_mapper` C regression：7 个测试函数累计 159 passed，0 failed，最终 `All regression tests passed.`。
+“不发布映射块设备”不等于“不需要设备号分配基础设施”。反过来，也不能因 major 分配依赖就提前搬入完整 block registry、lease、节点发布和注销状态机。命名 major 的 API 前置与 `/proc/devices` 用户态可见性须分清；本轮尚未完成 procfs 接线调查，不声称引入 API 就已完成工具发现支持。
 
-其中前三组是本轮重新执行的 191 项 Rust 测试。此前 core registry 7/0 与动态设备路径 1/0 仍是有效历史证据，但本轮未重跑；因此最新跨轮次清单可计为 199 项，不能写成“本轮 199 项全部通过”。C 的 159 是 focused ELF 内断言累计数，不是完整 initramfs regression，也不是 159 个独立测试函数。
+### 5. 审定顺序与后续验证计划
 
-**当前判定：**本轮授权子集已完成并通过验证；真实 alias/VFS 深层补偿、mount source 类型和条件性专项仍未完成，不据此宣称整份 V4 覆盖地图全部关闭。
+**结论：无表管理阶段成立，但尚不能宣称当前代码可无差异提取。** 写代码前建议按以下顺序审定：
+
+1. CREATE 冲突 errno：是否先在 dm 对齐 `EBUSY`，同步修正相关 Rust/C 断言。
+2. dev 解码：是否先在 dm ABI 边界匹配 Linux 低 32 位语义。
+3. 1 MiB 上限、UTF-8、deferred remove、全局事件：明确保留的兼容限制与先行补齐项目。
+4. REMOVE 的完成与引用释放：决定是否先处理等待语义，并补可控并发证据。
+5. 命名 major 前置及 DmDevice 身份部分的裁剪：先列逐文件依赖，不在 PR 分支另造架构。
+6. 审定后先在 dm 修正并验证必要生产行为，再在已创建的 PR3 分支提取；保持 PR1/PR2 不变。
+
+建议测试覆盖如下，**均为计划，不是通过记录**：
+
+| 层次 | 覆盖 |
+|---|---|
+| manager / device ktest | name/UUID/dev 查询、重复身份、minor 优先级与失败释放、索引删除、旧引用保号、同名新对象保护、无表状态 |
+| core 参数与命令 ktest | 固定前缀复制、NO_PARAMS、secure 清理、错误优先级、字符串和编码边界、LIST 过滤/对齐/UUID 扩展/容量、copyout 失败后的真实状态 |
+| 官方 initramfs C ABI | CREATE → 三种身份 STATUS → LIST → REMOVE；重复与非法参数；不引入 target/table 或依赖映射 I/O 的场景 |
+| 用户态可见边界 | 核对没有提前发布运行时块设备；若使用真实工具，另查工具的 major 发现、节点编排及前置命令，不把原始 ioctl 成功夸大为 dmsetup 全流程通过 |
+
+最终验证在目标 PR 源码树执行：先 `make format` 并检查范围外修改，再 `make check`、`make kernel`、相关 crate/文件测试与官方 C ABI 回归。测试串行，记录源码树、命令、非零计数、退出码和日志；dm 的结果不替代 PR3 验收。现有全量回归 cgroup 基线阻塞单独披露，不借本轮重新扩大排查。
+
+### 6. 本轮记录边界
+
+- 已执行：核实分支/提交与 Linux 来源；读取上述双方源码及必要的基线差异；`git diff --check` 通过。
+- 未执行：生产代码修改、缺口修复、外部 VM 实验、构建、ktest、C ABI 或系统测试。
+- 未执行：切分支、stash/恢复六份文档、提交、推送或修改远端 PR。
+- 本节是在用户授权下记录分析；结论中的建议和验证矩阵不构成后续实施授权。

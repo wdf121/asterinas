@@ -1,17 +1,27 @@
 # Device Mapper 当前项目状态
 
-> **更新日期**：2026-10-26。当前 dm 为 `37ddb9245` 加恢复的未提交改动，最新 main 为 `ceb65e3f8`，未 push。
+> **更新日期**：2026-10-27。当前在 `dm`，HEAD `7c46b2ee8` 加未提交修复；用户反馈最新验证全部通过，当前按授权集中更新文档。未切分支、未提交或推送。
 >
-> 实现以源码为准，验证区分助手实际执行、用户反馈及历史证据。今日明细见 [日报](daily/2026-10-26.md)。
+> 实现以源码为准，验证区分助手实际执行、用户反馈及历史证据。今日明细见 [日报](daily/2026-10-27.md)。
 
 ## 当前停点摘要
+
+- PR3 制备前完整 dm 已修 CREATE 冲突 errno、ioctl dev 低 32 位、固定 C ABI 4.48.0、1 GiB 参数上限/NO_PARAMS、opaque UUID、全局事件与 ARM_POLL、REMOVE 控制引用及 BIO 排空、minor 释放和旧实例隔离。
+- 最新 make check 两处失败（测试辅助函数 dead-code、泛型临时值多余借用）已修；用户随后确认“验证都通过了”。未独立取得最终日志、计数、逐条退出码或镜像来源，不宣称全仓测试通过。
+- [global.md §10.4](../docs/global.md#104-pr3-制备前修复与待办总账2026-10-27) 是逐项修复与待办总账，记录 F01–F12、T01–T09。deferred REMOVE、DM uevent、非 UTF-8 名称因跨子系统依赖暂缓；allocator 极限证据、精确事件点和 PR3 提取仍待处理。
+- `dm-device-management` 和 `dm-control-interface` 均为 `808d36daf`；PR3 无独有实现，未验证。先审定命名 major/原设备模型裁剪/事件拆分，再提取无表管理；不另造模型，不自动修改 PR1/PR2。
+- 本次仅更新旧文档说明与今日日志；保留既有未提交资料，未来不进入 upstream diff。
+
+## 历史同步摘要（2026-10-26）
 
 - 上游新增 23 个提交已 merge；原研发改动恢复，唯一 stash 冲突 test/nixos/Makefile 已解决，保留上游缩进和套件 runner。安全引用和 stash 保留。
 - 用户反馈合并后 make check 与控制面集成测试通过；无独立输出/计数/镜像来源记录。本次同步按用户决定跳过 make kernel，未运行合并后 ktest/C 全量回归。
 - 控制面 13 例恢复薄 main.rs + cases.sh，删除实验性四个 Rust 模块及辅助层 7 项单测；run.sh/runner.py 保留，日志为 CST。同步前恢复运行 13/13、62 秒，用户随后反馈 45 秒；不是同步后性能数据。
 - extra_config.nix 显式声明工具并保留基础包，复用 dm overlay 的 aster-test-disk-locator；格式/语法检查通过，未重建镜像，上游需另行解决 locator 依赖。
-- ABI 4.48.0、测试与文档改动仍未提交；旧 PR 档案及 Word 删除保持用户原状态。
-- PR1 不改实现；新 PR2 为 ea1a9639c，后续 PR2～PR11 框架路线见 [规划](../docs/pull_request.md)，框架后接最小 linear 终验。当前只批准记录规划，不自动授权实现缺口。
+- ABI 4.48.0、格式化入口、测试套件、同步规则和规划文档已分五个提交并推送；旧 PR 档案及 Word 删除已纳入授权整理。
+- PR1 rebase 后为 `2dd1bcac5`，用户反馈验证成功，已精确 lease 推送并核验远端。PR2 更新前置链后清理为 `808d36daf`，六文件，不带回归筛选扩展或临时代理配置，本轮未推送。
+- PR2 用户反馈格式、check、kernel 和 core 测试成功；源码七个 ktest/七个 C 场景不冒充实际计数。清理后未重跑。全量 regression 在 cgroup 处失败且 main 同环境复现，用户确认上游 bug 后决定暂不处理，助手未独立取得修复依据，不记全量通过。
+- 后续 PR2～PR11 框架路线见 [规划](../docs/pull_request.md)，框架后接最小 linear 终验。规划不自动授权实现缺口；PR2 维护者描述交代系列目标，但不承诺全部 Linux DM 功能。
 
 ## 历史停点（2026-10-19 至 2026-10-20）
 
@@ -107,11 +117,11 @@ make run_kernel AUTO_TEST=regression REGRESSION_TESTS="device/device_mapper_cont
 
 | 程序 | 职责 | 场景数 |
 |---|---|---:|
-| `device_mapper_control` | 版本、权限、参数/内存边界、选择器、回写、无事件 poll | 13 |
+| `device_mapper_control` | 版本、权限、参数/内存边界、选择器、回写、opaque UUID、poll/ARM_POLL | 15 |
 | `device_mapper_lifecycle` | 身份、节点回滚、挂载占用、WAIT 信号与事件 | 7 |
 | `device_mapper_table` | 表查询、backing 路径、只读转换、范围 ioctl | 5 |
 
-原 `device_mapper`、`device_mapper_version` 不再是当前源码构建/runner 入口；旧构建目录即使残留二进制也不能用于本轮验收。按职责而非命令分文件，原 24 个场景保留，新增后共 25 个，不是断言数量。这些是真实系统调用的用户态 ABI 测试，不替代 dmsetup/LVM 集成。
+原 `device_mapper`、`device_mapper_version` 不再是当前源码构建/runner 入口；旧构建目录即使残留二进制也不能用于本轮验收。按职责而非命令分文件，当前源码共 27 个场景，不是实际执行数或断言数量。这些是真实系统调用的用户态 ABI 测试，不替代 dmsetup/LVM 集成。
 
 ### 3.3 NixOS DM system suite
 
@@ -155,7 +165,7 @@ release 验收须确认镜像来自目标源码的显式 release 构建，不能
 
 - uevent / sysfs / udev / systemd 自动发现和自动激活；
 - DM-on-DM stacking；
-- deferred remove、完整 control ABI 扩展及全局控制事件 poll/ARM_POLL；
+- deferred remove、其余未实现 control ABI 扩展；全局控制事件 poll/ARM_POLL 已在完整 dm 实现，不再列为未实现项；
 - 完整 queue stacking、后端限制自动再拆；
 - ext4 / exfat 作为当前核心验收；
 - MlsDisk 生命周期、virtio/NVMe fault injection 等框架专项工作。
@@ -169,7 +179,7 @@ CLAUDE.md / AGENTS.md
 → docs/device-mapper-handoff.md
 → 本项目状态
 → docs/pull_request.md / docs/upstream-sync.md
-→ log/daily/2026-10-19.md（更早日志按需回溯）
+→ log/daily/2026-10-27.md（更早日志按需回溯）
 → 按任务阅读源码证据、设计或测试手册
 → 核对当前工作区与实际任务的比较基线
 ```
