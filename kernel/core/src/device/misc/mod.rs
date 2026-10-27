@@ -18,7 +18,7 @@ static MISC_MAJOR: Once<MajorIdOwner> = Once::new();
 
 // Linux misc devices use character major 10.
 pub(super) fn init_in_first_kthread() {
-    MISC_MAJOR.call_once(|| acquire_major(MajorId::new(10)).unwrap());
+    MISC_MAJOR.call_once(|| acquire_major(MajorId::new(10), "misc").unwrap());
 
     dm_control::init_in_first_kthread();
     hwrng::init_in_first_kthread();
