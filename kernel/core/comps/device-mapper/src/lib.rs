@@ -24,7 +24,7 @@ mod manager;
 mod table;
 pub mod target;
 
-pub use device::{DmDevice, DmDeviceStatus};
+pub use device::{DmControlRef, DmDevice, DmDeviceStatus};
 pub use manager::{DmManager, RuntimeRenameReservation};
 pub use table::DmTable;
 

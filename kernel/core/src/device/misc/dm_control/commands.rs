@@ -11,7 +11,7 @@ use core::ops::Deref;
 
 use aster_block::{BlockDevice, BlockDeviceLease, id::Sid, lookup_lease};
 use aster_device_mapper::{
-    DmDevice, DmManager, DmTable,
+    DmControlRef, DmDevice, DmManager, DmTable,
     target::{TargetStatusMode, parse_target_with},
 };
 use device_id::{DeviceId, MajorId, MinorId};
@@ -29,8 +29,9 @@ use super::{
         DM_TABLE_LOAD_CMD, DM_TABLE_STATUS_CMD, DM_TARGET_SPEC_SIZE, DM_TARGET_TYPE_LEN,
         DM_UUID_FLAG, DM_UUID_LEN, DM_VERSION_CMD, OFF_DATA_SIZE, OFF_DATA_START, OFF_DEV,
         OFF_EVENT_NR, OFF_FLAGS, OFF_NAME, OFF_OPEN_COUNT, OFF_TARGET_COUNT, OFF_UUID, align_up,
-        available_from, c_string_until, data_start, fixed_bytes, invalid_buffer, map_table_error,
-        map_target_parse_error, name_list_record_layout, optional_c_string, read_u32, read_u64,
+        available_from, c_bytes_until, c_string_until, data_start, decode_ioctl_device,
+        fixed_bytes, invalid_buffer, map_table_error, map_target_parse_error,
+        name_list_record_layout, optional_c_string, optional_uuid, read_u32, read_u64,
         require_range, required_c_string, result_start, set_buffer_full, table_status_record_len,
         validate_target_spec_next, write_c_string, write_c_string_fixed, write_u32, write_u64,
     },
@@ -76,11 +77,10 @@ pub(super) fn handle_command(command: u8, buffer: &mut [u8]) -> Result<()> {
 /// Creates a mapped device and writes its assigned identity back into the ioctl header.
 pub(super) fn create_device(buffer: &mut [u8]) -> Result<()> {
     let name = required_c_string(buffer, OFF_NAME, DM_NAME_LEN)?;
-    let uuid = optional_c_string(buffer, OFF_UUID, DM_UUID_LEN)?;
+    let uuid = optional_uuid(buffer, OFF_UUID, DM_UUID_LEN)?;
     let flags = read_u32(buffer, OFF_FLAGS)?;
     let requested_minor = if flags & DM_PERSISTENT_DEV_FLAG != 0 {
-        let dev = DeviceId::from_encoded_u64(read_u64(buffer, OFF_DEV)?)
-            .ok_or_else(|| Error::with_message(Errno::EINVAL, "persistent dev 编码无效"))?;
+        let dev = decode_ioctl_device(read_u64(buffer, OFF_DEV)?);
         Some(dev.minor().get())
     } else {
         None
@@ -109,12 +109,12 @@ fn remove_device(buffer: &mut [u8]) -> Result<()> {
     with_current_device_lifecycle_allow_isolated(&device, |device| {
         // Linux find_device fills identity and the pre-removal inactive flag;
         // dev_remove does not call __dev_status or synthesize a final event.
-        write_c_string_fixed(buffer, OFF_NAME, DM_NAME_LEN, &device.mapper_name())?;
+        write_c_string_fixed(buffer, OFF_NAME, DM_NAME_LEN, device.mapper_name())?;
         write_c_string_fixed(
             buffer,
             OFF_UUID,
             DM_UUID_LEN,
-            device.uuid().as_deref().unwrap_or(""),
+            device.uuid().as_deref().unwrap_or(b""),
         )?;
         let mut flags =
             read_u32(buffer, OFF_FLAGS)? & !(DM_INACTIVE_PRESENT_FLAG | DM_DEFERRED_REMOVE);
@@ -129,7 +129,11 @@ fn remove_device(buffer: &mut [u8]) -> Result<()> {
             DeviceIdLogLabel(device.id())
         );
         Ok(())
-    })
+    })?;
+    // WAIT and mutations admitted before detach may need the lifecycle lock.
+    // Never retain it while waiting for their Linux-style control references.
+    device.drain_removed();
+    Ok(())
 }
 
 /// Implements Linux-style best-effort removal across all mapped devices.
@@ -137,7 +141,9 @@ pub(super) fn remove_all(buffer: &mut [u8]) -> Result<()> {
     let workflow = ControlWorkflow::new(manager());
     let request = RemoveAllRequest::new(manager().devices());
     let outcome = workflow.remove_all(request, |device| {
-        with_current_device_lifecycle_allow_isolated(device, |device| workflow.remove(device))
+        with_current_device_lifecycle_allow_isolated(device, |device| workflow.remove(device))?;
+        device.drain_removed();
+        Ok(())
     });
     ostd::error!(
         "[dm-debug] control remove-all committed attempted={} removed={}",
@@ -208,20 +214,22 @@ pub(super) fn device_rename(buffer: &mut [u8]) -> Result<()> {
     if data_start < DM_IOCTL_FIXED_PREFIX_SIZE {
         return Err(invalid_buffer());
     }
-    let value = c_string_until(buffer, data_start, buffer.len())?;
-    if flags & DM_UUID_FLAG != 0 {
+    let value = c_bytes_until(buffer, data_start, buffer.len())?;
+    let request = if flags & DM_UUID_FLAG != 0 {
         if value.is_empty() || value.len() >= DM_UUID_LEN {
             return_errno_with_message!(Errno::EINVAL, "invalid new mapper UUID length");
         }
+        RenameRequest::Uuid(value)
     } else {
-        validate_mapper_name(value)?;
-    }
+        let name = c_string_until(buffer, data_start, buffer.len())?;
+        validate_mapper_name(name)?;
+        RenameRequest::Name(name)
+    };
     // dm_hash_rename checks the destination before resolving the source by
     // name. Unlike ordinary lookups, rename does not select by dev or UUID.
-    let destination = if flags & DM_UUID_FLAG != 0 {
-        manager().lookup_uuid(value)
-    } else {
-        manager().lookup_name(value)
+    let destination = match request {
+        RenameRequest::Uuid(uuid) => manager().lookup_uuid(uuid),
+        RenameRequest::Name(name) => manager().lookup_name(name),
     };
     if destination.is_some() {
         return_errno_with_message!(Errno::EBUSY, "mapper rename destination already exists");
@@ -230,14 +238,16 @@ pub(super) fn device_rename(buffer: &mut [u8]) -> Result<()> {
     let device = name
         .and_then(|name| manager().lookup_name(&name))
         .ok_or_else(|| Error::with_message(Errno::ENXIO, "mapper rename source does not exist"))?;
+    let device = manager()
+        .acquire_control(&device)
+        .ok_or_else(|| Error::new(Errno::ENXIO))?;
     let workflow = ControlWorkflow::new(manager());
 
     with_current_device_lifecycle(&device, |device| {
-        let value = c_string_until(buffer, data_start, buffer.len())?;
         let request = if flags & DM_UUID_FLAG != 0 {
-            RenameRequest::Uuid(value)
+            RenameRequest::Uuid(c_bytes_until(buffer, data_start, buffer.len())?)
         } else {
-            RenameRequest::Name(value)
+            RenameRequest::Name(c_string_until(buffer, data_start, buffer.len())?)
         };
         workflow.rename(device, &request)?;
         let kind = request.kind();
@@ -580,8 +590,10 @@ fn list_devices(buffer: &mut [u8]) -> Result<()> {
     let devices = manager()
         .devices()
         .into_iter()
-        .filter(|device| !aster_block::is_removing(device.id()));
-    list_devices_for_snapshots(buffer, QueryWorkflow::devices(devices), include_uuid)
+        .filter_map(|device| manager().acquire_control(&device))
+        .filter(|device| !aster_block::is_removing(device.id()))
+        .map(|device| QueryWorkflow::device(&device));
+    list_devices_for_snapshots(buffer, devices, include_uuid)
 }
 
 /// Lists mapped device names and UUID extensions in Linux `DM_LIST_DEVICES` format.
@@ -612,8 +624,7 @@ pub(super) fn list_devices_for_snapshots(
                 && device
                     .uuid
                     .as_deref()
-                    .unwrap_or("")
-                    .as_bytes()
+                    .unwrap_or(b"")
                     .starts_with(uuid_prefix)
         })
         .collect();
@@ -672,8 +683,11 @@ enum DeviceLookupPolicy {
     AllowIsolated,
 }
 
-fn lookup_device(buffer: &[u8]) -> Result<Arc<DmDevice>> {
-    lookup_device_with_policy(buffer, DeviceLookupPolicy::RejectIsolated)
+fn lookup_device(buffer: &[u8]) -> Result<DmControlRef> {
+    let device = lookup_device_with_policy(buffer, DeviceLookupPolicy::RejectIsolated)?;
+    manager()
+        .acquire_control(&device)
+        .ok_or_else(|| Error::new(Errno::ENXIO))
 }
 
 fn lookup_device_allow_isolated(buffer: &[u8]) -> Result<Arc<DmDevice>> {
@@ -699,7 +713,7 @@ fn lookup_device_in_manager_with_policy(
 ) -> Result<Arc<DmDevice>> {
     let raw_dev = read_u64(buffer, OFF_DEV)?;
     let name = optional_c_string(buffer, OFF_NAME, DM_NAME_LEN)?;
-    let uuid = optional_c_string(buffer, OFF_UUID, DM_UUID_LEN)?;
+    let uuid = optional_uuid(buffer, OFF_UUID, DM_UUID_LEN)?;
 
     // validate_params rejects name+UUID first; lookup rejects a textual
     // selector combined with dev. Linux returns ENXIO for lookup ambiguity.
@@ -717,17 +731,22 @@ fn lookup_device_in_manager_with_policy(
     } else if let Some(name) = name {
         manager.lookup_name(&name)
     } else if raw_dev != 0 {
-        let id = DeviceId::from_encoded_u64(raw_dev)
-            .ok_or_else(|| Error::with_message(Errno::EINVAL, "Device Mapper dev 编码无效"))?;
-        manager.lookup_id(id)
+        manager.lookup_id(decode_ioctl_device(raw_dev))
     } else {
         return_errno_with_message!(Errno::ENXIO, "missing mapper selector");
     };
 
     let device =
         device.ok_or_else(|| Error::with_message(Errno::ENXIO, "Device Mapper 设备不存在"))?;
-    if policy == DeviceLookupPolicy::RejectIsolated && aster_block::is_removing(device.id()) {
-        return_errno_with_message!(Errno::ENXIO, "Device Mapper 设备正在删除");
+    if policy == DeviceLookupPolicy::RejectIsolated {
+        // Keep this exact instance's minor allocated while consulting the block
+        // registry. A structural lookup alone can outlive removal and ID reuse.
+        let _control = manager
+            .acquire_control(&device)
+            .ok_or_else(|| Error::new(Errno::ENXIO))?;
+        if aster_block::is_removing(device.id()) {
+            return_errno_with_message!(Errno::ENXIO, "Device Mapper 设备正在删除");
+        }
     }
     Ok(device)
 }
@@ -851,7 +870,7 @@ fn fill_device_header_snapshot(buffer: &mut [u8], device: &DeviceSnapshot) -> Re
         buffer,
         OFF_UUID,
         DM_UUID_LEN,
-        device.uuid.as_deref().unwrap_or(""),
+        device.uuid.as_deref().unwrap_or(b""),
     )?;
     Ok(())
 }

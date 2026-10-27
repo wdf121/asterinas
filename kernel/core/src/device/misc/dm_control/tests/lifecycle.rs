@@ -315,7 +315,7 @@ fn persistent_create_reports_allocation_before_identity_errors() {
     let device = workflow
         .create(CreateRequest {
             name: "dm-create-order".to_string(),
-            uuid: Some("dm-create-order-uuid".to_string()),
+            uuid: Some(b"dm-create-order-uuid".to_vec()),
             requested_minor: Some(7),
         })
         .unwrap();
@@ -329,17 +329,17 @@ fn persistent_create_reports_allocation_before_identity_errors() {
             7,
             Errno::ENXIO,
         ),
-        ("dm-create-order", None, 8, Errno::EEXIST),
+        ("dm-create-order", None, 8, Errno::EBUSY),
         (
             "dm-create-new",
             Some("dm-create-order-uuid"),
             8,
-            Errno::EEXIST,
+            Errno::EBUSY,
         ),
     ] {
         let result = workflow.create(CreateRequest {
             name: name.to_string(),
-            uuid: uuid.map(|value| value.to_string()),
+            uuid: uuid.map(|value| value.as_bytes().to_vec()),
             requested_minor: Some(minor),
         });
         assert_eq!(result.unwrap_err().error(), expected);
@@ -680,7 +680,7 @@ fn rename_runtime_updates_manager_and_device_name() {
     let device = manager
         .create(
             "dm-rename-old".to_string(),
-            Some("dm-rename-uuid".to_string()),
+            Some(b"dm-rename-uuid".to_vec()),
             None,
         )
         .unwrap();
@@ -736,7 +736,7 @@ fn rename_runtime_rolls_back_manager_when_alias_rename_fails() {
     let device = manager
         .create(
             "dm-rollback-old".to_string(),
-            Some("dm-rollback-uuid".to_string()),
+            Some(b"dm-rollback-uuid".to_vec()),
             None,
         )
         .unwrap();
@@ -805,7 +805,7 @@ fn device_rename_with_uuid_flag_updates_uuid_not_name() {
     device_rename(&mut buffer).unwrap();
 
     assert_eq!(device.mapper_name(), "dm-uuid-rename-name");
-    assert_eq!(device.uuid().unwrap(), "dm-uuid-rename-new");
+    assert_eq!(device.uuid().unwrap(), b"dm-uuid-rename-new");
     assert!(manager().lookup_uuid("dm-uuid-rename-old").is_none());
     assert_eq!(
         manager().lookup_uuid("dm-uuid-rename-new").unwrap().id(),
@@ -840,7 +840,7 @@ fn command_errors_preserve_linux_lookup_and_validation_order() {
     let uuid = "dm-error-order-uuid";
     let missing = "dm-error-order-missing";
     let device = manager()
-        .create(name.to_string(), Some(uuid.to_string()), None)
+        .create(name.to_string(), Some(uuid.as_bytes().to_vec()), None)
         .unwrap();
     let before = device.status();
 
@@ -873,7 +873,7 @@ fn command_errors_preserve_linux_lookup_and_validation_order() {
         assert_eq!(device_rename(&mut buffer).unwrap_err().error(), expected);
         assert_eq!(device.status(), before);
         assert_eq!(device.mapper_name(), name);
-        assert_eq!(device.uuid().as_deref(), Some(uuid));
+        assert_eq!(device.uuid().as_deref(), Some(uuid.as_bytes()));
         assert!(Arc::ptr_eq(&manager().lookup_name(name).unwrap(), &device));
         assert!(Arc::ptr_eq(&manager().lookup_uuid(uuid).unwrap(), &device));
     }
@@ -903,14 +903,14 @@ fn device_rename_rejects_duplicate_and_empty_uuid_without_state_change() {
     let first = manager()
         .create(
             "dm-uuid-rename-first".to_string(),
-            Some("dm-uuid-rename-first-old".to_string()),
+            Some(b"dm-uuid-rename-first-old".to_vec()),
             None,
         )
         .unwrap();
     let second = manager()
         .create(
             "dm-uuid-rename-second".to_string(),
-            Some("dm-uuid-rename-second-uuid".to_string()),
+            Some(b"dm-uuid-rename-second-uuid".to_vec()),
             None,
         )
         .unwrap();
@@ -919,7 +919,7 @@ fn device_rename_rejects_duplicate_and_empty_uuid_without_state_change() {
 
     let mut duplicate = test_buffer(DM_IOCTL_HEADER_SIZE + 32);
     write_u32(&mut duplicate, OFF_FLAGS, DM_UUID_FLAG).unwrap();
-    write_c_string_fixed(&mut duplicate, OFF_NAME, DM_NAME_LEN, &first.mapper_name()).unwrap();
+    write_c_string_fixed(&mut duplicate, OFF_NAME, DM_NAME_LEN, first.mapper_name()).unwrap();
     write_c_string(
         &mut duplicate,
         DM_IOCTL_HEADER_SIZE,
@@ -931,7 +931,7 @@ fn device_rename_rejects_duplicate_and_empty_uuid_without_state_change() {
         Errno::EBUSY
     );
 
-    assert_eq!(first.uuid().unwrap(), "dm-uuid-rename-first-old");
+    assert_eq!(first.uuid().unwrap(), b"dm-uuid-rename-first-old");
     assert_eq!(first.status(), status_before);
     assert_eq!(
         manager()
@@ -950,13 +950,13 @@ fn device_rename_rejects_duplicate_and_empty_uuid_without_state_change() {
 
     let mut empty = test_buffer(DM_IOCTL_HEADER_SIZE + 1);
     write_u32(&mut empty, OFF_FLAGS, DM_UUID_FLAG).unwrap();
-    write_c_string_fixed(&mut empty, OFF_NAME, DM_NAME_LEN, &first.mapper_name()).unwrap();
+    write_c_string_fixed(&mut empty, OFF_NAME, DM_NAME_LEN, first.mapper_name()).unwrap();
     write_c_string(&mut empty, DM_IOCTL_HEADER_SIZE, "").unwrap();
     assert_eq!(
         device_rename(&mut empty).unwrap_err().error(),
         Errno::EINVAL
     );
-    assert_eq!(first.uuid().unwrap(), "dm-uuid-rename-first-old");
+    assert_eq!(first.uuid().unwrap(), b"dm-uuid-rename-first-old");
 }
 
 #[ktest]
@@ -1540,7 +1540,7 @@ fn removal_keeps_live_table_for_existing_wait_reference_only() {
     let registered = Arc::new(AtomicBool::new(false));
     let result = Arc::new(Mutex::new(None));
     {
-        let waiter = device.clone();
+        let waiter = manager.acquire_control(&device).unwrap();
         let registered = registered.clone();
         let result = result.clone();
         TaskOptions::new(move || {
@@ -1570,6 +1570,9 @@ fn removal_keeps_live_table_for_existing_wait_reference_only() {
     .unwrap();
     assert!(Arc::ptr_eq(&device.active_table().unwrap(), &active));
     assert!(device.inactive_table().is_none());
+    assert!(manager.acquire_control(&device).is_none());
+    device.drain_removed();
+    assert!(device.active_table().is_none());
     while result.lock().is_none() {
         Task::yield_now();
     }
@@ -1603,7 +1606,7 @@ fn rename_and_remove_emit_events_only_for_live_tables() {
         with_current_device_lifecycle_in(&manager, &device, |current| {
             let workflow = ControlWorkflow::new(&manager);
             workflow.rename(current, &RenameRequest::Name("v5-event-new"))?;
-            workflow.rename(current, &RenameRequest::Uuid("v5-event-uuid"))?;
+            workflow.rename(current, &RenameRequest::Uuid(b"v5-event-uuid"))?;
             assert_eq!(
                 device.status().event_nr,
                 if table_state == 2 { 2 } else { 0 }

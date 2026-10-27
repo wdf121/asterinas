@@ -7,7 +7,7 @@ use crate::{device::misc::dm_control::DmControlFile, events::IoEvents, process::
 
 #[ktest]
 fn control_without_events_is_not_ready() {
-    let file = DmControlFile;
+    let file = DmControlFile::new();
     for mask in [
         IoEvents::empty(),
         IoEvents::IN,
@@ -16,6 +16,117 @@ fn control_without_events_is_not_ready() {
     ] {
         assert_eq!(file.poll(mask, None), IoEvents::empty());
     }
+}
+
+#[ktest]
+fn control_events_are_per_open_and_wrap_like_linux() {
+    use core::sync::atomic::Ordering;
+
+    use crate::device::misc::dm_control::ControlEvents;
+
+    let events = ControlEvents::new();
+    events.generation.store(u32::MAX, Ordering::Release);
+    let first = DmControlFile::new_with_events(&events);
+    let second = DmControlFile::new_with_events(&events);
+    events.notify();
+    assert_eq!(first.poll_events(&events, IoEvents::IN, None), IoEvents::IN);
+    assert_eq!(
+        first.poll_events(&events, IoEvents::OUT, None),
+        IoEvents::empty()
+    );
+    first.arm(&events);
+    assert_eq!(
+        first.poll_events(&events, IoEvents::IN, None),
+        IoEvents::empty()
+    );
+    assert_eq!(
+        second.poll_events(&events, IoEvents::IN, None),
+        IoEvents::IN
+    );
+    let fresh = DmControlFile::new_with_events(&events);
+    assert_eq!(
+        fresh.poll_events(&events, IoEvents::IN, None),
+        IoEvents::empty()
+    );
+    events.notify();
+    assert_eq!(first.poll_events(&events, IoEvents::IN, None), IoEvents::IN);
+}
+
+#[ktest]
+fn opaque_uuid_roundtrips_through_identity_and_list_records() {
+    let manager = DmManager::new().unwrap();
+    let uuid = b"opaque-\xff\x80";
+    let device = manager
+        .create("dm-opaque-uuid".to_string(), Some(uuid.to_vec()), None)
+        .unwrap();
+    let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
+    write_c_string_fixed(&mut buffer, OFF_UUID, DM_UUID_LEN, uuid).unwrap();
+    assert!(Arc::ptr_eq(
+        &lookup_device_in_manager(&buffer, &manager).unwrap(),
+        &device
+    ));
+    fill_device_header(&mut buffer, &device).unwrap();
+    assert_eq!(
+        optional_uuid(&buffer, OFF_UUID, DM_UUID_LEN)
+            .unwrap()
+            .unwrap(),
+        uuid
+    );
+
+    let mut output = test_buffer(DM_IOCTL_HEADER_SIZE + 128);
+    write_c_string_fixed(&mut output, OFF_UUID, DM_UUID_LEN, b"opaque-\xff").unwrap();
+    list_devices_for_devices(&mut output, vec![device.clone()]).unwrap();
+    let (extension, _) =
+        name_list_record_layout(device.mapper_name().len() + 1, uuid.len() + 1).unwrap();
+    assert_eq!(
+        c_bytes_until(&output, DM_IOCTL_HEADER_SIZE + extension + 8, output.len()).unwrap(),
+        uuid
+    );
+    manager
+        .rename("dm-opaque-uuid", "dm-opaque-renamed")
+        .unwrap();
+    assert!(Arc::ptr_eq(&manager.lookup_uuid(uuid).unwrap(), &device));
+    manager.remove("dm-opaque-renamed").unwrap();
+    assert!(manager.lookup_uuid(uuid).is_none());
+
+    buffer[OFF_UUID..OFF_UUID + DM_UUID_LEN].fill(0xff);
+    assert_eq!(
+        optional_uuid(&buffer, OFF_UUID, DM_UUID_LEN)
+            .unwrap_err()
+            .error(),
+        Errno::EINVAL
+    );
+}
+
+#[ktest]
+fn arm_acknowledges_events_even_when_result_copyout_faults() {
+    use crate::device::misc::dm_control::ControlEvents;
+
+    let events = ControlEvents::new();
+    let file = DmControlFile::new_with_events(&events);
+    events.notify();
+    let input = test_buffer(DM_IOCTL_HEADER_SIZE);
+    let mut version = [0; 12];
+    write_version(&mut version).unwrap();
+    let result = process_ioctl_parameters(
+        DM_DEV_ARM_POLL_CMD,
+        &version,
+        |offset, bytes| {
+            bytes.copy_from_slice(&input[offset..offset + bytes.len()]);
+            Ok(())
+        },
+        |_| panic!("ordinary request must not clear input"),
+        |_| Err(Error::new(Errno::EFAULT)),
+        |_| {
+            file.arm(&events);
+            Ok(())
+        },
+    );
+    assert_eq!(result.unwrap_err().error(), Errno::EFAULT);
+    assert_eq!(
+        file.poll_events(&events, IoEvents::IN, None),
+        IoEvents::empty()
+    );
 }
 
 #[ktest]
@@ -170,7 +281,7 @@ fn fills_device_header_from_runtime_state() {
     let device = manager
         .create(
             "dm-control-header-test".to_string(),
-            Some("dm-control-header-uuid".to_string()),
+            Some(b"dm-control-header-uuid".to_vec()),
             None,
         )
         .unwrap();
@@ -199,7 +310,9 @@ fn fills_device_header_from_runtime_state() {
         device.mapper_name()
     );
     assert_eq!(
-        required_c_string(&buffer, OFF_UUID, DM_UUID_LEN).unwrap(),
+        optional_uuid(&buffer, OFF_UUID, DM_UUID_LEN)
+            .unwrap()
+            .unwrap(),
         device.uuid().unwrap()
     );
     assert!(
@@ -223,12 +336,36 @@ fn accepts_only_complete_aligned_ioctl_envelopes() {
 }
 
 #[ktest]
+fn device_selectors_ignore_high_encoding_bits() {
+    let manager = DmManager::new().unwrap();
+    let device = manager
+        .create("dm-selector-high-bits".to_string(), None, Some(0xfffff))
+        .unwrap();
+    for high in [0, 1u64 << 32, u64::MAX << 32] {
+        let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
+        write_u64(&mut buffer, OFF_DEV, device.id().as_encoded_u64() | high).unwrap();
+        assert!(Arc::ptr_eq(
+            &lookup_device_in_manager(&buffer, &manager).unwrap(),
+            &device
+        ));
+    }
+    let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
+    write_u64(&mut buffer, OFF_DEV, 1u64 << 32).unwrap();
+    assert_eq!(
+        lookup_device_in_manager(&buffer, &manager)
+            .unwrap_err()
+            .error(),
+        Errno::ENXIO
+    );
+}
+
+#[ktest]
 fn rejects_ambiguous_selectors_without_selecting_either_device() {
     let manager = DmManager::new().unwrap();
     let first = manager
         .create(
             "dm-selector-first".to_string(),
-            Some("dm-selector-uuid".to_string()),
+            Some(b"dm-selector-uuid".to_vec()),
             None,
         )
         .unwrap();
@@ -238,8 +375,7 @@ fn rejects_ambiguous_selectors_without_selecting_either_device() {
     for mask in 0..8 {
         let mut buffer = test_buffer(DM_IOCTL_HEADER_SIZE);
         if mask & 1 != 0 {
-            write_c_string_fixed(&mut buffer, OFF_NAME, DM_NAME_LEN, &second.mapper_name())
-                .unwrap();
+            write_c_string_fixed(&mut buffer, OFF_NAME, DM_NAME_LEN, second.mapper_name()).unwrap();
         }
         if mask & 2 != 0 {
             write_c_string_fixed(&mut buffer, OFF_UUID, DM_UUID_LEN, "dm-selector-uuid").unwrap();
@@ -332,11 +468,8 @@ fn validates_ioctl_encoding_and_alignment() {
         decode_command(0xc138_fd11).unwrap(),
         DM_GET_TARGET_VERSION_CMD
     );
-    for unsupported_command in [
-        DM_IOCTL_COMMAND_PREFIX + 14,
-        DM_IOCTL_COMMAND_PREFIX + 15,
-        DM_IOCTL_COMMAND_PREFIX + 16,
-    ] {
+    assert_eq!(decode_command(0xc138_fd10).unwrap(), DM_DEV_ARM_POLL_CMD);
+    for unsupported_command in [DM_IOCTL_COMMAND_PREFIX + 14, DM_IOCTL_COMMAND_PREFIX + 15] {
         assert_eq!(
             decode_command(unsupported_command).unwrap_err().error(),
             Errno::ENOTTY
@@ -363,6 +496,7 @@ fn no_params_reads_and_returns_only_the_fixed_prefix() {
         DM_DEV_SUSPEND_CMD,
         DM_DEV_STATUS_CMD,
         DM_TABLE_CLEAR_CMD,
+        DM_DEV_ARM_POLL_CMD,
         DM_REMOVE_ALL_CMD,
     ] {
         let mut input = request(DM_IOCTL_FIXED_PREFIX_SIZE);

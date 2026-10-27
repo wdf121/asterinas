@@ -9,10 +9,10 @@
 use core::ops::{Deref, DerefMut};
 
 use super::abi::{
-    DM_DEV_CREATE_CMD, DM_DEV_REMOVE_CMD, DM_DEV_STATUS_CMD, DM_DEV_SUSPEND_CMD,
-    DM_IOCTL_FIXED_PREFIX_SIZE, DM_REMOVE_ALL_CMD, DM_SECURE_DATA_FLAG, DM_TABLE_CLEAR_CMD,
-    OFF_DATA_SIZE, OFF_FLAGS, read_u32, require_range, validate_ioctl_params, validate_ioctl_size,
-    write_u32,
+    DM_DEV_ARM_POLL_CMD, DM_DEV_CREATE_CMD, DM_DEV_REMOVE_CMD, DM_DEV_STATUS_CMD,
+    DM_DEV_SUSPEND_CMD, DM_IOCTL_FIXED_PREFIX_SIZE, DM_REMOVE_ALL_CMD, DM_SECURE_DATA_FLAG,
+    DM_TABLE_CLEAR_CMD, OFF_DATA_SIZE, OFF_FLAGS, read_u32, require_range, validate_ioctl_params,
+    validate_ioctl_size, write_u32,
 };
 use crate::prelude::*;
 
@@ -96,6 +96,7 @@ fn command_has_no_params(command: u8) -> bool {
             | DM_DEV_SUSPEND_CMD
             | DM_DEV_STATUS_CMD
             | DM_TABLE_CLEAR_CMD
+            | DM_DEV_ARM_POLL_CMD
     )
 }
 

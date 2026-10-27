@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Mapper identity indexes, runtime name reservations, and device-number ownership.
-//! Failed creation releases its temporary minor; removal retains the number until
-//! the final device reference is dropped.
+//! Failed creation releases its temporary minor; completed removal releases the
+//! number after control and I/O drain, independently of structural references.
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
@@ -20,15 +20,18 @@ use crate::{DmDevice, DmError};
 
 struct ManagerInner {
     by_name: BTreeMap<String, Arc<DmDevice>>,
-    name_by_uuid: BTreeMap<String, String>,
+    name_by_uuid: BTreeMap<Vec<u8>, String>,
     reserved_runtime_names: BTreeSet<String>,
 }
 
-/// Keeps a DM device number allocated until the device object is finally destroyed.
+/// Owns a minor allocation independently of the immutable device identity.
+///
+/// Completed removal releases the allocation explicitly. Drop remains a fallback
+/// for failed creation and component users that only detach a device.
 pub(crate) struct DmDeviceIdOwner {
     id: DeviceId,
     _major: Arc<MajorIdOwner>,
-    minors: Arc<Mutex<IdAlloc>>,
+    minors: Mutex<Option<Arc<Mutex<IdAlloc>>>>,
 }
 
 impl DmDeviceIdOwner {
@@ -36,7 +39,15 @@ impl DmDeviceIdOwner {
         Self {
             id,
             _major: major,
-            minors,
+            minors: Mutex::new(Some(minors)),
+        }
+    }
+
+    /// Releases the minor once; an old object's eventual drop cannot free a
+    /// replacement device's allocation of the same number.
+    pub(crate) fn release(&self) {
+        if let Some(minors) = self.minors.lock().take() {
+            minors.lock().free(self.id.minor().get() as usize);
         }
     }
 
@@ -47,7 +58,7 @@ impl DmDeviceIdOwner {
 
 impl Drop for DmDeviceIdOwner {
     fn drop(&mut self) {
-        self.minors.lock().free(self.id.minor().get() as usize);
+        self.release();
     }
 }
 
@@ -132,9 +143,22 @@ impl DmManager {
     pub fn create(
         &self,
         name: String,
-        uuid: Option<String>,
+        uuid: Option<Vec<u8>>,
         requested_minor: Option<u32>,
     ) -> Result<Arc<DmDevice>, DmError> {
+        self.create_control(name, uuid, requested_minor)
+            .map(|device| Arc::clone(&device))
+    }
+
+    /// Creates a device with a control reference admitted before publication.
+    /// This keeps its number reserved through the CREATE response snapshot even
+    /// if another control operation immediately removes the new identity.
+    pub fn create_control(
+        &self,
+        name: String,
+        uuid: Option<Vec<u8>>,
+        requested_minor: Option<u32>,
+    ) -> Result<crate::DmControlRef, DmError> {
         let mut inner = self.inner.lock();
         let minor = {
             let mut minors = self.minors.lock();
@@ -167,7 +191,7 @@ impl DmManager {
         if let Some(uuid) = uuid {
             inner.name_by_uuid.insert(uuid, name);
         }
-        Ok(device)
+        Ok(crate::DmControlRef::new(device))
     }
 
     /// Looks up a device by name and returns an independent `Arc` without holding the manager lock.
@@ -175,10 +199,10 @@ impl DmManager {
         self.inner.lock().by_name.get(name).cloned()
     }
 
-    /// Looks up a device by UUID.
-    pub fn lookup_uuid(&self, uuid: &str) -> Option<Arc<DmDevice>> {
+    /// Looks up an opaque UUID by its exact bytes, without Unicode normalization.
+    pub fn lookup_uuid(&self, uuid: impl AsRef<[u8]>) -> Option<Arc<DmDevice>> {
         let inner = self.inner.lock();
-        let name = inner.name_by_uuid.get(uuid)?;
+        let name = inner.name_by_uuid.get(uuid.as_ref())?;
         inner.by_name.get(name).cloned()
     }
 
@@ -206,6 +230,17 @@ impl DmManager {
             .by_name
             .values()
             .any(|current| Arc::ptr_eq(current, device))
+    }
+
+    /// Admits a control reference only while this exact instance is indexed.
+    /// The shared index lock closes the lookup-versus-removal admission race.
+    pub fn acquire_control(&self, device: &Arc<DmDevice>) -> Option<crate::DmControlRef> {
+        let inner = self.inner.lock();
+        inner
+            .by_name
+            .values()
+            .any(|current| Arc::ptr_eq(current, device))
+            .then(|| crate::DmControlRef::new(device.clone()))
     }
 
     /// Reserves a new name while a runtime mapper alias moves outside this lock.
@@ -277,7 +312,7 @@ impl DmManager {
     ///
     /// Like Linux `dm_hash_rename`, an existing destination (including the
     /// device's own UUID) is a conflict; an established UUID is immutable.
-    pub fn rename_uuid(&self, name: &str, new_uuid: String) -> Result<(), DmError> {
+    pub fn rename_uuid(&self, name: &str, new_uuid: Vec<u8>) -> Result<(), DmError> {
         let mut inner = self.inner.lock();
         if inner.name_by_uuid.contains_key(&new_uuid) {
             return Err(DmError::UuidExists);
@@ -322,7 +357,7 @@ mod tests {
         let device = manager
             .create(
                 "existing".to_string(),
-                Some("existing-uuid".to_string()),
+                Some(b"existing-uuid".to_vec()),
                 Some(7),
             )
             .unwrap();
@@ -332,13 +367,21 @@ mod tests {
         ] {
             assert_eq!(
                 manager
-                    .create(name.to_string(), uuid.map(ToString::to_string), Some(7))
+                    .create(
+                        name.to_string(),
+                        uuid.map(|value| value.as_bytes().to_vec()),
+                        Some(7)
+                    )
                     .unwrap_err(),
                 DmError::MinorBusy
             );
             assert_eq!(
                 manager
-                    .create(name.to_string(), uuid.map(ToString::to_string), Some(8))
+                    .create(
+                        name.to_string(),
+                        uuid.map(|value| value.as_bytes().to_vec()),
+                        Some(8)
+                    )
                     .unwrap_err(),
                 identity_error
             );
@@ -363,11 +406,7 @@ mod tests {
     fn manages_indexes_and_requested_minors() {
         let manager = DmManager::new().unwrap();
         let device = manager
-            .create(
-                "dm-test".to_string(),
-                Some("uuid-test".to_string()),
-                Some(7),
-            )
+            .create("dm-test".to_string(), Some(b"uuid-test".to_vec()), Some(7))
             .unwrap();
 
         assert_eq!(device.id().minor().get(), 7);
@@ -383,7 +422,7 @@ mod tests {
         );
         assert_eq!(
             manager
-                .create("dm-other".to_string(), Some("uuid-test".to_string()), None,)
+                .create("dm-other".to_string(), Some(b"uuid-test".to_vec()), None,)
                 .unwrap_err(),
             DmError::UuidExists
         );
@@ -414,7 +453,7 @@ mod tests {
     fn renames_name_and_uuid_indexes_together() {
         let manager = DmManager::new().unwrap();
         let device = manager
-            .create("dm-old".to_string(), Some("dm-uuid".to_string()), None)
+            .create("dm-old".to_string(), Some(b"dm-uuid".to_vec()), None)
             .unwrap();
 
         manager.rename("dm-old", "dm-new").unwrap();
@@ -432,7 +471,7 @@ mod tests {
         let device = manager
             .create(
                 "dm-reservation-old".to_string(),
-                Some("dm-reservation-uuid".to_string()),
+                Some(b"dm-reservation-uuid".to_vec()),
                 None,
             )
             .unwrap();
@@ -491,44 +530,40 @@ mod tests {
         let device = manager
             .create(
                 "dm-uuid-device".to_string(),
-                Some("old-uuid".to_string()),
+                Some(b"old-uuid".to_vec()),
                 None,
             )
             .unwrap();
         let id = device.id();
 
         assert_eq!(
-            manager.rename_uuid("dm-uuid-device", "new-uuid".to_string()),
+            manager.rename_uuid("dm-uuid-device", b"new-uuid".to_vec()),
             Err(DmError::InvalidState)
         );
         assert_eq!(
-            manager.rename_uuid("dm-uuid-device", "old-uuid".to_string()),
+            manager.rename_uuid("dm-uuid-device", b"old-uuid".to_vec()),
             Err(DmError::UuidExists)
         );
         assert_eq!(manager.lookup_uuid("old-uuid").unwrap().id(), id);
         assert!(manager.lookup_uuid("new-uuid").is_none());
         assert_eq!(manager.lookup_name("dm-uuid-device").unwrap().id(), id);
         assert_eq!(device.mapper_name(), "dm-uuid-device");
-        assert_eq!(device.uuid().unwrap(), "old-uuid");
+        assert_eq!(device.uuid().unwrap(), b"old-uuid");
     }
 
     #[ktest]
     fn rejects_duplicate_uuid_rename_without_changing_state() {
         let manager = DmManager::new().unwrap();
         let first = manager
-            .create("dm-first".to_string(), Some("first-uuid".to_string()), None)
+            .create("dm-first".to_string(), Some(b"first-uuid".to_vec()), None)
             .unwrap();
         let second = manager
-            .create(
-                "dm-second".to_string(),
-                Some("second-uuid".to_string()),
-                None,
-            )
+            .create("dm-second".to_string(), Some(b"second-uuid".to_vec()), None)
             .unwrap();
 
         assert_eq!(
             manager
-                .rename_uuid("dm-first", "second-uuid".to_string())
+                .rename_uuid("dm-first", b"second-uuid".to_vec())
                 .unwrap_err(),
             DmError::UuidExists
         );
@@ -538,8 +573,8 @@ mod tests {
             manager.lookup_uuid("second-uuid").unwrap().id(),
             second.id()
         );
-        assert_eq!(first.uuid().unwrap(), "first-uuid");
-        assert_eq!(second.uuid().unwrap(), "second-uuid");
+        assert_eq!(first.uuid().unwrap(), b"first-uuid");
+        assert_eq!(second.uuid().unwrap(), b"second-uuid");
     }
 
     #[ktest]
@@ -550,14 +585,54 @@ mod tests {
             .unwrap();
 
         manager
-            .rename_uuid("dm-no-uuid", "created-uuid".to_string())
+            .rename_uuid("dm-no-uuid", b"created-uuid".to_vec())
             .unwrap();
 
         assert_eq!(
             manager.lookup_uuid("created-uuid").unwrap().id(),
             device.id()
         );
-        assert_eq!(device.uuid().unwrap(), "created-uuid");
+        assert_eq!(device.uuid().unwrap(), b"created-uuid");
+    }
+
+    #[ktest]
+    fn completed_removal_releases_minor_without_dropping_old_snapshots() {
+        let manager = DmManager::new().unwrap();
+        let old = manager
+            .create("dm-reuse".to_string(), None, Some(7))
+            .unwrap();
+        let id = old.id();
+        {
+            let _lifecycle = old.lock_lifecycle();
+            old.stop_removed_io();
+            manager.remove("dm-reuse").unwrap();
+        }
+        old.drain_removed();
+        let replacement = manager
+            .create("dm-reuse".to_string(), None, Some(7))
+            .unwrap();
+        assert_eq!(replacement.id(), id);
+        assert_eq!(old.id(), id);
+        assert!(!manager.is_current(&old));
+        assert!(manager.acquire_control(&old).is_none());
+        assert!(Arc::ptr_eq(&manager.lookup_id(id).unwrap(), &replacement));
+        // Repeated cleanup and the old object's drop must not release the new
+        // allocation. Structural snapshots keep identity, not minor ownership.
+        old.drain_removed();
+        drop(old);
+        assert_eq!(
+            manager
+                .create("dm-collision".to_string(), None, Some(7))
+                .unwrap_err(),
+            DmError::MinorBusy
+        );
+        {
+            let _lifecycle = replacement.lock_lifecycle();
+            replacement.stop_removed_io();
+            manager.remove("dm-reuse").unwrap();
+        }
+        replacement.drain_removed();
+        assert!(manager.create("dm-next".to_string(), None, Some(7)).is_ok());
     }
 
     #[ktest]

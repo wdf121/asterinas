@@ -24,7 +24,7 @@ use crate::prelude::*;
 /// Decoded parameters for `DM_DEV_CREATE`.
 pub(super) struct CreateRequest {
     pub(super) name: String,
-    pub(super) uuid: Option<String>,
+    pub(super) uuid: Option<Vec<u8>>,
     pub(super) requested_minor: Option<u32>,
 }
 
@@ -34,7 +34,7 @@ pub(super) enum RenameRequest<'a> {
     /// Replaces the mapper's user-visible name and, when published, its alias.
     Name(&'a str),
     /// Sets the mapper UUID once without changing its name or alias.
-    Uuid(&'a str),
+    Uuid(&'a [u8]),
 }
 
 impl RenameRequest<'_> {
@@ -101,7 +101,7 @@ pub(super) struct RemoveAllOutcome {
 pub(super) struct DeviceSnapshot {
     pub(super) id: DeviceId,
     pub(super) name: String,
-    pub(super) uuid: Option<String>,
+    pub(super) uuid: Option<Vec<u8>>,
     pub(super) status: DmDeviceStatus,
     pub(super) target_count: usize,
 }
@@ -234,6 +234,7 @@ impl QueryWorkflow {
     }
 
     /// Captures a manager-selected sequence of visible mapper identities.
+    #[cfg(ktest)]
     pub(super) fn devices(devices: impl IntoIterator<Item = Arc<DmDevice>>) -> Vec<DeviceSnapshot> {
         devices
             .into_iter()
@@ -298,9 +299,12 @@ impl<'a> ControlWorkflow<'a> {
     }
 
     /// Creates a tableless mapper from validated `DM_DEV_CREATE` parameters.
-    pub(super) fn create(&self, request: CreateRequest) -> Result<Arc<DmDevice>> {
+    pub(super) fn create(
+        &self,
+        request: CreateRequest,
+    ) -> Result<aster_device_mapper::DmControlRef> {
         self.manager
-            .create(request.name, request.uuid, request.requested_minor)
+            .create_control(request.name, request.uuid, request.requested_minor)
             .map_err(map_create_error)
     }
 
@@ -352,12 +356,13 @@ impl<'a> ControlWorkflow<'a> {
         F: FnOnce(&DmDevice) -> Result<()>,
     {
         unregister_runtime(device)?;
-        device.fail_postponed_bios();
+        device.stop_removed_io();
         // Linux detaches the pending table at hash removal but retains the live
         // table for holders, including a WAIT already sleeping on this device.
         device.clear_inactive_table().map_err(map_dm_error)?;
         if device.active_table().is_some() {
             device.notify_event();
+            super::issue_global_event();
         }
         self.manager
             .remove(&device.mapper_name())
@@ -414,7 +419,7 @@ impl<'a> ControlWorkflow<'a> {
                     ));
                 }
                 self.manager
-                    .rename_uuid(&device.mapper_name(), (*uuid).to_string())
+                    .rename_uuid(&device.mapper_name(), uuid.to_vec())
                     .map_err(map_rename_error)
             }
             RenameRequest::Name(new_name) => {
@@ -432,6 +437,7 @@ impl<'a> ControlWorkflow<'a> {
         }?;
         if device.active_table().is_some() {
             device.notify_event();
+            super::issue_global_event();
         }
         Ok(())
     }
@@ -455,9 +461,13 @@ impl<'a> ControlWorkflow<'a> {
                 let runtime = MapperRuntimeCoordinator::new(self.manager);
                 if !runtime.is_registered(device) || runtime.is_alias_published(device)? {
                     device.resume_with(wait_for_drain).map_err(map_dm_error)?;
+                    if status.has_inactive_table {
+                        super::issue_global_event();
+                    }
                     Ok(LifecycleOutcome::Resumed { initial: false })
                 } else {
                     runtime.activate_initial(device)?;
+                    super::issue_global_event();
                     Ok(LifecycleOutcome::Resumed { initial: true })
                 }
             }

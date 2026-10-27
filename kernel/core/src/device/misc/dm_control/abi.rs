@@ -6,6 +6,7 @@
 //! acquire mapper lifecycle locks or publish runtime devices.
 
 use aster_device_mapper::{DmError, TableError, target::DmTargetParseError};
+use device_id::{DeviceId, MajorId, MinorId};
 
 use crate::prelude::*;
 
@@ -14,7 +15,8 @@ pub(super) const DM_IOCTL_MAGIC: u32 = 0xfd;
 // aligned `sizeof(dm_ioctl)`. These sizes serve different ABI contracts.
 pub(super) const DM_IOCTL_FIXED_PREFIX_SIZE: usize = 305;
 pub(super) const DM_IOCTL_HEADER_SIZE: usize = 312;
-pub(super) const DM_IOCTL_MAX_SIZE: usize = 1024 * 1024;
+// Linux 6.6: DM_MAX_TARGETS (1048576) * DM_MAX_TARGET_PARAMS (1024).
+pub(super) const DM_IOCTL_MAX_SIZE: usize = 1024 * 1024 * 1024;
 #[cfg(ktest)]
 pub(super) const DM_IOCTL_COMMAND_PREFIX: u32 = 0xc138_fd00;
 
@@ -32,6 +34,7 @@ pub(super) const DM_TABLE_CLEAR_CMD: u8 = 10;
 pub(super) const DM_TABLE_DEPS_CMD: u8 = 11;
 pub(super) const DM_TABLE_STATUS_CMD: u8 = 12;
 pub(super) const DM_LIST_VERSIONS_CMD: u8 = 13;
+pub(super) const DM_DEV_ARM_POLL_CMD: u8 = 16;
 pub(super) const DM_GET_TARGET_VERSION_CMD: u8 = 17;
 
 pub(super) const DM_VERSION: [u32; 3] = [4, 48, 0];
@@ -78,7 +81,8 @@ pub(super) const DM_TARGET_TYPE_LEN: usize = 16;
 
 /// Bounds allocations independently of the command's data offset.
 ///
-/// The 1 MiB ceiling is a local resource policy, not Linux's 1 GiB limit.
+/// Matches Linux's 1 GiB ABI ceiling, not a promise of allocation success.
+/// NO_PARAMS commands validate this bound but only allocate the fixed prefix.
 pub(super) fn validate_ioctl_size(data_size: usize) -> Result<()> {
     if !(DM_IOCTL_FIXED_PREFIX_SIZE..=DM_IOCTL_MAX_SIZE).contains(&data_size) {
         return_errno_with_message!(Errno::EINVAL, "dm_ioctl.data_size exceeds supported bounds");
@@ -117,6 +121,7 @@ pub(super) fn decode_command(raw: u32) -> Result<u8> {
         | DM_TABLE_DEPS_CMD
         | DM_TABLE_STATUS_CMD
         | DM_LIST_VERSIONS_CMD
+        | DM_DEV_ARM_POLL_CMD
         | DM_GET_TARGET_VERSION_CMD => Ok(command),
         _ => return_errno_with_message!(Errno::ENOTTY, "尚未支持该 Device Mapper ioctl 命令"),
     }
@@ -139,6 +144,7 @@ pub(super) fn command_name(command: u8) -> &'static str {
         DM_TABLE_DEPS_CMD => "DM_TABLE_DEPS",
         DM_TABLE_STATUS_CMD => "DM_TABLE_STATUS",
         DM_LIST_VERSIONS_CMD => "DM_LIST_VERSIONS",
+        DM_DEV_ARM_POLL_CMD => "DM_DEV_ARM_POLL",
         DM_GET_TARGET_VERSION_CMD => "DM_GET_TARGET_VERSION",
         _ => "DM_UNKNOWN",
     }
@@ -320,19 +326,30 @@ pub(super) fn optional_c_string(
     Ok(Some(value.to_string()))
 }
 
-/// Reads a variable-length NUL-terminated parameter string between two offsets.
-pub(super) fn c_string_until(buffer: &[u8], start: usize, end: usize) -> Result<&str> {
+/// Reads an optional opaque UUID, requiring NUL but not UTF-8.
+pub(super) fn optional_uuid(buffer: &[u8], offset: usize, len: usize) -> Result<Option<Vec<u8>>> {
+    require_range(buffer, offset, len)?;
+    let bytes = c_bytes_until(buffer, offset, offset + len)?;
+    Ok((!bytes.is_empty()).then(|| bytes.to_vec()))
+}
+
+/// Borrows one bounded NUL-terminated byte string without interpreting its encoding.
+pub(super) fn c_bytes_until(buffer: &[u8], start: usize, end: usize) -> Result<&[u8]> {
     if start >= end || end > buffer.len() {
         return Err(invalid_buffer());
     }
     let bytes = &buffer[start..end];
-    let nul = bytes.iter().position(|byte| *byte == 0).ok_or_else(|| {
-        Error::with_message(Errno::EINVAL, "Device Mapper 字符串字段缺少 NUL 终止符")
-    })?;
-    let value = core::str::from_utf8(&bytes[..nul]).map_err(|_| {
-        Error::with_message(Errno::EINVAL, "Device Mapper 字符串字段不是有效 UTF-8")
-    })?;
-    Ok(value)
+    let nul = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "mapper field is not NUL-terminated"))?;
+    Ok(&bytes[..nul])
+}
+
+/// Reads a variable-length UTF-8 parameter string between two offsets.
+pub(super) fn c_string_until(buffer: &[u8], start: usize, end: usize) -> Result<&str> {
+    core::str::from_utf8(c_bytes_until(buffer, start, end)?)
+        .map_err(|_| Error::with_message(Errno::EINVAL, "mapper parameter is not valid UTF-8"))
 }
 
 /// Writes and zero-pads a fixed-size NUL-terminated ABI string field.
@@ -340,22 +357,28 @@ pub(super) fn write_c_string_fixed(
     buffer: &mut [u8],
     offset: usize,
     len: usize,
-    value: &str,
+    value: impl AsRef<[u8]>,
 ) -> Result<()> {
+    let value = value.as_ref();
     if value.len() >= len {
         return_errno_with_message!(Errno::EINVAL, "输出字符串超过 ABI 字段长度");
     }
     require_range(buffer, offset, len)?;
     buffer[offset..offset + len].fill(0);
-    buffer[offset..offset + value.len()].copy_from_slice(value.as_bytes());
+    buffer[offset..offset + value.len()].copy_from_slice(value);
     Ok(())
 }
 
 /// Writes a variable-length NUL-terminated ABI string.
-pub(super) fn write_c_string(buffer: &mut [u8], offset: usize, value: &str) -> Result<()> {
+pub(super) fn write_c_string(
+    buffer: &mut [u8],
+    offset: usize,
+    value: impl AsRef<[u8]>,
+) -> Result<()> {
+    let value = value.as_ref();
     let len = value.len().checked_add(1).ok_or_else(invalid_buffer)?;
     require_range(buffer, offset, len)?;
-    buffer[offset..offset + value.len()].copy_from_slice(value.as_bytes());
+    buffer[offset..offset + value.len()].copy_from_slice(value);
     buffer[offset + value.len()] = 0;
     Ok(())
 }
@@ -402,15 +425,26 @@ pub(super) fn write_u64(buffer: &mut [u8], offset: usize, value: u64) -> Result<
     Ok(())
 }
 
+/// Decodes the low 32 bits, matching Linux's `huge_decode_dev` ioctl contract.
+pub(super) fn decode_ioctl_device(raw: u64) -> DeviceId {
+    let raw = raw as u32;
+    let major = ((raw >> 8) & 0xfff) as u16;
+    let minor = (raw & 0xff) | ((raw >> 12) & 0xfff00);
+    DeviceId::new(MajorId::new(major), MinorId::new(minor))
+}
+
 pub(super) fn invalid_buffer() -> Error {
     Error::with_message(Errno::EINVAL, "Device Mapper ioctl 缓冲区布局无效")
 }
 
 /// Preserves the allocation-error boundary of Linux `dev_create`/`dm_create`.
 /// Device-number allocation failures become ENXIO before identity insertion;
-/// name and UUID collisions still report EEXIST.
+/// name and UUID collisions report EBUSY.
 pub(super) fn map_create_error(error: DmError) -> Error {
     match error {
+        DmError::NameExists | DmError::UuidExists => {
+            Error::with_message(Errno::EBUSY, "mapper identity already exists")
+        }
         DmError::MinorBusy | DmError::MinorExhausted => {
             Error::with_message(Errno::ENXIO, "cannot allocate mapper device number")
         }

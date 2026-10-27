@@ -6,7 +6,10 @@
 //! order. `abi` defines wire contracts, `ioctl` owns parameter-copy lifetimes,
 //! and `commands` translates requests into `workflow` and `runtime` operations.
 
-use core::fmt::{Display, Formatter};
+use core::{
+    fmt::{Display, Formatter},
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use aster_device_mapper::DmManager;
 use device_id::{DeviceId, MinorId};
@@ -22,7 +25,8 @@ mod tests;
 mod workflow;
 
 use abi::{
-    DM_DEV_WAIT_CMD, DM_IOCTL_MAGIC, DM_VERSION_CMD, command_name, decode_command,
+    DM_DEV_ARM_POLL_CMD, DM_DEV_CREATE_CMD, DM_DEV_REMOVE_CMD, DM_DEV_RENAME_CMD, DM_DEV_WAIT_CMD,
+    DM_IOCTL_MAGIC, DM_REMOVE_ALL_CMD, DM_VERSION_CMD, command_name, decode_command,
     validate_client_version, write_version,
 };
 use commands::{device_wait, handle_command};
@@ -42,7 +46,7 @@ use crate::{
         UserNamespace,
         credentials::capabilities::CapSet,
         posix_thread::AsPosixThread,
-        signal::{PollHandle, Pollable},
+        signal::{PollHandle, Pollable, Pollee},
     },
     security::lsm::hooks as lsm_hooks,
     util::ioctl::RawIoctl,
@@ -95,17 +99,86 @@ impl Device for DmControlDevice {
     }
 
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
-        Ok(Box::new(DmControlFile))
+        Ok(Box::new(DmControlFile::new()))
     }
 }
 
-/// Per-open file state for the stateless Device Mapper control node.
-struct DmControlFile;
+/// Global sequence and wakeups, independent of each file's armed generation.
+struct ControlEvents {
+    generation: AtomicU32,
+    pollee: Pollee,
+}
+
+impl ControlEvents {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU32::new(0),
+            pollee: Pollee::new(),
+        }
+    }
+
+    /// Publishes a committed change before waking registered pollers.
+    fn notify(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.pollee.notify(IoEvents::IN);
+    }
+}
+
+fn control_events() -> &'static ControlEvents {
+    static EVENTS: Once<ControlEvents> = Once::new();
+    EVENTS.call_once(ControlEvents::new)
+}
+
+/// Publishes Linux's global control event without implying a userspace uevent.
+fn issue_global_event() {
+    control_events().notify();
+}
+
+/// Per-open generation acknowledged by DM_DEV_ARM_POLL, shared by duplicated fds.
+struct DmControlFile {
+    generation: AtomicU32,
+}
+
+impl DmControlFile {
+    fn new() -> Self {
+        Self::new_with_events(control_events())
+    }
+
+    fn new_with_events(events: &ControlEvents) -> Self {
+        Self {
+            generation: AtomicU32::new(events.generation.load(Ordering::Acquire)),
+        }
+    }
+
+    /// Acknowledges current events even if the later ioctl copyout fails.
+    fn arm(&self, events: &ControlEvents) {
+        self.generation
+            .store(events.generation.load(Ordering::Acquire), Ordering::Release);
+    }
+
+    fn poll_events(
+        &self,
+        events: &ControlEvents,
+        mask: IoEvents,
+        poller: Option<&mut PollHandle>,
+    ) -> IoEvents {
+        // Readiness is per file: never cache it in the shared Pollee.
+        if let Some(poller) = poller {
+            events.pollee.register_poller(poller, mask);
+        }
+        let current = events.generation.load(Ordering::Acquire);
+        let armed = self.generation.load(Ordering::Acquire);
+        if (current.wrapping_sub(armed) as i32) > 0 {
+            IoEvents::IN & mask
+        } else {
+            IoEvents::empty()
+        }
+    }
+}
 
 impl Pollable for DmControlFile {
-    fn poll(&self, _mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
-        // Global control events are not implemented; do not report spurious readiness.
-        IoEvents::empty()
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
+        self.poll_events(control_events(), mask, poller)
     }
 }
 
@@ -202,11 +275,23 @@ impl PerOpenFileOps for DmControlFile {
                 Ok(())
             },
             |buffer| {
-                if command == DM_DEV_WAIT_CMD {
-                    device_wait(buffer)
-                } else {
-                    handle_command(command, buffer)
+                if command == DM_DEV_ARM_POLL_CMD {
+                    self.arm(control_events());
+                    return Ok(());
                 }
+                if command == DM_DEV_WAIT_CMD {
+                    device_wait(buffer)?;
+                } else {
+                    handle_command(command, buffer)?;
+                }
+                // Linux emits these events after dispatch, before result copyout.
+                if matches!(
+                    command,
+                    DM_REMOVE_ALL_CMD | DM_DEV_CREATE_CMD | DM_DEV_REMOVE_CMD | DM_DEV_RENAME_CMD
+                ) {
+                    issue_global_event();
+                }
+                Ok(())
             },
         )
         .map(|()| 0);

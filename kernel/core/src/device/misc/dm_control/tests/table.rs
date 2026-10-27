@@ -1632,7 +1632,7 @@ fn lists_devices_with_linux_next_offsets_and_uuid_flags() {
     let first = manager
         .create(
             "dm-list-first".to_string(),
-            Some("dm-list-first-uuid".to_string()),
+            Some(b"dm-list-first-uuid".to_vec()),
             None,
         )
         .unwrap();
@@ -1642,7 +1642,7 @@ fn lists_devices_with_linux_next_offsets_and_uuid_flags() {
         .unwrap();
 
     let first_name = first.mapper_name();
-    let first_uuid = first.uuid().unwrap().to_string();
+    let first_uuid = first.uuid().unwrap();
     let (first_extension, first_len) =
         name_list_record_layout(first_name.len() + 1, first_uuid.len() + 1).unwrap();
     let second_name = second.mapper_name();
@@ -1673,7 +1673,7 @@ fn lists_devices_with_linux_next_offsets_and_uuid_flags() {
         DM_NAME_LIST_FLAG_HAS_UUID
     );
     assert_eq!(
-        c_string_until(
+        c_bytes_until(
             &buffer,
             first_record + first_extension + 8,
             first_record + first_len
@@ -1900,7 +1900,7 @@ fn final_target_next_is_ignored_but_nonfinal_overlap_is_rejected() {
 fn name_lists_filter_and_keep_events_without_uuid_output() {
     let manager = DmManager::new().unwrap();
     let first = manager
-        .create("v5-list-a".to_string(), Some("v5-uuid-a".to_string()), None)
+        .create("v5-list-a".to_string(), Some(b"v5-uuid-a".to_vec()), None)
         .unwrap();
     let second = manager.create("v5-list-b".to_string(), None, None).unwrap();
     first.notify_event();

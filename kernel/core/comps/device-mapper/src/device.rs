@@ -6,7 +6,7 @@
 //! policies are injected by the control plane so this component has no process
 //! or signal dependency; failed waits restore admission before returning.
 
-use alloc::{collections::VecDeque, format, string::String, sync::Arc};
+use alloc::{collections::VecDeque, format, string::String, sync::Arc, vec::Vec};
 use core::{
     fmt::{Debug, Display, Formatter},
     sync::atomic::{AtomicUsize, Ordering},
@@ -71,6 +71,9 @@ struct DmDeviceState {
     // has been selected for them. Resume replays them through its new active table.
     postponed: VecDeque<SubmittedBio>,
     phase: DmDevicePhase,
+    // Runtime teardown closes admission permanently, independently of suspend.
+    // Existing control holders may still inspect the live table until drained.
+    removed: bool,
     event_nr: u32,
 }
 
@@ -81,6 +84,7 @@ impl Default for DmDeviceState {
             inactive: None,
             postponed: VecDeque::new(),
             phase: DmDevicePhase::Running,
+            removed: false,
             event_nr: 0,
         }
     }
@@ -145,18 +149,80 @@ pub struct DmDevice {
     id_owner: DmDeviceIdOwner,
     primary_name: String,
     mapper_name: Mutex<String>,
-    uuid: Mutex<Option<String>>,
+    uuid: Mutex<Option<Vec<u8>>>,
     lifecycle: Mutex<()>,
     state: Mutex<DmDeviceState>,
     io: Arc<DmIoState>,
     events: WaitQueue,
+    control_users: AtomicUsize,
+    control_drained: WaitQueue,
+}
+
+/// An admitted control operation, distinct from structural `Arc` ownership.
+///
+/// Admission is serialized with manager detachment. Removal waits for these
+/// guards outside the lifecycle lock so an already waiting ioctl can finish.
+#[derive(Debug)]
+pub struct DmControlRef {
+    device: Arc<DmDevice>,
+}
+
+impl DmControlRef {
+    pub(crate) fn new(device: Arc<DmDevice>) -> Self {
+        device.control_users.fetch_add(1, Ordering::AcqRel);
+        Self { device }
+    }
+}
+
+impl core::ops::Deref for DmControlRef {
+    type Target = Arc<DmDevice>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.device
+    }
+}
+
+impl Drop for DmControlRef {
+    fn drop(&mut self) {
+        if self.device.control_users.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.device.control_drained.wake_all();
+        }
+    }
 }
 
 impl DmDevice {
+    /// Permanently closes BIO admission after successful runtime unregistration.
+    ///
+    /// Call with the lifecycle lock held, before detaching manager indexes. The
+    /// state lock serializes this barrier with assigning a BIO to a live table.
+    /// Already postponed BIOs fail, while assigned BIOs complete normally.
+    pub fn stop_removed_io(&self) {
+        self.state.lock().removed = true;
+        self.fail_postponed_bios();
+    }
+
+    /// Waits for admitted ioctls after manager detach, without a lifecycle lock.
+    ///
+    /// Call only after `stop_removed_io` and manager detachment. Structural
+    /// references do not delay this barrier; assigned BIOs do. The live table
+    /// remains readable by pre-existing control holders until they finish.
+    pub fn drain_removed(&self) {
+        debug_assert!(self.state.lock().removed);
+        self.control_drained
+            .wait_until(|| (self.control_users.load(Ordering::Acquire) == 0).then_some(()));
+        self.io
+            .drained
+            .wait_until(|| (self.io.in_flight.load(Ordering::Acquire) == 0).then_some(()));
+        self.state.lock().active.take();
+        // Runtime registration and admitted operations no longer refer to this
+        // identity. Structural snapshots may retain the object, not its number.
+        self.id_owner.release();
+    }
+
     pub(crate) fn new(
         id_owner: DmDeviceIdOwner,
         mapper_name: String,
-        uuid: Option<String>,
+        uuid: Option<Vec<u8>>,
     ) -> Self {
         let primary_name = format!("dm-{}", id_owner.id().minor().get());
         Self {
@@ -168,6 +234,8 @@ impl DmDevice {
             state: Mutex::new(DmDeviceState::default()),
             io: Arc::new(DmIoState::new()),
             events: WaitQueue::new(),
+            control_users: AtomicUsize::new(0),
+            control_drained: WaitQueue::new(),
         }
     }
 
@@ -293,13 +361,14 @@ impl DmDevice {
         *self.mapper_name.lock() = new_name;
     }
 
-    /// Returns the Device Mapper UUID, or `None` if creation omitted it.
-    pub fn uuid(&self) -> Option<String> {
+    /// Returns the opaque UUID bytes, excluding NUL, or `None` if omitted.
+    /// Unlike mapper paths, Linux UUIDs need not be valid UTF-8.
+    pub fn uuid(&self) -> Option<Vec<u8>> {
         self.uuid.lock().clone()
     }
 
     /// Updates the DM device UUID.
-    pub(crate) fn rename_uuid(&self, new_uuid: String) {
+    pub(crate) fn rename_uuid(&self, new_uuid: Vec<u8>) {
         let mut uuid = self.uuid.lock();
         *uuid = Some(new_uuid);
     }
@@ -566,6 +635,9 @@ impl BlockDevice for DmDevice {
     fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
         let table = {
             let mut state = self.state.lock();
+            if state.removed {
+                return Err(BioEnqueueError::Refused);
+            }
             match state.phase {
                 DmDevicePhase::Running => {
                     let table = state.active.clone().ok_or(BioEnqueueError::Refused)?;
@@ -623,7 +695,7 @@ impl Debug for DmDevice {
 
 #[cfg(ktest)]
 mod tests {
-    use alloc::{boxed::Box, string::ToString, vec, vec::Vec};
+    use alloc::{boxed::Box, string::ToString, vec};
 
     use aster_block::{
         BlockDeviceLease, allocate_major,
@@ -819,6 +891,68 @@ mod tests {
             assert_eq!(batch.wait_all().is_ok(), status == BioStatus::Complete);
             assert_eq!(*completions.lock(), vec![status]);
         }
+    }
+
+    #[ktest]
+    fn removal_closes_admission_before_draining_holders_and_bios() {
+        let manager = DmManager::new().unwrap();
+        let device = manager
+            .create("dm-remove-drain".to_string(), None, None)
+            .unwrap();
+        let holder = manager.acquire_control(&device).unwrap();
+        let backing = DeferredBlockDevice::new();
+        let table = Arc::new(
+            DmTable::new_single_linear(
+                Sid::new(0),
+                128,
+                Sid::new(0),
+                BlockDeviceLease::new_untracked(backing.clone() as Arc<dyn BlockDevice>),
+            )
+            .unwrap(),
+        );
+        device.load_table(table);
+        device.resume().unwrap();
+        let completions = Arc::new(Mutex::new(Vec::new()));
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        recorded_read(0, &completions)
+            .submit(device.as_ref(), &mut batch)
+            .unwrap();
+        {
+            let _lifecycle = device.lock_lifecycle();
+            device.stop_removed_io();
+            manager.remove(&device.mapper_name()).unwrap();
+        }
+        assert!(manager.acquire_control(&device).is_none());
+        assert_eq!(
+            recorded_read(4, &completions).submit(device.as_ref(), &mut batch),
+            Err(BioEnqueueError::Refused)
+        );
+        let finished = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        {
+            let device = device.clone();
+            let finished = finished.clone();
+            TaskOptions::new(move || {
+                device.drain_removed();
+                finished.store(true, Ordering::Release);
+            })
+            .spawn()
+            .unwrap();
+        }
+        // Neither a control holder nor an assigned BIO may lose its live table.
+        Task::yield_now();
+        assert!(!finished.load(Ordering::Acquire));
+        assert!(holder.active_table().is_some());
+        drop(holder);
+        Task::yield_now();
+        assert!(!finished.load(Ordering::Acquire));
+        assert!(device.active_table().is_some());
+        backing.complete_with(BioStatus::Complete);
+        while !finished.load(Ordering::Acquire) {
+            Task::yield_now();
+        }
+        assert!(device.active_table().is_none());
+        assert!(batch.wait_all().is_ok());
+        assert_eq!(*completions.lock(), vec![BioStatus::Complete]);
     }
 
     #[ktest]
