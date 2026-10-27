@@ -1,11 +1,10 @@
 # Asterinas Device Mapper 全局规划
 
-> **2026-10-27 修复状态**：PR3 制备前的 DM 内语义修复已落在 `dm` 工作区，用户反馈验证全部通过；尚未提交、尚未提取到 `dm-device-management`。完整逐项台账（含待修复状态、卡点与后续条件）见 [10.4 节](#104-pr3-制备前修复与待办总账2026-10-27)，过程与证据边界见 [今日日志](../log/daily/2026-10-27.md)。不将 dm 验证等同于 PR3 验收。
+> **2026-10-27 当前卡点：PR4 已验证，待拆分。** 完整 dm 修复已提交至 `7de7025ad`、`74ee6b89e`；当前 dm HEAD 为 `3cd8af8b7`。PR2 `074e7e80d`、枚举 PR3 `be3f79c88`、无表管理 PR4 `6995e5ab3` 均已推送。PR4 助手 format/check 通过，用户确认包括 NixOS 的测试全部通过；下一步讨论拆分，不是继续等待提取或验收。
 >
-> **2026-10-26 路线决策**：PR1 保持实现不动，从 PR2～PR11 交付通用 DM 框架，再接最小 linear 完成真实用户态验收。详细依赖、验收和待审定缺口以 [PR 路线](pull_request.md) 为准。下文 P0/P1～P10 是历史工程能力分类，不是当前 PR 顺序；verity 等新 target 不先于框架闭环。规划不等于实现授权。
+> **路线编号**：插入枚举 PR3 后，原无表管理及后续框架顺延为 PR4–PR12，最小 linear 暂为 PR13。PR4 拆分后再调整。依赖与范围以 [PR 路线](pull_request.md) 为准；本页 P0/P1～P10 是历史能力分类，不是 PR 编号。
 >
-> dm 已 merge main 至 `37ddb9245`，用户反馈合并后 check 与控制面集成通过；未独立归档输出，本次同步跳过 kernel。今日事实见 [日报](../log/daily/2026-10-26.md)。
-
+> PR 分支的枚举、目录整理和新套件尚未自动回补 dm。逐项台账见 [10.4 节](#104-pr3-制备前修复与待办总账2026-10-27)，实际过程及证据边界见 [今日日志](../log/daily/2026-10-27.md)。当前只更新文档，不修改生产代码或推送。
 
 > **定位**：Device Mapper 项目的唯一全局路线图。
 >
@@ -190,9 +189,12 @@
 
 ### 10.4 PR3 制备前修复与待办总账（2026-10-27）
 
-这里的 PR3 指当前 `dm-device-management`（无表设备管理），不是 10.3 节历史编号中的控制入口 PR。范围为 CREATE、STATUS、LIST_DEVICES、单设备无表 REMOVE、必要参数与 manager 接线；不包含 table/target/BIO、runtime 发布、rename、REMOVE_ALL。为保持唯一实现来源，先修完整 dm；下表的完整 dm 修复不意味着全部进入 PR3。
+本节标题和 `PR3-Fxx` / `PR3-Txx` 保留为历史稳定索引，避免破坏引用；其中的 PR3 是当时的无表管理，现已顺延为 PR4，不是当前 `/proc/devices` 枚举 PR3。
+无表范围仍为 CREATE、STATUS、LIST_DEVICES、单设备 REMOVE、必要参数及身份管理；不包含 table/target/BIO、runtime 发布、rename、REMOVE_ALL。
 
-**证据与状态规则：**源码为 `dm` 的 `7c46b2ee8` 加未提交修改；Linux 固定提交为 `5078a3a23a1e1825ec136485173ec98668cdd640`，读取 Git 版本，避开本地学习修改。用户在 lint 修正后确认“验证都通过了”；助手未独立取得最终完整日志、计数、退出码或镜像来源。下表“已修复”均指完整 dm 工作区，未提交、未提取；不表示全部 Linux 语义均已验证。完整命令证据边界见 [日报](../log/daily/2026-10-27.md)。
+**当前状态与证据：**完整 dm 修复已在 `7de7025ad`、`74ee6b89e` 提交，当前 HEAD `3cd8af8b7`。下表源码链接仍指完整 dm，不随 PR 分支文件重命名而修改。
+无表子集已经提取为 PR4 `6995e5ab3`，助手完整 format/check 通过，用户确认 Rust/C/NixOS 测试全部通过，已提交推送，当前待拆分。
+Linux 仍固定参考 `5078a3a23a1e1825ec136485173ec98668cdd640` 的 Git 版本。用户运行结果无完整逐项日志/计数，不虚构；完整 dm 的事件能力没有自动进入 PR4。
 
 #### 已修复项
 
@@ -222,10 +224,10 @@
 | PR3-T03 | 非 UTF-8 设备名称/路径：仍不支持；UUID 已独立修复。 | mapper name、runtime alias 与 VFS/devtmpfs 路径使用字符串；任意字节路径需要跨层表示审定。当前仍可能对 Linux 合法字节名称返回 EINVAL。 | 不在 PR3 另造 byte-name 模型；若重启工作，先追踪 manager→节点→VFS 全链与错误/输出语义。 |
 | PR3-T04 | 通用 DeviceId major 截断旁支：未修，非 DM 新引入。 | 原审查发现通用解码器在转 u16 后检查 major，可能丢高位；DM 已在 ABI 边界绕开该解码契约，不代表通用问题修复。 | 独立核实其他调用方和影响后另立任务，不混入 PR3。 |
 | PR3-T05 | 1 GiB 实际分配/失败承接：待专项核实，不承诺容量可用。 | F04 对齐的是协议校验上限；NO_PARAMS 不分配声明大小。大 payload 仍受 heap/内存资源限制，allocator 大块失败链路及极限压力证据未完整归档。 | 不为此修改全局 allocator；后续先读清失败路径，再单独决定安全的故障注入/压力验收。不能写“已验证能分配 1 GiB”。 |
-| PR3-T06 | PR3 提取与前置依赖：尚未实施。 | `dm-device-management` 仍为 `808d36daf`、与 PR2 相同。完整 DmDevice 耦合 table/BIO；PR3 基线缺 `allocate_major_with_name`；全局事件已在完整 dm 实现但超出原 PR3 约定边界。 | 先逐文件审定身份裁剪、命名 major/工具发现前置及事件拆分，不另造设备模型，不静默扩大 PR3；目标分支须独立验证。 |
+| PR3-T06 | 无表子集提取与前置：已完成，当前 PR4 待拆分。 | 命名注册及发现前置已独立为枚举 PR3；PR4 `6995e5ab3` 已提取无表身份及控制引用，不带 table/BIO/runtime/global poll；已验证并推送。 | 因 26 文件、+3203/-24 的审阅体量先讨论拆分，保留必要测试；不自动改写远端、不向 dm 回补、不重新扩范围。 |
 | PR3-T07 | 事件精确提交点与 blocking poll 专项证据：仍待核实。 | 现有 workflow 在 resume 成功返回后发全局事件；是否需前移到精确 bind 提交点，及阻塞 poll 唤醒的直接专项覆盖，本轮未形成完整结论。已有 readiness/ARM 测试不替代所有调度交错证明。 | 对固定 Linux `__bind/event_callback` 和当前 replay/通知顺序逐项比较；确认可见差异后再决定修改，不能因套件通过宣称逐指令等价。 |
 | PR3-T08 | 测试辅助代码三处泛型多余借用：已发现，未修改。 | `tests/lifecycle.rs` 的 duplicate/empty UUID rename 请求、`tests/ioctl.rs` 的 selector 请求仍借用临时 mapper_name；本次仅获准修复生产报错并只读检查其余调用。 | 不视为运行时缺陷；后续获准清理时按 ktest 构建/lint 检查，不把当前用户验收结果否定为失败。 |
-| PR3-T09 | PR3 最终证据与文档移植：未完成。 | 当前通过来自完整 dm 用户反馈，缺助手独立完整运行记录；未执行 PR3 提取、目标分支验证、提交或推送。Book/SCML 能力说明本轮未修改。 | PR3 制备后保存目标源码、命令、非零计数、退出码；仅移植直接代码/测试和英文说明，本地 docs/log 不进入 upstream diff。 |
+| PR3-T09 | 目标分支验证、提交、推送已完成；拆分后的独立证据待补。 | PR4 助手 format/check 通过，用户确认系统及其他测试通过；历史整理核验工作文件不变。PR2/PR3 档案已更新；Book/SCML 未修改。 | 不再标记“未提取/未验证”；用户日志和精确计数未归档不等于测试失败。拆分后逐份验证，docs/log 不进入 upstream 源码 diff。 |
 
 上述为本次 PR3 制备审查发现的全部已登记项；其他历史框架路线（freeze/thaw、target hooks、stacking 等）继续按第 6 节及 PR 规划管理，不能误记为本次已实施或无表 PR3 的新增交付。
 

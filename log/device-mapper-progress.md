@@ -1,16 +1,19 @@
 # Device Mapper 当前项目状态
 
-> **更新日期**：2026-10-27。当前在 `dm`，HEAD `7c46b2ee8` 加未提交修复；用户反馈最新验证全部通过，当前按授权集中更新文档。未切分支、未提交或推送。
+> **更新日期**：2026-10-27。当前在 `dm`，HEAD `3cd8af8b7`，文档更新未提交。当前卡点为 **PR4 已验证，待拆分**。
 >
-> 实现以源码为准，验证区分助手实际执行、用户反馈及历史证据。今日明细见 [日报](daily/2026-10-27.md)。
+> 验证区分助手实际执行、用户反馈及历史证据。今日明细见 [日报](daily/2026-10-27.md)。
 
 ## 当前停点摘要
 
-- PR3 制备前完整 dm 已修 CREATE 冲突 errno、ioctl dev 低 32 位、固定 C ABI 4.48.0、1 GiB 参数上限/NO_PARAMS、opaque UUID、全局事件与 ARM_POLL、REMOVE 控制引用及 BIO 排空、minor 释放和旧实例隔离。
-- 最新 make check 两处失败（测试辅助函数 dead-code、泛型临时值多余借用）已修；用户随后确认“验证都通过了”。未独立取得最终日志、计数、逐条退出码或镜像来源，不宣称全仓测试通过。
-- [global.md §10.4](../docs/global.md#104-pr3-制备前修复与待办总账2026-10-27) 是逐项修复与待办总账，记录 F01–F12、T01–T09。deferred REMOVE、DM uevent、非 UTF-8 名称因跨子系统依赖暂缓；allocator 极限证据、精确事件点和 PR3 提取仍待处理。
-- `dm-device-management` 和 `dm-control-interface` 均为 `808d36daf`；PR3 无独有实现，未验证。先审定命名 major/原设备模型裁剪/事件拆分，再提取无表管理；不另造模型，不自动修改 PR1/PR2。
-- 本次仅更新旧文档说明与今日日志；保留既有未提交资料，未来不进入 upstream diff。
+- PR2 `074e7e80d`、PR3 `be3f79c88`、PR4 `6995e5ab3` 均已推送并核验远端；本轮没有创建 GitHub PR。
+- PR2 测试目录整理归入原提交，七个测试函数体及生产代码未变；PR3 在新 PR2 上重放，补丁不变。
+- 新增 PR3 为 `/proc/devices` 枚举。用户确认 make check、make kernel、block/core ktest、guest C 回归通过，并人工查看 cat 输出，见 [PR3 档案](PR/PR-3-proc-devices.md)。
+- PR4 已实现无表 CREATE/STATUS/LIST/单设备 REMOVE，含组件、参数复制与清零、Rust/C/NixOS 测试。助手 format/check 通过，用户最终确认测试全部通过；当前不是测试失败或未提取状态。
+- PR4 NixOS 脚本改为随镜像安装，保留真实 dmsetup 默认调用链、退出码与标记检查。完整 dm 的旧上传/runner 方案未被顺带更改。
+- PR4 当前 +3203/-24、26 文件，因审阅负担暂缓，下一步先讨论拆分；已推送版本保留，不自动改写。按新增枚举 PR，后续框架暂编 PR5–PR12，linear 为 PR13，详见 [规划](../docs/pull_request.md)。
+- 完整 dm 修复已提交；PR 分支枚举及组织调整未自动回补。[global.md §10.4](../docs/global.md#104-pr3-制备前修复与待办总账2026-10-27) 保留稳定问题编号，并更新提取/验证状态。
+- 九个本地备份分支已按授权删除，stash 和磁盘备份未清理。当前仅更新交接、日报、规划及相关旧说明，不提交或推送文档。
 
 ## 历史同步摘要（2026-10-26）
 

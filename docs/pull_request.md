@@ -6,9 +6,11 @@
 >
 > **最后更新**：2026-10-27。
 >
-> **PR3 制备进展**：完整 dm 的已批准语义修复已写入工作区，用户反馈验证通过；尚未提交和提取。`dm-device-management` 仍为 `808d36daf`，与 PR2 相同。所有已修/待修项、状态和卡点统一维护在 [global.md §10.4](global.md#104-pr3-制备前修复与待办总账2026-10-27)；[今日日志](../log/daily/2026-10-27.md) 区分用户反馈和独立证据。PR3 仍限定无表管理，不自动前移 table/BIO、runtime、rename、REMOVE_ALL；命名 major 前置及全局事件拆分待审定。dm 验证不能替代 PR3 验证。
+> **当前进展**：PR2 `dm-control-interface` 为 `074e7e80d`；PR3 已独立为 `/proc/devices` 字符/块设备注册枚举，`proc-devices` 为 `be3f79c88`。两个分支均已推送并核验远端，档案见 [PR2](../log/PR/PR-2-control-interface.md) 和 [PR3](../log/PR/PR-3-proc-devices.md)。本轮未创建 GitHub PR。
 >
-> **当前说明**：PR1 不改实现；从现有 PR2 开始规划至通用 DM 框架闭环，再以一个最简单的 linear target 完成真实用户态终验。PR2～PR11 为候选拆分，不代表已实现。dm 已 merge 最新 main；随后经单独授权，PR1/PR2 已线性更新至 main `ceb65e3f8`。PR1 已推送，PR2 清理后为 `808d36daf`、未推送；网页审阅状态未复核。
+> **PR4 待拆分**：无表管理当前保存于 `dm-device-management` 的 `6995e5ab3`，已经提交、推送；用户反馈测试通过。因审阅体量偏大，用户决定暂缓，后续拆分。本次不制定最终拆分边界、不改写 PR4、不推进下一功能，也不自动回补 `dm`。
+>
+> **编号与证据**：PR1 不改实现；已确定链为 `ceb65e3f8 → 2dd1bcac5 → 074e7e80d → be3f79c88`。插入枚举 PR3 后，原无表管理及后续阶段顺延为 PR4–PR12，最小 linear 为 PR13；PR4 拆分后再调整受影响编号，不承诺固定 PR 数量。历史完整 dm 修复记录仍见 [global.md §10.4](global.md#104-pr3-制备前修复与待办总账2026-10-27)，其中旧称“PR3”的无表管理不是当前枚举 PR3，dm 验证不替代 PR 分支验证。
 
 ## 1. 规范
 
@@ -79,12 +81,17 @@
 
 ## 2. 已实际制备 PR 总览与历史
 
-| PR | 主题 | 本地状态（2026-10-26 核对） | 直接 base | HEAD | 档案 |
+| PR | 主题 | 状态（2026-10-27 核对） | 直接 base | HEAD | 档案 |
 |---|---|---|---|---|---|
-| PR1 | mapped BIO ranges | 用户反馈检查及 block 测试成功；已推送并核对远端 SHA，历史关联 #3937 | `ceb65e3f8` | `2dd1bcac5` | [PR1](../log/PR/PR-1-mapped-bio-ranges.md) |
-| 新 PR2 | 控制设备与 DM_VERSION | 六文件单提交，已移除公共筛选扩展；本轮未推送 | `2dd1bcac5` | `808d36daf` | [PR2](../log/PR/PR-2-control-interface.md) |
+| PR1 | mapped BIO ranges | 已推送，历史关联 #3937；本轮未变更或重新核验页面 | `ceb65e3f8` | `2dd1bcac5` | [PR1](../log/PR/PR-1-mapped-bio-ranges.md) |
+| PR2 | 控制设备与 DM_VERSION | 七文件单提交，测试目录整理已归入原提交；已推送并核验远端 | `2dd1bcac5` | `074e7e80d` | [PR2](../log/PR/PR-2-control-interface.md) |
+| PR3 | 字符/块注册枚举 | 18 文件单提交；重放前后补丁一致，已推送并核验远端 | `074e7e80d` | `be3f79c88` | [PR3](../log/PR/PR-3-proc-devices.md) |
+| PR4（暂缓） | 无表设备管理 | 当前版本已推送，后续拆分；不是最终评审边界 | `be3f79c88` | `6995e5ab3` | 本次不建档，待用户确定拆分 |
 
-两者共同 main 基线现为 `ceb65e3f8`，保持 `main → PR1 → PR2` 线性链。PR2 的格式/静态/构建/core 测试成功为用户反馈，最终清理后未重跑；官方全量回归在 cgroup 断言处失败，main 同环境复现，不能写为全量通过。具体命令与边界见 PR2 档案；dm 测试不替代 PR 验收。
+共同 main 基线为 `ceb65e3f8`，保持线性依赖链。
+PR2 早期静态/构建/core 测试成功、PR3 枚举测试成功均按用户反馈记录；最终 PR2 目录整理与 PR3 重放后没有独立重跑系统测试。
+PR2 官方全量回归曾在 cgroup 断言处失败，main 同环境复现，不能写为全量通过。
+具体证据和边界见各 PR 档案；后继 PR4 或 dm 的成功不替代前置 PR 独立验收。
 
 | 日期 | PR | 事件 | 事实 |
 |---|---|---|---|
@@ -93,7 +100,12 @@
 | 2026-09-28 | PR 1 | 语义化分支迁移 | fork 分支从 `pr` 改为 `mapped-bio-ranges`，保持 `c14d68c93` 不变并删除旧远端引用。 |
 | 2026-10-09 | PR 1 | 线性更新本地基线 | 在 mapped-bio-ranges 执行 git rebase main，无冲突；c14d68c93 → 67ed6c70f，base 为 10a241870。range-diff 为 =，三文件范围不变，无 merge commit，diff --check 通过。未推送新 SHA；用户随后反馈验证通过，未提供命令输出与计数。 |
 | 2026-10-26 | PR1 | rebase 与推送 | `2f4fdc9a7` → `2dd1bcac5`，range-diff 为 `=`；用户反馈验证成功，精确 lease 推送后远端 SHA 核验一致。 |
-| 2026-10-26 | PR2 | rebase 与范围收口 | `ea1a9639c` → `fabadd3cb` → `808d36daf`；移除回归参数扩展，代理前缀撤销，保留六文件；未推送。 |
+| 2026-10-26 | PR2 | rebase 与范围收口 | `ea1a9639c` → `fabadd3cb` → `808d36daf`；移除回归参数扩展，代理前缀撤销，保留六文件；当时未推送。 |
+| 2026-10-27 | PR3 | 独立枚举前置 | 从 PR2 制备 `proc-devices`，`be23d3b32` 已验证反馈、提交并推送；无表管理顺延。 |
+| 2026-10-27 | PR2/PR3 | 测试目录历史归属 | PR2 替换为 `074e7e80d`，原七个测试函数体和生产行为不变；PR3 原补丁重放为 `be3f79c88`。 |
+| 2026-10-27 | PR2/PR3/PR4 | 原子推送 | 三分支以精确 lease 推送，远端 SHA 核验一致；未创建 GitHub PR。 |
+| 2026-10-27 | PR4 | 暂缓并准备拆分 | `6995e5ab3` 保留为已推送版本；用户认为体量偏大，后续拆分，本轮仅更新 PR2/PR3 文档。 |
+| 2026-10-27 | 本地备份 | 按授权清理 | 删除九个本地备份分支；未清理磁盘备份或 stash。 |
 
 PR 1 的当前 Git branch 为 `mapped-bio-ranges`；文档中的稳定编号统一为 **PR 1**。
 
@@ -107,23 +119,28 @@ PR1 保持原范围，不在本阶段重做。从 PR2 开始交付不依赖具�
 
 每份必须以 dm 为生产实现来源。当前缺口先在 dm 审定、实现和验证，再提取；不在 PR 分支另造实现。下表为候选顺序，文件边界和数量允许依源码审查调整；安全依赖不能为了维持编号而后移。
 
-### 3.2 候选 PR 与验收边界
+### 3.2 插入枚举 PR 后的阶段编号
+
+PR1 保持 mapped BIO ranges；PR2 为控制入口；新增 PR3 为注册枚举。原 PR3–PR11 顺延为 PR4–PR12，最小 linear 终验暂列 PR13。
+PR4 已验证、待拆分；下表先按插入一份 PR 后的顺序编号，不预设 PR4 拆成几份。拆分方案确认后再顺延后续编号；规划不授权立即实施。
 
 | PR | 主题 | 交付与依赖 | 主要验收 |
 |---|---|---|---|
-| PR2 | 控制入口 | 现有 control device、权限、编码校验、版本握手、未知命令处理；依赖现有 PR 链。 | 原始 ioctl 的权限、版本、指针及错误优先级。 |
-| PR3 | 身份与基础管理 | component/manager、编号、名称/UUID 索引、无表状态；CREATE、STATUS、LIST_DEVICES、无表 REMOVE；普通参数处理随命令引入。 | 无 target 的创建、查询、删除；重复标识、查找并发和失败回滚。 |
-| PR4 | backing 持有与安全注销基础 | 必要的 block registry、lease、open/mount 持有与注销状态机，作为通用前置。 | 长期持有阻止错误注销；失败恢复，不把 Arc 内存保活当作设备使用权。 |
-| PR5 | 节点身份与发布基础 | 必要的 devtmpfs identity handle、节点创建/删除/回滚；服务后续 runtime 接线。 | 同路径外来替换不能被旧 handle 误删；失败不留下半发布状态。 |
-| PR6 | target 类型与实例契约 | 类型目录、构造、参数/backing 解析边界、能力表达、状态/依赖遍历与类型发现；依赖 PR4。 | 增加测试专用实现无需改控制命令；无生产 target 的空目录行为明确。 |
-| PR7 | 通用表与 inactive 装载 | 范围校验、实例/lease 所有权、容量及能力汇总；LOAD、CLEAR、STATUS、DEPS；依赖 PR3/4/6。 | 构造失败保留旧状态；引用释放、active/inactive 查询与缓冲区边界。 |
-| PR8 | 通用 BIO 通路 | 定位/拆分、下层提交、完成聚合、错误传播、异步表保活；明确普通和特殊 I/O 契约；依赖 PR7。 | 延迟/乱序完成、部分提交失败时恰好完成一次，旧表和 backing 不提前释放。 |
-| PR9 | 首次激活与运行时生命周期 | primary/alias、容量/只读、激活事务、open gate、安全移除；整合 PR4/5/7/8。 | 无表→可用块设备→删除闭环；各失败点可见状态及恢复正确。 |
-| PR10 | 暂停、恢复与换表 | in-flight/drain、排队重放、表切换、target hooks 及失败撤销；审定普通 suspend/NOFLUSH 与文件系统协调。 | 并发 I/O 换表；中断和回调失败不丢请求、不丢表、不提前发布新状态。 |
-| PR11 | 管理与事件闭环 | rename/UUID、单设备事件与 WAIT、信号中断/重启、REMOVE_ALL 忙设备及部分成功语义。 | 索引与节点一致，事件与状态一致，批量操作保留忙设备。 |
-| 框架后首个 target PR | 最小 linear 与终验 | 从 dm 提取符合新框架接口的最简单 linear，不加入 striped/LVM 等扩展；依赖完整框架。 | 真实 dmsetup 创建、读写、暂停/换表/恢复、忙设备删除检查与清理。 |
+| PR2 | 控制入口 | control device、权限、编码校验、版本握手、未知命令处理。 | 原始 ioctl 的权限、版本、指针及错误优先级。 |
+| PR3 | 注册枚举 | 命名 char/block 注册及 `/proc/devices`，作为后续用户工具发现前置。 | 注册生命周期、共享 major、输出排序、短读/seek/EOF。 |
+| PR4（已验证，待拆分） | 身份与基础管理 | component、编号、名称/UUID 索引、无表状态；CREATE、STATUS、LIST_DEVICES、无表 REMOVE。最终拆分另议。 | 创建、查询、删除、冲突、并发和失败回滚；真实 dmsetup。 |
+| PR5 | backing 持有与安全注销基础 | 必要的 block registry、lease、open/mount 持有与注销状态机。 | 长期持有阻止错误注销；失败恢复，不把 Arc 保活当作设备使用权。 |
+| PR6 | 节点身份与发布基础 | devtmpfs identity handle、节点创建/删除/回滚。 | 外来替换不能被旧 handle 误删，失败不留下半发布状态。 |
+| PR7 | target 类型与实例契约 | 类型目录、构造、参数/backing 边界、能力、状态/依赖与发现；依赖 PR5。 | 测试实现无需改控制命令，无生产 target 的空目录行为明确。 |
+| PR8 | 通用表与 inactive 装载 | 范围校验、实例/lease 所有权、容量和能力汇总；LOAD、CLEAR、STATUS、DEPS；依赖 PR4/PR5/PR7。 | 构造失败保留旧状态，释放及缓冲区边界正确。 |
+| PR9 | 通用 BIO 通路 | 定位/拆分、提交、完成聚合、错误传播、异步表保活；依赖 PR8。 | 延迟/乱序完成、部分提交失败时恰好完成一次，资源不提前释放。 |
+| PR10 | 首次激活与运行时生命周期 | primary/alias、容量/只读、激活事务、open gate、安全移除；整合 PR5/PR6/PR8/PR9。 | 无表→可用块设备→删除闭环与失败恢复。 |
+| PR11 | 暂停、恢复与换表 | in-flight/drain、排队重放、表切换、target hooks、失败撤销及文件系统协调。 | 并发换表，中断/回调失败不丢请求和表，不提前发布状态。 |
+| PR12 | 管理与事件闭环 | rename/UUID、事件与 WAIT、信号中断/重启、REMOVE_ALL 忙设备和部分成功语义。 | 索引、节点和事件一致，批量操作保留忙设备。 |
+| PR13 | 最小 linear 与终验 | 提取最简单 linear，不加入 striped/LVM 等扩展。 | 真实 dmsetup 创建、读写、换表、忙设备删除与清理。 |
 
-PR4/5 是公共安全前置，不强塞进 target 实现。PR9 首次开放设备 I/O 时必须同时具备相应删除保护。涉及公共基础设施过大时可独立拆分，不提前承诺具体文件数。
+PR5/PR6 是公共安全前置，不强塞进 target 实现。PR10 首次开放设备 I/O 时必须同时具备相应删除保护。
+涉及公共基础设施过大时可独立拆分，不提前承诺具体文件数或 PR 数量。
 
 ### 3.3 当前已发现的前置问题与决策点
 
@@ -131,11 +148,11 @@ PR4/5 是公共安全前置，不强塞进 target 实现。PR9 首次开放设�
 
 | 项目 | 当前事实与证据 | 路线处理 |
 |---|---|---|
-| 固定 target 目录 | `target/mod.rs` 的 TargetKind/TARGET_CATALOG 显式引用四种具体 target。 | PR6 前在 dm 审定构造/注册边界；静态注册即可作为候选，不要求动态模块加载。 |
-| 映射动作受限 | DmTarget::map_io_range 返回 Remap/Error/Zero 动作，不能据此推定支持 target 自持 BIO、重排队或完成回调。 | PR6/8 审定异步所有权、特殊 I/O 与支持范围；Zero 动作是否属于通用协议也须说明。 |
-| target hooks | 当前 DmTarget trait 无 suspend/resume hooks；Linux 基线的 target_type 有 presuspend/undo/postsuspend/preresume/resume，dm.c 经 dm-table.c 调用。 | PR10 前追清调用顺序、失败/撤销语义，再在 dm 补齐；不是仅添加空方法。 |
+| 固定 target 目录 | `target/mod.rs` 的 TargetKind/TARGET_CATALOG 显式引用四种具体 target。 | PR7 前在 dm 审定构造/注册边界；静态注册即可作为候选，不要求动态模块加载。 |
+| 映射动作受限 | DmTarget::map_io_range 返回 Remap/Error/Zero 动作，不能据此推定支持 target 自持 BIO、重排队或完成回调。 | PR7/PR9 审定异步所有权、特殊 I/O 与支持范围；Zero 动作是否属于通用协议也须说明。 |
+| target hooks | 当前 DmTarget trait 无 suspend/resume hooks；Linux 基线的 target_type 有 presuspend/undo/postsuspend/preresume/resume，dm.c 经 dm-table.c 调用。 | PR11 前追清调用顺序、失败/撤销语义，再在 dm 补齐；不是仅添加空方法。 |
 | 文件系统协调 | device.rs 明确仅提供 BIO drain、不提供 freeze；Linux dm.c 存在 lock_fs/freeze_bdev 与 unlock_fs/thaw_bdev。 | 核对 VFS 前置；补齐依赖或明确收窄暂停语义，不宣称完整 Linux suspend。 |
-| DM 堆叠 | table.rs 当前拒绝 DmDevice backing。 | PR4/7/8 审定是否纳入；需要依赖图、持有及删除协调，不能默认自然支持。 |
+| DM 堆叠 | table.rs 当前拒绝 DmDevice backing。 | PR5/PR8/PR9 审定是否纳入；需要依赖图、持有及删除协调，不能默认自然支持。 |
 | 设备管理生态 | 已有 devtmpfs 节点不等于 sysfs/uevent/udev 自动发现，单设备 WAIT 不等于全局 poll。 | 分别列依赖与验收；不自动纳入完整 LVM 自动激活或 request-based DM。 |
 
 主要 Linux 依据仍为本机 `/root/Linux-tree-code/kernel` 的 `5078a3a23a1e1825ec136485173ec98668cdd640`。实施前逐项提供双方源码调用链、差异、影响与验证方案，不能把本表推断当已确认缺陷或已完成能力。
@@ -151,7 +168,12 @@ PR4/5 是公共安全前置，不强塞进 target 实现。PR9 首次开放设�
 
 ### 3.5 旧系列与新系列关系
 
-旧 linear-first 路线不再作为当前规划。旧 PR2/PR3 档案为工作区待提交删除，旧分支的历史验证不能移用于新 PR2。当前本地 dm-control-interface 已复用于新 PR2；本次未核查远端旧分支删除状态。
+旧 linear-first 路线不再作为当前规划，旧分支的历史验证不能移用于新 PR2。
+`dm-control-interface` 已复用于控制入口 PR2，`proc-devices` 是当前枚举 PR3；文档中的旧无表管理“PR3”应按历史语境理解。
+无表管理 PR4 已验证、待拆分；当前先按新增枚举 PR 顺延后续编号，见第 3.2 节。拆分后的实际 PR 数量和编号另议。旧日报保留当时编号，不将历史事实批量替换。
+
+当前 PR3 的命名注册及枚举能力属于用户明确批准的例外：先在 PR 分支实现、验证，再考虑回补 `dm`。
+这不构成其他生产功能可以绕过第 1.1 节来源规则的授权。
 
 ## 4. 提取边界
 

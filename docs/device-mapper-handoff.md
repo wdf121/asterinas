@@ -1,12 +1,34 @@
 # Device Mapper 对话交接
 
-> **更新日期：2026-10-27。** 当前仍在 `dm`，HEAD `7c46b2ee8` 加未提交生产/测试修复。用户在最新两处 lint 修正后确认验证全部通过；助手未独立取得最终日志、计数及镜像来源。当前阶段已获授权集中更新文档，不继续修改生产代码。
->
-> **接手重点**：PR3 制备前已修 CREATE errno、dev 低 32 位、C ABI 4.48.0、1 GiB 校验上限、UUID bytes、全局 poll/ARM_POLL、REMOVE 控制引用与 BIO 排空、minor 一次性释放及旧实例保护。逐项状态与全部卡点见 [global.md §10.4](global.md#104-pr3-制备前修复与待办总账2026-10-27)，实际过程见 [10 月 27 日日志](../log/daily/2026-10-27.md)。
->
-> **未完成/禁止默认为完成**：deferred REMOVE 与 DM uevent 因缺跨子系统接口暂缓，非 UTF-8 名称仍不支持；精确事件提交点、极限分配证据、PR3 前置及裁剪待处理。`dm-device-management` 仍与 PR2 同为 `808d36daf`，尚未提取、验证、提交或推送。PR3 只含无表管理，不另造模型、不自动修改 PR1/PR2。
->
-> 以下 10 月 26 日同步摘要及第 1–3 节保留历史事实，不代表本轮已提交或当前 poll/ABI 状态。
+## 当前交接（2026-10-27 收尾）
+
+**当前卡点：PR4 已验证、已提交并推送，待拆分。** 不再停留在“尚未提取”或“等待 NixOS 验证”。
+当前检出 `dm`，HEAD `3cd8af8b7`；本轮只有文档改动未提交，没有把 PR 分支代码自动回补到 dm。
+
+| 阶段 | 分支 | HEAD | 状态 |
+|---|---|---|---|
+| PR1 | `mapped-bio-ranges` | `2dd1bcac5` | 保持不动 |
+| PR2 | `dm-control-interface` | `074e7e80d` | 测试目录整理已归入原提交，已推送 |
+| PR3 | `proc-devices` | `be3f79c88` | 字符/块注册枚举，已验证、已推送 |
+| PR4 | `dm-device-management` | `6995e5ab3` | 无表管理已验证、已推送，因体量待拆分 |
+
+- PR2/PR3/PR4 三分支原子推送后已核验远端 SHA；未创建 GitHub PR。
+- PR3 用户确认 check、kernel、block/core ktest、guest `/test/fs/procfs/devices` 通过，并用 `cat /proc/devices` 检查输出。
+- PR4 助手执行 make format、完整 make check 成功；用户先反馈除 NixOS 外通过，修正脚本交付方式后确认测试全部通过。实际运行计数和完整用户日志未归档，不虚构。
+- PR4 共 26 文件、+3203/-24；没有删除文件。拆分应保留直接测试，不为减少行数去掉必要覆盖；具体拆分边界未定。
+- PR4 NixOS 套件把 cases.sh 安装为 `/etc/dm-management-cases.sh`，不再经串口分块上传；构建/运行使用 `NIXOS_TEST_SUITE=device-mapper-management`，单例用 `NIXOS_TEST_CASE`。脚本变化须重建镜像。该套件尚未回补 dm。
+- PR2 原七个测试函数体和生产代码不变；PR3 重放前后补丁一致；历史整理未改变已验证 PR4 工作文件。未独立重跑最终 PR2/PR3 系统测试。
+- 九个本地备份分支已按用户要求删除；两个 stash 仍在，磁盘备份未清理，不据旧摘要声称备份分支仍存在。
+
+### 下一步边界
+
+1. 先审定 PR4 拆分方案，不自行改写已经推送的提交，也不继续 table/BIO 等后续功能。
+2. [PR 规划](pull_request.md) 已按插入枚举 PR3 重编号：PR4 无表管理、PR5–PR12 后续框架、PR13 最小 linear；PR4 拆分后再调整。
+3. 完整 dm 的语义修复已在 `7de7025ad`、`74ee6b89e` 提交；PR 分支的枚举、新文件组织与 NixOS 套件尚未自动回补。
+4. deferred REMOVE、DM uevent/cookie、非 UTF-8 名称、极限分配和精确事件点仍为独立后续事项。无表 dmsetup 通过不代表完整 uevent/udev 支持，见 [总账](global.md#104-pr3-制备前修复与待办总账2026-10-27)。
+5. 本轮仅集中更新文档；提交、push、拆分和回补各需对应授权。详情见 [今日日志](../log/daily/2026-10-27.md)、[PR2](../log/PR/PR-2-control-interface.md)、[PR3](../log/PR/PR-3-proc-devices.md)。
+
+## 历史同步摘要（以下仅代表当时）
 
 > **2026-10-26 同步摘要。** dm 已 merge 最新 main `ceb65e3f8`，合并提交 `37ddb9245`；后续五点提交收口至 `7c46b2ee8` 并普通推送，远端 SHA 已核验。stash 恢复的 Makefile 冲突修复已纳入测试套件提交；原研发内容与已确认删除项已提交。当前在 dm 进行经授权的文档更新，不修改 PR 生产实现。
 >
@@ -16,7 +38,7 @@
 >
 > 下一阶段从新 PR2 开始，PR1 不改实现；PR2～PR11 完成框架，随后最小 linear 终验。路线与前置缺口见 [PR 规划](pull_request.md)，今日过程见 [日报](../log/daily/2026-10-26.md)。PR 链经单独授权更新为 `ceb65e3f8 → 2dd1bcac5 → 808d36daf`；PR1 已推送，PR2 未推送。PR2 六文件，不含公共 REGRESSION_TESTS 扩展或代理前缀；原 commit 描述保留，英文页面草稿见 [PR2 档案](../log/PR/PR-2-control-interface.md)。
 >
-> 安全引用 `dm-backup-20261026-before-sync` 和 stash `1b60fbd99901a77bbcd91f4773aedcb970433a6b` 保留；另有 PR1/PR2 的 `*-backup-20261026` 分支，均未删除；不要擅自清理备份或其他 stash。
+> 当时安全引用 `dm-backup-20261026-before-sync` 和 stash `1b60fbd99901a77bbcd91f4773aedcb970433a6b` 保留；另有 PR1/PR2 的 `*-backup-20261026` 分支，当时均未删除；备份分支已于 10 月 27 日按授权删除，stash 未清理。
 
 > **PR2 验证边界**：用户反馈 format/check/kernel/core 测试成功；core 入口为 `cd kernel/core && cargo osdk test`，不记未提供的运行计数。官方全量回归在 cgroup CPU 记账阈值处失败，main 同命令复现；用户表示已确认上游 bug 并停止排查，未提供链接。最终清理后未重跑，不列定向 C 回归通过。对照日志保存在 `/tmp/pr2-main-cgroup-20261026-7l3yamjc/`。临时 DCAP 代理修改已撤销，main 未改写。
 
