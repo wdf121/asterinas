@@ -24,12 +24,15 @@ union dm_table_buffer {
 	unsigned char bytes[DM_TABLE_BUFFER_SIZE];
 };
 
+/* Pin requests and response expectations to Linux 6.6 (5078a3a23a1e),
+ * independently of the build environment's Linux header version.
+ */
+static const uint32_t kernel_version[3] = { 4, 48, 0 };
+
 static inline void init_ioctl(struct dm_ioctl *io)
 {
 	memset(io, 0, sizeof(*io));
-	io->version[0] = DM_VERSION_MAJOR;
-	io->version[1] = DM_VERSION_MINOR;
-	io->version[2] = DM_VERSION_PATCHLEVEL;
+	memcpy(io->version, kernel_version, sizeof(io->version));
 	io->data_size = sizeof(*io);
 	io->data_start = sizeof(*io);
 }

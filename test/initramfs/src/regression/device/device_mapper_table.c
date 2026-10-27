@@ -26,9 +26,8 @@ FN_TEST(device_mapper_tableless_status_is_linux_compatible)
 
 	init_ioctl(&io);
 	TEST_SUCC(ioctl(fd, DM_VERSION, &io));
-	TEST_RES(io.version[0] == DM_VERSION_MAJOR, _ret == 1);
-	TEST_RES(io.version[1] == DM_VERSION_MINOR, _ret == 1);
-	TEST_RES(io.version[2] == DM_VERSION_PATCHLEVEL, _ret == 1);
+	TEST_RES(memcmp(io.version, kernel_version, sizeof(io.version)),
+		 _ret == 0);
 	TEST_RES(io.data_size == DM_IOCTL_ENVELOPE_SIZE, _ret == 1);
 	TEST_RES(io.data_start == DM_IOCTL_ENVELOPE_SIZE, _ret == 1);
 

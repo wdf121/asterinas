@@ -26,8 +26,6 @@ static int bytes_are(const unsigned char *bytes, size_t len,
 	return 1;
 }
 
-/* Match the DM ABI of the pinned Linux 6.6 baseline (5078a3a23a1e). */
-static const uint32_t kernel_version[3] = { 4, 48, 0 };
 static const uint32_t client_version[3] = { 4, 0, UINT32_MAX };
 
 FN_TEST(device_mapper_control_without_events_is_not_ready)
@@ -45,6 +43,93 @@ FN_TEST(device_mapper_control_without_events_is_not_ready)
 		TEST_RES(poll(&poll_fd, 1, 0), _ret == 0);
 		TEST_RES(poll_fd.revents, _ret == 0);
 	}
+	TEST_SUCC(close(fd));
+}
+END_TEST()
+
+FN_TEST(device_mapper_control_events_and_arm_poll)
+{
+	int first = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+	int second = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+	int duplicate = CHECK(dup(first));
+	struct dm_ioctl io;
+	struct pollfd fds[] = {
+		{ .fd = first, .events = POLLIN | POLLOUT },
+		{ .fd = second, .events = POLLIN | POLLOUT },
+		{ .fd = duplicate, .events = POLLIN | POLLOUT },
+	};
+	char name[DM_NAME_LEN];
+
+	snprintf(name, sizeof(name), "dm-poll-%ld", (long)getpid());
+	init_named_ioctl(&io, name);
+	TEST_SUCC(ioctl(first, DM_DEV_CREATE, &io));
+	TEST_RES(poll(fds, 3, 0), _ret == 3);
+	for (int i = 0; i < 3; i++)
+		TEST_RES(fds[i].revents, _ret == POLLIN);
+
+	init_ioctl(&io);
+	TEST_SUCC(ioctl(duplicate, DM_DEV_ARM_POLL, &io));
+	TEST_RES(io.data_size, _ret == DM_IOCTL_FIXED_SIZE);
+	TEST_RES(poll(fds, 3, 0), _ret == 1);
+	TEST_RES(fds[0].revents, _ret == 0);
+	TEST_RES(fds[1].revents, _ret == POLLIN);
+	TEST_RES(fds[2].revents, _ret == 0);
+
+	init_ioctl(&io);
+	TEST_SUCC(ioctl(second, DM_DEV_ARM_POLL, &io));
+	init_named_ioctl(&io, name);
+	TEST(ioctl(first, DM_DEV_CREATE, &io), EBUSY, _ret == -1);
+	TEST_RES(poll(fds, 3, 0), _ret == 0);
+	init_named_ioctl(&io, name);
+	TEST_SUCC(ioctl(first, DM_DEV_REMOVE, &io));
+	TEST_RES(poll(fds, 3, 0), _ret == 3);
+	TEST_SUCC(close(duplicate));
+	TEST_SUCC(close(second));
+	TEST_SUCC(close(first));
+}
+END_TEST()
+
+FN_TEST(device_mapper_opaque_uuid)
+{
+	int fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+	struct dm_ioctl io;
+	unsigned char buffer[sizeof(struct dm_ioctl) + DM_UUID_LEN] = { 0 };
+	struct dm_ioctl *rename = (void *)buffer;
+	char name[DM_NAME_LEN];
+	char other[DM_NAME_LEN];
+	char uuid[DM_UUID_LEN];
+
+	snprintf(name, sizeof(name), "dm-bytes-%ld", (long)getpid());
+	snprintf(other, sizeof(other), "dm-bytes-other-%ld", (long)getpid());
+	snprintf(uuid, sizeof(uuid), "opaque-%ld-\xff\x80", (long)getpid());
+	init_named_ioctl(&io, name);
+	memcpy(io.uuid, uuid, strlen(uuid) + 1);
+	TEST_SUCC(ioctl(fd, DM_DEV_CREATE, &io));
+	TEST_RES(memcmp(io.uuid, uuid, strlen(uuid) + 1), _ret == 0);
+
+	init_ioctl(&io);
+	memcpy(io.uuid, uuid, strlen(uuid) + 1);
+	TEST_SUCC(ioctl(fd, DM_DEV_STATUS, &io));
+	TEST_RES(strcmp(io.name, name), _ret == 0);
+	TEST_RES(memcmp(io.uuid, uuid, strlen(uuid) + 1), _ret == 0);
+	init_named_ioctl(&io, other);
+	memcpy(io.uuid, uuid, strlen(uuid) + 1);
+	TEST(ioctl(fd, DM_DEV_CREATE, &io), EBUSY, _ret == -1);
+	init_ioctl(&io);
+	memcpy(io.uuid, uuid, strlen(uuid) + 1);
+	TEST_SUCC(ioctl(fd, DM_DEV_REMOVE, &io));
+
+	init_named_ioctl(&io, other);
+	TEST_SUCC(ioctl(fd, DM_DEV_CREATE, &io));
+	init_named_ioctl(rename, other);
+	rename->data_size = sizeof(buffer);
+	rename->flags = DM_UUID_FLAG;
+	memcpy(buffer + rename->data_start, uuid, strlen(uuid) + 1);
+	TEST_SUCC(ioctl(fd, DM_DEV_RENAME, rename));
+	TEST_RES(memcmp(rename->uuid, uuid, strlen(uuid) + 1), _ret == 0);
+	init_ioctl(&io);
+	memcpy(io.uuid, uuid, strlen(uuid) + 1);
+	TEST_SUCC(ioctl(fd, DM_DEV_REMOVE, &io));
 	TEST_SUCC(close(fd));
 }
 END_TEST()
@@ -263,9 +348,8 @@ FN_TEST(device_mapper_reports_version_before_parameter_errors)
 		/* Parameter rejection must not hide the earlier ABI handshake. */
 		TEST(ioctl(fd, DM_DEV_STATUS, &io), i == 0 ? EINVAL : ENXIO,
 		     _ret == -1);
-		TEST_RES(io.version[0] == DM_VERSION_MAJOR, _ret == 1);
-		TEST_RES(io.version[1] == DM_VERSION_MINOR, _ret == 1);
-		TEST_RES(io.version[2] == DM_VERSION_PATCHLEVEL, _ret == 1);
+		TEST_RES(memcmp(io.version, kernel_version, sizeof(io.version)),
+			 _ret == 0);
 	}
 	TEST_SUCC(close(fd));
 }
@@ -273,7 +357,8 @@ END_TEST()
 
 FN_TEST(device_mapper_fixed_prefix_and_no_params_guard_pages)
 {
-	const size_t sizes[] = { 305, 311, 312, 1024 * 1024 };
+	const size_t sizes[] = { 305, 311, 312, 1024 * 1024,
+				 1024 * 1024 * 1024 };
 	long page_size = CHECK_WITH(sysconf(_SC_PAGESIZE), _ret > 0);
 	unsigned char *pages =
 		CHECK_WITH(mmap(NULL, page_size * 2, PROT_READ | PROT_WRITE,
@@ -342,8 +427,9 @@ FN_TEST(device_mapper_failure_copyout_and_secure_clear_boundaries)
 			TEST_RES(bytes_are(input.bytes, sizeof(input.bytes), 0),
 				 _ret == 1);
 		} else {
-			TEST_RES(input.align.version[1],
-				 _ret == DM_VERSION_MINOR);
+			TEST_RES(memcmp(input.align.version, kernel_version,
+					sizeof(input.align.version)),
+				 _ret == 0);
 			TEST_RES(memcmp(input.bytes + 12, before.bytes + 12,
 					sizeof(input.bytes) - 12),
 				 _ret == 0);

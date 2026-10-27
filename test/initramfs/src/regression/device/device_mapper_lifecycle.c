@@ -175,15 +175,15 @@ FN_TEST(device_mapper_persistent_minor_error_precedes_identity_collision)
 		if (collision == 2)
 			snprintf(io.uuid, sizeof(io.uuid), "%s", uuid);
 		io.flags = DM_PERSISTENT_DEV_FLAG;
-		io.dev = dev;
+		io.dev = dev | (UINT64_C(1) << 32);
 		TEST(ioctl(fd, DM_DEV_CREATE, &io), ENXIO, _ret == -1);
 	}
-	/* Without a requested minor, identity collisions still return EEXIST. */
+	/* Linux dm_hash_insert reports EBUSY for either identity collision. */
 	init_named_ioctl(&io, name);
-	TEST(ioctl(fd, DM_DEV_CREATE, &io), EEXIST, _ret == -1);
+	TEST(ioctl(fd, DM_DEV_CREATE, &io), EBUSY, _ret == -1);
 	init_named_ioctl(&io, other);
 	snprintf(io.uuid, sizeof(io.uuid), "%s", uuid);
-	TEST(ioctl(fd, DM_DEV_CREATE, &io), EEXIST, _ret == -1);
+	TEST(ioctl(fd, DM_DEV_CREATE, &io), EBUSY, _ret == -1);
 	init_named_ioctl(&io, name);
 	TEST_RES(ioctl(fd, DM_DEV_STATUS, &io), _ret == 0);
 	TEST_RES(io.dev, _ret == dev);
