@@ -1,6 +1,30 @@
 # Device Mapper 对话交接
 
-## 当前交接（2026-10-27 收尾）
+## 当前交接（2026-10-28）
+
+**当前停点：无表管理拆分已完成，六份档案已整理；未启动后续框架功能。**
+当前 `dm` HEAD 为 `7767dd9bf`，字符注册枚举已回补；新 NixOS 管理套件及整个制备链未自动回补。
+
+| 范围 | 分支 / 提交 | 状态 |
+|---|---|---|
+| PR1 | `mapped-bio-ranges` / `2dd1bcac5` | 保持不动 |
+| PR2 | `dm-control-interface` / `d5347826f` | 本地及 origin 已更新 |
+| PR3 | `proc-devices` / `aa11c7ab6` | 本地及 origin 已更新 |
+| PR4 | `dm-device-registry` / `0c68ed7da` | 本地及 origin 已更新 |
+| PR5–PR9 | `5bd01f020` → `03b2d721a` → `c13e94ffc` → `1e0415869` → `24e7ee2e8` | 本地 `pr-dm` 制备链，未独立建分支或推送 |
+
+- 三个正式分支以精确 lease 原子推送并核验远端；旧 `dm-device-management` 本地和远端分支已删除，历史版本按 `6995e5ab3` 引用。未创建 GitHub PR。
+- `pr-dm` 是经用户批准的本地命名例外，不是上游正式分支。当前不自动建分支、改写历史或推送。
+- 用户反馈 C 定向检查 control 64、management 180 通过；数字为检查次数，不是 FN_TEST 数。
+- 最后套件的一次 `make check` 退出 137，根因未确定；用户随后确认 check 通过，并在 guest 手动跑完三个 dmsetup 场景。不是助手自动 runner 通过记录。
+- 套件脚本随镜像安装至 `/etc/dm-management-cases.sh`，构建使用 `make nixos NIXOS_TEST_SUITE=device-mapper-management`；当前 dm 的旧套件仍为 `device-mapper-control-plane`，不得跨分支混用。
+- 默认 udev 同步下无表场景通过不等于完整 uevent/sysfs/udev 支持。源码推导和验证边界见 [PR9](../log/PR/PR-9-management-nixos.md)。
+- 档案编号为 PR4–PR9，英文维护者描述不含内部编号，保留全英文小标题。原 PR1–PR3 描述不重写，旧 SHA 为历史。
+- 后续候选路线顺延至 PR10–PR18，详见 [规划与全部档案索引](pull_request.md)。本次仅文档更新，不提交、不推送、不实施后续功能。
+
+最新过程见 [10 月 28 日日志](../log/daily/2026-10-28.md)。以下保留旧交接事实，旧分支状态及待拆分结论不代表现在。
+
+## 历史交接（2026-10-27 收尾）
 
 **当前卡点：PR4 已验证、已提交并推送，待拆分。** 不再停留在“尚未提取”或“等待 NixOS 验证”。
 当前检出 `dm`，HEAD `3cd8af8b7`；本轮只有文档改动未提交，没有把 PR 分支代码自动回补到 dm。
@@ -125,7 +149,7 @@ make run_kernel AUTO_TEST=regression REGRESSION_TESTS="device/device_mapper_cont
 [CLAUDE.md](../CLAUDE.md) / [AGENTS.md](../AGENTS.md)
 → 本交接
 → [项目状态](../log/device-mapper-progress.md)
-→ [最新日志（2026-10-27）](../log/daily/2026-10-27.md)
+→ [最新日志（2026-10-28）](../log/daily/2026-10-28.md)
 → 按任务阅读源码与历史 PR 档案。
 
 接手先核对分支、HEAD 和工作区，不自动切分支、提交或 push。阶段中只汇报进度，验证完成后经授权集中更新文档。每日新增“协作复盘与心得”，记录得到验证的判断、需纠正的认识与下次改进，不重复清单、不虚构经验。

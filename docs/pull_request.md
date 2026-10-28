@@ -4,7 +4,13 @@
 >
 > **职责边界**：每个已实际制备的 PR 的技术细节、Git 元数据、验证证据和英文 maintainer 描述记录在 [`log/PR/`](../log/PR/)；日报只记录当天发生的操作与结论。
 >
-> **最后更新**：2026-10-27。
+> **最后更新**：2026-10-28。
+>
+> **最新状态（取代下方 10 月 27 日摘要）**：原无表管理已拆为 PR4–PR9；本地制备链 `pr-dm` 为 `24e7ee2e8`。正式分支 `dm-control-interface`、`proc-devices`、`dm-device-registry` 分别为 `d5347826f`、`aa11c7ab6`、`0c68ed7da`，已推送并核验。旧 `dm-device-management` 本地与远端分支已按授权删除，旧完整版本仅按 SHA `6995e5ab3` 引用。PR5–PR9 尚未独立建分支或推送；未创建 GitHub PR。
+>
+> **工作区与证据**：当前 `dm` 为 `7767dd9bf`，已回补字符注册枚举，不表示整条制备链和新 NixOS 套件已回补。用户反馈 C 定向检查 control 64、management 180 通过，NixOS 三场景手动执行通过；不记为助手自动 runner 验证或全量回归通过。原 PR1–PR3 描述不重写，旧 SHA 保留为历史。
+>
+> **以下三段为 2026-10-27 历史摘要，当前索引见第 2 节。**
 >
 > **当前进展**：PR2 `dm-control-interface` 为 `074e7e80d`；PR3 已独立为 `/proc/devices` 字符/块设备注册枚举，`proc-devices` 为 `be3f79c88`。两个分支均已推送并核验远端，档案见 [PR2](../log/PR/PR-2-control-interface.md) 和 [PR3](../log/PR/PR-3-proc-devices.md)。本轮未创建 GitHub PR。
 >
@@ -81,6 +87,27 @@
 
 ## 2. 已实际制备 PR 总览与历史
 
+### 当前提交链（2026-10-28）
+
+| PR | 主题 | 直接 base | HEAD | 档案 |
+|---|---|---|---|---|
+| PR1 | mapped BIO ranges | `ceb65e3f8` | `2dd1bcac5` | [PR1](../log/PR/PR-1-mapped-bio-ranges.md) |
+| PR2 | 控制入口 | `2dd1bcac5` | `d5347826f` | [PR2](../log/PR/PR-2-control-interface.md) |
+| PR3 | 注册枚举 | `d5347826f` | `aa11c7ab6` | [PR3](../log/PR/PR-3-proc-devices.md) |
+| PR4 | 身份组件 | `aa11c7ab6` | `0c68ed7da` | [PR4](../log/PR/PR-4-device-registry.md) |
+| PR5 | CREATE | `0c68ed7da` | `5bd01f020` | [PR5](../log/PR/PR-5-create.md) |
+| PR6 | STATUS 与 LIST | `5bd01f020` | `03b2d721a` | [PR6](../log/PR/PR-6-status-list.md) |
+| PR7 | REMOVE | `03b2d721a` | `c13e94ffc` | [PR7](../log/PR/PR-7-remove.md) |
+| PR8 | C 管理回归 | `c13e94ffc` | `1e0415869` | [PR8](../log/PR/PR-8-management-regression.md) |
+| PR9 | NixOS dmsetup 测试 | `1e0415869` | `24e7ee2e8` | [PR9](../log/PR/PR-9-management-nixos.md) |
+
+PR1 保持不动；PR2–PR4 正式分支已更新，精确 lease 原子推送并核验远端，同时删除旧完整管理分支。
+PR5–PR9 仅在本地制备链保存；`pr-dm` 是用户批准的命名例外，不改变正式分支语义化命名要求。
+公共 C 程序汇总归入 PR2 后，后继提交已重写；不声称每个重写提交点均重新执行全部测试。
+复现命令不是运行记录，具体证据及缺口见各档案。旧全量 C 回归的 cgroup 失败不能因定向通过而改记成功。
+
+### 历史快照（2026-10-27，非当前分支状态）
+
 | PR | 主题 | 状态（2026-10-27 核对） | 直接 base | HEAD | 档案 |
 |---|---|---|---|---|---|
 | PR1 | mapped BIO ranges | 已推送，历史关联 #3937；本轮未变更或重新核验页面 | `ceb65e3f8` | `2dd1bcac5` | [PR1](../log/PR/PR-1-mapped-bio-ranges.md) |
@@ -119,7 +146,24 @@ PR1 保持原范围，不在本阶段重做。从 PR2 开始交付不依赖具�
 
 每份必须以 dm 为生产实现来源。当前缺口先在 dm 审定、实现和验证，再提取；不在 PR 分支另造实现。下表为候选顺序，文件边界和数量允许依源码审查调整；安全依赖不能为了维持编号而后移。
 
-### 3.2 插入枚举 PR 后的阶段编号
+### 3.2 当前阶段编号与历史路线
+
+2026-10-28：已制备范围为 PR1–PR9，其中原整体无表管理拆为身份组件、CREATE、STATUS/LIST、REMOVE、C 回归、NixOS 测试六项。
+后续候选阶段顺延如下；只是编号同步，不授权实施或改变安全依赖：
+
+| 当前编号 | 主题 | 下方历史路线中的编号 |
+|---|---|---|
+| PR10 | backing 持有与安全注销 | PR5 |
+| PR11 | 节点身份与发布 | PR6 |
+| PR12 | target 类型与实例契约 | PR7 |
+| PR13 | 通用表与 inactive 装载 | PR8 |
+| PR14 | 通用 BIO 通路 | PR9 |
+| PR15 | 首次激活与运行时生命周期 | PR10 |
+| PR16 | 暂停、恢复与换表 | PR11 |
+| PR17 | 管理与事件闭环 | PR12 |
+| PR18 | 最小 linear 终验 | PR13 |
+
+**以下阶段表及第 3.3 节的编号保留 10 月 27 日历史语境，按上表映射；不是新增的当前 PR4–PR9 范围。**
 
 PR1 保持 mapped BIO ranges；PR2 为控制入口；新增 PR3 为注册枚举。原 PR3–PR11 顺延为 PR4–PR12，最小 linear 终验暂列 PR13。
 PR4 已验证、待拆分；下表先按插入一份 PR 后的顺序编号，不预设 PR4 拆成几份。拆分方案确认后再顺延后续编号；规划不授权立即实施。
@@ -170,7 +214,7 @@ PR5/PR6 是公共安全前置，不强塞进 target 实现。PR10 首次开放�
 
 旧 linear-first 路线不再作为当前规划，旧分支的历史验证不能移用于新 PR2。
 `dm-control-interface` 已复用于控制入口 PR2，`proc-devices` 是当前枚举 PR3；文档中的旧无表管理“PR3”应按历史语境理解。
-无表管理 PR4 已验证、待拆分；当前先按新增枚举 PR 顺延后续编号，见第 3.2 节。拆分后的实际 PR 数量和编号另议。旧日报保留当时编号，不将历史事实批量替换。
+原无表管理已拆为 PR4–PR9，当前提交链见第 2 节，后续编号映射见第 3.2 节。旧日报保留当时编号，不将历史事实批量替换。
 
 当前 PR3 的命名注册及枚举能力属于用户明确批准的例外：先在 PR 分支实现、验证，再考虑回补 `dm`。
 这不构成其他生产功能可以绕过第 1.1 节来源规则的授权。
@@ -190,3 +234,6 @@ PR5/PR6 是公共安全前置，不强塞进 target 实现。PR10 首次开放�
 每个 `log/PR/PR-<n>-<topic>.md` 必须包含：状态与 Git 标识、远端事件、目标与非目标、设计/范围、diff、验证证据、风险/后续动作，以及可直接给 maintainer 的英文标题和描述。
 
 英文维护者描述只说明行为、设计取舍、范围和真实测试；不得包含中文过程、工作区路径、未验证推测或虚构通过结果。
+档案文件名与中文索引保留编号，英文描述不包含内部 PR 编号。
+沿用七节档案模板，英文小标题为 Title、Summary、Design、Scope、Testing、Review focus。
+测试默认在容器 `/root/asterinas` 执行，不加宿主机容器包装；复现流程保留 `make kernel`，与实际运行证据分开。
