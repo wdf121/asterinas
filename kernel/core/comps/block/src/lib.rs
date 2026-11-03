@@ -51,6 +51,73 @@ use ::device_id::DeviceId;
 use component::{ComponentInitError, init_component};
 use ostd::sync::Mutex;
 
+/// A registered device and the number of long-term users holding it.
+#[derive(Debug)]
+struct RegisteredBlockDevice {
+    device: Arc<dyn BlockDevice>,
+    lease_count: Mutex<usize>,
+}
+
+/// A lease that prevents a registered block device from being unregistered while
+/// it is in long-term use.
+#[derive(Debug)]
+pub struct BlockDeviceLease {
+    device: Arc<dyn BlockDevice>,
+    registered: Option<Arc<RegisteredBlockDevice>>,
+}
+
+impl BlockDeviceLease {
+    /// Returns the block device protected by this lease.
+    pub fn device(&self) -> &Arc<dyn BlockDevice> {
+        &self.device
+    }
+
+    /// Creates a lease for a pre-resolved device that does not participate in
+    /// registry lifetime tracking.
+    pub fn new_untracked(device: Arc<dyn BlockDevice>) -> Self {
+        Self {
+            device,
+            registered: None,
+        }
+    }
+}
+
+impl core::ops::Deref for BlockDeviceLease {
+    type Target = dyn BlockDevice;
+
+    fn deref(&self) -> &Self::Target {
+        self.device.as_ref()
+    }
+}
+
+impl Clone for BlockDeviceLease {
+    fn clone(&self) -> Self {
+        if let Some(registered) = &self.registered {
+            let mut count = registered.lease_count.lock();
+            debug_assert!(*count > 0);
+            *count = count
+                .checked_add(1)
+                .expect("block device lease count overflow");
+        }
+
+        Self {
+            device: self.device.clone(),
+            registered: self.registered.clone(),
+        }
+    }
+}
+
+impl Drop for BlockDeviceLease {
+    fn drop(&mut self) {
+        let Some(registered) = &self.registered else {
+            return;
+        };
+        let mut count = registered.lease_count.lock();
+        debug_assert!(*count > 0);
+        *count -= 1;
+    }
+}
+
 use self::{
     bio::{BioEnqueueError, SubmittedBio},
     prelude::*,
@@ -130,36 +197,71 @@ pub enum Error {
     IdAcquired,
     /// ID exhausted
     IdExhausted,
+    /// The device is held by a lease.
+    Busy,
 }
 
 /// Registers a new block device.
 pub fn register(device: Arc<dyn BlockDevice>) -> Result<(), Error> {
+    // Callbacks may reenter the registry, so resolve the ID before locking it.
+    let id = device.id();
     let mut registry = DEVICE_REGISTRY.lock();
-    let id = device.id().to_raw();
-    if registry.contains_key(&id) {
+    if registry.contains_key(&id.to_raw()) {
         return Err(Error::Registered);
     }
-    registry.insert(id, device);
+    registry.insert(
+        id.to_raw(),
+        Arc::new(RegisteredBlockDevice {
+            device,
+            lease_count: Mutex::new(0),
+        }),
+    );
 
     Ok(())
 }
 
 /// Unregisters an existing block device, returning the device if found.
 pub fn unregister(id: DeviceId) -> Result<Arc<dyn BlockDevice>, Error> {
-    DEVICE_REGISTRY
-        .lock()
-        .remove(&id.to_raw())
-        .ok_or(Error::NotFound)
+    let mut registry = DEVICE_REGISTRY.lock();
+    let registered = registry.get(&id.to_raw()).ok_or(Error::NotFound)?;
+    if *registered.lease_count.lock() != 0 {
+        return Err(Error::Busy);
+    }
+    Ok(registry.remove(&id.to_raw()).unwrap().device.clone())
 }
 
 /// Collects all block devices.
 pub fn collect_all() -> Vec<Arc<dyn BlockDevice>> {
-    DEVICE_REGISTRY.lock().values().cloned().collect()
+    DEVICE_REGISTRY
+        .lock()
+        .values()
+        .map(|registered| registered.device.clone())
+        .collect()
 }
 
 /// Looks up a block device of a given device ID.
 pub fn lookup(id: DeviceId) -> Option<Arc<dyn BlockDevice>> {
-    DEVICE_REGISTRY.lock().get(&id.to_raw()).cloned()
+    DEVICE_REGISTRY
+        .lock()
+        .get(&id.to_raw())
+        .map(|registered| registered.device.clone())
+}
+
+/// Gets a lease for a published block device.
+///
+/// Long-term users such as mounted filesystems must hold the lease for the whole
+/// period in which they can issue I/O.
+pub fn lookup_lease(id: DeviceId) -> Option<BlockDeviceLease> {
+    let registry = DEVICE_REGISTRY.lock();
+    let registered = registry.get(&id.to_raw())?;
+    let mut count = registered.lease_count.lock();
+    *count = count.checked_add(1)?;
+    drop(count);
+
+    Some(BlockDeviceLease {
+        device: registered.device.clone(),
+        registered: Some(registered.clone()),
+    })
 }
 
 /// Looks up a block device by its kernel device name.
@@ -167,8 +269,8 @@ pub fn lookup_by_name(name: &str) -> Option<Arc<dyn BlockDevice>> {
     DEVICE_REGISTRY
         .lock()
         .values()
-        .find(|device| device.name() == name)
-        .cloned()
+        .find(|registered| registered.device.name() == name)
+        .map(|registered| registered.device.clone())
 }
 
 /// Scans registered whole-disk devices and updates their partitions.
@@ -191,7 +293,110 @@ pub fn scan_partitions() {
     }
 }
 
-static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<dyn BlockDevice>>> = Mutex::new(BTreeMap::new());
+static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<RegisteredBlockDevice>>> =
+    Mutex::new(BTreeMap::new());
+
+#[cfg(ktest)]
+mod tests {
+    use ::device_id::{MajorId, MinorId};
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestBlockDevice {
+        id: DeviceId,
+    }
+
+    impl TestBlockDevice {
+        fn new(minor: u32) -> Arc<Self> {
+            Arc::new(Self {
+                id: DeviceId::new(MajorId::new(510), MinorId::new(minor)),
+            })
+        }
+    }
+
+    impl BlockDevice for TestBlockDevice {
+        fn enqueue(&self, _bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            unreachable!()
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta::default()
+        }
+
+        fn name(&self) -> &str {
+            "block-registry-test"
+        }
+
+        fn id(&self) -> DeviceId {
+            self.id
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReentrantIdBlockDevice {
+        id: DeviceId,
+        id_calls: AtomicUsize,
+    }
+
+    impl ReentrantIdBlockDevice {
+        fn new(minor: u32) -> Arc<Self> {
+            Arc::new(Self {
+                id: DeviceId::new(MajorId::new(510), MinorId::new(minor)),
+                id_calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl BlockDevice for ReentrantIdBlockDevice {
+        fn enqueue(&self, _bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            unreachable!()
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta::default()
+        }
+
+        fn name(&self) -> &str {
+            "block-registry-reentrant-id-test"
+        }
+
+        fn id(&self) -> DeviceId {
+            self.id_calls.fetch_add(1, Ordering::Relaxed);
+            let _ = lookup(self.id);
+            self.id
+        }
+    }
+
+    #[ktest]
+    fn caches_device_id_before_locking_registry() {
+        let device = ReentrantIdBlockDevice::new(6);
+        let id = device.id;
+        register(device.clone()).unwrap();
+        assert_eq!(device.id_calls.load(Ordering::Relaxed), 1);
+        unregister(id).unwrap();
+        assert_eq!(device.id_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[ktest]
+    fn lease_blocks_unregistration_until_last_holder_drops() {
+        let device = TestBlockDevice::new(1);
+        let id = device.id();
+        register(device).unwrap();
+
+        let lease = lookup_lease(id).unwrap();
+        let cloned = lease.clone();
+        assert_eq!(unregister(id).unwrap_err(), Error::Busy);
+        assert!(lookup(id).is_some());
+
+        drop(lease);
+        assert_eq!(unregister(id).unwrap_err(), Error::Busy);
+        drop(cloned);
+        assert!(unregister(id).is_ok());
+        assert!(lookup_lease(id).is_none());
+    }
+}
 
 #[init_component]
 fn init() -> Result<(), ComponentInitError> {
