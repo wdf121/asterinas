@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-/* VERSION-only Device Mapper control ABI regression tests. */
+/* VERSION and tableless CREATE Device Mapper control ABI regression tests. */
 
 #include <fcntl.h>
 #include <linux/dm-ioctl.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -103,6 +104,73 @@ FN_TEST(device_mapper_version_only_accesses_version_bytes)
 			 _ret == 0);
 	}
 	TEST_SUCC(munmap(pages, page_size * 2));
+	TEST_SUCC(close(fd));
+}
+END_TEST()
+
+FN_TEST(device_mapper_create_tableless)
+{
+	int fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+	struct dm_ioctl io = {};
+	char name[DM_NAME_LEN];
+	char uuid[DM_UUID_LEN];
+	char collision_name[DM_NAME_LEN];
+	char retry_name[DM_NAME_LEN];
+
+	snprintf(name, sizeof(name), "dm-phase1-%ld", (long)getpid());
+	snprintf(uuid, sizeof(uuid), "dm-phase1-uuid-%ld", (long)getpid());
+	snprintf(collision_name, sizeof(collision_name),
+		 "dm-phase1-uuid-collision-%ld", (long)getpid());
+	snprintf(retry_name, sizeof(retry_name), "dm-phase1-minor-retry-%ld",
+		 (long)getpid());
+	memcpy(io.version, kernel_version, sizeof(io.version));
+	io.data_size = sizeof(io);
+	strcpy(io.name, name);
+	strcpy(io.uuid, uuid);
+	TEST_RES(ioctl(fd, DM_DEV_CREATE, &io), _ret == 0);
+	TEST_RES(strcmp(io.name, name), _ret == 0);
+	TEST_RES(strcmp(io.uuid, uuid), _ret == 0);
+	TEST_RES(io.dev, _ret != 0 && minor(io.dev) == 0);
+	TEST_RES(io.data_size, _ret == offsetof(struct dm_ioctl, data));
+	TEST_RES(io.target_count, _ret == 0);
+	TEST_RES(io.flags, _ret == 0);
+
+	struct dm_ioctl duplicate = {};
+	memcpy(duplicate.version, kernel_version, sizeof(duplicate.version));
+	duplicate.data_size = sizeof(duplicate);
+	strcpy(duplicate.name, name);
+	TEST(ioctl(fd, DM_DEV_CREATE, &duplicate), EBUSY, _ret == -1);
+
+	/* Number allocation precedes name/UUID collision checks. */
+	duplicate.flags = DM_PERSISTENT_DEV_FLAG;
+	duplicate.dev = io.dev;
+	TEST(ioctl(fd, DM_DEV_CREATE, &duplicate), ENXIO, _ret == -1);
+
+	struct dm_ioctl duplicate_uuid = {};
+	memcpy(duplicate_uuid.version, kernel_version,
+	       sizeof(duplicate_uuid.version));
+	duplicate_uuid.data_size = sizeof(duplicate_uuid);
+	strcpy(duplicate_uuid.name, collision_name);
+	strcpy(duplicate_uuid.uuid, uuid);
+	duplicate_uuid.flags = DM_PERSISTENT_DEV_FLAG;
+	duplicate_uuid.dev = makedev(major(io.dev), 7);
+	TEST(ioctl(fd, DM_DEV_CREATE, &duplicate_uuid), EBUSY, _ret == -1);
+
+	struct dm_ioctl retry = {};
+	memcpy(retry.version, kernel_version, sizeof(retry.version));
+	retry.data_size = sizeof(retry);
+	strcpy(retry.name, retry_name);
+	retry.flags = DM_PERSISTENT_DEV_FLAG;
+	retry.dev = duplicate_uuid.dev;
+	TEST_RES(ioctl(fd, DM_DEV_CREATE, &retry),
+		 _ret == 0 && minor(retry.dev) == 7);
+
+	struct dm_ioctl invalid = {};
+	memcpy(invalid.version, kernel_version, sizeof(invalid.version));
+	invalid.data_size = sizeof(invalid);
+	strcpy(invalid.name, "invalid/name");
+	TEST(ioctl(fd, DM_DEV_CREATE, &invalid), EINVAL, _ret == -1);
+
 	TEST_SUCC(close(fd));
 }
 END_TEST()

@@ -6,7 +6,7 @@
 
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 
-use aster_block::{MajorIdOwner, allocate_major};
+use aster_block::{MajorIdOwner, allocate_major_with_name};
 use device_id::{DeviceId, MinorId};
 use id_alloc::IdAlloc;
 use ostd::sync::Mutex;
@@ -72,8 +72,9 @@ pub struct DmManager {
 impl DmManager {
     /// Creates a manager and dynamically allocates a block major.
     pub fn new() -> Result<Self, DmError> {
-        // This branch does not yet register names for /proc/devices.
-        let major = Arc::new(allocate_major().map_err(|_| DmError::MajorExhausted)?);
+        let major = Arc::new(
+            allocate_major_with_name("device-mapper").map_err(|_| DmError::MajorExhausted)?,
+        );
         Ok(Self {
             major,
             minors: Arc::new(Mutex::new(IdAlloc::with_capacity(

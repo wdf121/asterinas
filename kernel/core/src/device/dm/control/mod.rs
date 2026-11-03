@@ -2,8 +2,8 @@
 
 //! Linux Device Mapper control-device registration and VERSION ioctl entry point.
 //!
-//! This first stage only exposes the control device and ABI version handshake;
-//! mapper identities, tables, and block I/O belong to later stages.
+//! The control device supports the VERSION handshake and tableless CREATE.
+//! Mapping tables and block I/O belong to later stages.
 
 use device_id::{DeviceId, MinorId};
 use ostd::mm::VmIo;
@@ -27,6 +27,10 @@ use crate::{
     security::lsm::hooks as lsm_hooks,
     util::ioctl::RawIoctl,
 };
+
+mod abi;
+mod commands;
+mod ioctl;
 
 const DM_CONTROL_MINOR: u32 = 236;
 const DM_IOCTL_MAGIC: u32 = 0xfd;
@@ -66,7 +70,7 @@ impl Device for DmControlDevice {
     }
 }
 
-/// Open control handle; only version negotiation is available at this stage.
+/// Open control handle; VERSION and tableless CREATE are available.
 struct DmControlFile;
 
 impl Pollable for DmControlFile {
@@ -140,10 +144,13 @@ impl PerOpenFileOps for DmControlFile {
         current_userspace!().write_bytes(raw_ioctl.arg(), &version)?;
         version_result?;
 
-        if raw_cmd as u8 != DM_VERSION_CMD {
-            return_errno_with_message!(Errno::ENOTTY, "unsupported device-mapper ioctl command");
+        let command = raw_cmd as u8;
+        if command == DM_VERSION_CMD {
+            return Ok(0);
         }
-        Ok(0)
+        // Linux negotiates the version before checking command support.
+        let handler = commands::handler_for(command)?;
+        ioctl::process_ioctl_parameters(raw_ioctl.arg(), &version, handler)
     }
 }
 
