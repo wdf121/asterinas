@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Device Mapper identities and their device-number ownership.
+//! Device Mapper identities, device-number ownership, and inactive linear tables.
 //!
 //! Creating a mapper here does not install a table or register a block device.
 
@@ -11,9 +11,12 @@ extern crate alloc;
 
 mod device;
 mod manager;
+mod table;
+pub mod target;
 
 pub use device::DmDevice;
 pub use manager::DmManager;
+pub use table::DmTable;
 
 /// Reasons why a core Device Mapper operation failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,4 +33,25 @@ pub enum DmError {
     MinorExhausted,
     /// Block device major numbers are exhausted.
     MajorExhausted,
+}
+
+/// Reasons why mapping table validation failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableError {
+    /// A mapping table needs at least one target.
+    UnsupportedTargetCount,
+    /// Logical targets must start at sector 0 and be contiguous.
+    UnsupportedLogicalStart,
+    /// Target length cannot be zero.
+    ZeroLength,
+    /// The logical range overflowed.
+    LogicalRangeOverflow,
+    /// The backing range overflowed.
+    BackingRangeOverflow,
+    /// The backing range exceeds the block device capacity.
+    BackingRangeOutOfBounds,
+    /// The backing device type is not currently supported.
+    UnsupportedBackingDevice,
+    /// Target parameters or geometry are invalid.
+    InvalidTargetParams,
 }

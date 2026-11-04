@@ -1,22 +1,27 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Tableless mapper identity. Its number remains owned while references exist,
-//! unless completed removal explicitly releases it after the control-plane drain.
+//! Mapper identity and inactive table ownership. Its number remains owned while
+//! references exist, unless removal releases it after the control-plane drain.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
+use aster_block::{
+    BlockDevice, BlockDeviceMeta,
+    bio::{BioEnqueueError, SubmittedBio},
+};
 use device_id::DeviceId;
 use ostd::sync::Mutex;
 
-use crate::manager::DmDeviceIdOwner;
+use crate::{DmTable, manager::DmDeviceIdOwner};
 
-/// An unregistered Device Mapper identity without an active or inactive table.
+/// A mapper identity with an optional inactive table, not yet registered as a block device.
 #[derive(Debug)]
 pub struct DmDevice {
     id_owner: DmDeviceIdOwner,
     primary_name: String,
     mapper_name: Mutex<String>,
     uuid: Mutex<Option<Vec<u8>>>,
+    inactive: Mutex<Option<Arc<DmTable>>>,
 }
 
 impl DmDevice {
@@ -31,6 +36,7 @@ impl DmDevice {
             primary_name,
             mapper_name: Mutex::new(mapper_name),
             uuid: Mutex::new(uuid),
+            inactive: Mutex::new(None),
         }
     }
 
@@ -54,9 +60,38 @@ impl DmDevice {
         self.uuid.lock().clone()
     }
 
+    /// Installs a fully validated mapping table as the inactive table.
+    pub fn load_table(&self, table: Arc<DmTable>) {
+        *self.inactive.lock() = Some(table);
+    }
+
+    /// Returns the inactive table, if one has been installed.
+    pub fn inactive_table(&self) -> Option<Arc<DmTable>> {
+        self.inactive.lock().clone()
+    }
+
     /// Releases the number after the caller has drained control and I/O users.
     /// Structural references can continue to observe the immutable identity.
     pub fn drain_removed(&self) {
         self.id_owner.release();
+    }
+}
+
+impl BlockDevice for DmDevice {
+    fn enqueue(&self, _bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+        // No table is active before the initial resume.
+        Err(BioEnqueueError::Refused)
+    }
+
+    fn metadata(&self) -> BlockDeviceMeta {
+        BlockDeviceMeta::default()
+    }
+
+    fn name(&self) -> &str {
+        self.primary_name.as_str()
+    }
+
+    fn id(&self) -> DeviceId {
+        self.id_owner.id()
     }
 }
