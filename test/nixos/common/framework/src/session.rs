@@ -135,7 +135,18 @@ impl Session {
     /// }
     /// ```
     pub fn run_cmd_and_expect(&mut self, command: &str, expected: &str) -> Result<(), Error> {
-        println!("--> Running: {} (expecting: {})", command, expected);
+        self.run_cmd_and_expect_display(command, command, expected)
+    }
+
+    /// Runs a command with assertions while showing a concise description in the log.
+    /// The displayed text describes the operation; the full command still runs unchanged.
+    pub fn run_cmd_and_expect_display(
+        &mut self,
+        display: &str,
+        command: &str,
+        expected: &str,
+    ) -> Result<(), Error> {
+        println!("--> Running: {} (expecting: {})", display, expected);
         self.pty_session.send_line(command).map_err(Error::from)?;
         // Read and consume the echoed command line
         self.pty_session.exp_string(command).map_err(Error::from)?;

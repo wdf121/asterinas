@@ -402,7 +402,6 @@ impl PerOpenFileOps for OpenBlockFile {
 /// Until publication finishes, the wrapper rejects opens. If node creation
 /// fails and sysfs cleanup cannot complete, the pending registration and
 /// wrapper remain reserved for a later `unregister_runtime_primary` retry.
-#[cfg_attr(not(ktest), expect(dead_code, reason = "used by the LOAD phase"))]
 pub(crate) fn register_runtime_primary(device: Arc<dyn BlockDevice>, path: String) -> Result<()> {
     // Validate before building the sysfs device: its name cannot contain '/'.
     let meta = DevtmpfsNodeMeta::new(path.clone())
@@ -458,6 +457,14 @@ fn remove_owned_node_or_accept_stale(handle: &DevtmpfsHandle) -> Result<()> {
         Err(error) if matches!(error.error(), Errno::ENOENT | Errno::ESTALE) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// Reports whether a runtime primary node has completed publication.
+pub(crate) fn is_runtime_primary_registered(id: DeviceId) -> bool {
+    DEVICE_REGISTRY
+        .lock()
+        .get(&id.to_raw())
+        .is_some_and(|file| file.state.lock().accepting_opens)
 }
 
 fn lookup_runtime_block_file(id: DeviceId) -> Result<Arc<BlockFile>> {

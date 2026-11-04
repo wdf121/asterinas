@@ -22,6 +22,8 @@ pub struct DmDevice {
     mapper_name: Mutex<String>,
     uuid: Mutex<Option<Vec<u8>>>,
     inactive: Mutex<Option<Arc<DmTable>>>,
+    /// Serializes first publication with table replacement for this mapper.
+    lifecycle: Mutex<()>,
 }
 
 impl DmDevice {
@@ -37,6 +39,7 @@ impl DmDevice {
             mapper_name: Mutex::new(mapper_name),
             uuid: Mutex::new(uuid),
             inactive: Mutex::new(None),
+            lifecycle: Mutex::new(()),
         }
     }
 
@@ -58,6 +61,11 @@ impl DmDevice {
     /// Returns the opaque UUID bytes, if specified.
     pub fn uuid(&self) -> Option<Vec<u8>> {
         self.uuid.lock().clone()
+    }
+
+    /// Holds the mapper lifecycle across primary publication and table installation.
+    pub fn lock_lifecycle(&self) -> ostd::sync::MutexGuard<'_, ()> {
+        self.lifecycle.lock()
     }
 
     /// Installs a fully validated mapping table as the inactive table.

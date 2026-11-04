@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Fixed-prefix Device Mapper ioctl ABI used by the supported commands.
+//! Device Mapper ioctl ABI for the supported CREATE and LOAD commands.
 
 use crate::prelude::*;
 
 pub(super) const DM_DEV_CREATE_CMD: u8 = 3;
+pub(super) const DM_TABLE_LOAD_CMD: u8 = 9;
+pub(super) const DM_IOCTL_HEADER_SIZE: usize = 312;
+pub(super) const DM_TARGET_SPEC_SIZE: usize = 40;
 pub(super) const FIXED_PREFIX_SIZE: usize = 305;
 pub(super) const MAX_IOCTL_SIZE: u32 = 1024 * 1024 * 1024;
 pub(super) const OFF_DATA_SIZE: usize = 12;
+pub(super) const OFF_DATA_START: usize = 16;
 pub(super) const OFF_TARGET_COUNT: usize = 20;
 pub(super) const OFF_OPEN_COUNT: usize = 24;
 pub(super) const OFF_FLAGS: usize = 28;
@@ -35,12 +39,22 @@ pub(super) fn validate_ioctl_size(size: u32) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_ioctl_params(buffer: &mut [u8; FIXED_PREFIX_SIZE]) -> Result<()> {
+pub(super) fn validate_ioctl_params(
+    buffer: &mut [u8; FIXED_PREFIX_SIZE],
+    command: u8,
+) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS)
         & !(BUFFER_FULL_FLAG | UEVENT_GENERATED_FLAG | SECURE_DATA_FLAG | DATA_OUT_FLAG);
     write_u32(buffer, OFF_FLAGS, flags);
-    if buffer[OFF_NAME] == 0 {
-        return_errno_with_message!(Errno::EINVAL, "missing mapper name");
+    if command == DM_DEV_CREATE_CMD {
+        if buffer[OFF_NAME] == 0 {
+            return_errno_with_message!(Errno::EINVAL, "missing mapper name");
+        }
+    } else if buffer[OFF_NAME] != 0 && buffer[OFF_UUID] != 0 {
+        return_errno_with_message!(
+            Errno::EINVAL,
+            "name and UUID selectors are mutually exclusive"
+        );
     }
     buffer[OFF_NAME + NAME_LEN - 1] = 0;
     buffer[OFF_UUID + UUID_LEN - 1] = 0;

@@ -151,13 +151,18 @@ inventory::collect!(TestCase);
 macro_rules! nixos_test_main {
     () => {
         fn main() -> Result<(), Box<dyn std::error::Error>> {
-            $crate::__nixos_test_main()
+            $crate::__nixos_test_main_with_order(&[])
+        }
+    };
+    (order = [$($name:literal),+ $(,)?]) => {
+        fn main() -> Result<(), Box<dyn std::error::Error>> {
+            $crate::__nixos_test_main_with_order(&[$($name),+])
         }
     };
 }
 
 #[doc(hidden)]
-pub fn __nixos_test_main() -> Result<(), Box<dyn std::error::Error>> {
+pub fn __nixos_test_main_with_order(order: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
     // Check for --help flag
@@ -179,10 +184,20 @@ pub fn __nixos_test_main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?
         .unwrap_or(600_000); // Default: 10 minutes
 
-    let all_test_cases: Vec<&TestCase> = inventory::iter::<TestCase>().collect();
+    let mut all_test_cases: Vec<&TestCase> = inventory::iter::<TestCase>().collect();
 
     if all_test_cases.is_empty() {
         return Err("No test cases found".into());
+    }
+    if !order.is_empty() {
+        if order.len() != all_test_cases.len()
+            || order
+                .iter()
+                .any(|name| all_test_cases.iter().filter(|tc| tc.name == *name).count() != 1)
+        {
+            return Err("Test order must list every registered case exactly once".into());
+        }
+        all_test_cases.sort_by_key(|tc| order.iter().position(|name| *name == tc.name).unwrap());
     }
 
     // Filter test cases if --test is specified

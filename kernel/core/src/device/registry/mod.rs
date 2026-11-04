@@ -7,7 +7,7 @@ use crate::{
     prelude::*,
 };
 
-mod block;
+pub(crate) mod block;
 pub mod char;
 
 pub(super) fn init_in_first_kthread() {

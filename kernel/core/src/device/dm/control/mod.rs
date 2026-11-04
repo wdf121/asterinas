@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Linux Device Mapper control-device registration and VERSION ioctl entry point.
+//! Linux Device Mapper control-device registration and VERSION/CREATE/LOAD entry points.
 //!
-//! The control device supports the VERSION handshake and tableless CREATE.
-//! Mapping tables and block I/O belong to later stages.
+//! LOAD validates an inactive linear table and publishes only `/dev/dm-N`.
+//! Initial RESUME and mapping I/O belong to later stages.
 
 use device_id::{DeviceId, MinorId};
 use ostd::mm::VmIo;
@@ -70,7 +70,7 @@ impl Device for DmControlDevice {
     }
 }
 
-/// Open control handle; VERSION and tableless CREATE are available.
+/// Open control handle; VERSION, tableless CREATE and inactive-table LOAD are available.
 struct DmControlFile;
 
 impl Pollable for DmControlFile {
@@ -150,7 +150,7 @@ impl PerOpenFileOps for DmControlFile {
         }
         // Linux negotiates the version before checking command support.
         let handler = commands::handler_for(command)?;
-        ioctl::process_ioctl_parameters(raw_ioctl.arg(), &version, handler)
+        ioctl::process_ioctl_parameters(raw_ioctl.arg(), &version, command, handler)
     }
 }
 

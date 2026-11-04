@@ -6,6 +6,7 @@ use aster_dm::DmManager;
 use spin::Once;
 
 mod control;
+mod runtime;
 
 static DM_MANAGER: Once<DmManager> = Once::new();
 
