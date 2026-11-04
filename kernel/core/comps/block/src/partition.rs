@@ -255,7 +255,7 @@ struct PartitionNode {
 
 impl BlockDevice for PartitionNode {
     fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
-        bio.set_sid_offset(self.info.start_sector());
+        bio.offset_mapped_sid_range(self.info.start_sector())?;
         self.device.enqueue(bio)
     }
 
@@ -365,5 +365,94 @@ fn partition_name(disk_name: &str, partno: u32) -> String {
         format!("{}p{}", disk_name, partno)
     } else {
         format!("{}{}", disk_name, partno)
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ::device_id::MajorId;
+    use ostd::prelude::ktest;
+
+    use super::*;
+    use crate::{
+        bio::{Bio, BioDirection, BioSegment, BioStatus, BioType},
+        id::Sid,
+    };
+
+    #[derive(Debug)]
+    struct RecordingBlockDevice {
+        id: DeviceId,
+        range: Mutex<Option<Range<Sid>>>,
+    }
+
+    impl BlockDevice for RecordingBlockDevice {
+        fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+            *self.range.lock() = Some(bio.sid_range().clone());
+            bio.complete(BioStatus::Complete);
+            Ok(())
+        }
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta::default()
+        }
+        fn name(&self) -> &str {
+            "partition-test-backing"
+        }
+        fn id(&self) -> DeviceId {
+            self.id
+        }
+    }
+
+    fn partition(id: u32, start: u32, device: Arc<dyn BlockDevice>) -> PartitionNode {
+        PartitionNode::new(
+            DeviceId::new(MajorId::new(510), MinorId::new(id)),
+            String::from("partition-test"),
+            device,
+            PartitionInfo::Mbr(MbrEntry {
+                flag: 0,
+                start_chs: ChsAddr([0, 1, 0]),
+                type_: 0x83,
+                end_chs: ChsAddr([0, 1, 0]),
+                start_sector: start,
+                total_sectors: 128,
+            }),
+        )
+    }
+
+    #[ktest]
+    fn partition_offsets_compose_across_layers() {
+        let backing = Arc::new(RecordingBlockDevice {
+            id: DeviceId::new(MajorId::new(510), MinorId::new(1)),
+            range: Mutex::new(None),
+        });
+        let lower = Arc::new(partition(2, 100, backing.clone()));
+        let upper = partition(3, 20, lower);
+        let bio = Bio::new(
+            BioType::Read,
+            Sid::new(7),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        )
+        .submit_for_test();
+        upper.enqueue(bio).unwrap();
+        assert_eq!(*backing.range.lock(), Some(Sid::new(127)..Sid::new(135)));
+    }
+
+    #[ktest]
+    fn partition_rejects_remap_overflow() {
+        let backing = Arc::new(RecordingBlockDevice {
+            id: DeviceId::new(MajorId::new(510), MinorId::new(4)),
+            range: Mutex::new(None),
+        });
+        let partition = partition(5, 100, backing.clone());
+        let mut bio = Bio::new(
+            BioType::Read,
+            Sid::new(0),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        )
+        .submit_for_test();
+        bio.remap_sid_start(Sid::new(u64::MAX - 8)).unwrap();
+        assert_eq!(partition.enqueue(bio), Err(BioEnqueueError::Refused));
+        assert!(backing.range.lock().is_none());
     }
 }

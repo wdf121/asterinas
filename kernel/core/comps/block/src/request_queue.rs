@@ -137,11 +137,9 @@ impl Debug for BioRequestSingleQueue {
 /// that (1) are of the same request type and (2) are contiguous in terms of target sectors.
 /// This helps reduce the number of I/O requests submitted to the underlying storage medium.
 ///
-/// Second, a `BioRequest` provides the physical sector addresses suitable for storage medium.
-/// The sector addresses returned from `SubmittedBio::sid_range()` are logical ones:
-/// they need to be adjusted with `SubmittedBio::sid_offset()` to calculate the physical ones.
-/// This calculation is handled internally by `BioRequest`.
-/// One can simply call `BioRequest::sid_range()` to obtain the physical sector addresses.
+/// Second, a `BioRequest` exposes the current sector addresses after all upper block layers
+/// have remapped the submitted BIO. One can simply call `BioRequest::sid_range()` to obtain
+/// the addresses that should be sent to the storage medium.
 #[derive(Debug)]
 pub struct BioRequest {
     /// The type of the I/O
@@ -193,10 +191,8 @@ impl BioRequest {
             return false;
         }
 
-        let sid_offset = rq_bio.sid_offset();
-
-        rq_bio.sid_range().start + sid_offset == self.sid_range.end
-            || rq_bio.sid_range().end + sid_offset == self.sid_range.start
+        rq_bio.sid_range().start == self.sid_range.end
+            || rq_bio.sid_range().end == self.sid_range.start
     }
 
     /// Merges the `SubmittedBio` into this request.
@@ -210,13 +206,12 @@ impl BioRequest {
         assert!(self.can_merge(&rq_bio));
 
         let rq_bio_nr_segments = rq_bio.segments().len();
-        let sid_offset = rq_bio.sid_offset();
 
-        if rq_bio.sid_range().start + sid_offset == self.sid_range.end {
-            self.sid_range.end = rq_bio.sid_range().end + sid_offset;
+        if rq_bio.sid_range().start == self.sid_range.end {
+            self.sid_range.end = rq_bio.sid_range().end;
             self.bios.push_back(rq_bio);
         } else {
-            self.sid_range.start = rq_bio.sid_range().start + sid_offset;
+            self.sid_range.start = rq_bio.sid_range().start;
             self.bios.push_front(rq_bio);
         }
 
@@ -226,9 +221,7 @@ impl BioRequest {
 
 impl From<SubmittedBio> for BioRequest {
     fn from(bio: SubmittedBio) -> Self {
-        let mut sid_range = bio.sid_range().clone();
-        sid_range.start = sid_range.start + bio.sid_offset();
-        sid_range.end = sid_range.end + bio.sid_offset();
+        let sid_range = bio.sid_range().clone();
 
         Self {
             type_: bio.type_(),
@@ -239,6 +232,52 @@ impl From<SubmittedBio> for BioRequest {
                 bios.push_front(bio);
                 bios
             },
+        }
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+    use crate::bio::{Bio, BioDirection, BioSegment, BioStatus};
+
+    fn mapped_bio(logical: u64, mapped: u64) -> SubmittedBio {
+        let mut bio = Bio::new(
+            BioType::Read,
+            Sid::new(logical),
+            vec![BioSegment::alloc(1, BioDirection::FromDevice)],
+            None,
+        )
+        .submit_for_test();
+        bio.remap_sid_start(Sid::new(mapped)).unwrap();
+        bio
+    }
+
+    #[ktest]
+    fn merges_only_when_mapped_ranges_are_contiguous() {
+        let queue = BioRequestSingleQueue::new();
+        queue.enqueue(mapped_bio(0, 100)).unwrap();
+        queue.enqueue(mapped_bio(8, 108)).unwrap();
+        assert_eq!(queue.num_requests(), 1);
+        let request = queue.dequeue();
+        assert_eq!(request.sid_range(), &(Sid::new(100)..Sid::new(116)));
+        assert_eq!(request.bios().count(), 2);
+        for bio in request.into_bios() {
+            bio.complete(BioStatus::Complete);
+        }
+
+        queue.enqueue(mapped_bio(0, 100)).unwrap();
+        // Logically adjacent, but the device addresses have a gap.
+        queue.enqueue(mapped_bio(8, 200)).unwrap();
+        assert_eq!(queue.num_requests(), 2);
+        for expected in [100, 200] {
+            let request = queue.dequeue();
+            assert_eq!(request.sid_range().start, Sid::new(expected));
+            for bio in request.into_bios() {
+                bio.complete(BioStatus::Complete);
+            }
         }
     }
 }
