@@ -6,6 +6,7 @@
 //! this tree are expected to be `RamInode`s.
 
 use alloc::borrow::Cow;
+use core::fmt::Debug;
 
 use device_id::DeviceId;
 
@@ -100,12 +101,53 @@ impl DevtmpfsNode {
     }
 }
 
-pub(super) fn create_node(node: &DevtmpfsNode) -> Result<()> {
-    let (parent_path, node_name) = node.meta.path().split_dirname_and_basename().unwrap();
-    let parent_inode = lookup_or_create_path(parent_path)?;
-    create_device_node(parent_inode.as_ref(), node_name, node)
+/// An owned devtmpfs tree entry.
+///
+/// The inode identity is private so callers can only remove the original entry
+/// through devtmpfsd. `path` is relative to the devtmpfs root.
+#[derive(Clone)]
+pub(crate) struct DevtmpfsHandle {
+    inode: Arc<RamInode>,
+    path: String,
 }
 
+impl Debug for DevtmpfsHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DevtmpfsHandle")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DevtmpfsHandle {
+    fn new(inode: Arc<RamInode>, path: &str) -> Self {
+        Self {
+            inode,
+            path: path.into(),
+        }
+    }
+}
+
+pub(super) fn create_node(node: &DevtmpfsNode) -> Result<DevtmpfsHandle> {
+    let (parent_path, node_name) = node.meta.path().split_dirname_and_basename().unwrap();
+    let parent_inode = lookup_or_create_path(parent_path)?;
+    let inode = create_device_node(parent_inode.as_ref(), node_name, node)?;
+    Ok(DevtmpfsHandle::new(inode, node.meta.path()))
+}
+
+/// Deletes an entry only if it is still the inode created for `handle`.
+pub(super) fn delete(handle: DevtmpfsHandle) -> Result<()> {
+    let (parent_path, name) = handle.path.split_dirname_and_basename().unwrap();
+    let parent = Arc::downcast::<RamInode>(lookup_path(parent_path)?).unwrap();
+    match handle.inode.type_() {
+        InodeType::Dir => parent.rmdir_if_same(name, &handle.inode)?,
+        _ => parent.unlink_if_same(name, &handle.inode)?,
+    }
+    remove_empty_parent_dirs(parent_path);
+    Ok(())
+}
+
+/// Retains the legacy best-effort deletion semantics for ordinary device callers.
 pub(super) fn delete_node(node: &DevtmpfsNode) -> Result<()> {
     let (parent_path, node_name) = node.meta.path().split_dirname_and_basename().unwrap();
     let parent_inode = lookup_path(parent_path)?;
@@ -156,7 +198,11 @@ fn lookup_or_create_dir(parent_inode: &dyn Inode, name: &str) -> Result<Arc<dyn 
     }
 }
 
-fn create_device_node(parent_inode: &dyn Inode, name: &str, node: &DevtmpfsNode) -> Result<()> {
+fn create_device_node(
+    parent_inode: &dyn Inode,
+    name: &str,
+    node: &DevtmpfsNode,
+) -> Result<Arc<RamInode>> {
     let rdev = node.device_id.as_encoded_u64();
     let mknod_type = match node.device_type {
         DeviceType::Block => MknodType::BlockDevice(rdev),
@@ -164,8 +210,8 @@ fn create_device_node(parent_inode: &dyn Inode, name: &str, node: &DevtmpfsNode)
     };
 
     let parent_ram_inode = parent_inode.downcast_ref::<RamInode>().unwrap();
-    parent_ram_inode.mknod_with_revalidation(name, node.meta.mode(), mknod_type)?;
-    Ok(())
+    let inode = parent_ram_inode.mknod_with_revalidation(name, node.meta.mode(), mknod_type)?;
+    Ok(Arc::downcast::<RamInode>(inode).unwrap())
 }
 
 fn remove_empty_parent_dirs(path: &str) {

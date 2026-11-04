@@ -132,6 +132,10 @@ impl<C: Class> DeviceInternals for ClassDevice<C> {
     fn wants_device_link(&self) -> bool {
         self.declared.has_device_link()
     }
+
+    fn creates_devnode(&self) -> bool {
+        C::CREATES_DEVNODE
+    }
 }
 
 impl<C: Class> core::fmt::Debug for ClassDevice<C> {

@@ -889,6 +889,75 @@ impl RamInode {
         Ok(true)
     }
 
+    /// Removes a non-directory entry only if it is still `expected`.
+    ///
+    /// The identity comparison and unlink happen while the parent directory is
+    /// locked, so a replacement cannot turn an ownership check into a TOCTOU.
+    pub(in crate::fs::fs_impls) fn unlink_if_same(
+        &self,
+        name: &str,
+        expected: &Arc<Self>,
+    ) -> Result<()> {
+        if !self.unlink_if(name, |current| {
+            core::ptr::eq(current, Arc::as_ptr(expected))
+        })? {
+            return_errno_with_message!(Errno::ESTALE, "the directory entry was replaced");
+        }
+        Ok(())
+    }
+
+    /// Removes an empty directory only if it is still `expected`.
+    ///
+    /// Both the entry lookup and the identity comparison occur after taking the
+    /// stable parent/child directory locks.
+    pub(in crate::fs::fs_impls) fn rmdir_if_same(
+        &self,
+        name: &str,
+        expected: &Arc<Self>,
+    ) -> Result<()> {
+        if is_dot(name) {
+            return_errno_with_message!(Errno::EINVAL, "rmdir on .");
+        }
+        if is_dotdot(name) {
+            return_errno_with_message!(Errno::ENOTEMPTY, "rmdir on ..");
+        }
+        if self.typ != InodeType::Dir {
+            return_errno_with_message!(Errno::ENOTDIR, "self is not dir");
+        }
+        if expected.typ != InodeType::Dir {
+            return_errno_with_message!(Errno::ENOTDIR, "rmdir on not dir");
+        }
+
+        let (mut self_dir, target_dir) = write_lock_two_direntries_by_ino(
+            (self.ino, self.inner.as_direntry().unwrap()),
+            (expected.ino, expected.inner.as_direntry().unwrap()),
+        );
+        let Some((idx, current)) = self_dir.get_entry(name) else {
+            return_errno!(Errno::ENOENT);
+        };
+        if !Arc::ptr_eq(&current, expected) {
+            return_errno_with_message!(Errno::ESTALE, "the directory entry was replaced");
+        }
+        if !target_dir.is_empty_children() {
+            return_errno_with_message!(Errno::ENOTEMPTY, "dir not empty");
+        }
+        self_dir.remove_entry(idx);
+        drop(self_dir);
+        drop(target_dir);
+
+        let now = now();
+        let mut self_meta = self.metadata.lock();
+        self_meta.dec_size();
+        self_meta.dec_nlinks();
+        self_meta.set_mtime(now);
+        self_meta.set_ctime(now);
+        drop(self_meta);
+        let mut target_meta = expected.metadata.lock();
+        target_meta.dec_nlinks();
+        target_meta.dec_nlinks();
+        Ok(())
+    }
+
     fn create_impl(
         &self,
         name: &str,

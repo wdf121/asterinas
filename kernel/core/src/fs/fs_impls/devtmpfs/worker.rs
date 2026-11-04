@@ -5,32 +5,41 @@
 use ostd::sync::{Waiter, Waker};
 use spin::Once;
 
-use super::{DevtmpfsNode, tree};
+use super::{DevtmpfsHandle, DevtmpfsNode, tree};
 use crate::{prelude::*, thread::kernel_thread::ThreadOptions};
 
-/// Creates a device node through `devtmpfsd`.
-///
-/// The request is queued to the dedicated devtmpfs kernel thread and this
-/// function waits until the node has been created or the creation fails.
-pub(crate) fn create_node(node: DevtmpfsNode) -> Result<()> {
-    submit(Request::CreateNode(node))
+/// Creates a device node through `devtmpfsd` and returns its ownership handle.
+pub(crate) fn create_node(node: DevtmpfsNode) -> Result<DevtmpfsHandle> {
+    match submit(Request::CreateNode(node))? {
+        Response::Handle(handle) => Ok(handle),
+        Response::Unit => unreachable!(),
+    }
 }
 
-/// Deletes a device node through `devtmpfsd`.
+/// Deletes a handle's node through `devtmpfsd` using inode identity.
 ///
-/// The request is queued to the dedicated devtmpfs kernel thread and this
-/// function waits until the deletion has completed or failed. The deletion only
-/// unlinks nodes that were created by `devtmpfsd` and still match the requested
-/// device type and device ID.
+/// The caller retains the handle if deletion fails, so it can preserve its
+/// registration state and retry or recover the operation.
+pub(crate) fn delete(handle: &DevtmpfsHandle) -> Result<()> {
+    match submit(Request::Delete(handle.clone()))? {
+        Response::Unit => Ok(()),
+        Response::Handle(_) => unreachable!(),
+    }
+}
+
+/// Retains the legacy best-effort device-node deletion API for ordinary callers.
 pub(crate) fn delete_node(node: DevtmpfsNode) -> Result<()> {
-    submit(Request::DeleteNode(node))
+    match submit(Request::DeleteNode(node))? {
+        Response::Unit => Ok(()),
+        Response::Handle(_) => unreachable!(),
+    }
 }
 
 pub(super) fn init_in_first_kthread() {
     ThreadOptions::new(devtmpfsd).spawn();
 }
 
-fn submit(request: Request) -> Result<()> {
+fn submit(request: Request) -> Result<Response> {
     let (waiter, waker) = Waiter::new_pair();
     let request = Arc::new(PendingRequest::new(request, waker));
 
@@ -43,8 +52,7 @@ fn submit(request: Request) -> Result<()> {
 
     waiter.wait();
 
-    // `result` is guaranteed to be available after `waiter.wait()`.
-    *request.result.get().unwrap()
+    request.result.lock().take().unwrap()
 }
 
 fn devtmpfsd() {
@@ -60,10 +68,11 @@ fn devtmpfsd() {
         };
 
         let result = match &request.request {
-            Request::CreateNode(node) => tree::create_node(node),
-            Request::DeleteNode(node) => tree::delete_node(node),
+            Request::CreateNode(node) => tree::create_node(node).map(Response::Handle),
+            Request::Delete(handle) => tree::delete(handle.clone()).map(|()| Response::Unit),
+            Request::DeleteNode(node) => tree::delete_node(node).map(|()| Response::Unit),
         };
-        request.result.call_once(|| result);
+        *request.result.lock() = Some(result);
         request.waker.wake_up();
     }
 }
@@ -80,7 +89,7 @@ static REQUEST_QUEUE: RequestQueue = RequestQueue {
 
 struct PendingRequest {
     request: Request,
-    result: Once<Result<()>>,
+    result: Mutex<Option<Result<Response>>>,
     waker: Arc<Waker>,
 }
 
@@ -88,7 +97,7 @@ impl PendingRequest {
     fn new(request: Request, waker: Arc<Waker>) -> Self {
         Self {
             request,
-            result: Once::new(),
+            result: Mutex::new(None),
             waker,
         }
     }
@@ -96,7 +105,13 @@ impl PendingRequest {
 
 enum Request {
     CreateNode(DevtmpfsNode),
+    Delete(DevtmpfsHandle),
     DeleteNode(DevtmpfsNode),
+}
+
+enum Response {
+    Unit,
+    Handle(DevtmpfsHandle),
 }
 
 #[cfg(ktest)]

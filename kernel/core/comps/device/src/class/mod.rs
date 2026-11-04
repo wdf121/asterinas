@@ -60,6 +60,10 @@ pub trait Class: Sized + Send + Sync + 'static {
     /// Returns the attributes shared by all devices on this class.
     fn dev_attrs(&self) -> &'static [Attr<ClassDevice<Self>>];
 
+    /// Whether registration creates the devtmpfs node through the device-model hook.
+    /// Classes managing node publication as part of a separate transaction opt out.
+    const CREATES_DEVNODE: bool = true;
+
     /// Whether a device of this class placed under a class device still gets its own glue directory.
     const KEEPS_GLUE_DIR: bool = false;
 }

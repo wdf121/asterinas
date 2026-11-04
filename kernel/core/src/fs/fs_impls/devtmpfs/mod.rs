@@ -23,9 +23,9 @@ mod tree;
 mod worker;
 
 pub(in crate::fs) use fs::singleton;
-pub(crate) use tree::DevtmpfsNode;
 pub use tree::DevtmpfsNodeMeta;
-pub(crate) use worker::{create_node, delete_node};
+pub(crate) use tree::{DevtmpfsHandle, DevtmpfsNode};
+pub(crate) use worker::{create_node, delete, delete_node};
 
 pub(super) fn init() {
     fs::init();
@@ -36,12 +36,24 @@ pub(super) fn init_in_first_kthread() {
 }
 
 #[cfg(ktest)]
+pub(crate) fn init_for_ktest() {
+    worker::init_for_ktest();
+}
+
+#[cfg(ktest)]
+pub(crate) fn lookup_path_for_ktest(
+    path: &str,
+) -> crate::prelude::Result<crate::prelude::Arc<dyn crate::fs::vfs::inode::Inode>> {
+    tree::lookup_path(path)
+}
+
+#[cfg(ktest)]
 mod tests {
     use device_id::{DeviceId, MajorId, MinorId};
     use ostd::prelude::ktest;
 
     use super::{
-        DevtmpfsNode, DevtmpfsNodeMeta, create_node, delete_node, singleton, tree, worker,
+        DevtmpfsNode, DevtmpfsNodeMeta, create_node, delete, delete_node, singleton, tree, worker,
     };
     use crate::{
         device::DeviceType,
@@ -172,5 +184,18 @@ mod tests {
             Some(device_id(240, 6))
         );
         delete_node(char_node(path, 240, 6)).unwrap();
+    }
+
+    #[ktest]
+    fn owned_node_keeps_replacement() {
+        worker::init_for_ktest();
+        let path = "__devtmpfs_ktest_owned_replacement";
+        let handle = create_node(char_node(path, 240, 12)).unwrap();
+        delete_node(char_node(path, 240, 12)).unwrap();
+        let replacement = create_node(char_node(path, 240, 12)).unwrap();
+        assert_eq!(delete(&handle).unwrap_err().error(), Errno::ESTALE);
+        assert!(tree::lookup_path(path).is_ok());
+        delete(&replacement).unwrap();
+        assert_missing(path);
     }
 }

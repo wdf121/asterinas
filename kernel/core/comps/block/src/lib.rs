@@ -54,8 +54,91 @@ use ostd::sync::Mutex;
 /// A registered device and the number of long-term users holding it.
 #[derive(Debug)]
 struct RegisteredBlockDevice {
+    id: DeviceId,
     device: Arc<dyn BlockDevice>,
-    lease_count: Mutex<usize>,
+    state: Mutex<RegisteredBlockDeviceState>,
+}
+
+#[derive(Debug)]
+struct RegisteredBlockDeviceState {
+    status: RegistrationStatus,
+    lease_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistrationStatus {
+    Pending,
+    Live,
+    Removing,
+}
+
+/// A block device registration not yet published to lookups.
+#[derive(Debug)]
+pub struct PendingBlockDeviceRegistration {
+    registered: Arc<RegisteredBlockDevice>,
+}
+
+impl PendingBlockDeviceRegistration {
+    pub fn id(&self) -> DeviceId {
+        self.registered.id
+    }
+}
+
+/// A block device removed from new lookups while cleanup is in progress.
+#[derive(Debug)]
+pub struct PendingBlockDeviceUnregistration {
+    registered: Arc<RegisteredBlockDevice>,
+    restore_on_drop: bool,
+}
+
+impl PendingBlockDeviceUnregistration {
+    pub fn id(&self) -> DeviceId {
+        self.registered.id
+    }
+
+    /// Leave the entry isolated on drop when external cleanup could not be recovered.
+    pub fn retain_removing(mut self) -> Self {
+        self.restore_on_drop = false;
+        self
+    }
+}
+
+impl Drop for PendingBlockDeviceRegistration {
+    fn drop(&mut self) {
+        let mut registry = DEVICE_REGISTRY.lock();
+        let id = self.id().to_raw();
+        let Some(current) = registry.get(&id) else {
+            return;
+        };
+        if !Arc::ptr_eq(current, &self.registered) {
+            return;
+        }
+        let state = current.state.lock();
+        if state.status != RegistrationStatus::Pending || state.lease_count != 0 {
+            return;
+        }
+        drop(state);
+        registry.remove(&id);
+    }
+}
+
+impl Drop for PendingBlockDeviceUnregistration {
+    fn drop(&mut self) {
+        if !self.restore_on_drop {
+            return;
+        }
+        let registry = DEVICE_REGISTRY.lock();
+        let Some(current) = registry.get(&self.id().to_raw()) else {
+            return;
+        };
+        if !Arc::ptr_eq(current, &self.registered) {
+            return;
+        }
+        let mut state = current.state.lock();
+        if state.status == RegistrationStatus::Removing && state.lease_count == 0 {
+            state.status = RegistrationStatus::Live;
+        }
+    }
 }
 
 /// A lease that prevents a registered block device from being unregistered while
@@ -93,9 +176,10 @@ impl core::ops::Deref for BlockDeviceLease {
 impl Clone for BlockDeviceLease {
     fn clone(&self) -> Self {
         if let Some(registered) = &self.registered {
-            let mut count = registered.lease_count.lock();
-            debug_assert!(*count > 0);
-            *count = count
+            let mut state = registered.state.lock();
+            debug_assert!(state.lease_count > 0);
+            state.lease_count = state
+                .lease_count
                 .checked_add(1)
                 .expect("block device lease count overflow");
         }
@@ -112,9 +196,9 @@ impl Drop for BlockDeviceLease {
         let Some(registered) = &self.registered else {
             return;
         };
-        let mut count = registered.lease_count.lock();
-        debug_assert!(*count > 0);
-        *count -= 1;
+        let mut state = registered.state.lock();
+        debug_assert!(state.lease_count > 0);
+        state.lease_count -= 1;
     }
 }
 
@@ -197,54 +281,159 @@ pub enum Error {
     IdAcquired,
     /// ID exhausted
     IdExhausted,
-    /// The device is held by a lease.
+    /// The device is in use or transitioning between lifecycle states.
     Busy,
 }
 
-/// Registers a new block device.
-pub fn register(device: Arc<dyn BlockDevice>) -> Result<(), Error> {
-    // Callbacks may reenter the registry, so resolve the ID before locking it.
+/// Begins registering a block device without publishing it to lookups yet.
+pub fn register_pending(
+    device: Arc<dyn BlockDevice>,
+) -> Result<PendingBlockDeviceRegistration, Error> {
+    // Public trait callbacks must run outside the registry lock to avoid
+    // self-deadlock if an implementation reenters the registry.
     let id = device.id();
+    let registered = Arc::new(RegisteredBlockDevice {
+        id,
+        device,
+        state: Mutex::new(RegisteredBlockDeviceState {
+            status: RegistrationStatus::Pending,
+            lease_count: 0,
+        }),
+    });
     let mut registry = DEVICE_REGISTRY.lock();
     if registry.contains_key(&id.to_raw()) {
         return Err(Error::Registered);
     }
-    registry.insert(
-        id.to_raw(),
-        Arc::new(RegisteredBlockDevice {
-            device,
-            lease_count: Mutex::new(0),
-        }),
-    );
+    registry.insert(id.to_raw(), registered.clone());
 
+    Ok(PendingBlockDeviceRegistration { registered })
+}
+
+/// Commits a pending block device registration.
+pub fn commit_registration(registration: &PendingBlockDeviceRegistration) -> Result<(), Error> {
+    let registry = DEVICE_REGISTRY.lock();
+    let current = registry
+        .get(&registration.id().to_raw())
+        .ok_or(Error::NotFound)?;
+    if !Arc::ptr_eq(current, &registration.registered) {
+        return Err(Error::Registered);
+    }
+
+    let mut state = current.state.lock();
+    if state.status != RegistrationStatus::Pending {
+        return Err(Error::Busy);
+    }
+    state.status = RegistrationStatus::Live;
     Ok(())
 }
 
-/// Unregisters an existing block device, returning the device if found.
-pub fn unregister(id: DeviceId) -> Result<Arc<dyn BlockDevice>, Error> {
+/// Aborts a block device registration that has not been published yet.
+pub fn abort_registration(
+    registration: PendingBlockDeviceRegistration,
+) -> Result<Arc<dyn BlockDevice>, Error> {
     let mut registry = DEVICE_REGISTRY.lock();
-    let registered = registry.get(&id.to_raw()).ok_or(Error::NotFound)?;
-    if *registered.lease_count.lock() != 0 {
+    let id = registration.id().to_raw();
+    let current = registry.get(&id).ok_or(Error::NotFound)?;
+    if !Arc::ptr_eq(current, &registration.registered) {
+        return Err(Error::Registered);
+    }
+
+    let state = current.state.lock();
+    if state.status != RegistrationStatus::Pending || state.lease_count != 0 {
         return Err(Error::Busy);
     }
-    Ok(registry.remove(&id.to_raw()).unwrap().device.clone())
+    drop(state);
+
+    let registered = registry.remove(&id).unwrap();
+    Ok(registered.device.clone())
 }
 
-/// Collects all block devices.
+/// Registers a new block device.
+pub fn register(device: Arc<dyn BlockDevice>) -> Result<(), Error> {
+    let registration = register_pending(device)?;
+    commit_registration(&registration)
+}
+
+/// Begins unregistering a published device and stops new lookups and leases.
+pub fn begin_unregister(id: DeviceId) -> Result<PendingBlockDeviceUnregistration, Error> {
+    let registry = DEVICE_REGISTRY.lock();
+    let registered = registry.get(&id.to_raw()).ok_or(Error::NotFound)?;
+    let mut state = registered.state.lock();
+    if state.status != RegistrationStatus::Live || state.lease_count != 0 {
+        return Err(Error::Busy);
+    }
+    state.status = RegistrationStatus::Removing;
+    drop(state);
+
+    Ok(PendingBlockDeviceUnregistration {
+        registered: registered.clone(),
+        restore_on_drop: true,
+    })
+}
+
+/// Commits a pending block device unregistration.
+pub fn commit_unregister(
+    unregistration: PendingBlockDeviceUnregistration,
+) -> Result<Arc<dyn BlockDevice>, (PendingBlockDeviceUnregistration, Error)> {
+    let mut registry = DEVICE_REGISTRY.lock();
+    let id = unregistration.id().to_raw();
+    let Some(current) = registry.get(&id) else {
+        return Err((unregistration, Error::NotFound));
+    };
+    if !Arc::ptr_eq(current, &unregistration.registered) {
+        return Err((unregistration, Error::Registered));
+    }
+    let state = current.state.lock();
+    if state.status != RegistrationStatus::Removing || state.lease_count != 0 {
+        return Err((unregistration, Error::Busy));
+    }
+    drop(state);
+
+    let registered = registry.remove(&id).unwrap();
+    Ok(registered.device.clone())
+}
+
+/// Aborts a pending unregistration and republishes the same device.
+pub fn abort_unregister(unregistration: PendingBlockDeviceUnregistration) -> Result<(), Error> {
+    let registry = DEVICE_REGISTRY.lock();
+    let current = registry
+        .get(&unregistration.id().to_raw())
+        .ok_or(Error::NotFound)?;
+    if !Arc::ptr_eq(current, &unregistration.registered) {
+        return Err(Error::Registered);
+    }
+    let mut state = current.state.lock();
+    if state.status != RegistrationStatus::Removing || state.lease_count != 0 {
+        return Err(Error::Busy);
+    }
+    state.status = RegistrationStatus::Live;
+    Ok(())
+}
+
+/// Unregisters an existing block device and returns it on success.
+pub fn unregister(id: DeviceId) -> Result<Arc<dyn BlockDevice>, Error> {
+    let unregistration = begin_unregister(id)?;
+    commit_unregister(unregistration).map_err(|(_, error)| error)
+}
+
+/// Collects all published block devices.
 pub fn collect_all() -> Vec<Arc<dyn BlockDevice>> {
     DEVICE_REGISTRY
         .lock()
         .values()
-        .map(|registered| registered.device.clone())
+        .filter_map(|registered| {
+            let state = registered.state.lock();
+            (state.status == RegistrationStatus::Live).then(|| registered.device.clone())
+        })
         .collect()
 }
 
-/// Looks up a block device of a given device ID.
+/// Looks up a published block device by device ID.
 pub fn lookup(id: DeviceId) -> Option<Arc<dyn BlockDevice>> {
-    DEVICE_REGISTRY
-        .lock()
-        .get(&id.to_raw())
-        .map(|registered| registered.device.clone())
+    let registry = DEVICE_REGISTRY.lock();
+    let registered = registry.get(&id.to_raw())?;
+    let state = registered.state.lock();
+    (state.status == RegistrationStatus::Live).then(|| registered.device.clone())
 }
 
 /// Gets a lease for a published block device.
@@ -254,9 +443,12 @@ pub fn lookup(id: DeviceId) -> Option<Arc<dyn BlockDevice>> {
 pub fn lookup_lease(id: DeviceId) -> Option<BlockDeviceLease> {
     let registry = DEVICE_REGISTRY.lock();
     let registered = registry.get(&id.to_raw())?;
-    let mut count = registered.lease_count.lock();
-    *count = count.checked_add(1)?;
-    drop(count);
+    let mut state = registered.state.lock();
+    if state.status != RegistrationStatus::Live {
+        return None;
+    }
+    state.lease_count = state.lease_count.checked_add(1)?;
+    drop(state);
 
     Some(BlockDeviceLease {
         device: registered.device.clone(),
@@ -264,13 +456,26 @@ pub fn lookup_lease(id: DeviceId) -> Option<BlockDeviceLease> {
     })
 }
 
-/// Looks up a block device by its kernel device name.
+fn registered_devices_snapshot() -> Vec<Arc<RegisteredBlockDevice>> {
+    DEVICE_REGISTRY.lock().values().cloned().collect()
+}
+
+fn lookup_live_device(registered: &Arc<RegisteredBlockDevice>) -> Option<Arc<dyn BlockDevice>> {
+    let registry = DEVICE_REGISTRY.lock();
+    let current = registry.get(&registered.id.to_raw())?;
+    if !Arc::ptr_eq(current, registered) {
+        return None;
+    }
+    let state = current.state.lock();
+    (state.status == RegistrationStatus::Live).then(|| current.device.clone())
+}
+
+/// Looks up a published block device by its kernel device name.
 pub fn lookup_by_name(name: &str) -> Option<Arc<dyn BlockDevice>> {
-    DEVICE_REGISTRY
-        .lock()
-        .values()
-        .find(|registered| registered.device.name() == name)
-        .map(|registered| registered.device.clone())
+    registered_devices_snapshot()
+        .into_iter()
+        .filter(|registered| registered.device.name() == name)
+        .find_map(|registered| lookup_live_device(&registered))
 }
 
 /// Scans registered whole-disk devices and updates their partitions.
@@ -370,12 +575,58 @@ mod tests {
     }
 
     #[ktest]
+    fn pending_registration_is_hidden_until_commit() {
+        let device = TestBlockDevice::new(2);
+        let id = device.id();
+        let pending = register_pending(device).unwrap();
+
+        assert!(lookup(id).is_none());
+        assert!(lookup_lease(id).is_none());
+        commit_registration(&pending).unwrap();
+        assert!(lookup(id).is_some());
+        assert!(unregister(id).is_ok());
+    }
+
+    #[ktest]
+    fn pending_unregistration_blocks_new_holders_and_can_abort() {
+        let device = TestBlockDevice::new(3);
+        let id = device.id();
+        register(device).unwrap();
+
+        let pending = begin_unregister(id).unwrap();
+        assert!(lookup(id).is_none());
+        assert!(lookup_lease(id).is_none());
+        abort_unregister(pending).unwrap();
+        let lease = lookup_lease(id).unwrap();
+        assert_eq!(unregister(id).unwrap_err(), Error::Busy);
+        drop(lease);
+        assert!(unregister(id).is_ok());
+    }
+
+    #[ktest]
+    fn dropped_pending_registration_rolls_back_automatically() {
+        let device = TestBlockDevice::new(4);
+        let id = device.id();
+        drop(register_pending(device.clone()).unwrap());
+
+        assert!(lookup(id).is_none());
+        assert!(register(device).is_ok());
+        assert!(unregister(id).is_ok());
+    }
+
+    #[ktest]
     fn caches_device_id_before_locking_registry() {
         let device = ReentrantIdBlockDevice::new(6);
         let id = device.id;
-        register(device.clone()).unwrap();
+        let pending = register_pending(device.clone()).unwrap();
         assert_eq!(device.id_calls.load(Ordering::Relaxed), 1);
-        unregister(id).unwrap();
+        assert_eq!(pending.id(), id);
+        commit_registration(&pending).unwrap();
+        assert_eq!(device.id_calls.load(Ordering::Relaxed), 1);
+
+        let pending = begin_unregister(id).unwrap();
+        assert_eq!(pending.id(), id);
+        commit_unregister(pending).unwrap();
         assert_eq!(device.id_calls.load(Ordering::Relaxed), 1);
     }
 
@@ -395,6 +646,31 @@ mod tests {
         drop(cloned);
         assert!(unregister(id).is_ok());
         assert!(lookup_lease(id).is_none());
+    }
+    #[ktest]
+    fn dropped_tokens_use_cached_device_id() {
+        let registration_device = ReentrantIdBlockDevice::new(7);
+        drop(register_pending(registration_device.clone()).unwrap());
+        assert_eq!(registration_device.id_calls.load(Ordering::Relaxed), 1);
+
+        let unregistration_device = ReentrantIdBlockDevice::new(8);
+        let id = unregistration_device.id;
+        register(unregistration_device.clone()).unwrap();
+        drop(begin_unregister(id).unwrap());
+        assert!(lookup(id).is_some());
+        assert_eq!(unregistration_device.id_calls.load(Ordering::Relaxed), 1);
+        unregister(id).unwrap();
+    }
+
+    #[ktest]
+    fn dropped_pending_unregistration_restores_live_state() {
+        let device = TestBlockDevice::new(5);
+        let id = device.id();
+        register(device).unwrap();
+        drop(begin_unregister(id).unwrap());
+
+        assert!(lookup(id).is_some());
+        assert!(unregister(id).is_ok());
     }
 }
 

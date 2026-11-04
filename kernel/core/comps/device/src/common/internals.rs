@@ -45,6 +45,11 @@ pub trait DeviceInternals {
     fn wants_device_link(&self) -> bool {
         true
     }
+
+    /// Returns whether device registration should publish a devtmpfs node.
+    fn creates_devnode(&self) -> bool {
+        true
+    }
 }
 
 /// The properties and registration status shared by all devices.
