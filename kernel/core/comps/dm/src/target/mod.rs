@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Linear target parsing and table geometry; BIO mapping follows in RESUME.
+//! Linear target parsing, geometry, and BIO mapping.
 
-use alloc::{boxed::Box, string::String};
+use alloc::{boxed::Box, string::String, vec::Vec};
 #[cfg(ktest)]
 use core::any::Any;
 use core::{fmt::Debug, ops::Range};
@@ -67,6 +67,16 @@ impl TargetRange {
     }
 }
 
+/// One linear mapping action for a table-local part of a BIO.
+pub struct TargetIoAction<'a> {
+    /// Logical range covered by this child BIO.
+    pub(crate) logical_range: Range<Sid>,
+    /// Backing sector corresponding to the start of the logical range.
+    pub(crate) backing_start: Sid,
+    /// Resolved backing device retained by the owning table.
+    pub(crate) backing: &'a dyn BlockDevice,
+}
+
 /// Selects the Linux table/status parameter flavor requested by `DM_TABLE_STATUS`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TargetStatusMode {
@@ -104,6 +114,9 @@ pub trait DmTarget: Debug + Send + Sync {
 
     /// Visits resolved backing devices referenced by this target in Linux table order.
     fn for_each_backing<'a>(&'a self, f: &mut dyn FnMut(&'a dyn BlockDevice));
+
+    /// Maps a target-local logical range to backing I/O actions.
+    fn map_io_range(&self, logical: Range<Sid>) -> Option<Vec<TargetIoAction<'_>>>;
 
     /// Formats target-specific Linux table/status parameters.
     fn status_params(&self, mode: TargetStatusMode) -> Result<String, TableError>;

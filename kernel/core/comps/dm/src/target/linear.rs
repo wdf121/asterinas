@@ -13,8 +13,8 @@ use device_id::DeviceId;
 use crate::{
     TableError,
     target::{
-        DmTarget, DmTargetMetadata, DmTargetParseError, LINEAR_METADATA, TargetRange,
-        TargetStatusMode,
+        DmTarget, DmTargetMetadata, DmTargetParseError, LINEAR_METADATA, TargetIoAction,
+        TargetRange, TargetStatusMode,
         args::{Argument, Arguments},
     },
 };
@@ -109,6 +109,15 @@ impl LinearTarget {
     pub fn backing(&self) -> &dyn BlockDevice {
         self.backing.device().as_ref()
     }
+
+    /// Maps an in-range logical sector to the corresponding backing sector.
+    pub fn map_sector(&self, logical: Sid) -> Option<Sid> {
+        let offset = self.range.offset_of(logical)?;
+        self.backing_start
+            .to_raw()
+            .checked_add(offset)
+            .map(Sid::new)
+    }
 }
 
 impl DmTarget for LinearTarget {
@@ -135,6 +144,17 @@ impl DmTarget for LinearTarget {
 
     fn for_each_backing<'a>(&'a self, f: &mut dyn FnMut(&'a dyn BlockDevice)) {
         f(self.backing());
+    }
+
+    fn map_io_range(&self, logical: Range<Sid>) -> Option<alloc::vec::Vec<TargetIoAction<'_>>> {
+        if !self.range.contains_range(&logical) {
+            return None;
+        }
+        Some(alloc::vec![TargetIoAction {
+            logical_range: logical.clone(),
+            backing_start: self.map_sector(logical.start)?,
+            backing: self.backing(),
+        }])
     }
 
     fn status_params(&self, mode: TargetStatusMode) -> Result<String, TableError> {

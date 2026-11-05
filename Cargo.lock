@@ -219,6 +219,7 @@ dependencies = [
  "aster-block",
  "device-id",
  "id-alloc",
+ "io-util",
  "ostd",
 ]
 
