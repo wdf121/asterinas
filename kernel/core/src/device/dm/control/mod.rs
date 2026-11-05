@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Linux Device Mapper control-device registration and VERSION/CREATE/LOAD entry points.
+//! Linux Device Mapper control-device registration and VERSION/CREATE/LOAD/RESUME entry points.
 //!
 //! LOAD validates an inactive linear table and publishes only `/dev/dm-N`.
-//! Initial RESUME and mapping I/O belong to later stages.
+//! First RESUME activates it for mapped I/O; suspend and hot replacement remain unsupported.
 
 use device_id::{DeviceId, MinorId};
 use ostd::mm::VmIo;
@@ -70,7 +70,7 @@ impl Device for DmControlDevice {
     }
 }
 
-/// Open control handle; VERSION, tableless CREATE and inactive-table LOAD are available.
+/// Open control handle for VERSION, tableless CREATE, linear LOAD and first RESUME.
 struct DmControlFile;
 
 impl Pollable for DmControlFile {

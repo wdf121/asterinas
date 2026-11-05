@@ -24,6 +24,7 @@ type CommandHandler = fn(&mut [u8]) -> Result<()>;
 pub(super) fn handler_for(command: u8) -> Result<CommandHandler> {
     match command {
         DM_DEV_CREATE_CMD => Ok(create_device),
+        DM_DEV_SUSPEND_CMD => Ok(resume_device),
         DM_TABLE_LOAD_CMD => Ok(table_load),
         _ => return_errno_with_message!(Errno::ENOTTY, "unsupported device-mapper ioctl command"),
     }
@@ -46,7 +47,7 @@ fn create_device(buffer: &mut [u8]) -> Result<()> {
         .unwrap()
         .create(name, uuid, requested_minor)
         .map_err(map_create_error)?;
-    fill_device_header(buffer, &device);
+    fill_device_header(buffer, &device, false);
     Ok(())
 }
 
@@ -75,35 +76,37 @@ fn validate_mapper_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn fill_device_header(buffer: &mut [u8], device: &DmDevice) {
+fn fill_device_header(buffer: &mut [u8], device: &DmDevice, prefer_inactive: bool) {
+    let (active, inactive) = device.table_snapshot();
+    // LOAD reports the candidate; RESUME describes the table currently serving I/O.
+    let selected = if prefer_inactive {
+        inactive.as_ref().or(active.as_ref())
+    } else {
+        active.as_ref().or(inactive.as_ref())
+    };
     write_u32(
         buffer,
         OFF_TARGET_COUNT,
-        device
-            .inactive_table()
-            .as_ref()
-            .map_or(0, |table| table.target_count() as u32),
+        selected.map_or(0, |table| table.target_count() as u32),
     );
     write_u32(buffer, OFF_OPEN_COUNT, 0);
     write_u32(buffer, OFF_EVENT_NR, 0);
     write_u64(buffer, OFF_DEV, device.id().as_encoded_u64());
-    let flags = read_u32(buffer, OFF_FLAGS)
+    let mut flags = read_u32(buffer, OFF_FLAGS)
         & !(READONLY_FLAG
             | SUSPEND_FLAG
             | ACTIVE_PRESENT_FLAG
             | INACTIVE_PRESENT_FLAG
             | INTERNAL_SUSPEND_FLAG);
-    let flags = if let Some(table) = device.inactive_table() {
-        flags
-            | INACTIVE_PRESENT_FLAG
-            | if table.is_readonly() {
-                READONLY_FLAG
-            } else {
-                0
-            }
-    } else {
-        flags
-    };
+    if active.is_some() {
+        flags |= ACTIVE_PRESENT_FLAG;
+    }
+    if inactive.is_some() {
+        flags |= INACTIVE_PRESENT_FLAG;
+    }
+    if selected.is_some_and(|table| table.is_readonly()) {
+        flags |= READONLY_FLAG;
+    }
     write_u32(buffer, OFF_FLAGS, flags);
     let name = device.mapper_name();
     buffer[OFF_NAME..OFF_NAME + NAME_LEN].fill(0);
@@ -174,7 +177,28 @@ fn table_load_for_device_with_primary(
     let table = parse_table_load_request(buffer)?;
     publish_primary(device)?;
     device.load_table(table);
-    fill_device_header(buffer, device);
+    fill_device_header(buffer, device, true);
+    Ok(())
+}
+
+/// Performs only the initial RESUME transition; hot replacement needs suspend/drain.
+fn resume_device(buffer: &mut [u8]) -> Result<()> {
+    let device = lookup_load_device(buffer)?;
+    let _lifecycle = device.lock_lifecycle();
+    resume_device_for(buffer, &device)
+}
+
+fn resume_device_for(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
+    if read_u32(buffer, OFF_FLAGS) & SUSPEND_FLAG != 0 {
+        return_errno_with_message!(Errno::EINVAL, "mapper suspend is not supported");
+    }
+    device.resume_initial().map_err(|_| {
+        Error::with_message(
+            Errno::EINVAL,
+            "mapper has no initial table or requires suspend",
+        )
+    })?;
+    fill_device_header(buffer, device, false);
     Ok(())
 }
 
@@ -436,6 +460,63 @@ mod tests {
         );
         aster_block::unregister(first).unwrap();
         aster_block::unregister(second).unwrap();
+    }
+
+    #[ktest]
+    fn first_resume_reports_active_table_and_preserves_failed_transitions() {
+        let manager = aster_dm::DmManager::new().unwrap();
+        let device = manager
+            .create("first-resume-test".into(), None, None)
+            .unwrap();
+        let backing = DeviceId::new(MajorId::new(510), MinorId::new(161));
+        aster_block::register(Arc::new(Backing(backing))).unwrap();
+        let mut resume = vec![0u8; FIXED_PREFIX_SIZE];
+        resume[OFF_NAME..OFF_NAME + 17].copy_from_slice(b"first-resume-test");
+        assert_eq!(
+            resume_device_for(&mut resume, &device).unwrap_err().error(),
+            Errno::EINVAL
+        );
+        let mut request = buffer("first-resume-test", backing);
+        write_u32(&mut request, OFF_FLAGS, READONLY_FLAG);
+        table_load_for_device_with_primary(&mut request, &device, |_| Ok(())).unwrap();
+        assert_eq!(
+            read_u32(&request, OFF_FLAGS) & INACTIVE_PRESENT_FLAG,
+            INACTIVE_PRESENT_FLAG
+        );
+        write_u32(&mut resume, OFF_FLAGS, SUSPEND_FLAG);
+        assert_eq!(
+            resume_device_for(&mut resume, &device).unwrap_err().error(),
+            Errno::EINVAL
+        );
+        assert!(device.active_table().is_none());
+        assert!(device.inactive_table().is_some());
+        write_u32(&mut resume, OFF_FLAGS, 0);
+        resume_device_for(&mut resume, &device).unwrap();
+        assert_eq!(read_u32(&resume, OFF_TARGET_COUNT), 1);
+        assert_eq!(
+            read_u32(&resume, OFF_FLAGS) & (ACTIVE_PRESENT_FLAG | READONLY_FLAG),
+            ACTIVE_PRESENT_FLAG | READONLY_FLAG
+        );
+        assert_eq!(read_u32(&resume, OFF_FLAGS) & INACTIVE_PRESENT_FLAG, 0);
+        resume_device_for(&mut resume, &device).unwrap();
+        let mut replacement = buffer("first-resume-test", backing);
+        table_load_for_device_with_primary(&mut replacement, &device, |_| Ok(())).unwrap();
+        assert_eq!(
+            read_u32(&replacement, OFF_FLAGS) & (ACTIVE_PRESENT_FLAG | INACTIVE_PRESENT_FLAG),
+            ACTIVE_PRESENT_FLAG | INACTIVE_PRESENT_FLAG
+        );
+        assert_eq!(read_u32(&replacement, OFF_FLAGS) & READONLY_FLAG, 0);
+        assert_eq!(
+            resume_device_for(&mut resume, &device).unwrap_err().error(),
+            Errno::EINVAL
+        );
+        assert!(device.active_table().unwrap().is_readonly());
+        assert!(!device.inactive_table().unwrap().is_readonly());
+        drop(replacement);
+        drop(request);
+        manager.remove("first-resume-test").unwrap();
+        drop(device);
+        aster_block::unregister(backing).unwrap();
     }
 
     #[ktest]

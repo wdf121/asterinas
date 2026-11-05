@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Device Mapper ioctl ABI for the supported CREATE and LOAD commands.
+//! Device Mapper ioctl ABI for the supported CREATE, LOAD and first RESUME commands.
 
 use crate::prelude::*;
 
 pub(super) const DM_DEV_CREATE_CMD: u8 = 3;
 pub(super) const DM_TABLE_LOAD_CMD: u8 = 9;
+pub(super) const DM_DEV_SUSPEND_CMD: u8 = 6;
 pub(super) const DM_IOCTL_HEADER_SIZE: usize = 312;
 pub(super) const DM_TARGET_SPEC_SIZE: usize = 40;
 pub(super) const FIXED_PREFIX_SIZE: usize = 305;

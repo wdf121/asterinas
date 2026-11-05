@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Device Mapper identities, device-number ownership, and inactive linear tables.
+//! Device Mapper identities, device-number ownership, and linear table activation.
 //!
 //! Creating a mapper here does not install a table or register a block device.
 
@@ -21,6 +21,8 @@ pub use table::DmTable;
 /// Reasons why a core Device Mapper operation failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DmError {
+    /// The requested table transition cannot be performed in the current state.
+    InvalidState,
     /// The name already exists.
     NameExists,
     /// The UUID already exists.

@@ -5,8 +5,8 @@
 use ostd::mm::VmIo;
 
 use super::abi::{
-    self, DM_DEV_CREATE_CMD, DM_TABLE_LOAD_CMD, FIXED_PREFIX_SIZE, OFF_DATA_SIZE, OFF_FLAGS,
-    SECURE_DATA_FLAG,
+    self, DM_DEV_CREATE_CMD, DM_DEV_SUSPEND_CMD, DM_TABLE_LOAD_CMD, FIXED_PREFIX_SIZE,
+    OFF_DATA_SIZE, OFF_FLAGS, SECURE_DATA_FLAG,
 };
 use crate::{context::current_userspace, prelude::*};
 
@@ -25,7 +25,7 @@ impl Drop for IoctlBuffer {
     }
 }
 
-/// Copies a bounded LOAD payload, or only the prefix for CREATE, before dispatch.
+/// Copies a bounded LOAD payload, or only the prefix for CREATE and RESUME, before dispatch.
 pub(super) fn process_ioctl_parameters(
     arg: usize,
     version: &[u8; 12],
@@ -43,7 +43,7 @@ pub(super) fn process_ioctl_parameters(
     let size = if command == DM_TABLE_LOAD_CMD {
         input_size as usize
     } else {
-        debug_assert_eq!(command, DM_DEV_CREATE_CMD);
+        debug_assert!(matches!(command, DM_DEV_CREATE_CMD | DM_DEV_SUSPEND_CMD));
         FIXED_PREFIX_SIZE
     };
     let secure = abi::read_u32(&header, OFF_FLAGS) & SECURE_DATA_FLAG != 0;
