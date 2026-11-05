@@ -84,6 +84,15 @@ PJDFSTEST_FS_TYPE ?= ext2
 
 # Specify whether to build regression tests under `test/initramfs/src/regression`.
 ENABLE_REGRESSION_TEST ?= false
+# Number of persistent raw test disks attached to a test VM (default: none).
+raw_disk ?= 0
+ifneq ($(shell printf '%s' '$(raw_disk)' | grep -E '^(0|[1-9][0-9]*)$$'),$(raw_disk))
+$(error raw_disk must be an integer between 0 and 18)
+endif
+ifneq ($(shell test '$(raw_disk)' -le 18 && printf yes),yes)
+$(error raw_disk must be an integer between 0 and 18)
+endif
+export raw_disk
 # End of auto test features.
 
 # Network settings

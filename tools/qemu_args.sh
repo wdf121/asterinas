@@ -25,6 +25,7 @@
 #  - MEM: amount of memory, e.g. "8G";
 #  - VNC_PORT: VNC display number, default is "42" (TCP port 5942),
 #    ignored when QEMU_DISPLAY is set;
+#  - raw_disk: number of persistent 512 MiB raw test disks (default: 0).
 #  - XFSTESTS_NEEDS_BLOCK_DEVICES: "true" or "false", whether to attach
 #    xfstests images (xfstests_test.img and xfstests_scratch.img) to the VM.
 
@@ -39,7 +40,17 @@ VIRTIOFS_SCRATCH=${VIRTIOFS_SCRATCH:-"off"}
 NETDEV=${NETDEV:-"user"}
 QEMU_DISPLAY=${QEMU_DISPLAY:-"vnc=0.0.0.0:${VNC_PORT:-42}"}
 CONSOLE=${CONSOLE:-"hvc0"}
+raw_disk=${raw_disk:-0}
 XFSTESTS_NEEDS_BLOCK_DEVICES=${XFSTESTS_NEEDS_BLOCK_DEVICES:-false}
+if ! [[ "$raw_disk" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "Invalid raw_disk=${raw_disk}: expected a nonnegative integer" >&2
+    exit 1
+fi
+# PCI addresses 0xd–0x1e are available for initramfs test disks.
+if (( raw_disk > 18 )); then
+    echo "Invalid raw_disk=${raw_disk}: at most 18 disks are supported" >&2
+    exit 1
+fi
 
 if [ "$XFSTESTS_NEEDS_BLOCK_DEVICES" != "true" ] && \
    [ "$XFSTESTS_NEEDS_BLOCK_DEVICES" != "false" ]; then
@@ -117,12 +128,17 @@ if [ "$1" = "riscv" ]; then
     # `/dev/vda`, `/dev/vdb`, and `/dev/vdc`, respectively. RISC-V virtio-mmio
     # block devices are discovered in reverse command-line order, so list them
     # in the reverse of the desired device-node order.
-    # When booting without initramfs, `rootfs.img` is placed before these devices
-    # so that it is discovered after them as `/dev/vdd`.
+    # When enabled, the raw test disk is discovered before the preexisting disks
+    # but after the optional rootfs disk (which is absent in initramfs runs).
     # TODO: Once UUID-based mounting is implemented, this strict ordering will no longer be required.
     if [ "$INITRAMFS" = "off" ]; then
         ROOTFS_RISCV_DEVICE_ARGS="-device virtio-blk-device,drive=rootfs"
     fi
+    for ((index = 1; index <= raw_disk; index++)); do
+        RAW_RISCV_DRIVE_ARGS+=" -drive if=none,format=raw,id=rawtest${index},file=./test/initramfs/build/raw_test_${index}.img"
+        # RISC-V discovers virtio-mmio devices in reverse command-line order.
+        RAW_RISCV_DEVICE_ARGS="-device virtio-blk-device,drive=rawtest${index} ${RAW_RISCV_DEVICE_ARGS}"
+    done
 
     QEMU_ARGS="\
         -cpu rv64,svpbmt=true,zkr=true \
@@ -138,7 +154,9 @@ if [ "$1" = "riscv" ]; then
         -drive if=none,format=raw,id=x0,file=./test/initramfs/build/ext2.img \
         -drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img \
         -drive if=none,format=raw,id=x2,file=./test/initramfs/build/ltp_dev.img \
+        $RAW_RISCV_DRIVE_ARGS \
         $ROOTFS_RISCV_DEVICE_ARGS \
+        $RAW_RISCV_DEVICE_ARGS \
         -device virtio-blk-device,drive=x2 \
         -device virtio-blk-device,drive=x1 \
         -device virtio-blk-device,drive=x0 \
@@ -158,6 +176,10 @@ if [ "$1" = "aarch64" ]; then
     else
         CPU_MODEL=cortex-a72
     fi
+    for ((index = 1; index <= raw_disk; index++)); do
+        RAW_AARCH64_ARGS+=" -drive if=none,format=raw,id=rawtest${index},file=./test/initramfs/build/raw_test_${index}.img"
+        RAW_AARCH64_DEVICES="-device virtio-blk-device,drive=rawtest${index} ${RAW_AARCH64_DEVICES}"
+    done
     QEMU_ARGS="\
         -cpu ${CPU_MODEL} \
         -machine virt,gic-version=3 \
@@ -171,6 +193,8 @@ if [ "$1" = "aarch64" ]; then
         -drive if=none,format=raw,id=x0,file=./test/initramfs/build/ext2.img \
         -drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img \
         -drive if=none,format=raw,id=x2,file=./test/initramfs/build/ltp_dev.img \
+        $RAW_AARCH64_ARGS \
+        $RAW_AARCH64_DEVICES \
         -device virtio-blk-device,drive=x2 \
         -device virtio-blk-device,drive=x1 \
         -device virtio-blk-device,drive=x0 \
@@ -188,6 +212,10 @@ if [ "$1" = "tdx" ]; then
         ROOTFS_TDX_DEVICE_ARGS="-device virtio-blk-pci,bus=pcie.0,addr=0xb,drive=rootfs,serial=vrootfs,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off"
     fi
 
+    for ((index = 1; index <= raw_disk; index++)); do
+        addr=$(printf '0x%x' $((0xc + index)))
+        RAW_TDX_ARGS+=" -drive if=none,format=raw,id=rawtest${index},file=./test/initramfs/build/raw_test_${index}.img -device virtio-blk-pci,bus=pcie.0,addr=${addr},drive=rawtest${index},serial=vrawtest${index},disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off"
+    done
     QEMU_ARGS="\
         -m ${MEM:-8G} \
         -smp ${SMP:-1} \
@@ -206,6 +234,7 @@ if [ "$1" = "tdx" ]; then
         -device virtio-blk-pci,bus=pcie.0,addr=0x6,drive=x0,serial=vext2,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
         -device virtio-blk-pci,bus=pcie.0,addr=0x7,drive=x1,serial=vexfat,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
         -device virtio-blk-pci,bus=pcie.0,addr=0x8,drive=x2,serial=vltpdev,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        $RAW_TDX_ARGS \
         $ROOTFS_TDX_DEVICE_ARGS \
         -device virtio-net-pci,netdev=net01,disable-legacy=on,disable-modern=off$VIRTIO_NET_FEATURES \
         -device virtio-keyboard-pci,disable-legacy=on,disable-modern=off \
@@ -222,6 +251,13 @@ if [ "$1" = "tdx" ]; then
     exit 0
 fi
 
+for ((index = 1; index <= raw_disk; index++)); do
+    addr=$(printf '0x%x' $((0xc + index)))
+    RAW_COMMON_DRIVE_ARGS+=" -drive if=none,format=raw,id=rawtest${index},file=./test/initramfs/build/raw_test_${index}.img"
+    RAW_MICROVM_DEVICE_ARGS+=" -device virtio-blk-device,drive=rawtest${index},serial=vrawtest${index}"
+    RAW_Q35_DEVICE_ARGS+=" -device virtio-blk-pci,bus=pcie.0,addr=${addr},drive=rawtest${index},serial=vrawtest${index},disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA"
+done
+
 COMMON_QEMU_ARGS="\
     -cpu Icelake-Server,+x2apic,+vmx \
     -smp ${SMP:-1} \
@@ -237,6 +273,7 @@ COMMON_QEMU_ARGS="\
     -drive if=none,format=raw,id=x0,file=./test/initramfs/build/ext2.img \
     -drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img \
     -drive if=none,format=raw,id=x2,file=./test/initramfs/build/ltp_dev.img \
+    $RAW_COMMON_DRIVE_ARGS \
     $ROOTFS_DRIVE_ARGS \
 "
 
@@ -281,6 +318,7 @@ if [ "$1" = "microvm" ]; then
         -device virtio-blk-device,drive=x0,serial=vext2 \
         -device virtio-blk-device,drive=x1,serial=vexfat \
         -device virtio-blk-device,drive=x2,serial=vltpdev \
+        $RAW_MICROVM_DEVICE_ARGS \
         $ROOTFS_MICROVM_DEVICE_ARGS \
         -device virtio-keyboard-device \
         -device virtio-net-device,netdev=net01 \
@@ -294,6 +332,7 @@ else
         -device virtio-blk-pci,bus=pcie.0,addr=0x6,drive=x0,serial=vext2,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
         -device virtio-blk-pci,bus=pcie.0,addr=0x7,drive=x1,serial=vexfat,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
         -device virtio-blk-pci,bus=pcie.0,addr=0x8,drive=x2,serial=vltpdev,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        $RAW_Q35_DEVICE_ARGS \
         $ROOTFS_Q35_DEVICE_ARGS \
         -object rng-random,id=rng0,filename=/dev/urandom \
         -device virtio-rng-pci,bus=pcie.0,addr=0x9,disable-legacy=on,disable-modern=off,rng=rng0,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \

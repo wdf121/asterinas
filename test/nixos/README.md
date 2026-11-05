@@ -97,6 +97,18 @@ If your test requires additional packages or system configuration, edit `extra_c
 ```
 This content of this file will be merged with the [default configuration file](../../distro/etc_nixos/configuration.nix) to generate the final configuration file for the testing Asterinas NixOS system.
 
+### Persistent raw test disks
+
+Set `raw_disk=2` when running tests that need `/dev/vde` and `/dev/vdf`:
+
+```bash
+make run_nixos NIXOS_TEST_SUITE=device-mapper-control-plane raw_disk=2
+```
+
+Both the initramfs and NixOS runners use the **same** numbered images, `test/initramfs/build/raw_test_1.img` through `raw_test_18.img`. `raw_disk=N` attaches the first N images. Missing images are created as 512 MiB unformatted disks; existing images are reused without clearing, resizing, or formatting them. An existing image with a different size causes an error rather than being silently changed. The `/dev/vd*` names differ between the two guests because their other devices differ; the underlying numbered host files are identical.
+
+The images live in the initramfs build directory, so `make clean` deletes them along with other initramfs build artifacts. Ordinary test runs and VM shutdowns do not clear them. Existing device-mapper tests assume blank backing ranges; run tests that consume a prior boot's data separately from tests that assume blank disks. A recovery test must run setup and verification in separate VM boots.
+
 ## Running Tests
 
 The following commands should be run under the project root.

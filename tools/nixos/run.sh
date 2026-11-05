@@ -22,6 +22,36 @@ TARGET_ARCH=${TARGET_ARCH:-x86_64}
 SCRIPT_DIR=$(dirname "$0")
 ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
 
+# Reuse the same numbered raw images as the initramfs runner across boots.
+append_raw_test_disks() {
+    count=${raw_disk:-0}
+    case "${count}" in
+        ''|*[!0-9]*) echo "Error: raw_disk must be a nonnegative integer" >&2; exit 1 ;;
+    esac
+    if [ "${count}" -gt 18 ]; then
+        echo "Error: at most 18 raw disks are supported" >&2
+        exit 1
+    fi
+    if [ "${count}" -eq 0 ]; then
+        return
+    fi
+    if [ "${MODE}" != nixos ]; then
+        echo "Error: raw disks are supported only in nixos mode" >&2
+        exit 1
+    fi
+    sh "${ASTERINAS_DIR}/tools/prepare_raw_test_disks.sh" "${count}"
+    index=1
+    while [ "${index}" -le "${count}" ]; do
+        image="${ASTERINAS_DIR}/test/initramfs/build/raw_test_${index}.img"
+        addr=$(printf '0x%x' $((0xb + index)))
+        QEMU_ARGS="${QEMU_ARGS} \
+            -drive if=none,format=raw,id=rawtest${index},file=${image},cache=none \
+            -device virtio-blk-pci,bus=pcie.0,addr=${addr},drive=rawtest${index},serial=vrawtest${index},disable-legacy=on,disable-modern=off \
+        "
+        index=$((index + 1))
+    done
+}
+
 # tools/qemu_args.sh currently emits x86_64-specific arguments.
 # Reject other architectures to avoid invoking non-x86 QEMU with incompatible args.
 if [ "${TARGET_ARCH}" != "x86_64" ]; then
@@ -33,7 +63,8 @@ fi
 cd "${ASTERINAS_DIR}"
 
 # Get base QEMU arguments from qemu_args.sh script
-QEMU_ARGS=$(${ASTERINAS_DIR}/tools/qemu_args.sh common 2>/dev/null)
+QEMU_ARGS=$(raw_disk=0 ${ASTERINAS_DIR}/tools/qemu_args.sh common 2>/dev/null)
+append_raw_test_disks
 
 # Add mode-specific disk and device arguments
 case "$MODE" in
@@ -41,7 +72,7 @@ case "$MODE" in
         NIXOS_DIR="${ASTERINAS_DIR}/target/nixos"
         QEMU_ARGS="${QEMU_ARGS} \
             -drive if=none,format=raw,id=u0,file=${NIXOS_DIR}/asterinas.img \
-            -device virtio-blk-pci,drive=u0,disable-legacy=on,disable-modern=off \
+            -device virtio-blk-pci,bus=pcie.0,addr=0x5,drive=u0,bootindex=1,disable-legacy=on,disable-modern=off \
         "
         ;;
     iso)

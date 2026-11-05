@@ -3,6 +3,8 @@
 NIXOS_TEST_SUITE ?=
 NIXOS_TEST_CASE ?=
 NIXOS_TEST_TIMEOUT ?= 10min
+# Number of persistent raw test disks for the NixOS test VM.
+raw_disk ?= 0
 
 # Generated configuration file name
 TEST_CONFIG_FILE_NAME := _configuration_for_test.nix
@@ -83,7 +85,7 @@ run_nixos: check-test-name
 		TEST_CASE_ARG="--test $(NIXOS_TEST_CASE)"; \
 	fi; \
 	QEMU_CMD="bash $(RUN_SCRIPT) nixos"; \
-	cargo run -- --qemu-cmd "$$QEMU_CMD" $$TEST_CASE_ARG || exit 1
+	raw_disk=$(raw_disk) cargo run -- --qemu-cmd "$$QEMU_CMD" $$TEST_CASE_ARG || exit 1
 
 .PHONY: check
 check:

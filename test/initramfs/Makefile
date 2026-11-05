@@ -8,6 +8,13 @@ CONFORMANCE_TEST_SUITE ?= ltp
 CONFORMANCE_TEST_WORKDIR ?= /tmp
 CONFORMANCE_TEST_SELECTOR ?=
 ENABLE_REGRESSION_TEST ?= false
+raw_disk ?= 0
+ifneq ($(shell printf '%s' '$(raw_disk)' | grep -E '^(0|[1-9][0-9]*)$$'),$(raw_disk))
+$(error raw_disk must be an integer between 0 and 18)
+endif
+ifneq ($(shell test '$(raw_disk)' -le 18 && printf yes),yes)
+$(error raw_disk must be an integer between 0 and 18)
+endif
 # Specify platform macros when building regression tests (supported: asterinas, linux).
 # - asterinas: Define both `__asterinas__` and `__linux__`. Tests may fail in Linux.
 # - linux: Define only `__linux__`. Tests may fail in Asterinas.
@@ -50,6 +57,7 @@ endif
 EXT2_IMAGE := $(BUILD_DIR)/ext2.img
 EXFAT_IMAGE := $(BUILD_DIR)/exfat.img
 LTP_DEV_IMAGE := $(BUILD_DIR)/ltp_dev.img
+# Raw test disks are prepared by the shared runner, not by individual Make file targets.
 SSD_IMAGE := $(BUILD_DIR)/nvme0n1.img
 XFSTESTS_TEST_IMAGE := $(BUILD_DIR)/xfstests_test.img
 XFSTESTS_SCRATCH_IMAGE := $(BUILD_DIR)/xfstests_scratch.img
@@ -100,6 +108,7 @@ data-disk-images: $(EXT2_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(SSD_IMAGE) $(X
 else
 data-disk-images: $(EXT2_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(SSD_IMAGE)
 endif
+data-disk-images: prepare-raw-test-disks
 
 .PHONY: $(INITRAMFS_IMAGE)
 $(INITRAMFS_IMAGE): $(INITRAMFS_DIR)
@@ -232,6 +241,11 @@ $(LTP_DEV_IMAGE):
 	@mkdir -p $(BUILD_DIR)
 	@dd if=/dev/zero of=$(LTP_DEV_IMAGE) bs=512M count=1
 	@mke2fs -t ext2 -F $(LTP_DEV_IMAGE)
+
+# Both the initramfs and NixOS runners prepare these same 512 MiB images.
+.PHONY: prepare-raw-test-disks
+prepare-raw-test-disks:
+	@sh $(CUR_DIR)/../../tools/prepare_raw_test_disks.sh $(raw_disk)
 
 $(SSD_IMAGE):
 	@mkdir -p $(BUILD_DIR)
