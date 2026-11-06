@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Device Mapper ioctl ABI for the supported CREATE, LOAD and first RESUME commands.
+//! Device Mapper ioctl ABI for CREATE, LOAD, first RESUME and static queries.
 
 use crate::prelude::*;
 
+pub(super) const DM_LIST_DEVICES_CMD: u8 = 2;
 pub(super) const DM_DEV_CREATE_CMD: u8 = 3;
-pub(super) const DM_TABLE_LOAD_CMD: u8 = 9;
 pub(super) const DM_DEV_SUSPEND_CMD: u8 = 6;
+pub(super) const DM_DEV_STATUS_CMD: u8 = 7;
+pub(super) const DM_TABLE_LOAD_CMD: u8 = 9;
+pub(super) const DM_TABLE_STATUS_CMD: u8 = 12;
+pub(super) const DM_LIST_VERSIONS_CMD: u8 = 13;
 pub(super) const DM_IOCTL_HEADER_SIZE: usize = 312;
 pub(super) const DM_TARGET_SPEC_SIZE: usize = 40;
 pub(super) const FIXED_PREFIX_SIZE: usize = 305;
@@ -25,10 +29,13 @@ pub(super) const UUID_LEN: usize = 129;
 pub(super) const READONLY_FLAG: u32 = 1;
 pub(super) const SUSPEND_FLAG: u32 = 1 << 1;
 pub(super) const PERSISTENT_DEV_FLAG: u32 = 1 << 3;
+pub(super) const STATUS_TABLE_FLAG: u32 = 1 << 4;
 pub(super) const ACTIVE_PRESENT_FLAG: u32 = 1 << 5;
 pub(super) const INACTIVE_PRESENT_FLAG: u32 = 1 << 6;
 pub(super) const BUFFER_FULL_FLAG: u32 = 1 << 8;
+pub(super) const QUERY_INACTIVE_TABLE_FLAG: u32 = 1 << 12;
 pub(super) const UEVENT_GENERATED_FLAG: u32 = 1 << 13;
+pub(super) const UUID_FLAG: u32 = 1 << 14;
 pub(super) const SECURE_DATA_FLAG: u32 = 1 << 15;
 pub(super) const DATA_OUT_FLAG: u32 = 1 << 16;
 pub(super) const INTERNAL_SUSPEND_FLAG: u32 = 1 << 18;
@@ -51,7 +58,7 @@ pub(super) fn validate_ioctl_params(
         if buffer[OFF_NAME] == 0 {
             return_errno_with_message!(Errno::EINVAL, "missing mapper name");
         }
-    } else if buffer[OFF_NAME] != 0 && buffer[OFF_UUID] != 0 {
+    } else if command != DM_LIST_DEVICES_CMD && buffer[OFF_NAME] != 0 && buffer[OFF_UUID] != 0 {
         return_errno_with_message!(
             Errno::EINVAL,
             "name and UUID selectors are mutually exclusive"

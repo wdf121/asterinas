@@ -585,6 +585,13 @@ pub(crate) fn unregister_runtime_primary(id: DeviceId) -> Result<Arc<dyn BlockDe
     }
 }
 
+/// Returns the current open count of a registered block device, if published.
+pub(crate) fn open_count(id: DeviceId) -> Option<usize> {
+    let block_file = DEVICE_REGISTRY.lock().get(&id.to_raw()).cloned()?;
+    let count = block_file.state.lock().open_count;
+    Some(count)
+}
+
 pub(super) fn lookup(id: DeviceId) -> Option<Arc<dyn Device>> {
     let block_file = DEVICE_REGISTRY.lock().get(&id.to_raw()).cloned()?;
     Some(block_file)

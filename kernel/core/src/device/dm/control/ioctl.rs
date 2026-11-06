@@ -5,8 +5,9 @@
 use ostd::mm::VmIo;
 
 use super::abi::{
-    self, DM_DEV_CREATE_CMD, DM_DEV_SUSPEND_CMD, DM_TABLE_LOAD_CMD, FIXED_PREFIX_SIZE,
-    OFF_DATA_SIZE, OFF_FLAGS, SECURE_DATA_FLAG,
+    self, DM_DEV_CREATE_CMD, DM_DEV_STATUS_CMD, DM_DEV_SUSPEND_CMD, DM_LIST_DEVICES_CMD,
+    DM_LIST_VERSIONS_CMD, DM_TABLE_LOAD_CMD, DM_TABLE_STATUS_CMD, FIXED_PREFIX_SIZE, OFF_DATA_SIZE,
+    OFF_FLAGS, SECURE_DATA_FLAG,
 };
 use crate::{context::current_userspace, prelude::*};
 
@@ -25,7 +26,8 @@ impl Drop for IoctlBuffer {
     }
 }
 
-/// Copies a bounded LOAD payload, or only the prefix for CREATE and RESUME, before dispatch.
+/// Copies a bounded LOAD payload, or a fixed prefix for commands without input records.
+/// Query commands allocate output capacity without reading it from userspace.
 pub(super) fn process_ioctl_parameters(
     arg: usize,
     version: &[u8; 12],
@@ -40,10 +42,17 @@ pub(super) fn process_ioctl_parameters(
     current_userspace!().read_bytes(addr, &mut header[version.len()..])?;
     let input_size = abi::read_u32(&header, OFF_DATA_SIZE);
     abi::validate_ioctl_size(input_size)?;
-    let size = if command == DM_TABLE_LOAD_CMD {
+    let variable = matches!(
+        command,
+        DM_TABLE_LOAD_CMD | DM_LIST_DEVICES_CMD | DM_TABLE_STATUS_CMD | DM_LIST_VERSIONS_CMD
+    );
+    let size = if variable {
         input_size as usize
     } else {
-        debug_assert!(matches!(command, DM_DEV_CREATE_CMD | DM_DEV_SUSPEND_CMD));
+        debug_assert!(matches!(
+            command,
+            DM_DEV_CREATE_CMD | DM_DEV_SUSPEND_CMD | DM_DEV_STATUS_CMD
+        ));
         FIXED_PREFIX_SIZE
     };
     let secure = abi::read_u32(&header, OFF_FLAGS) & SECURE_DATA_FLAG != 0;
@@ -60,7 +69,7 @@ pub(super) fn process_ioctl_parameters(
     bytes.resize(size, 0);
     let mut buffer = IoctlBuffer { bytes, secure };
     buffer.bytes[..header.len()].copy_from_slice(&header);
-    if size > FIXED_PREFIX_SIZE {
+    if size > FIXED_PREFIX_SIZE && command == DM_TABLE_LOAD_CMD {
         let payload_addr = arg.checked_add(FIXED_PREFIX_SIZE).ok_or_else(|| {
             Error::with_message(Errno::EFAULT, "device-mapper ioctl address overflow")
         })?;
@@ -81,6 +90,56 @@ pub(super) fn process_ioctl_parameters(
     )?;
     abi::write_u32(&mut buffer.bytes, OFF_DATA_SIZE, FIXED_PREFIX_SIZE as u32);
     dispatch(&mut buffer.bytes)?;
-    current_userspace!().write_bytes(arg, &buffer.bytes[..FIXED_PREFIX_SIZE])?;
+    let output_len = output_len(command, variable, &buffer.bytes);
+    current_userspace!().write_bytes(arg, &buffer.bytes[..output_len])?;
     Ok(0)
+}
+
+fn output_len(command: u8, variable: bool, bytes: &[u8]) -> usize {
+    if variable && command != DM_TABLE_LOAD_CMD {
+        (abi::read_u32(bytes, OFF_DATA_SIZE) as usize)
+            .max(FIXED_PREFIX_SIZE)
+            .min(bytes.len())
+    } else {
+        FIXED_PREFIX_SIZE
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn query_copyout_respects_capacity_and_reported_size() {
+        for command in [
+            DM_LIST_DEVICES_CMD,
+            DM_TABLE_STATUS_CMD,
+            DM_LIST_VERSIONS_CMD,
+        ] {
+            for (capacity, reported, expected) in [
+                (FIXED_PREFIX_SIZE, 312, FIXED_PREFIX_SIZE),
+                (312, 312, 312),
+                (320, 319, 319),
+                (320, 321, 320),
+            ] {
+                let mut bytes = vec![0; capacity];
+                abi::write_u32(&mut bytes, OFF_DATA_SIZE, reported as u32);
+                assert_eq!(output_len(command, true, &bytes), expected);
+            }
+        }
+        let mut load = vec![0; 512];
+        abi::write_u32(&mut load, OFF_DATA_SIZE, 512);
+        assert_eq!(
+            output_len(DM_TABLE_LOAD_CMD, true, &load),
+            FIXED_PREFIX_SIZE
+        );
+        let mut info = vec![0; FIXED_PREFIX_SIZE];
+        abi::write_u32(&mut info, OFF_DATA_SIZE, 312);
+        assert_eq!(
+            output_len(DM_DEV_STATUS_CMD, false, &info),
+            FIXED_PREFIX_SIZE
+        );
+    }
 }

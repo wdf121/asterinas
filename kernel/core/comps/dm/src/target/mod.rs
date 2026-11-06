@@ -161,6 +161,11 @@ impl DmTargetMetadata {
 
 const LINEAR_METADATA: DmTargetMetadata = DmTargetMetadata::new("linear", [1, 4, 0]);
 
+/// Target types actually supported by the table parser and reported to userspace.
+pub fn supported_target_metadata() -> &'static [DmTargetMetadata] {
+    &[LINEAR_METADATA]
+}
+
 /// Error boundary between target semantics and environment-specific backing lookup.
 #[derive(Debug, Eq, PartialEq)]
 pub enum DmTargetParseError<E> {

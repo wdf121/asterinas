@@ -13,7 +13,8 @@ nixos_test_main!(
         "first_linear_resume_reads_and_writes",
         "multi_target_linear_reads_and_writes",
         "multi_disk_linear_reads_and_writes",
-        "active_failure_readonly_and_bounds"
+        "active_failure_readonly_and_bounds",
+        "static_queries"
     ]
 );
 
@@ -125,6 +126,31 @@ fn check_multi_target_linear_io(
         "read and overwrite only the two sectors straddling the target boundary",
         &command(r#"node=$(cat /tmp/phase1_multi_node); dd if="$node" bs=512 skip=3 count=2 status=none | cmp - <(dd if=/tmp/phase1_multi_expected bs=512 skip=3 count=2 status=none); head -c 512 /dev/zero | tr "\000" X > /tmp/phase1_partial; head -c 512 /dev/zero | tr "\000" Y >> /tmp/phase1_partial; dd if=/tmp/phase1_partial of="$node" bs=1024 oflag=seek_bytes seek=1536 conv=notrunc status=none; dd if=/tmp/phase1_partial of=/tmp/phase1_multi_expected bs=512 seek=3 conv=notrunc status=none; dd if=/dev/vde bs=512 skip="$first_sector" count=4 status=none > /tmp/phase1_multi_backing; dd if="$second" bs=512 skip="$second_sector" count=4 status=none >> /tmp/phase1_multi_backing; cmp /tmp/phase1_multi_expected /tmp/phase1_multi_backing; dd if="$node" bs=4096 count=1 status=none | cmp - /tmp/phase1_multi_expected; echo PARTIAL_CROSS_OK"#),
         "PARTIAL_CROSS_OK",
+    )?;
+    Ok(())
+}
+
+#[nixos_test]
+fn static_queries(nixos_shell: &mut Session) -> Result<(), Error> {
+    nixos_shell.run_cmd_and_expect_display(
+        "list supported DM targets",
+        r#"bash -euo pipefail -c 'dmsetup targets | grep -q "^linear "; echo TARGETS_OK'"#,
+        "TARGETS_OK",
+    )?;
+    nixos_shell.run_cmd_and_expect_display(
+        "query tableless device",
+        r#"bash -euo pipefail -c 'dmsetup create phase1_query --notable; dmsetup ls | grep -q phase1_query; dmsetup info phase1_query | grep -q "State:"; test -z "$(dmsetup table phase1_query)"; echo QUERY_TABLELESS_OK'"#,
+        "QUERY_TABLELESS_OK",
+    )?;
+    nixos_shell.run_cmd_and_expect_display(
+        "query inactive table without falling back to active",
+        r#"bash -euo pipefail -c 'dmsetup load phase1_query --table "0 4 linear /dev/vde 320"; test -z "$(dmsetup table phase1_query)"; dmsetup table --inactive phase1_query | grep -q "0 4 linear .* 320"; dmsetup status --inactive phase1_query | grep -q "0 4 linear"; echo QUERY_INACTIVE_OK'"#,
+        "QUERY_INACTIVE_OK",
+    )?;
+    nixos_shell.run_cmd_and_expect_display(
+        "query active table and device information",
+        r#"bash -euo pipefail -c 'dmsetup resume phase1_query; dmsetup table phase1_query | grep -q "0 4 linear .* 320"; dmsetup status phase1_query | grep -q "0 4 linear"; dmsetup info phase1_query | grep -q "Open count:"; echo QUERY_ACTIVE_OK'"#,
+        "QUERY_ACTIVE_OK",
     )?;
     Ok(())
 }

@@ -175,6 +175,158 @@ FN_TEST(device_mapper_create_tableless)
 }
 END_TEST()
 
+FN_TEST(device_mapper_static_queries)
+{
+	char name[DM_NAME_LEN];
+	char primary[64];
+	struct dm_ioctl create = {}, info = {};
+	union dm_table_buffer table;
+	union {
+		struct dm_ioctl align;
+		unsigned char bytes[1024];
+	} list_buf = {};
+	union dm_table_buffer status_buf = {};
+	struct dm_ioctl *list = &list_buf.align;
+	struct dm_ioctl *status = &status_buf.align;
+	int control = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+
+	snprintf(name, sizeof(name), "dm-query-%ld", (long)getpid());
+	memcpy(create.version, kernel_version, sizeof(create.version));
+	create.data_size = sizeof(create);
+	strcpy(create.name, name);
+	TEST_SUCC(ioctl(control, DM_DEV_CREATE, &create));
+	snprintf(primary, sizeof(primary), "/dev/dm-%u", minor(create.dev));
+
+	memcpy(list->version, kernel_version, sizeof(list->version));
+	list->data_size = sizeof(list_buf.bytes);
+	list->data_start = sizeof(*list);
+	TEST_SUCC(ioctl(control, DM_LIST_DEVICES, list));
+	TEST_RES(list->flags & DM_BUFFER_FULL_FLAG, _ret == 0);
+	int found = 0;
+	for (size_t pos = list->data_start;
+	     pos + offsetof(struct dm_name_list, name) <= list->data_size;) {
+		struct dm_name_list *entry =
+			(struct dm_name_list *)(list_buf.bytes + pos);
+		size_t remaining = list->data_size - pos;
+		const char *end =
+			memchr(entry->name, 0,
+			       remaining - offsetof(struct dm_name_list, name));
+		TEST_RES(end != NULL, _ret == 1);
+		if (!end)
+			break;
+		if (entry->dev == create.dev &&
+		    (size_t)(end - entry->name) == strlen(name) &&
+		    memcmp(entry->name, name, strlen(name)) == 0)
+			found++;
+		if (!entry->next)
+			break;
+		TEST_RES(entry->next >= offsetof(struct dm_name_list, name) +
+						 1 &&
+				 entry->next <=
+					 remaining -
+						 offsetof(struct dm_name_list,
+							  name),
+			 _ret == 1);
+		if (entry->next < offsetof(struct dm_name_list, name) + 1 ||
+		    entry->next >
+			    remaining - offsetof(struct dm_name_list, name))
+			break;
+		pos += entry->next;
+	}
+	TEST_RES(found, _ret == 1);
+
+	union {
+		struct dm_ioctl align;
+		unsigned char bytes[512];
+	} versions_buf = {};
+	struct dm_ioctl *versions = &versions_buf.align;
+	memcpy(versions->version, kernel_version, sizeof(versions->version));
+	versions->data_size = sizeof(versions_buf.bytes);
+	TEST_SUCC(ioctl(control, DM_LIST_VERSIONS, versions));
+	TEST_RES(versions->flags & DM_BUFFER_FULL_FLAG, _ret == 0);
+	struct dm_target_versions *target =
+		(struct dm_target_versions *)(versions_buf.bytes +
+					      versions->data_start);
+	TEST_RES(strcmp(target->name, "linear"), _ret == 0);
+	TEST_RES(target->version[0], _ret == 1);
+	TEST_RES(target->next, _ret == 0);
+
+	/* A query with capacity for only the fixed prefix reports truncation. */
+	struct dm_ioctl short_query = {};
+	memcpy(short_query.version, kernel_version,
+	       sizeof(short_query.version));
+	short_query.data_size = offsetof(struct dm_ioctl, data);
+	TEST_SUCC(ioctl(control, DM_LIST_VERSIONS, &short_query));
+	TEST_RES(short_query.flags & DM_BUFFER_FULL_FLAG, _ret != 0);
+	TEST_RES(short_query.data_start, _ret == sizeof(struct dm_ioctl));
+
+	memcpy(info.version, kernel_version, sizeof(info.version));
+	info.data_size = sizeof(info);
+	strcpy(info.name, name);
+	TEST_SUCC(ioctl(control, DM_DEV_STATUS, &info));
+	TEST_RES(info.dev, _ret == create.dev);
+	TEST_RES(info.target_count, _ret == 0);
+	TEST_RES(info.open_count, _ret == 0);
+
+	/* Reject conflicting selectors rather than silently choosing a mapper. */
+	struct dm_ioctl ambiguous = {};
+	memcpy(ambiguous.version, kernel_version, sizeof(ambiguous.version));
+	ambiguous.data_size = sizeof(ambiguous);
+	strcpy(ambiguous.name, name);
+	ambiguous.dev = create.dev;
+	TEST(ioctl(control, DM_DEV_STATUS, &ambiguous), ENXIO, _ret == -1);
+
+	memcpy(status->version, kernel_version, sizeof(status->version));
+	status->data_size = sizeof(status_buf);
+	status->data_start = sizeof(*status);
+	strcpy(status->name, name);
+	status->flags = DM_STATUS_TABLE_FLAG;
+	TEST_SUCC(ioctl(control, DM_TABLE_STATUS, status));
+	TEST_RES(status->target_count, _ret == 0);
+
+	init_linear_table_params(table.bytes, sizeof(table.bytes), name, 8,
+				 "/dev/vdd", 320);
+	TEST_SUCC(ioctl(control, DM_TABLE_LOAD, table.bytes));
+	status->flags = DM_STATUS_TABLE_FLAG;
+	status->data_size = sizeof(status_buf);
+	status->dev = 0;
+	TEST_SUCC(ioctl(control, DM_TABLE_STATUS, status));
+	TEST_RES(status->target_count, _ret == 0);
+	status->flags = DM_STATUS_TABLE_FLAG | DM_QUERY_INACTIVE_TABLE_FLAG;
+	status->data_size = sizeof(status_buf);
+	status->dev = 0;
+	TEST_SUCC(ioctl(control, DM_TABLE_STATUS, status));
+	TEST_RES(status->target_count, _ret == 1);
+	struct dm_target_spec *spec =
+		(struct dm_target_spec *)(status_buf.bytes +
+					  status->data_start);
+	TEST_RES(spec->length, _ret == 8);
+	TEST_RES(strstr((char *)(spec + 1), " 320"), _ret != NULL);
+	status->flags = DM_QUERY_INACTIVE_TABLE_FLAG;
+	status->data_size = sizeof(status_buf);
+	status->dev = 0;
+	TEST_SUCC(ioctl(control, DM_TABLE_STATUS, status));
+	TEST_RES(spec->target_type[0], _ret == 'l');
+
+	struct dm_ioctl resume = {};
+	memcpy(resume.version, kernel_version, sizeof(resume.version));
+	resume.data_size = sizeof(resume);
+	strcpy(resume.name, name);
+	TEST_SUCC(ioctl(control, DM_DEV_SUSPEND, &resume));
+	int mapped = CHECK(open(primary, O_RDONLY | O_CLOEXEC));
+	info.flags = 0;
+	info.dev = 0;
+	TEST_SUCC(ioctl(control, DM_DEV_STATUS, &info));
+	TEST_RES(info.open_count, _ret == 1);
+	TEST_RES(info.flags & DM_ACTIVE_PRESENT_FLAG, _ret != 0);
+	TEST_SUCC(close(mapped));
+	info.dev = 0;
+	TEST_SUCC(ioctl(control, DM_DEV_STATUS, &info));
+	TEST_RES(info.open_count, _ret == 0);
+	TEST_SUCC(close(control));
+}
+END_TEST()
+
 /* No REMOVE yet; use the official fresh, unformatted /dev/vdd disk. */
 FN_TEST(device_mapper_first_resume_linear_io)
 {
