@@ -25,6 +25,7 @@ type CommandHandler = fn(&mut [u8]) -> Result<()>;
 pub(super) fn handler_for(command: u8) -> Result<CommandHandler> {
     match command {
         DM_DEV_CREATE_CMD => Ok(create_device),
+        DM_DEV_REMOVE_CMD => Ok(remove_device),
         DM_LIST_DEVICES_CMD => Ok(list_devices),
         DM_LIST_VERSIONS_CMD => Ok(list_versions),
         DM_DEV_STATUS_CMD => Ok(device_status),
@@ -33,6 +34,48 @@ pub(super) fn handler_for(command: u8) -> Result<CommandHandler> {
         DM_TABLE_LOAD_CMD => Ok(table_load),
         _ => return_errno_with_message!(Errno::ENOTTY, "unsupported device-mapper ioctl command"),
     }
+}
+
+fn ensure_control_live(device: &DmDevice) -> Result<()> {
+    if device.removal_isolated() {
+        return_errno_with_message!(Errno::ENXIO, "mapper removal is in progress");
+    }
+    Ok(())
+}
+
+/// Removes a mapper only after runtime unregistration succeeds. A partially
+/// unregistered wrapper stays indexed and reserved for a cleanup-only retry.
+fn remove_device(buffer: &mut [u8]) -> Result<()> {
+    if read_u32(buffer, OFF_FLAGS) & DEFERRED_REMOVE_FLAG != 0 {
+        return_errno_with_message!(Errno::EINVAL, "deferred mapper removal is not supported");
+    }
+    let device = lookup_load_device(buffer)?;
+    let _lifecycle = device.lock_lifecycle();
+    let isolated = device.removal_isolated();
+    if isolated && !runtime::primary_isolated(&device) {
+        return_errno_with_message!(Errno::EBUSY, "mapper removal is in progress");
+    }
+    if (isolated
+        || block::is_runtime_primary_registered(device.id())
+        || runtime::primary_isolated(&device))
+        && let Err(error) = runtime::unregister_primary(&device)
+    {
+        if runtime::primary_isolated(&device) {
+            device.isolate_removal();
+        }
+        return Err(error);
+    }
+    device.isolate_removal();
+    device.stop_and_drain_io();
+    fill_device_header(buffer, &device, false);
+    device.clear_removed_tables();
+    DM_MANAGER
+        .get()
+        .unwrap()
+        .remove(&device.mapper_name())
+        .map_err(|_| Error::new(Errno::ENXIO))?;
+    device.drain_removed();
+    Ok(())
 }
 
 /// Creates a mapped device and writes its assigned identity back into the ioctl header.
@@ -183,6 +226,7 @@ fn selected_table<'a>(
 fn device_status(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_load_device(buffer)?;
     let _lifecycle = device.lock_lifecycle();
+    ensure_control_live(&device)?;
     let (active, inactive) = device.table_snapshot();
     let table = selected_table(
         &active,
@@ -203,6 +247,7 @@ fn output_start(buffer: &mut [u8]) -> usize {
 fn table_status(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_load_device(buffer)?;
     let _lifecycle = device.lock_lifecycle();
+    ensure_control_live(&device)?;
     let flags = read_u32(buffer, OFF_FLAGS);
     let (active, inactive) = device.table_snapshot();
     let table = selected_table(&active, &inactive, flags & QUERY_INACTIVE_TABLE_FLAG != 0);
@@ -323,10 +368,11 @@ fn list_devices(buffer: &mut [u8]) -> Result<()> {
         .devices()
         .into_iter()
         .filter(|device| {
-            device
-                .mapper_name()
-                .as_bytes()
-                .starts_with(name_filter.as_deref().unwrap_or_default())
+            !device.removal_isolated()
+                && device
+                    .mapper_name()
+                    .as_bytes()
+                    .starts_with(name_filter.as_deref().unwrap_or_default())
                 && device
                     .uuid()
                     .as_deref()
@@ -455,6 +501,7 @@ fn optional_bytes(buffer: &[u8], offset: usize, len: usize) -> Option<&[u8]> {
 fn table_load(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_load_device(buffer)?;
     let _lifecycle = device.lock_lifecycle();
+    ensure_control_live(&device)?;
     table_load_for_device_with_primary(buffer, &device, runtime::ensure_primary)
 }
 
@@ -474,6 +521,7 @@ fn table_load_for_device_with_primary(
 fn resume_device(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_load_device(buffer)?;
     let _lifecycle = device.lock_lifecycle();
+    ensure_control_live(&device)?;
     resume_device_for(buffer, &device)
 }
 

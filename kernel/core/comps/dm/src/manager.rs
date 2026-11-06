@@ -165,7 +165,7 @@ impl DmManager {
     }
 
     /// Detaches a device from the manager indexes. The number remains reserved
-    /// until the final reference is dropped; runtime removal is not yet exposed.
+    /// until the final reference is dropped or removal explicitly drains it.
     pub fn remove(&self, name: &str) -> Result<Arc<DmDevice>, DmError> {
         let mut inner = self.inner.lock();
         let device = inner.by_name.remove(name).ok_or(DmError::DeviceNotFound)?;

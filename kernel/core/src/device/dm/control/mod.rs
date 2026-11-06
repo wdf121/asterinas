@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Linux Device Mapper control-device registration and supported commands, including static queries.
+//! Linux Device Mapper control-device registration and supported commands, including static queries and ordinary REMOVE.
 //!
 //! LOAD validates an inactive linear table and publishes only `/dev/dm-N`.
 //! First RESUME activates it for mapped I/O; suspend and hot replacement remain unsupported.
@@ -70,7 +70,7 @@ impl Device for DmControlDevice {
     }
 }
 
-/// Open control handle for VERSION, static queries, tableless CREATE, linear LOAD and first RESUME.
+/// Open control handle for VERSION, static queries, CREATE, LOAD, first RESUME and REMOVE.
 struct DmControlFile;
 
 impl Pollable for DmControlFile {

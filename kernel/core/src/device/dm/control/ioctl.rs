@@ -5,9 +5,9 @@
 use ostd::mm::VmIo;
 
 use super::abi::{
-    self, DM_DEV_CREATE_CMD, DM_DEV_STATUS_CMD, DM_DEV_SUSPEND_CMD, DM_LIST_DEVICES_CMD,
-    DM_LIST_VERSIONS_CMD, DM_TABLE_LOAD_CMD, DM_TABLE_STATUS_CMD, FIXED_PREFIX_SIZE, OFF_DATA_SIZE,
-    OFF_FLAGS, SECURE_DATA_FLAG,
+    self, DM_DEV_CREATE_CMD, DM_DEV_REMOVE_CMD, DM_DEV_STATUS_CMD, DM_DEV_SUSPEND_CMD,
+    DM_LIST_DEVICES_CMD, DM_LIST_VERSIONS_CMD, DM_TABLE_LOAD_CMD, DM_TABLE_STATUS_CMD,
+    FIXED_PREFIX_SIZE, OFF_DATA_SIZE, OFF_FLAGS, SECURE_DATA_FLAG,
 };
 use crate::{context::current_userspace, prelude::*};
 
@@ -51,7 +51,7 @@ pub(super) fn process_ioctl_parameters(
     } else {
         debug_assert!(matches!(
             command,
-            DM_DEV_CREATE_CMD | DM_DEV_SUSPEND_CMD | DM_DEV_STATUS_CMD
+            DM_DEV_CREATE_CMD | DM_DEV_REMOVE_CMD | DM_DEV_SUSPEND_CMD | DM_DEV_STATUS_CMD
         ));
         FIXED_PREFIX_SIZE
     };

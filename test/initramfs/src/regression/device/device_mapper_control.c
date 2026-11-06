@@ -22,6 +22,17 @@
 
 static const uint32_t kernel_version[3] = { 4, 48, 0 };
 
+/* ioctl replies fill dev; use a fresh, unambiguous name selector for teardown. */
+static int remove_mapper(int control, const char *name)
+{
+	struct dm_ioctl request = {};
+
+	memcpy(request.version, kernel_version, sizeof(request.version));
+	request.data_size = sizeof(request);
+	strcpy(request.name, name);
+	return ioctl(control, DM_DEV_REMOVE, &request);
+}
+
 FN_TEST(device_mapper_control_node)
 {
 	struct stat st;
@@ -171,6 +182,8 @@ FN_TEST(device_mapper_create_tableless)
 	strcpy(invalid.name, "invalid/name");
 	TEST(ioctl(fd, DM_DEV_CREATE, &invalid), EINVAL, _ret == -1);
 
+	TEST_SUCC(remove_mapper(fd, retry_name));
+	TEST_SUCC(remove_mapper(fd, name));
 	TEST_SUCC(close(fd));
 }
 END_TEST()
@@ -323,11 +336,81 @@ FN_TEST(device_mapper_static_queries)
 	info.dev = 0;
 	TEST_SUCC(ioctl(control, DM_DEV_STATUS, &info));
 	TEST_RES(info.open_count, _ret == 0);
+	TEST_SUCC(remove_mapper(control, name));
 	TEST_SUCC(close(control));
 }
 END_TEST()
 
-/* No REMOVE yet; use the official fresh, unformatted /dev/vdd disk. */
+FN_TEST(device_mapper_remove_lifecycle)
+{
+	char name[DM_NAME_LEN], primary[64];
+	struct dm_ioctl create = {}, request = {}, retry = {};
+	union dm_table_buffer table;
+	struct stat st;
+	int control = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+
+	snprintf(name, sizeof(name), "dm-remove-%ld", (long)getpid());
+	memcpy(create.version, kernel_version, sizeof(create.version));
+	create.data_size = sizeof(create);
+	strcpy(create.name, name);
+	TEST_SUCC(ioctl(control, DM_DEV_CREATE, &create));
+	snprintf(primary, sizeof(primary), "/dev/dm-%u", minor(create.dev));
+	memcpy(request.version, kernel_version, sizeof(request.version));
+	request.data_size = sizeof(request);
+	strcpy(request.name, name);
+	TEST_SUCC(ioctl(control, DM_DEV_REMOVE, &request));
+	TEST(stat(primary, &st), ENOENT, _ret == -1);
+	request.dev = 0;
+	TEST(ioctl(control, DM_DEV_REMOVE, &request), ENXIO, _ret == -1);
+
+	/* Reclaim the old minor, then reject removal while an open owns it. */
+	memcpy(retry.version, kernel_version, sizeof(retry.version));
+	retry.data_size = sizeof(retry);
+	retry.flags = DM_PERSISTENT_DEV_FLAG;
+	retry.dev = create.dev;
+	strcpy(retry.name, name);
+	TEST_SUCC(ioctl(control, DM_DEV_CREATE, &retry));
+	init_linear_table_params(table.bytes, sizeof(table.bytes), name, 8,
+				 "/dev/vdd", 400);
+	TEST_SUCC(ioctl(control, DM_TABLE_LOAD, table.bytes));
+	int opened = CHECK(open(primary, O_RDONLY | O_CLOEXEC));
+	request.dev = 0;
+	TEST(ioctl(control, DM_DEV_REMOVE, &request), EBUSY, _ret == -1);
+	TEST_RES(stat(primary, &st), _ret == 0);
+	TEST_SUCC(close(opened));
+	request.dev = 0;
+	TEST_SUCC(ioctl(control, DM_DEV_REMOVE, &request));
+	TEST(stat(primary, &st), ENOENT, _ret == -1);
+
+	/* The inactive table's backing lease is gone; reuse the minor and
+	 * remove a live mapping after a busy-open retry. */
+	struct dm_ioctl active = {};
+	memcpy(active.version, kernel_version, sizeof(active.version));
+	active.data_size = sizeof(active);
+	active.flags = DM_PERSISTENT_DEV_FLAG;
+	active.dev = create.dev;
+	strcpy(active.name, name);
+	TEST_SUCC(ioctl(control, DM_DEV_CREATE, &active));
+	init_linear_table_params(table.bytes, sizeof(table.bytes), name, 8,
+				 "/dev/vdd", 408);
+	TEST_SUCC(ioctl(control, DM_TABLE_LOAD, table.bytes));
+	struct dm_ioctl resume = {};
+	memcpy(resume.version, kernel_version, sizeof(resume.version));
+	resume.data_size = sizeof(resume);
+	strcpy(resume.name, name);
+	TEST_SUCC(ioctl(control, DM_DEV_SUSPEND, &resume));
+	opened = CHECK(open(primary, O_RDONLY | O_CLOEXEC));
+	request.dev = 0;
+	TEST(ioctl(control, DM_DEV_REMOVE, &request), EBUSY, _ret == -1);
+	TEST_SUCC(close(opened));
+	request.dev = 0;
+	TEST_SUCC(ioctl(control, DM_DEV_REMOVE, &request));
+	TEST(stat(primary, &st), ENOENT, _ret == -1);
+	TEST_SUCC(close(control));
+}
+END_TEST()
+
+/* Use the official fresh, unformatted /dev/vdd disk. */
 FN_TEST(device_mapper_first_resume_linear_io)
 {
 	char name[DM_NAME_LEN];
@@ -381,15 +464,15 @@ FN_TEST(device_mapper_first_resume_linear_io)
 	TEST_RES(pread(mapped, observed, sizeof(observed), 512),
 		 _ret == sizeof(observed));
 	TEST_RES(memcmp(written, observed, sizeof(written)), _ret == 0);
+	/* Restore the sectors this test writes before a same-guest rerun. */
+	TEST_RES(pwrite(mapped, zero, sizeof(zero), 512), _ret == sizeof(zero));
 	TEST_SUCC(close(backing));
 	TEST_SUCC(close(mapped));
+	TEST_SUCC(remove_mapper(control, name));
 	TEST_SUCC(close(control));
 }
 END_TEST()
 
-/* No REMOVE command yet: the mapper and backing lease remain until reboot.
- * Run with the official fresh /dev/vdd regression disk present.
- */
 /* A sector-aligned request becomes one BIO in the block-device VmIo path.
  * Crossing sector 4 therefore exercises DM splitting, not two user requests.
  */
@@ -500,9 +583,15 @@ static void check_multi_target_linear_io(const char *second_path,
 			 _ret == 512);
 		TEST_RES(memcmp(observed, zero, 512), _ret == 0);
 	}
+	/* The initial-zero assertions must also hold on a same-guest rerun. */
+	memset(observed, 0, 2048);
+	for (size_t i = 0; i < 2; ++i)
+		TEST_RES(pwrite(backing[i], observed, 2048, offsets[i]),
+			 _ret == 2048);
 	TEST_SUCC(close(mapped));
 	TEST_SUCC(close(backing[0]));
 	TEST_SUCC(close(backing[1]));
+	TEST_SUCC(remove_mapper(control, name));
 	TEST_SUCC(close(control));
 	*passes += __tests_passed;
 	*failures += __tests_failed;
@@ -557,6 +646,7 @@ FN_TEST(device_mapper_first_linear_load_publishes_primary)
 	TEST_RES(table.align.flags & DM_ACTIVE_PRESENT_FLAG, _ret == 0);
 	TEST_RES(stat(primary, &st),
 		 _ret == 0 && S_ISBLK(st.st_mode) && st.st_rdev == dev);
+	TEST_SUCC(remove_mapper(fd, name));
 	TEST_SUCC(close(fd));
 }
 END_TEST()
@@ -586,6 +676,7 @@ FN_TEST(device_mapper_numeric_backing_load)
 	TEST_RES(table.align.flags & DM_ACTIVE_PRESENT_FLAG, _ret == 0);
 	TEST_RES(stat(primary, &node), _ret == 0 && S_ISBLK(node.st_mode) &&
 					       node.st_rdev == create.dev);
+	TEST_SUCC(remove_mapper(control, name));
 	TEST_SUCC(close(control));
 }
 END_TEST()
@@ -673,8 +764,11 @@ FN_TEST(device_mapper_active_table_failure_and_bounds)
 	TEST_RES(memcmp(observed, expected, sizeof(expected)), _ret == 0);
 	TEST_RES(pread(backing, observed, 512, 200 * 512), _ret == 512);
 	TEST_RES(memcmp(observed, zero, 512), _ret == 0);
+	TEST_RES(pwrite(backing, zero, sizeof(zero), 192 * 512),
+		 _ret == sizeof(zero));
 	TEST_SUCC(close(mapped));
 	TEST_SUCC(close(backing));
+	TEST_SUCC(remove_mapper(control, name));
 	TEST_SUCC(close(control));
 }
 END_TEST()
@@ -720,6 +814,7 @@ FN_TEST(device_mapper_readonly_linear_io)
 	TEST_RES(memcmp(observed, expected, sizeof(expected)), _ret == 0);
 	TEST_SUCC(close(mapped));
 	TEST_SUCC(close(backing));
+	TEST_SUCC(remove_mapper(control, name));
 	TEST_SUCC(close(control));
 }
 END_TEST()

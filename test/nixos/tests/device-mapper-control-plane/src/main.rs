@@ -36,7 +36,7 @@ fn create_tableless(nixos_shell: &mut Session) -> Result<(), Error> {
 
 /// Observe the automatically allocated minor by comparing primary nodes
 /// before and after LOAD. The official NixOS test entry supplies a fresh raw
-/// backing disk at /dev/vde; without REMOVE, the mapper lasts until VM restart.
+/// backing disk at /dev/vde.
 #[nixos_test]
 fn first_linear_load_publishes_primary(nixos_shell: &mut Session) -> Result<(), Error> {
     nixos_shell.run_cmd_and_expect_display(
@@ -187,6 +187,11 @@ fn active_failure_readonly_and_bounds(nixos_shell: &mut Session) -> Result<(), E
         "activate a readonly mapping and check reads succeed while writes leave backing unchanged",
         r#"bash -euo pipefail -c 'printf "%s " /dev/dm-* > /tmp/phase1_ro_before; dd if=/tmp/phase1_checks_patch of=/dev/vde bs=512 seek=256 conv=notrunc status=none; dmsetup create phase1_readonly --notable; dmsetup load --readonly phase1_readonly --table "0 8 linear /dev/vde 256"; before=" $(cat /tmp/phase1_ro_before)"; count=0; for node in /dev/dm-*; do test -b "$node" || continue; case "$before" in *" $node "*) continue;; esac; count=$((count+1)); printf "%s" "$node" > /tmp/phase1_ro_node; done; test "$count" -eq 1; dmsetup resume phase1_readonly; node=$(cat /tmp/phase1_ro_node); dd if="$node" bs=512 count=1 status=none | cmp - /tmp/phase1_checks_patch; if dd if=/dev/zero of="$node" bs=512 count=1 conv=notrunc status=none; then exit 1; fi; dd if=/dev/vde bs=512 skip=256 count=1 status=none | cmp - /tmp/phase1_checks_patch; dd if="$node" bs=512 count=1 status=none | cmp - /tmp/phase1_checks_patch; echo READONLY_OK'"#,
         "READONLY_OK",
+    )?;
+    nixos_shell.run_cmd_and_expect_display(
+        "remove tableless, inactive and active mappers and reject busy removal",
+        r#"bash -euo pipefail -c 'dmsetup create phase1_remove_empty --notable; dmsetup remove phase1_remove_empty; if dmsetup info phase1_remove_empty; then exit 1; fi; dmsetup create phase1_remove_inactive --notable; dmsetup load phase1_remove_inactive --table "0 4 linear /dev/vde 384"; dmsetup remove phase1_remove_inactive; if dmsetup info phase1_remove_inactive; then exit 1; fi; dmsetup create phase1_remove_active --notable; dmsetup load phase1_remove_active --table "0 4 linear /dev/vde 392"; dmsetup resume phase1_remove_active; read -r major minor < <(dmsetup info -c --noheadings -o major,minor --separator " " phase1_remove_active); path="/dev/dm-$minor"; test -b "$path"; exec 9<"$path"; if dmsetup remove phase1_remove_active; then exit 1; fi; test -b "$path"; exec 9<&-; dmsetup remove phase1_remove_active; test ! -e "$path"; if dmsetup info phase1_remove_active; then exit 1; fi; echo REMOVE_LIFECYCLE_OK'"#,
+        "REMOVE_LIFECYCLE_OK",
     )?;
     Ok(())
 }

@@ -459,6 +459,17 @@ fn remove_owned_node_or_accept_stale(handle: &DevtmpfsHandle) -> Result<()> {
     }
 }
 
+/// Whether a runtime primary wrapper remains reserved after a failed removal.
+/// A non-live wrapper must only be retried for cleanup, never used for LOAD.
+pub(crate) fn is_runtime_primary_isolated(id: DeviceId) -> bool {
+    let Ok(file) = lookup_runtime_block_file(id) else {
+        return false;
+    };
+    file.failed_registration.lock().is_some()
+        || file.removing.lock().is_some()
+        || (aster_block::lookup(id).is_none() && !file.state.lock().accepting_opens)
+}
+
 /// Reports whether a runtime primary node has completed publication.
 pub(crate) fn is_runtime_primary_registered(id: DeviceId) -> bool {
     DEVICE_REGISTRY
@@ -529,10 +540,6 @@ fn isolate_runtime_unregistration(
 /// Failed restoration leaves the registration isolated for a later retry.
 /// A failed publication with a retained pending reservation can also be
 /// cleaned up through this entry point.
-#[cfg_attr(
-    not(ktest),
-    expect(dead_code, reason = "used by a later removal phase")
-)]
 pub(crate) fn unregister_runtime_primary(id: DeviceId) -> Result<Arc<dyn BlockDevice>> {
     let block_file = lookup_runtime_block_file(id)?;
     let _lifecycle = block_file.lifecycle.lock();

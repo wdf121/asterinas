@@ -10,6 +10,14 @@ use aster_dm::DmDevice;
 
 use crate::{device::registry::block, prelude::*};
 
+pub(super) fn unregister_primary(device: &Arc<DmDevice>) -> Result<()> {
+    block::unregister_runtime_primary(device.id()).map(|_| ())
+}
+
+pub(super) fn primary_isolated(device: &DmDevice) -> bool {
+    block::is_runtime_primary_isolated(device.id())
+}
+
 /// Publishes `/dev/dm-N` for a mapper after its table has been validated.
 ///
 /// Repeated publication of the same device is a no-op. A failed publication

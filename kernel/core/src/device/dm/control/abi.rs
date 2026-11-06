@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Device Mapper ioctl ABI for CREATE, LOAD, first RESUME and static queries.
+//! Device Mapper ioctl ABI for CREATE, LOAD, first RESUME, REMOVE and static queries.
 
 use crate::prelude::*;
 
 pub(super) const DM_LIST_DEVICES_CMD: u8 = 2;
 pub(super) const DM_DEV_CREATE_CMD: u8 = 3;
+pub(super) const DM_DEV_REMOVE_CMD: u8 = 4;
 pub(super) const DM_DEV_SUSPEND_CMD: u8 = 6;
 pub(super) const DM_DEV_STATUS_CMD: u8 = 7;
 pub(super) const DM_TABLE_LOAD_CMD: u8 = 9;
@@ -38,6 +39,7 @@ pub(super) const UEVENT_GENERATED_FLAG: u32 = 1 << 13;
 pub(super) const UUID_FLAG: u32 = 1 << 14;
 pub(super) const SECURE_DATA_FLAG: u32 = 1 << 15;
 pub(super) const DATA_OUT_FLAG: u32 = 1 << 16;
+pub(super) const DEFERRED_REMOVE_FLAG: u32 = 1 << 17;
 pub(super) const INTERNAL_SUSPEND_FLAG: u32 = 1 << 18;
 
 pub(super) fn validate_ioctl_size(size: u32) -> Result<()> {

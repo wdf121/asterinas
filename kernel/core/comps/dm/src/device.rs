@@ -4,13 +4,14 @@
 //! exist, unless removal releases it after the control-plane drain.
 
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta,
     bio::{BioEnqueueError, BioType, SubmittedBio},
 };
 use device_id::DeviceId;
-use ostd::sync::Mutex;
+use ostd::sync::{Mutex, WaitQueue};
 
 use crate::{DmError, DmTable, manager::DmDeviceIdOwner};
 
@@ -25,6 +26,46 @@ pub struct DmDevice {
     tables: Mutex<DmDeviceTables>,
     /// Serializes LOAD and first RESUME control transitions for this mapper.
     lifecycle: Mutex<()>,
+    io: Arc<DmIoState>,
+    removal_isolated: AtomicBool,
+}
+
+struct DmIoState {
+    inner: Mutex<DmIoInner>,
+    drained: WaitQueue,
+}
+
+#[derive(Debug, Default)]
+struct DmIoInner {
+    stopped: bool,
+    admitting: usize,
+    in_flight: usize,
+}
+
+impl core::fmt::Debug for DmIoState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DmIoState")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl DmIoState {
+    fn complete(&self) {
+        let mut inner = self.inner.lock();
+        inner.in_flight -= 1;
+        if inner.in_flight == 0 && inner.admitting == 0 {
+            self.drained.wake_all();
+        }
+    }
+
+    fn leave_enqueue(&self) {
+        let mut inner = self.inner.lock();
+        inner.admitting -= 1;
+        if inner.in_flight == 0 && inner.admitting == 0 {
+            self.drained.wake_all();
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -47,6 +88,11 @@ impl DmDevice {
             uuid: Mutex::new(uuid),
             tables: Mutex::new(DmDeviceTables::default()),
             lifecycle: Mutex::new(()),
+            io: Arc::new(DmIoState {
+                inner: Mutex::new(DmIoInner::default()),
+                drained: WaitQueue::new(),
+            }),
+            removal_isolated: AtomicBool::new(false),
         }
     }
 
@@ -113,6 +159,33 @@ impl DmDevice {
         Ok(())
     }
 
+    /// Marks a partially removed device as cleanup-only under its lifecycle lock.
+    pub fn isolate_removal(&self) {
+        self.removal_isolated.store(true, Ordering::Release);
+    }
+
+    pub fn removal_isolated(&self) -> bool {
+        self.removal_isolated.load(Ordering::Acquire)
+    }
+
+    /// Stops admitting new I/O and waits for both forwarding calls and accepted
+    /// BIO completions. The lifecycle caller must first unregister the primary
+    /// device so this transition cannot need rollback.
+    pub fn stop_and_drain_io(&self) {
+        self.io.inner.lock().stopped = true;
+        self.io.drained.wait_until(|| {
+            let inner = self.io.inner.lock();
+            (inner.admitting == 0 && inner.in_flight == 0).then_some(())
+        });
+    }
+
+    /// Drops both generations only after no accepted BIO can reference them.
+    pub fn clear_removed_tables(&self) {
+        let mut tables = self.tables.lock();
+        tables.active = None;
+        tables.inactive = None;
+    }
+
     /// Releases the number after the caller has drained control and I/O users.
     /// Structural references can continue to observe the immutable identity.
     pub fn drain_removed(&self) {
@@ -121,14 +194,36 @@ impl DmDevice {
 }
 
 impl BlockDevice for DmDevice {
-    fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
-        let table = self.active_table().ok_or(BioEnqueueError::Refused)?;
-        // Only Read, Write and Flush exist today; Flush must remain permitted on
-        // a read-only table so callers can drain backing write caches.
-        if table.is_readonly() && bio.type_() == BioType::Write {
-            return Err(BioEnqueueError::Refused);
+    fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+        let table = {
+            let mut io = self.io.inner.lock();
+            if io.stopped {
+                return Err(BioEnqueueError::Refused);
+            }
+            // Admission and table selection are serialized against removal.
+            let table = self.active_table().ok_or(BioEnqueueError::Refused)?;
+            // Flush must remain permitted on a read-only table.
+            if table.is_readonly() && bio.type_() == BioType::Write {
+                return Err(BioEnqueueError::Refused);
+            }
+            io.admitting += 1;
+            io.in_flight += 1;
+            table
+        };
+        let accounted = Arc::new(AtomicBool::new(true));
+        let completion_io = self.io.clone();
+        let completion_accounted = accounted.clone();
+        bio.chain_complete_fn(move |_| {
+            if completion_accounted.swap(false, Ordering::AcqRel) {
+                completion_io.complete();
+            }
+        });
+        let result = table.enqueue(bio);
+        if result.is_err() && accounted.swap(false, Ordering::AcqRel) {
+            self.io.complete();
         }
-        table.enqueue(bio)
+        self.io.leave_enqueue();
+        result
     }
 
     fn metadata(&self) -> BlockDeviceMeta {
@@ -315,6 +410,47 @@ mod tests {
         assert!(Arc::ptr_eq(&device.inactive_table().unwrap(), &replacement));
         drop(manager);
         drop(device);
+    }
+
+    #[ktest]
+    fn removal_waits_for_forwarded_io_and_rejects_later_io() {
+        let (manager, device) = mapper();
+        let backing = PendingBacking::new();
+        let active = table(backing.clone(), false);
+        device.load_table(active.clone());
+        device.resume_initial().unwrap();
+        let out_of_range = Bio::new(
+            BioType::Read,
+            Sid::new(1024),
+            vec![BioSegment::alloc_exact(1, 512, BioDirection::FromDevice)],
+            None,
+        );
+        assert_eq!(
+            out_of_range.submit_and_wait(device.as_ref()),
+            Err(BioEnqueueError::Refused)
+        );
+        assert_eq!(device.io.inner.lock().in_flight, 0);
+        let bio = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        bio.submit(device.as_ref(), &mut batch).unwrap();
+        assert!(backing.pending.lock().is_some());
+        // Completing an accepted request still holds the table even when the
+        // mapper has stopped accepting fresh requests.
+        device.io.inner.lock().stopped = true;
+        let rejected = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
+        assert_eq!(
+            rejected.submit_and_wait(device.as_ref()),
+            Err(BioEnqueueError::Refused)
+        );
+        assert_eq!(device.io.inner.lock().in_flight, 1);
+        backing.finish();
+        assert!(batch.wait_all().is_ok());
+        device.stop_and_drain_io();
+        assert_eq!(device.io.inner.lock().in_flight, 0);
+        device.clear_removed_tables();
+        assert!(device.active_table().is_none());
+        manager.remove("mapper-io-test").unwrap();
+        device.drain_removed();
     }
 
     #[ktest]
