@@ -3,7 +3,8 @@
 //! Linux Device Mapper control-device registration and supported commands, including static queries and ordinary REMOVE.
 //!
 //! LOAD validates an inactive linear table and publishes only `/dev/dm-N`.
-//! First RESUME activates it for mapped I/O; suspend and hot replacement remain unsupported.
+//! First RESUME activates it for mapped I/O; running mappings support suspend
+//! and resume without table replacement. Hot replacement remains unsupported.
 
 use device_id::{DeviceId, MinorId};
 use ostd::mm::VmIo;

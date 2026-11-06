@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-/* VERSION, tableless CREATE, linear LOAD and first RESUME ABI regression tests. */
+/* VERSION, CREATE, linear LOAD, suspend/resume and REMOVE ABI regression tests. */
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -447,6 +447,32 @@ FN_TEST(device_mapper_first_resume_linear_io)
 	repeat_resume.data_size = sizeof(repeat_resume);
 	strcpy(repeat_resume.name, name);
 	TEST_SUCC(ioctl(control, DM_DEV_SUSPEND, &repeat_resume));
+
+	/* A live mapping pauses, reports its state, and resumes the same table. */
+	struct dm_ioctl suspend = {}, status = {}, wake = {};
+	memcpy(suspend.version, kernel_version, sizeof(suspend.version));
+	suspend.data_size = sizeof(suspend);
+	strcpy(suspend.name, name);
+	suspend.flags = DM_SUSPEND_FLAG | DM_NOFLUSH_FLAG;
+	TEST(ioctl(control, DM_DEV_SUSPEND, &suspend), EINVAL, _ret == -1);
+	suspend.flags = DM_SUSPEND_FLAG | DM_SKIP_LOCKFS_FLAG;
+	TEST(ioctl(control, DM_DEV_SUSPEND, &suspend), EINVAL, _ret == -1);
+	suspend.flags = DM_SUSPEND_FLAG;
+	TEST_SUCC(ioctl(control, DM_DEV_SUSPEND, &suspend));
+	TEST_RES(suspend.flags & DM_SUSPEND_FLAG, _ret != 0);
+	memcpy(status.version, kernel_version, sizeof(status.version));
+	status.data_size = sizeof(status);
+	strcpy(status.name, name);
+	TEST_SUCC(ioctl(control, DM_DEV_STATUS, &status));
+	TEST_RES(status.flags & DM_SUSPEND_FLAG, _ret != 0);
+	/* The reply carries a dev selector; clear it before selecting by name. */
+	suspend.dev = 0;
+	TEST_SUCC(ioctl(control, DM_DEV_SUSPEND, &suspend));
+	memcpy(wake.version, kernel_version, sizeof(wake.version));
+	wake.data_size = sizeof(wake);
+	strcpy(wake.name, name);
+	TEST_SUCC(ioctl(control, DM_DEV_SUSPEND, &wake));
+	TEST_RES(wake.flags & DM_SUSPEND_FLAG, _ret == 0);
 
 	int mapped = CHECK(open(primary, O_RDWR | O_CLOEXEC));
 	int backing = CHECK(open("/dev/vdd", O_RDONLY | O_CLOEXEC));

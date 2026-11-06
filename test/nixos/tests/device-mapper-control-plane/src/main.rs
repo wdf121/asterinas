@@ -11,6 +11,7 @@ nixos_test_main!(
         "first_linear_load_publishes_primary",
         "numeric_backing_load",
         "first_linear_resume_reads_and_writes",
+        "suspend_and_resume_linear_mapping",
         "multi_target_linear_reads_and_writes",
         "multi_disk_linear_reads_and_writes",
         "active_failure_readonly_and_bounds",
@@ -79,6 +80,17 @@ fn first_linear_resume_reads_and_writes(nixos_shell: &mut Session) -> Result<(),
         "resume and verify mapped writes and reads against backing",
         r#"bash -e -c 'dmsetup resume phase1_resume; node=$(cat /tmp/phase1_resume_node); test -b "$node"; printf "phase1-linear-resume" | dd of="$node" bs=512 seek=1 conv=sync,notrunc status=none; printf "phase1-linear-resume" | dd bs=512 conv=sync status=none | cmp - <(dd if=/dev/vde bs=512 skip=9 count=1 status=none); dd if=/dev/vde bs=512 skip=9 count=1 status=none | cmp - <(dd if="$node" bs=512 skip=1 count=1 status=none); echo RESUME_LINEAR_IO_OK'"#,
         "RESUME_LINEAR_IO_OK",
+    )?;
+    Ok(())
+}
+
+/// Suspend an active raw mapping, query its state and resume the same table.
+#[nixos_test]
+fn suspend_and_resume_linear_mapping(nixos_shell: &mut Session) -> Result<(), Error> {
+    nixos_shell.run_cmd_and_expect_display(
+        "suspend and resume an active linear mapping",
+        r#"bash -euo pipefail -c 'node=$(cat /tmp/phase1_resume_node); dmsetup suspend phase1_resume; dmsetup info phase1_resume | grep -q "State:.*SUSPENDED"; dmsetup suspend phase1_resume; dmsetup resume phase1_resume; dmsetup info phase1_resume | grep -q "State:.*ACTIVE"; dd if="$node" bs=512 skip=1 count=1 status=none | cmp - <(dd if=/dev/vde bs=512 skip=9 count=1 status=none); echo SUSPEND_RESUME_OK'"#,
+        "SUSPEND_RESUME_OK",
     )?;
     Ok(())
 }

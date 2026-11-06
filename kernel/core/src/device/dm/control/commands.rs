@@ -155,6 +155,9 @@ fn fill_device_header(buffer: &mut [u8], device: &DmDevice, prefer_inactive: boo
     if selected.is_some_and(|table| table.is_readonly()) {
         flags |= READONLY_FLAG;
     }
+    if device.is_suspended() {
+        flags |= SUSPEND_FLAG;
+    }
     write_u32(buffer, OFF_FLAGS, flags);
     let name = device.mapper_name();
     buffer[OFF_NAME..OFF_NAME + NAME_LEN].fill(0);
@@ -200,6 +203,9 @@ fn query_header(
     }
     if selected.is_some_and(|table| table.is_readonly()) {
         flags |= READONLY_FLAG;
+    }
+    if device.is_suspended() {
+        flags |= SUSPEND_FLAG;
     }
     write_u32(buffer, OFF_FLAGS, flags);
     let name = device.mapper_name();
@@ -517,7 +523,7 @@ fn table_load_for_device_with_primary(
     Ok(())
 }
 
-/// Performs only the initial RESUME transition; hot replacement needs suspend/drain.
+/// Suspends a running mapping or resumes its existing active table.
 fn resume_device(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_load_device(buffer)?;
     let _lifecycle = device.lock_lifecycle();
@@ -526,15 +532,27 @@ fn resume_device(buffer: &mut [u8]) -> Result<()> {
 }
 
 fn resume_device_for(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
-    if read_u32(buffer, OFF_FLAGS) & SUSPEND_FLAG != 0 {
-        return_errno_with_message!(Errno::EINVAL, "mapper suspend is not supported");
-    }
-    device.resume_initial().map_err(|_| {
-        Error::with_message(
+    let flags = read_u32(buffer, OFF_FLAGS);
+    if flags & (NOFLUSH_FLAG | SKIP_LOCKFS_FLAG) != 0 {
+        return_errno_with_message!(
             Errno::EINVAL,
-            "mapper has no initial table or requires suspend",
-        )
-    })?;
+            "noflush and lockfs control are not supported"
+        );
+    }
+    if flags & SUSPEND_FLAG != 0 {
+        device.suspend().map_err(|_| Error::new(Errno::EINVAL))?;
+    } else if device.is_suspended() {
+        device
+            .resume_suspended()
+            .map_err(|_| Error::new(Errno::EINVAL))?;
+    } else {
+        device.resume_initial().map_err(|_| {
+            Error::with_message(
+                Errno::EINVAL,
+                "mapper has no initial table or requires suspend",
+            )
+        })?;
+    }
     fill_device_header(buffer, device, false);
     Ok(())
 }
@@ -1045,6 +1063,28 @@ mod tests {
             ACTIVE_PRESENT_FLAG | READONLY_FLAG
         );
         assert_eq!(read_u32(&resume, OFF_FLAGS) & INACTIVE_PRESENT_FLAG, 0);
+        write_u32(&mut resume, OFF_FLAGS, SUSPEND_FLAG | NOFLUSH_FLAG);
+        assert_eq!(
+            resume_device_for(&mut resume, &device).unwrap_err().error(),
+            Errno::EINVAL
+        );
+        assert!(!device.is_suspended());
+        write_u32(&mut resume, OFF_FLAGS, SUSPEND_FLAG);
+        resume_device_for(&mut resume, &device).unwrap();
+        assert_eq!(read_u32(&resume, OFF_FLAGS) & SUSPEND_FLAG, SUSPEND_FLAG);
+        let mut status = vec![0u8; FIXED_PREFIX_SIZE];
+        let (active, inactive) = device.table_snapshot();
+        query_header(
+            &mut status,
+            &device,
+            active.as_ref(),
+            inactive.as_ref(),
+            active.as_ref(),
+        );
+        assert_eq!(read_u32(&status, OFF_FLAGS) & SUSPEND_FLAG, SUSPEND_FLAG);
+        write_u32(&mut resume, OFF_FLAGS, 0);
+        resume_device_for(&mut resume, &device).unwrap();
+        assert_eq!(read_u32(&resume, OFF_FLAGS) & SUSPEND_FLAG, 0);
         resume_device_for(&mut resume, &device).unwrap();
         let mut replacement = buffer("first-resume-test", backing);
         table_load_for_device_with_primary(&mut replacement, &device, |_| Ok(())).unwrap();
@@ -1053,12 +1093,22 @@ mod tests {
             ACTIVE_PRESENT_FLAG | INACTIVE_PRESENT_FLAG
         );
         assert_eq!(read_u32(&replacement, OFF_FLAGS) & READONLY_FLAG, 0);
+        write_u32(&mut resume, OFF_FLAGS, SUSPEND_FLAG);
+        resume_device_for(&mut resume, &device).unwrap();
+        assert!(device.is_suspended());
+        write_u32(&mut resume, OFF_FLAGS, 0);
         assert_eq!(
             resume_device_for(&mut resume, &device).unwrap_err().error(),
             Errno::EINVAL
         );
+        assert!(device.is_suspended());
+        assert!(device.inactive_table().is_some());
         assert!(device.active_table().unwrap().is_readonly());
         assert!(!device.inactive_table().unwrap().is_readonly());
+        // The status snapshot holds a table (and its backing lease) independently
+        // of the mapper; release it before unregistering the backing device.
+        drop(active);
+        drop(inactive);
         drop(replacement);
         drop(request);
         manager.remove("first-resume-test").unwrap();

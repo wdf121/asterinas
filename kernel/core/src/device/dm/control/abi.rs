@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Device Mapper ioctl ABI for CREATE, LOAD, first RESUME, REMOVE and static queries.
+//! Device Mapper ioctl ABI for CREATE, LOAD, suspend/resume, REMOVE and static queries.
 
 use crate::prelude::*;
 
@@ -29,6 +29,8 @@ pub(super) const OFF_UUID: usize = 176;
 pub(super) const UUID_LEN: usize = 129;
 pub(super) const READONLY_FLAG: u32 = 1;
 pub(super) const SUSPEND_FLAG: u32 = 1 << 1;
+pub(super) const SKIP_LOCKFS_FLAG: u32 = 1 << 10;
+pub(super) const NOFLUSH_FLAG: u32 = 1 << 11;
 pub(super) const PERSISTENT_DEV_FLAG: u32 = 1 << 3;
 pub(super) const STATUS_TABLE_FLAG: u32 = 1 << 4;
 pub(super) const ACTIVE_PRESENT_FLAG: u32 = 1 << 5;
