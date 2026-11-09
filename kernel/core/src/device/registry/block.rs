@@ -99,6 +99,10 @@ mod ioctl_defs {
     /// Returns the device size in bytes.
     pub(super) type BlkGetSize64 = ioc!(BLKGETSIZE64, 0x12, 114, OutData<u64>);
 
+    /// Returns the block device's read-ahead setting in 512-byte sectors.
+    /// Linux uses a native long at the pointed-to address (not an encoded ioctl size).
+    pub(super) type BlkGetReadAhead = ioc!(BLKRAGET, 0x12, 99, NoData);
+
     /// Returns the logical sector size of the block device.
     ///
     /// This is the smallest unit of I/O the device can address and,
@@ -356,6 +360,12 @@ impl PerOpenFileOps for OpenBlockFile {
         use ioctl_defs::*;
 
         dispatch_ioctl!(match raw_ioctl {
+            _cmd @ BlkGetReadAhead => {
+                // Block-device read-ahead is not configured in Asterinas yet.
+                // Report zero rather than inventing a Linux queue setting.
+                current_userspace!().write_val(raw_ioctl.arg(), &0usize)?;
+                Ok(0)
+            }
             _cmd @ BlkGetSectorSize => {
                 // TODO: Query the per-device logical block size once block device metadata
                 // exposes it. For now, report the effective minimum I/O granularity enforced

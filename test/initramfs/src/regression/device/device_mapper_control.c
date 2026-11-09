@@ -262,7 +262,15 @@ FN_TEST(device_mapper_static_queries)
 					      versions->data_start);
 	TEST_RES(strcmp(target->name, "linear"), _ret == 0);
 	TEST_RES(target->version[0], _ret == 1);
-	TEST_RES(target->next, _ret == 0);
+	TEST_RES(target->next, _ret == 24);
+	struct dm_target_versions *striped =
+		(struct dm_target_versions *)((unsigned char *)target +
+					      target->next);
+	TEST_RES(strcmp(striped->name, "striped"), _ret == 0);
+	TEST_RES(striped->version[0], _ret == 1);
+	TEST_RES(striped->version[1], _ret == 6);
+	TEST_RES(striped->version[2], _ret == 0);
+	TEST_RES(striped->next, _ret == 0);
 
 	/* A query with capacity for only the fixed prefix reports truncation. */
 	struct dm_ioctl short_query = {};
@@ -320,6 +328,18 @@ FN_TEST(device_mapper_static_queries)
 	status->dev = 0;
 	TEST_SUCC(ioctl(control, DM_TABLE_STATUS, status));
 	TEST_RES(spec->target_type[0], _ret == 'l');
+
+	status->flags = DM_QUERY_INACTIVE_TABLE_FLAG;
+	status->data_size = sizeof(status_buf);
+	status->dev = 0;
+	TEST_SUCC(ioctl(control, DM_TABLE_DEPS, status));
+	struct dm_target_deps *dependency =
+		(struct dm_target_deps *)(status_buf.bytes +
+					  status->data_start);
+	TEST_RES(dependency->count, _ret == 1);
+	struct stat backing_st;
+	TEST_SUCC(stat("/dev/vdd", &backing_st));
+	TEST_RES(dependency->dev[0], _ret == (uint64_t)backing_st.st_rdev);
 
 	struct dm_ioctl resume = {};
 	memcpy(resume.version, kernel_version, sizeof(resume.version));

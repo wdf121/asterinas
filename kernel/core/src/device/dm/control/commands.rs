@@ -5,7 +5,7 @@
 use aster_block::id::Sid;
 use aster_dm::{
     DmDevice, DmError, DmTable, TableError,
-    target::{DmTargetParseError, TargetStatusMode, parse_target_with, supported_target_metadata},
+    target::{DmTargetParseError, TargetStatusMode, parse_target_with, reported_target_metadata},
 };
 use device_id::{DeviceId, MajorId, MinorId, decode_device_numbers};
 
@@ -28,6 +28,8 @@ pub(super) fn handler_for(command: u8) -> Result<CommandHandler> {
         DM_DEV_REMOVE_CMD => Ok(remove_device),
         DM_LIST_DEVICES_CMD => Ok(list_devices),
         DM_LIST_VERSIONS_CMD => Ok(list_versions),
+        DM_GET_TARGET_VERSION_CMD => Ok(get_target_version),
+        DM_TABLE_DEPS_CMD => Ok(table_deps),
         DM_DEV_STATUS_CMD => Ok(device_status),
         DM_TABLE_STATUS_CMD => Ok(table_status),
         DM_DEV_SUSPEND_CMD => Ok(resume_device),
@@ -250,6 +252,48 @@ fn output_start(buffer: &mut [u8]) -> usize {
     DM_IOCTL_HEADER_SIZE
 }
 
+fn table_deps(buffer: &mut [u8]) -> Result<()> {
+    let device = lookup_load_device(buffer)?;
+    let _lifecycle = device.lock_lifecycle();
+    ensure_control_live(&device)?;
+    let (active, inactive) = device.table_snapshot();
+    let table = selected_table(
+        &active,
+        &inactive,
+        read_u32(buffer, OFF_FLAGS) & QUERY_INACTIVE_TABLE_FLAG != 0,
+    );
+    query_header(buffer, &device, active.as_ref(), inactive.as_ref(), table);
+    let Some(table) = table else {
+        return Ok(());
+    };
+    encode_table_deps(buffer, table)
+}
+
+fn encode_table_deps(buffer: &mut [u8], table: &DmTable) -> Result<()> {
+    let start = output_start(buffer);
+    let ids = table.backing_ids();
+    let needed = ids
+        .len()
+        .checked_mul(8)
+        .and_then(|size| size.checked_add(8))
+        .ok_or_else(|| Error::new(Errno::EINVAL))?;
+    if buffer.len().saturating_sub(start) < needed {
+        write_u32(
+            buffer,
+            OFF_FLAGS,
+            read_u32(buffer, OFF_FLAGS) | BUFFER_FULL_FLAG,
+        );
+        return Ok(());
+    }
+    buffer[start..start + needed].fill(0);
+    write_u32(buffer, start, ids.len() as u32);
+    for (index, id) in ids.into_iter().enumerate() {
+        write_u64(buffer, start + 8 + index * 8, id.as_encoded_u64());
+    }
+    write_u32(buffer, OFF_DATA_SIZE, (start + needed) as u32);
+    Ok(())
+}
+
 fn table_status(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_load_device(buffer)?;
     let _lifecycle = device.lock_lifecycle();
@@ -317,9 +361,25 @@ fn encode_table_records(buffer: &mut [u8], table: &DmTable, mode: TargetStatusMo
     Ok(())
 }
 
-/// Reports only targets accepted by the table parser.
+/// Reports target versions, including probe-only entries that cannot be loaded.
 fn list_versions(buffer: &mut [u8]) -> Result<()> {
-    let targets = supported_target_metadata();
+    encode_target_versions(buffer, reported_target_metadata())
+}
+
+/// Reports the version of one advertised target by its Linux-visible name.
+fn get_target_version(buffer: &mut [u8]) -> Result<()> {
+    let name = required_name(buffer)?;
+    let target = reported_target_metadata()
+        .iter()
+        .find(|target| target.name() == name)
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "unknown mapper target"))?;
+    encode_target_versions(buffer, core::slice::from_ref(target))
+}
+
+fn encode_target_versions(
+    buffer: &mut [u8],
+    targets: &[aster_dm::target::DmTargetMetadata],
+) -> Result<()> {
     let start = output_start(buffer);
     let needed = targets.iter().try_fold(0usize, |total, target| {
         let record_len = 16usize
@@ -733,8 +793,10 @@ mod tests {
     }
 
     #[ktest]
-    fn versions_report_only_supported_target_and_short_buffer() {
-        let needed = (16 + "linear".len() + 1 + 7) & !7;
+    fn versions_report_linear_and_striped_and_short_buffer() {
+        let linear_len = (16 + "linear".len() + 1 + 7) & !7;
+        let striped_len = (16 + "striped".len() + 1 + 7) & !7;
+        let needed = linear_len + striped_len;
         for size in [
             FIXED_PREFIX_SIZE,
             DM_IOCTL_HEADER_SIZE,
@@ -754,15 +816,60 @@ mod tests {
         assert_eq!(read_u32(&exact, OFF_FLAGS) & BUFFER_FULL_FLAG, 0);
         let start = DM_IOCTL_HEADER_SIZE;
         assert_eq!(read_u32(&exact, OFF_DATA_SIZE) as usize, exact.len());
-        assert_eq!(read_u32(&exact, start), 0);
-        assert_eq!(
-            (0..3)
-                .map(|i| read_u32(&exact, start + 4 + i * 4))
-                .collect::<Vec<_>>(),
-            [1, 4, 0]
+        assert_eq!(read_u32(&exact, start), linear_len as u32);
+        assert_eq!(read_u32(&exact, start + linear_len), 0);
+        for (offset, name, version) in [
+            (0, b"linear\0".as_slice(), [1, 4, 0]),
+            (linear_len, b"striped\0".as_slice(), [1, 6, 0]),
+        ] {
+            assert_eq!(
+                (0..3)
+                    .map(|i| read_u32(&exact, start + offset + 4 + i * 4))
+                    .collect::<Vec<_>>(),
+                version
+            );
+            assert_eq!(
+                &exact[start + offset + 16..start + offset + 16 + name.len()],
+                name
+            );
+        }
+        assert!(
+            exact[start + linear_len + 16 + "striped".len() + 1..]
+                .iter()
+                .all(|byte| *byte == 0)
         );
-        assert_eq!(&exact[start + 16..start + 23], b"linear\0");
-        assert!(exact[start + 23..].iter().all(|byte| *byte == 0));
+    }
+
+    #[ktest]
+    fn get_target_version_filters_name_and_rejects_unknown_targets() {
+        let mut request = vec![0xa5; DM_IOCTL_HEADER_SIZE + 24];
+        write_u32(&mut request, OFF_FLAGS, 0);
+        request[OFF_NAME..OFF_NAME + NAME_LEN].fill(0);
+        request[OFF_NAME..OFF_NAME + 7].copy_from_slice(b"striped");
+        get_target_version(&mut request).unwrap();
+        assert_eq!(read_u32(&request, OFF_FLAGS) & BUFFER_FULL_FLAG, 0);
+        assert_eq!(
+            read_u32(&request, OFF_DATA_SIZE),
+            (DM_IOCTL_HEADER_SIZE + 24) as u32
+        );
+        assert_eq!(read_u32(&request, DM_IOCTL_HEADER_SIZE), 0);
+        assert_eq!(read_u32(&request, DM_IOCTL_HEADER_SIZE + 4), 1);
+        assert_eq!(read_u32(&request, DM_IOCTL_HEADER_SIZE + 8), 6);
+        assert_eq!(read_u32(&request, DM_IOCTL_HEADER_SIZE + 12), 0);
+        assert_eq!(
+            &request[DM_IOCTL_HEADER_SIZE + 16..DM_IOCTL_HEADER_SIZE + 24],
+            b"striped\0"
+        );
+        let mut short = vec![0; DM_IOCTL_HEADER_SIZE + 23];
+        short[OFF_NAME..OFF_NAME + 7].copy_from_slice(b"striped");
+        get_target_version(&mut short).unwrap();
+        assert_ne!(read_u32(&short, OFF_FLAGS) & BUFFER_FULL_FLAG, 0);
+        assert_eq!(read_u32(&short, OFF_DATA_SIZE), DM_IOCTL_HEADER_SIZE as u32);
+        short[OFF_NAME..OFF_NAME + 7].copy_from_slice(b"unknown");
+        assert_eq!(
+            get_target_version(&mut short).unwrap_err().error(),
+            Errno::EINVAL
+        );
     }
 
     #[ktest]
@@ -787,6 +894,97 @@ mod tests {
         assert_eq!(read_u32(&exact, DM_IOCTL_HEADER_SIZE + 8), 0);
         drop(devices);
         manager.remove("query-exact").unwrap();
+    }
+
+    #[ktest]
+    fn deps_select_inactive_and_active_tables_and_report_buffer_full() {
+        let manager = aster_dm::DmManager::new().unwrap();
+        let device = manager
+            .create("deps-query-test".into(), None, None)
+            .unwrap();
+        let backing = DeviceId::new(MajorId::new(510), MinorId::new(165));
+        aster_block::register(Arc::new(Backing(backing))).unwrap();
+        let mut request = buffer("deps-query-test", backing);
+        table_load_for_device_with_primary(&mut request, &device, |_| Ok(())).unwrap();
+        let make_query = |size, flags| {
+            let mut bytes = vec![0u8; size];
+            write_u32(&mut bytes, OFF_DATA_SIZE, FIXED_PREFIX_SIZE as u32);
+            write_u32(&mut bytes, OFF_FLAGS, flags);
+            bytes
+        };
+        let mut empty = make_query(DM_IOCTL_HEADER_SIZE + 16, 0);
+        let (active, inactive) = device.table_snapshot();
+        let selected = selected_table(&active, &inactive, false);
+        query_header(
+            &mut empty,
+            &device,
+            active.as_ref(),
+            inactive.as_ref(),
+            selected,
+        );
+        assert_eq!(read_u32(&empty, OFF_TARGET_COUNT), 0);
+        assert_eq!(read_u32(&empty, OFF_DATA_SIZE), FIXED_PREFIX_SIZE as u32);
+        let mut short = make_query(DM_IOCTL_HEADER_SIZE + 15, QUERY_INACTIVE_TABLE_FLAG);
+        let selected = selected_table(&active, &inactive, true);
+        query_header(
+            &mut short,
+            &device,
+            active.as_ref(),
+            inactive.as_ref(),
+            selected,
+        );
+        encode_table_deps(&mut short, selected.unwrap()).unwrap();
+        assert_eq!(read_u32(&short, OFF_TARGET_COUNT), 1);
+        assert_eq!(
+            read_u32(&short, OFF_FLAGS) & BUFFER_FULL_FLAG,
+            BUFFER_FULL_FLAG
+        );
+        assert_eq!(read_u32(&short, OFF_DATA_SIZE), FIXED_PREFIX_SIZE as u32);
+        let mut exact = make_query(DM_IOCTL_HEADER_SIZE + 16, QUERY_INACTIVE_TABLE_FLAG);
+        query_header(
+            &mut exact,
+            &device,
+            active.as_ref(),
+            inactive.as_ref(),
+            selected,
+        );
+        encode_table_deps(&mut exact, selected.unwrap()).unwrap();
+        assert_eq!(read_u32(&exact, OFF_FLAGS) & BUFFER_FULL_FLAG, 0);
+        assert_eq!(
+            read_u32(&exact, OFF_DATA_SIZE),
+            (DM_IOCTL_HEADER_SIZE + 16) as u32
+        );
+        assert_eq!(read_u32(&exact, DM_IOCTL_HEADER_SIZE), 1);
+        assert_eq!(read_u32(&exact, DM_IOCTL_HEADER_SIZE + 4), 0);
+        assert_eq!(
+            read_u64(&exact, DM_IOCTL_HEADER_SIZE + 8),
+            backing.as_encoded_u64()
+        );
+        drop(active);
+        drop(inactive);
+        device.resume_initial().unwrap();
+        let (active, inactive) = device.table_snapshot();
+        let selected = selected_table(&active, &inactive, false);
+        let mut live = make_query(DM_IOCTL_HEADER_SIZE + 16, 0);
+        query_header(
+            &mut live,
+            &device,
+            active.as_ref(),
+            inactive.as_ref(),
+            selected,
+        );
+        encode_table_deps(&mut live, selected.unwrap()).unwrap();
+        assert_eq!(
+            read_u64(&live, DM_IOCTL_HEADER_SIZE + 8),
+            backing.as_encoded_u64()
+        );
+        assert!(selected_table(&active, &inactive, true).is_none());
+        drop(active);
+        drop(inactive);
+        drop(request);
+        manager.remove("deps-query-test").unwrap();
+        drop(device);
+        aster_block::unregister(backing).unwrap();
     }
 
     #[ktest]
@@ -977,6 +1175,19 @@ mod tests {
         assert_eq!(device.inactive_table().unwrap().length(), old.length());
         assert!(!device.inactive_table().unwrap().is_readonly());
         assert!(device.active_table().is_none());
+        let mut striped = buffer("load-parse-test", backing);
+        striped[DM_IOCTL_HEADER_SIZE + 24..DM_IOCTL_HEADER_SIZE + 31].copy_from_slice(b"striped");
+        assert_eq!(
+            table_load_for_device_with_primary(&mut striped, &device, |_| {
+                publications += 1;
+                Ok(())
+            })
+            .unwrap_err()
+            .error(),
+            Errno::EINVAL
+        );
+        assert_eq!(publications, 1);
+        assert!(Arc::ptr_eq(&old, &device.inactive_table().unwrap()));
         let mut replacement = buffer("load-parse-test", backing);
         write_u32(&mut replacement, OFF_FLAGS, READONLY_FLAG);
         table_load_for_device_with_primary(&mut replacement, &device, |_| Ok(())).unwrap();
@@ -987,6 +1198,7 @@ mod tests {
         );
         assert_eq!(read_u32(&replacement, OFF_TARGET_COUNT), 1);
         drop(replacement);
+        drop(striped);
         drop(invalid);
         drop(request);
         drop(old);

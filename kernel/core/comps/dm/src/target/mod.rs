@@ -160,10 +160,13 @@ impl DmTargetMetadata {
 }
 
 const LINEAR_METADATA: DmTargetMetadata = DmTargetMetadata::new("linear", [1, 4, 0]);
+// LVM probes striped support even when creating an inactive linear LV. Only
+// advertise its version for now; table loading remains limited to linear.
+const STRIPED_METADATA: DmTargetMetadata = DmTargetMetadata::new("striped", [1, 6, 0]);
 
-/// Target types actually supported by the table parser and reported to userspace.
-pub fn supported_target_metadata() -> &'static [DmTargetMetadata] {
-    &[LINEAR_METADATA]
+/// Target versions reported to userspace, including probe-only entries.
+pub fn reported_target_metadata() -> &'static [DmTargetMetadata] {
+    &[LINEAR_METADATA, STRIPED_METADATA]
 }
 
 /// Error boundary between target semantics and environment-specific backing lookup.

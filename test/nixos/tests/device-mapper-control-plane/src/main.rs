@@ -191,8 +191,8 @@ fn check_ext2_multi_target(
 #[nixos_test]
 fn static_queries(nixos_shell: &mut Session) -> Result<(), Error> {
     nixos_shell.run_cmd_and_expect_display(
-        "list supported DM targets",
-        r#"bash -euo pipefail -c 'dmsetup targets | grep -q "^linear "; echo TARGETS_OK'"#,
+        "list advertised DM target versions",
+        r#"bash -euo pipefail -c 'dmsetup targets | grep -q "^linear "; dmsetup targets | grep -q "^striped "; dmsetup target-version striped | grep -q "1\.6\.0"; echo TARGETS_OK'"#,
         "TARGETS_OK",
     )?;
     nixos_shell.run_cmd_and_expect_display(
@@ -202,12 +202,12 @@ fn static_queries(nixos_shell: &mut Session) -> Result<(), Error> {
     )?;
     nixos_shell.run_cmd_and_expect_display(
         "query inactive table without falling back to active",
-        r#"bash -euo pipefail -c 'dmsetup load phase1_query --table "0 4 linear /dev/vde 320"; test -z "$(dmsetup table phase1_query)"; dmsetup table --inactive phase1_query | grep -q "0 4 linear .* 320"; dmsetup status --inactive phase1_query | grep -q "0 4 linear"; echo QUERY_INACTIVE_OK'"#,
+        r#"bash -euo pipefail -c 'dmsetup load phase1_query --table "0 4 linear /dev/vde 320"; test -z "$(dmsetup table phase1_query)"; dmsetup table --inactive phase1_query | grep -q "0 4 linear .* 320"; dmsetup status --inactive phase1_query | grep -q "0 4 linear"; dmsetup deps --inactive -o devname phase1_query | grep -q "vde"; echo QUERY_INACTIVE_OK'"#,
         "QUERY_INACTIVE_OK",
     )?;
     nixos_shell.run_cmd_and_expect_display(
         "query active table and device information",
-        r#"bash -euo pipefail -c 'dmsetup resume phase1_query; dmsetup table phase1_query | grep -q "0 4 linear .* 320"; dmsetup status phase1_query | grep -q "0 4 linear"; dmsetup info phase1_query | grep -q "Open count:"; echo QUERY_ACTIVE_OK'"#,
+        r#"bash -euo pipefail -c 'dmsetup resume phase1_query; dmsetup table phase1_query | grep -q "0 4 linear .* 320"; dmsetup status phase1_query | grep -q "0 4 linear"; dmsetup deps -o devname phase1_query | grep -q "vde"; test "$(blockdev --getra /dev/vde)" -eq 0; minor=$(dmsetup info -c --noheadings -o minor phase1_query | tr -d " "); test "$(blockdev --getra "/dev/dm-$minor")" -eq 0; dmsetup info phase1_query | grep -q "Open count:"; echo QUERY_ACTIVE_OK'"#,
         "QUERY_ACTIVE_OK",
     )?;
     Ok(())
