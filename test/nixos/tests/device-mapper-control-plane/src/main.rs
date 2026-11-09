@@ -14,6 +14,8 @@ nixos_test_main!(
         "suspend_and_resume_linear_mapping",
         "multi_target_linear_reads_and_writes",
         "multi_disk_linear_reads_and_writes",
+        "ext2_multi_target_same_disk",
+        "ext2_multi_target_cross_disk",
         "active_failure_readonly_and_bounds",
         "static_queries"
     ]
@@ -36,13 +38,13 @@ fn create_tableless(nixos_shell: &mut Session) -> Result<(), Error> {
 }
 
 /// Observe the automatically allocated minor by comparing primary nodes
-/// before and after LOAD. The official NixOS test entry supplies a fresh raw
+/// before and after LOAD. The official NixOS test entry supplies a persistent
 /// backing disk at /dev/vde.
 #[nixos_test]
 fn first_linear_load_publishes_primary(nixos_shell: &mut Session) -> Result<(), Error> {
     nixos_shell.run_cmd_and_expect_display(
-        "check fresh raw backing disk /dev/vde and record existing /dev/dm-* nodes",
-        r#"bash -e -c 'test -b /dev/vde; dd if=/dev/vde bs=512 count=1 status=none | cmp - <(head -c 512 /dev/zero); printf "%s " /dev/dm-* > /tmp/phase1_load_before_nodes; echo LOAD_PRECONDITIONS_OK'"#,
+        "clear the LOAD test sector and record existing /dev/dm-* nodes",
+        r#"bash -euo pipefail -c 'test -b /dev/vde; dd if=/dev/zero of=/dev/vde bs=512 count=1 conv=notrunc status=none; dd if=/dev/vde bs=512 count=1 status=none | cmp - <(head -c 512 /dev/zero); printf "%s " /dev/dm-* > /tmp/phase1_load_before_nodes; echo LOAD_PRECONDITIONS_OK'"#,
         "LOAD_PRECONDITIONS_OK",
     )?;
     nixos_shell.run_cmd_and_expect_display(
@@ -72,8 +74,8 @@ fn first_linear_load_publishes_primary(nixos_shell: &mut Session) -> Result<(), 
 #[nixos_test]
 fn first_linear_resume_reads_and_writes(nixos_shell: &mut Session) -> Result<(), Error> {
     nixos_shell.run_cmd_and_expect_display(
-        "create and load a linear mapper on the fresh raw test disk",
-        r#"bash -e -c 'test -b /dev/vde; printf "%s " /dev/dm-* > /tmp/phase1_resume_before; dmsetup create phase1_resume --notable; dmsetup load phase1_resume --table "0 8 linear /dev/vde 8"; before=" $(cat /tmp/phase1_resume_before)"; count=0; for node in /dev/dm-*; do test -b "$node" || continue; case "$before" in *" $node "*) continue;; esac; count=$((count + 1)); printf "%s" "$node" > /tmp/phase1_resume_node; done; test "$count" -eq 1; echo RESUME_LOAD_OK'"#,
+        "create and load a linear mapper on the persistent raw test disk",
+        r#"bash -euo pipefail -c 'test -b /dev/vde; dd if=/dev/zero of=/dev/vde bs=512 seek=9 count=1 conv=notrunc status=none; printf "%s " /dev/dm-* > /tmp/phase1_resume_before; dmsetup create phase1_resume --notable; dmsetup load phase1_resume --table "0 8 linear /dev/vde 8"; before=" $(cat /tmp/phase1_resume_before)"; count=0; for node in /dev/dm-*; do test -b "$node" || continue; case "$before" in *" $node "*) continue;; esac; count=$((count + 1)); printf "%s" "$node" > /tmp/phase1_resume_node; done; test "$count" -eq 1; echo RESUME_LOAD_OK'"#,
         "RESUME_LOAD_OK",
     )?;
     nixos_shell.run_cmd_and_expect_display(
@@ -121,7 +123,7 @@ fn check_multi_target_linear_io(
     };
     nixos_shell.run_cmd_and_expect_display(
         "load and activate two linear targets with discontiguous backing ranges",
-        &command(r#"test -b /dev/vde; test -b "$second"; if [ "$second" != /dev/vde ]; then test "$(stat -c %t:%T /dev/vde)" != "$(stat -c %t:%T "$second")"; fi; printf "%s " /dev/dm-* > /tmp/phase1_multi_before; dmsetup create "$name" --notable; dmsetup load "$name" --table "$(printf "0 4 linear /dev/vde %s\n4 4 linear %s %s\n" "$first_sector" "$second" "$second_sector")"; before=" $(cat /tmp/phase1_multi_before)"; count=0; for node in /dev/dm-*; do test -b "$node" || continue; case "$before" in *" $node "*) continue;; esac; count=$((count + 1)); printf "%s" "$node" > /tmp/phase1_multi_node; done; test "$count" -eq 1; dmsetup resume "$name"; echo MULTI_RESUME_OK"#),
+        &command(r#"test -b /dev/vde; test -b "$second"; if [ "$second" != /dev/vde ]; then test "$(stat -c %t:%T /dev/vde)" != "$(stat -c %t:%T "$second")"; fi; dd if=/dev/zero of=/dev/vde bs=512 seek="$((first_sector - 1))" count=6 conv=notrunc status=none; dd if=/dev/zero of="$second" bs=512 seek="$((second_sector - 1))" count=6 conv=notrunc status=none; printf "%s " /dev/dm-* > /tmp/phase1_multi_before; dmsetup create "$name" --notable; dmsetup load "$name" --table "$(printf "0 4 linear /dev/vde %s\n4 4 linear %s %s\n" "$first_sector" "$second" "$second_sector")"; before=" $(cat /tmp/phase1_multi_before)"; count=0; for node in /dev/dm-*; do test -b "$node" || continue; case "$before" in *" $node "*) continue;; esac; count=$((count + 1)); printf "%s" "$node" > /tmp/phase1_multi_node; done; test "$count" -eq 1; dmsetup resume "$name"; echo MULTI_RESUME_OK"#),
         "MULTI_RESUME_OK",
     )?;
     nixos_shell.run_cmd_and_expect_display(
@@ -138,6 +140,50 @@ fn check_multi_target_linear_io(
         "read and overwrite only the two sectors straddling the target boundary",
         &command(r#"node=$(cat /tmp/phase1_multi_node); dd if="$node" bs=512 skip=3 count=2 status=none | cmp - <(dd if=/tmp/phase1_multi_expected bs=512 skip=3 count=2 status=none); head -c 512 /dev/zero | tr "\000" X > /tmp/phase1_partial; head -c 512 /dev/zero | tr "\000" Y >> /tmp/phase1_partial; dd if=/tmp/phase1_partial of="$node" bs=1024 oflag=seek_bytes seek=1536 conv=notrunc status=none; dd if=/tmp/phase1_partial of=/tmp/phase1_multi_expected bs=512 seek=3 conv=notrunc status=none; dd if=/dev/vde bs=512 skip="$first_sector" count=4 status=none > /tmp/phase1_multi_backing; dd if="$second" bs=512 skip="$second_sector" count=4 status=none >> /tmp/phase1_multi_backing; cmp /tmp/phase1_multi_expected /tmp/phase1_multi_backing; dd if="$node" bs=4096 count=1 status=none | cmp - /tmp/phase1_multi_expected; echo PARTIAL_CROSS_OK"#),
         "PARTIAL_CROSS_OK",
+    )?;
+    Ok(())
+}
+
+/// Format and mount an ext2 filesystem whose data must span two linear targets.
+#[nixos_test]
+fn ext2_multi_target_same_disk(nixos_shell: &mut Session) -> Result<(), Error> {
+    check_ext2_multi_target(nixos_shell, "phase1_ext2_same", "/dev/vde", 4096, 40960)
+}
+
+/// Repeat the filesystem workload with the second target on another disk.
+#[nixos_test]
+fn ext2_multi_target_cross_disk(nixos_shell: &mut Session) -> Result<(), Error> {
+    check_ext2_multi_target(nixos_shell, "phase1_ext2_cross", "/dev/vdf", 131072, 4096)
+}
+
+fn check_ext2_multi_target(
+    nixos_shell: &mut Session,
+    name: &str,
+    second: &str,
+    first_sector: u64,
+    second_sector: u64,
+) -> Result<(), Error> {
+    // 32 MiB total, split at 16 MiB. Keep the backing ranges disjoint from
+    // the small raw-I/O tests above and from each other.
+    let command = |body: &str| {
+        format!(
+            "bash -euo pipefail -c 'name={name}; second={second}; first_sector={first_sector}; second_sector={second_sector}; {body}'"
+        )
+    };
+    nixos_shell.run_cmd_and_expect_display(
+        "clear both ext2 backing ranges and create a two-target mapper",
+        &command(r#"test -b /dev/vde; test -b "$second"; if [ "$second" != /dev/vde ]; then test "$(stat -c %t:%T /dev/vde)" != "$(stat -c %t:%T "$second")"; fi; dd if=/dev/zero of=/dev/vde bs=1M seek="$((first_sector / 2048))" count=16 conv=notrunc status=none; dd if=/dev/zero of="$second" bs=1M seek="$((second_sector / 2048))" count=16 conv=notrunc status=none; dd if=/dev/vde bs=512 skip="$first_sector" count=2048 status=none | cmp - <(dd if=/dev/zero bs=1M count=1 status=none); dd if="$second" bs=512 skip="$second_sector" count=2048 status=none | cmp - <(dd if=/dev/zero bs=1M count=1 status=none); dmsetup create "$name" --notable; dmsetup load "$name" --table "$(printf "0 32768 linear /dev/vde %s\n32768 32768 linear %s %s\n" "$first_sector" "$second" "$second_sector")"; dmsetup resume "$name"; minor=$(dmsetup info -c --noheadings -o minor "$name" | tr -d " "); node="/dev/dm-$minor"; test -b "$node"; printf "%s" "$node" > "/tmp/${name}_node"; test "$(blockdev --getsize64 "$node")" -eq 33554432; echo EXT2_MAPPING_READY"#),
+        "EXT2_MAPPING_READY",
+    )?;
+    nixos_shell.run_cmd_and_expect_display(
+        "format, mount and write a file larger than the first target",
+        &command(r#"node=$(cat "/tmp/${name}_node"); mkfs.ext2 -q -F -b 4096 -m 0 "$node"; mkdir -p "/tmp/${name}_mnt"; mount -t ext2 "$node" "/tmp/${name}_mnt"; dd if=/dev/urandom of="/tmp/${name}_expected" bs=1M count=24 status=none; cp "/tmp/${name}_expected" "/tmp/${name}_mnt/payload"; sync; cmp "/tmp/${name}_expected" "/tmp/${name}_mnt/payload"; echo EXT2_MOUNTED_IO_OK"#),
+        "EXT2_MOUNTED_IO_OK",
+    )?;
+    nixos_shell.run_cmd_and_expect_display(
+        "verify both physical backing ranges while ext2 remains mounted",
+        &command(r#"node=$(cat "/tmp/${name}_node"); cmp <(dd if="$node" bs=1M count=16 status=none) <(dd if=/dev/vde bs=512 skip="$first_sector" count=32768 status=none); cmp <(dd if="$node" bs=1M skip=16 count=16 status=none) <(dd if="$second" bs=512 skip="$second_sector" count=32768 status=none); if cmp -s <(dd if="$second" bs=512 skip="$second_sector" count=32768 status=none) <(dd if=/dev/zero bs=1M count=16 status=none); then exit 1; fi; cmp "/tmp/${name}_expected" "/tmp/${name}_mnt/payload"; umount "/tmp/${name}_mnt"; echo EXT2_BACKING_IO_OK"#),
+        "EXT2_BACKING_IO_OK",
     )?;
     Ok(())
 }
@@ -182,7 +228,7 @@ fn numeric_backing_load(nixos_shell: &mut Session) -> Result<(), Error> {
 fn active_failure_readonly_and_bounds(nixos_shell: &mut Session) -> Result<(), Error> {
     nixos_shell.run_cmd_and_expect_display(
         "activate a numeric-backing mapper and retain its node",
-        r#"bash -euo pipefail -c 'printf "%s " /dev/dm-* > /tmp/phase1_checks_before; read -r major minor < <(stat -c "%t %T" /dev/vde); backing="$((16#$major)):$((16#$minor))"; head -c 4096 /dev/zero | tr "\000" S > /tmp/phase1_checks_expected; dd if=/tmp/phase1_checks_expected of=/dev/vde bs=512 seek=192 conv=notrunc status=none; dmsetup create phase1_checks --notable; dmsetup load phase1_checks --table "0 8 linear $backing 192"; before=" $(cat /tmp/phase1_checks_before)"; count=0; for node in /dev/dm-*; do test -b "$node" || continue; case "$before" in *" $node "*) continue;; esac; count=$((count+1)); printf "%s" "$node" > /tmp/phase1_checks_node; done; test "$count" -eq 1; dmsetup resume phase1_checks; dd if="$(cat /tmp/phase1_checks_node)" bs=4096 count=1 status=none | cmp - /tmp/phase1_checks_expected; echo NUMERIC_IO_OK'"#,
+        r#"bash -euo pipefail -c 'test -b /dev/vde; dd if=/dev/zero of=/dev/vde bs=512 seek=192 count=8 conv=notrunc status=none; dd if=/dev/zero of=/dev/vde bs=512 seek=224 count=8 conv=notrunc status=none; dd if=/dev/zero of=/dev/vde bs=512 seek=256 count=8 conv=notrunc status=none; printf "%s " /dev/dm-* > /tmp/phase1_checks_before; read -r major minor < <(stat -c "%t %T" /dev/vde); backing="$((16#$major)):$((16#$minor))"; head -c 4096 /dev/zero | tr "\000" S > /tmp/phase1_checks_expected; dd if=/tmp/phase1_checks_expected of=/dev/vde bs=512 seek=192 conv=notrunc status=none; dmsetup create phase1_checks --notable; dmsetup load phase1_checks --table "0 8 linear $backing 192"; before=" $(cat /tmp/phase1_checks_before)"; count=0; for node in /dev/dm-*; do test -b "$node" || continue; case "$before" in *" $node "*) continue;; esac; count=$((count+1)); printf "%s" "$node" > /tmp/phase1_checks_node; done; test "$count" -eq 1; dmsetup resume phase1_checks; dd if="$(cat /tmp/phase1_checks_node)" bs=4096 count=1 status=none | cmp - /tmp/phase1_checks_expected; echo NUMERIC_IO_OK'"#,
         "NUMERIC_IO_OK",
     )?;
     nixos_shell.run_cmd_and_expect_display(

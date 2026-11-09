@@ -410,7 +410,7 @@ FN_TEST(device_mapper_remove_lifecycle)
 }
 END_TEST()
 
-/* Use the official fresh, unformatted /dev/vdd disk. */
+/* Use the persistent /dev/vdd disk, clearing only this test's sector. */
 FN_TEST(device_mapper_first_resume_linear_io)
 {
 	char name[DM_NAME_LEN];
@@ -475,8 +475,9 @@ FN_TEST(device_mapper_first_resume_linear_io)
 	TEST_RES(wake.flags & DM_SUSPEND_FLAG, _ret == 0);
 
 	int mapped = CHECK(open(primary, O_RDWR | O_CLOEXEC));
-	int backing = CHECK(open("/dev/vdd", O_RDONLY | O_CLOEXEC));
-	/* The official regression entry recreates the image before QEMU starts. */
+	int backing = CHECK(open("/dev/vdd", O_RDWR | O_CLOEXEC));
+	TEST_RES(pwrite(backing, zero, sizeof(zero), 512),
+		 _ret == sizeof(zero));
 	TEST_RES(pread(backing, observed, sizeof(observed), 512),
 		 _ret == sizeof(observed));
 	TEST_RES(memcmp(zero, observed, sizeof(zero)), _ret == 0);
@@ -555,7 +556,13 @@ static void check_multi_target_linear_io(const char *second_path,
 	TEST_RES(resume.target_count, _ret == 2);
 	int mapped = CHECK(open(primary, O_RDWR | O_CLOEXEC));
 
-	/* Check fresh backing ranges, then write distinct data to every sector. */
+	/* Clear the mapped sectors and adjacent guards before asserting zero. */
+	unsigned char clear[6 * 512] = {};
+	for (size_t i = 0; i < 2; ++i)
+		TEST_RES(pwrite(backing[i], clear, sizeof(clear),
+				offsets[i] - 512),
+			 _ret == sizeof(clear));
+	/* Check cleared backing ranges, then write distinct data to every sector. */
 	for (size_t i = 0; i < 2; ++i) {
 		TEST_RES(pread(backing[i], observed, 2048, offsets[i]),
 			 _ret == 2048);
@@ -717,6 +724,11 @@ FN_TEST(device_mapper_active_table_failure_and_bounds)
 	struct stat st;
 	int control = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
 	int backing = CHECK(open("/dev/vdd", O_RDWR | O_CLOEXEC));
+	unsigned char zero[4096] = {};
+	TEST_RES(pwrite(backing, zero, sizeof(zero), 192 * 512),
+		 _ret == sizeof(zero));
+	TEST_RES(pwrite(backing, zero, sizeof(zero), 224 * 512),
+		 _ret == sizeof(zero));
 	CHECK(fstat(backing, &st));
 	snprintf(backing_id, sizeof(backing_id), "%u:%u", major(st.st_rdev),
 		 minor(st.st_rdev));
@@ -770,7 +782,6 @@ FN_TEST(device_mapper_active_table_failure_and_bounds)
 	TEST_RES(pread(backing, observed, sizeof(observed), 192 * 512),
 		 _ret == sizeof(observed));
 	TEST_RES(memcmp(observed, expected, sizeof(expected)), _ret == 0);
-	unsigned char zero[4096] = {};
 	TEST_RES(pread(backing, observed, sizeof(observed), 224 * 512),
 		 _ret == sizeof(observed));
 	TEST_RES(memcmp(observed, zero, sizeof(zero)), _ret == 0);
@@ -807,6 +818,9 @@ FN_TEST(device_mapper_readonly_linear_io)
 	struct dm_ioctl create = {}, resume = {};
 	int control = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
 	int backing = CHECK(open("/dev/vdd", O_RDWR | O_CLOEXEC));
+	unsigned char zero[512] = {};
+	CHECK_WITH(pwrite(backing, zero, sizeof(zero), 256 * 512),
+		   _ret == sizeof(zero));
 	memset(expected, 0x42, sizeof(expected));
 	memset(attempted, 0xe1, sizeof(attempted));
 	CHECK_WITH(pwrite(backing, expected, sizeof(expected), 256 * 512),

@@ -6,6 +6,7 @@
   environment.systemPackages = with pkgs; [
     hello-asterinas
     gitMinimal
+    e2fsprogs
     lvm2
   ];
 }
