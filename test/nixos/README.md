@@ -109,6 +109,13 @@ Both the initramfs and NixOS runners use the **same** numbered images, `test/ini
 
 The images live in the initramfs build directory, so `make clean` deletes them along with other initramfs build artifacts. Ordinary test runs and VM shutdowns do not clear them. Existing device-mapper tests assume blank backing ranges; run tests that consume a prior boot's data separately from tests that assume blank disks. A recovery test must run setup and verification in separate VM boots.
 
+The `device-mapper-lvm` suite is an **opt-in, destructive integration test**. It requires `raw_disk=1`, uses the first numbered image (`raw_test_1.img`, `/dev/vde` in NixOS), and clears that entire 512 MiB disk before running `pvcreate`. Do not invoke it if that image contains data to retain, including data from another suite or a recovery test. The LVM and ordinary device-mapper suites run independently; their test images are persistent, not reserved for either suite. This single-boot test runs `pvcreate`, `vgcreate`, inactive linear `lvcreate`, activation, `/dev/dm-N` I/O, then ext2 format, mount, file read/write verification, and unmount. It does not test multiple PVs, LV growth, or reboot recovery. It is not part of the ordinary device-mapper suite or the NixOS CI matrix. After building the suite's NixOS image, invoke it explicitly:
+
+```bash
+make nixos NIXOS_TEST_SUITE=device-mapper-lvm
+make run_nixos NIXOS_TEST_SUITE=device-mapper-lvm raw_disk=1
+```
+
 ## Running Tests
 
 The following commands should be run under the project root.
