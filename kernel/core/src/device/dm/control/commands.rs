@@ -583,7 +583,7 @@ fn table_load_for_device_with_primary(
     Ok(())
 }
 
-/// Suspends a running mapping or resumes its existing active table.
+/// Suspends a running mapping or resumes it, switching a pending table if present.
 fn resume_device(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_load_device(buffer)?;
     let _lifecycle = device.lock_lifecycle();
@@ -602,6 +602,12 @@ fn resume_device_for(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     if flags & SUSPEND_FLAG != 0 {
         device.suspend().map_err(|_| Error::new(Errno::EINVAL))?;
     } else if device.is_suspended() {
+        device
+            .resume_suspended()
+            .map_err(|_| Error::new(Errno::EINVAL))?;
+    } else if device.active_table().is_some() && device.inactive_table().is_some() {
+        // Linux implicitly suspends a running mapper before installing a candidate.
+        device.suspend().map_err(|_| Error::new(Errno::EINVAL))?;
         device
             .resume_suspended()
             .map_err(|_| Error::new(Errno::EINVAL))?;
@@ -1309,14 +1315,20 @@ mod tests {
         resume_device_for(&mut resume, &device).unwrap();
         assert!(device.is_suspended());
         write_u32(&mut resume, OFF_FLAGS, 0);
-        assert_eq!(
-            resume_device_for(&mut resume, &device).unwrap_err().error(),
-            Errno::EINVAL
-        );
-        assert!(device.is_suspended());
-        assert!(device.inactive_table().is_some());
+        resume_device_for(&mut resume, &device).unwrap();
+        assert!(!device.is_suspended());
+        assert!(device.inactive_table().is_none());
+        assert!(!device.active_table().unwrap().is_readonly());
+        assert_eq!(read_u32(&resume, OFF_FLAGS) & READONLY_FLAG, 0);
+        // A loaded candidate on a running mapper also triggers an implicit drain.
+        let mut implicit = buffer("first-resume-test", backing);
+        write_u32(&mut implicit, OFF_FLAGS, READONLY_FLAG);
+        table_load_for_device_with_primary(&mut implicit, &device, |_| Ok(())).unwrap();
+        write_u32(&mut resume, OFF_FLAGS, 0);
+        resume_device_for(&mut resume, &device).unwrap();
         assert!(device.active_table().unwrap().is_readonly());
-        assert!(!device.inactive_table().unwrap().is_readonly());
+        assert!(device.inactive_table().is_none());
+        assert_eq!(read_u32(&resume, OFF_FLAGS) & READONLY_FLAG, READONLY_FLAG);
         // The status snapshot holds a table (and its backing lease) independently
         // of the mapper; release it before unregistering the backing device.
         drop(active);

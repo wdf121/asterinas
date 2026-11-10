@@ -24,7 +24,7 @@ pub struct DmDevice {
     uuid: Mutex<Option<Vec<u8>>>,
     /// Selected under one lock so BIO admission cannot race first activation.
     tables: Mutex<DmDeviceTables>,
-    /// Serializes LOAD and first RESUME control transitions for this mapper.
+    /// Serializes LOAD, suspend, resume, and removal transitions for this mapper.
     lifecycle: Mutex<()>,
     io: Arc<DmIoState>,
     removal_isolated: AtomicBool,
@@ -196,26 +196,30 @@ impl DmDevice {
         self.io.inner.lock().suspended
     }
 
-    /// Resumes the existing active table without replacing an inactive candidate.
+    /// Resumes the active table, replacing it with an inactive candidate if present.
+    /// A caller performing an implicit replacement must suspend and drain first.
+    /// The I/O admission lock covers the swap, replay reservation, and reopening,
+    /// so a new BIO cannot select the old table after the switch.
     pub fn resume_suspended(&self) -> Result<(), DmError> {
-        if self.inactive_table().is_some() {
-            return Err(DmError::InvalidState);
-        }
-        let table = self.active_table().ok_or(DmError::InvalidState)?;
-        let postponed = {
+        let (table, postponed) = {
             let mut io = self.io.inner.lock();
-            if io.stopped {
+            if io.stopped || !io.suspended || io.admitting != 0 || io.in_flight != 0 {
                 return Err(DmError::InvalidState);
             }
-            if !io.suspended {
-                return Ok(());
+            let mut tables = self.tables.lock();
+            if tables.active.is_none() {
+                return Err(DmError::InvalidState);
             }
+            if let Some(replacement) = tables.inactive.take() {
+                tables.active = Some(replacement);
+            }
+            let table = tables.active.as_ref().unwrap().clone();
             // Reserve replay completions before opening admission to new requests.
             let postponed = core::mem::take(&mut io.postponed);
             io.admitting += postponed.len();
             io.in_flight += postponed.len();
             io.suspended = false;
-            postponed
+            (table, postponed)
         };
         for bio in postponed {
             if table.is_readonly() && bio.type_() == BioType::Write {
@@ -296,13 +300,17 @@ impl BlockDevice for DmDevice {
                 return Err(BioEnqueueError::Refused);
             }
             let table = self.active_table().ok_or(BioEnqueueError::Refused)?;
-            // Flush must remain permitted on a read-only table.
-            if table.is_readonly() && bio.type_() == BioType::Write {
-                return Err(BioEnqueueError::Refused);
-            }
+            // BIOs that reach a suspended mapper belong to the postponed queue,
+            // regardless of the old table's mode. Judge writes against the new
+            // active table on replay; the block-file or filesystem layer may
+            // still reject a write before it reaches this method.
             if io.suspended {
                 io.postponed.push_back(bio);
                 return Ok(());
+            }
+            // Flush must remain permitted on a read-only table.
+            if table.is_readonly() && bio.type_() == BioType::Write {
+                return Err(BioEnqueueError::Refused);
             }
             io.admitting += 1;
             io.in_flight += 1;
@@ -390,11 +398,16 @@ mod tests {
         }
     }
 
-    fn table(backing: Arc<PendingBacking>, readonly: bool) -> Arc<DmTable> {
+    fn table_with_range(
+        backing: Arc<PendingBacking>,
+        sectors: u64,
+        offset: u64,
+        readonly: bool,
+    ) -> Arc<DmTable> {
         let target = LinearTarget::new(
             Sid::new(0),
-            8,
-            Sid::new(100),
+            sectors,
+            Sid::new(offset),
             BlockDeviceLease::new_untracked(backing),
         )
         .unwrap();
@@ -402,6 +415,10 @@ mod tests {
             DmTable::new_targets_with_readonly(vec![alloc::boxed::Box::new(target)], readonly)
                 .unwrap(),
         )
+    }
+
+    fn table(backing: Arc<PendingBacking>, readonly: bool) -> Arc<DmTable> {
+        table_with_range(backing, 8, 100, readonly)
     }
 
     fn mapper() -> (DmManager, Arc<DmDevice>) {
@@ -596,7 +613,85 @@ mod tests {
     }
 
     #[ktest]
-    fn suspend_preserves_inactive_candidate_and_rejects_replacement() {
+    fn suspend_switches_table_and_replays_on_new_generation() {
+        let (manager, device) = mapper();
+        let old_backing = PendingBacking::new();
+        let new_backing = PendingBacking::new();
+        let active = table(old_backing.clone(), false);
+        device.load_table(active.clone());
+        device.resume_initial().unwrap();
+        device.suspend().unwrap();
+        let replacement = table(new_backing.clone(), false);
+        device.load_table(replacement.clone());
+        let bio = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        bio.submit(device.as_ref(), &mut batch).unwrap();
+        assert!(old_backing.pending.lock().is_none());
+        device.resume_suspended().unwrap();
+        assert!(Arc::ptr_eq(&device.active_table().unwrap(), &replacement));
+        assert!(device.inactive_table().is_none());
+        assert!(new_backing.pending.lock().is_some());
+        new_backing.finish();
+        assert!(batch.wait_all().is_ok());
+        drop(manager);
+        drop(device);
+    }
+
+    #[ktest]
+    fn suspended_shrink_replays_only_new_in_range_requests() {
+        let (manager, device) = mapper();
+        let backing = PendingBacking::new();
+        device.load_table(table_with_range(backing.clone(), 16, 100, false));
+        device.resume_initial().unwrap();
+        assert_eq!(device.metadata().nr_sectors, 16);
+        device.suspend().unwrap();
+        let make_read = |sector| {
+            Bio::new(
+                BioType::Read,
+                Sid::new(sector),
+                vec![BioSegment::alloc_exact(1, 512, BioDirection::FromDevice)],
+                None,
+            )
+        };
+        let mut invalid_batch = io_util::batch::IoBatch::with_capacity(1);
+        make_read(12)
+            .submit(device.as_ref(), &mut invalid_batch)
+            .unwrap();
+        let mut valid_batch = io_util::batch::IoBatch::with_capacity(1);
+        make_read(3)
+            .submit(device.as_ref(), &mut valid_batch)
+            .unwrap();
+        device.load_table(table_with_range(backing.clone(), 8, 200, false));
+        device.resume_suspended().unwrap();
+        assert_eq!(device.metadata().nr_sectors, 8);
+        assert!(invalid_batch.wait_all().is_err());
+        assert_eq!(
+            backing.pending.lock().as_ref().unwrap().sid_range(),
+            &(Sid::new(203)..Sid::new(204))
+        );
+        backing.finish();
+        assert!(valid_batch.wait_all().is_ok());
+        assert_eq!(device.io.inner.lock().in_flight, 0);
+        device.suspend().unwrap();
+        device.load_table(table_with_range(backing.clone(), 24, 300, false));
+        device.resume_suspended().unwrap();
+        assert_eq!(device.metadata().nr_sectors, 24);
+        let mut grown_batch = io_util::batch::IoBatch::with_capacity(1);
+        make_read(20)
+            .submit(device.as_ref(), &mut grown_batch)
+            .unwrap();
+        assert_eq!(
+            backing.pending.lock().as_ref().unwrap().sid_range(),
+            &(Sid::new(320)..Sid::new(321))
+        );
+        backing.finish();
+        assert!(grown_batch.wait_all().is_ok());
+        drop(manager);
+        drop(device);
+    }
+
+    #[ktest]
+    fn suspend_switches_inactive_candidate() {
         let (manager, device) = mapper();
         let backing = PendingBacking::new();
         let active = table(backing.clone(), false);
@@ -605,14 +700,70 @@ mod tests {
         let replacement = table(backing, true);
         device.load_table(replacement.clone());
         device.suspend().unwrap();
-        assert_eq!(device.resume_suspended(), Err(DmError::InvalidState));
-        assert!(device.is_suspended());
-        assert!(Arc::ptr_eq(&device.active_table().unwrap(), &active));
-        assert!(Arc::ptr_eq(&device.inactive_table().unwrap(), &replacement));
+        device.resume_suspended().unwrap();
+        assert!(!device.is_suspended());
+        assert!(Arc::ptr_eq(&device.active_table().unwrap(), &replacement));
+        assert!(device.inactive_table().is_none());
         device.stop_and_drain_io();
         device.clear_removed_tables();
         manager.remove("mapper-io-test").unwrap();
         device.drain_removed();
+    }
+
+    #[ktest]
+    fn suspended_writes_obey_old_and_new_readonly_tables() {
+        let (manager, device) = mapper();
+        let backing = PendingBacking::new();
+        device.load_table(table(backing.clone(), false));
+        device.resume_initial().unwrap();
+        device.suspend().unwrap();
+        let write = || {
+            Bio::new(
+                BioType::Write,
+                Sid::new(0),
+                vec![BioSegment::alloc_exact(1, 512, BioDirection::ToDevice)],
+                None,
+            )
+        };
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        write().submit(device.as_ref(), &mut batch).unwrap();
+        device.load_table(table(backing.clone(), true));
+        device.resume_suspended().unwrap();
+        assert!(batch.wait_all().is_err());
+        assert!(backing.pending.lock().is_none());
+        assert_eq!(device.io.inner.lock().in_flight, 0);
+        device.suspend().unwrap();
+        device.load_table(table(backing.clone(), false));
+        let mut queued = io_util::batch::IoBatch::with_capacity(1);
+        write().submit(device.as_ref(), &mut queued).unwrap();
+        assert_eq!(device.io.inner.lock().postponed.len(), 1);
+        assert!(backing.pending.lock().is_none());
+        device.resume_suspended().unwrap();
+        assert!(backing.pending.lock().is_some());
+        backing.finish();
+        assert!(queued.wait_all().is_ok());
+        device.suspend().unwrap();
+        device.load_table(table(backing.clone(), true));
+        let mut still_readonly = io_util::batch::IoBatch::with_capacity(1);
+        write()
+            .submit(device.as_ref(), &mut still_readonly)
+            .unwrap();
+        device.resume_suspended().unwrap();
+        assert!(still_readonly.wait_all().is_err());
+        assert!(backing.pending.lock().is_none());
+        assert_eq!(
+            write().submit_and_wait(device.as_ref()),
+            Err(BioEnqueueError::Refused)
+        );
+        device.suspend().unwrap();
+        device.load_table(table(backing.clone(), false));
+        device.resume_suspended().unwrap();
+        let mut writable = io_util::batch::IoBatch::with_capacity(1);
+        write().submit(device.as_ref(), &mut writable).unwrap();
+        backing.finish();
+        assert!(writable.wait_all().is_ok());
+        drop(manager);
+        drop(device);
     }
 
     #[ktest]

@@ -17,7 +17,8 @@ nixos_test_main!(
         "ext2_multi_target_same_disk",
         "ext2_multi_target_cross_disk",
         "active_failure_readonly_and_bounds",
-        "static_queries"
+        "static_queries",
+        "raw_table_replacement_and_resize"
     ]
 );
 
@@ -213,6 +214,16 @@ fn static_queries(nixos_shell: &mut Session) -> Result<(), Error> {
     Ok(())
 }
 
+#[nixos_test]
+fn raw_table_replacement_and_resize(nixos_shell: &mut Session) -> Result<(), Error> {
+    nixos_shell.run_cmd_and_expect_display(
+        "replace a live raw mapping implicitly and verify capacity and bounds",
+        r#"bash -euo pipefail -c 'name=phase1_resize; test -b /dev/vde; dmsetup create "$name" --notable; dmsetup load "$name" --table "0 8 linear /dev/vde 300000"; dmsetup resume "$name"; echo RAW_INITIAL_RESUME_OK; minor=$(dmsetup info -c --noheadings -o minor "$name" | tr -d " "); node=/dev/dm-$minor; test "$(blockdev --getsize64 "$node")" -eq 4096; dmsetup load "$name" --table "0 16 linear /dev/vde 300128"; test "$(blockdev --getsize64 "$node")" -eq 4096; echo RAW_BEFORE_IMPLICIT_RESUME; dmsetup resume "$name"; echo RAW_IMPLICIT_RESUME_OK; test "$(blockdev --getsize64 "$node")" -eq 8192; printf expanded | dd of="$node" bs=512 seek=12 conv=sync,notrunc status=none; dd if=/dev/vde bs=512 skip=300140 count=1 status=none | grep -aq expanded; dd if=/dev/zero of=/dev/vde bs=512 seek=300140 count=1 conv=notrunc status=none; dmsetup suspend "$name"; dmsetup load "$name" --table "0 4 linear /dev/vde 300256"; echo RAW_BEFORE_EXPLICIT_RESUME; dmsetup resume "$name"; echo RAW_EXPLICIT_RESUME_OK; test "$(blockdev --getsize64 "$node")" -eq 2048; test "$(dd if="$node" bs=512 skip=4 count=1 status=none | wc -c)" -eq 0; if printf reject | dd of="$node" bs=512 seek=4 conv=sync,notrunc status=none; then exit 1; fi; dmsetup remove "$name"; echo RAW_REPLACEMENT_OK'"#,
+        "RAW_REPLACEMENT_OK",
+    )?;
+    Ok(())
+}
+
 // LOAD-only coverage, independent of the later activation milestone.
 #[nixos_test]
 fn numeric_backing_load(nixos_shell: &mut Session) -> Result<(), Error> {
@@ -232,13 +243,18 @@ fn active_failure_readonly_and_bounds(nixos_shell: &mut Session) -> Result<(), E
         "NUMERIC_IO_OK",
     )?;
     nixos_shell.run_cmd_and_expect_display(
-        "failed LOAD and refused hot replacement keep the original active mapping usable",
-        r#"bash -euo pipefail -c 'node=$(cat /tmp/phase1_checks_node); if dmsetup load phase1_checks --table "0 8 linear /dev/vde 999999999"; then exit 1; fi; dd if="$node" bs=4096 count=1 status=none | cmp - /tmp/phase1_checks_expected; dmsetup load phase1_checks --table "0 8 linear /dev/vde 224"; if dmsetup resume phase1_checks; then exit 1; fi; dd if="$node" bs=4096 count=1 status=none | cmp - /tmp/phase1_checks_expected; head -c 512 /dev/zero | tr "\000" W > /tmp/phase1_checks_patch; dd if=/tmp/phase1_checks_patch of="$node" bs=512 conv=notrunc status=none; dd if=/tmp/phase1_checks_patch of=/tmp/phase1_checks_expected bs=512 conv=notrunc status=none; dd if=/dev/vde bs=512 skip=192 count=8 status=none | cmp - /tmp/phase1_checks_expected; dd if=/dev/vde bs=512 skip=224 count=8 status=none | cmp - <(head -c 4096 /dev/zero); echo ACTIVE_PRESERVED_OK'"#,
+        "failed LOAD preserves the original active mapping",
+        r#"bash -euo pipefail -c 'node=$(cat /tmp/phase1_checks_node); if dmsetup load phase1_checks --table "0 8 linear /dev/vde 999999999"; then exit 1; fi; dd if="$node" bs=4096 count=1 status=none | cmp - /tmp/phase1_checks_expected; echo ACTIVE_PRESERVED_OK'"#,
         "ACTIVE_PRESERVED_OK",
     )?;
     nixos_shell.run_cmd_and_expect_display(
+        "implicitly switch to the new table and preserve the old backing range",
+        r#"bash -euo pipefail -c 'node=$(cat /tmp/phase1_checks_node); dmsetup load phase1_checks --table "0 8 linear /dev/vde 224"; dmsetup resume phase1_checks; dd if="$node" bs=4096 count=1 status=none | cmp - <(head -c 4096 /dev/zero); head -c 512 /dev/zero | tr "\000" W > /tmp/phase1_checks_patch; dd if=/tmp/phase1_checks_patch of="$node" bs=512 conv=notrunc status=none; dd if=/dev/vde bs=512 skip=192 count=8 status=none | cmp - /tmp/phase1_checks_expected; dd if=/dev/vde bs=512 skip=224 count=1 status=none | cmp - /tmp/phase1_checks_patch; echo IMPLICIT_SWITCH_OK'"#,
+        "IMPLICIT_SWITCH_OK",
+    )?;
+    nixos_shell.run_cmd_and_expect_display(
         "verify short I/O at the mapper end and rejected writes beyond it",
-        r#"bash -euo pipefail -c 'node=$(cat /tmp/phase1_checks_node); dd if="$node" bs=512 skip=7 count=2 status=none > /tmp/phase1_checks_tail; test "$(stat -c %s /tmp/phase1_checks_tail)" -eq 512; dd if=/tmp/phase1_checks_expected bs=512 skip=7 count=1 status=none | cmp - /tmp/phase1_checks_tail; head -c 1024 /dev/zero | tr "\000" T > /tmp/phase1_checks_tail_input; if dd if=/tmp/phase1_checks_tail_input of="$node" bs=1024 oflag=seek_bytes seek=3584 conv=notrunc status=none; then exit 1; fi; dd if=/tmp/phase1_checks_tail_input of=/tmp/phase1_checks_expected bs=512 seek=7 count=1 conv=notrunc status=none; dd if="$node" bs=4096 count=1 status=none | cmp - /tmp/phase1_checks_expected; for sector in 8 9; do dd if="$node" bs=512 skip="$sector" count=1 status=none > /tmp/phase1_checks_eof; test ! -s /tmp/phase1_checks_eof; if dd if=/tmp/phase1_checks_patch of="$node" bs=512 seek="$sector" conv=notrunc status=none; then exit 1; fi; done; dd if=/dev/vde bs=512 skip=200 count=1 status=none | cmp - <(head -c 512 /dev/zero); echo BOUNDS_OK'"#,
+        r#"bash -euo pipefail -c 'node=$(cat /tmp/phase1_checks_node); dd if="$node" bs=512 skip=7 count=2 status=none > /tmp/phase1_checks_tail; test "$(stat -c %s /tmp/phase1_checks_tail)" -eq 512; dd if=/dev/vde bs=512 skip=231 count=1 status=none | cmp - /tmp/phase1_checks_tail; head -c 1024 /dev/zero | tr "\000" T > /tmp/phase1_checks_tail_input; if dd if=/tmp/phase1_checks_tail_input of="$node" bs=1024 oflag=seek_bytes seek=3584 conv=notrunc status=none; then exit 1; fi; dd if=/tmp/phase1_checks_tail_input bs=512 count=1 status=none | cmp - <(dd if=/dev/vde bs=512 skip=231 count=1 status=none); for sector in 8 9; do dd if="$node" bs=512 skip="$sector" count=1 status=none > /tmp/phase1_checks_eof; test ! -s /tmp/phase1_checks_eof; if dd if=/tmp/phase1_checks_patch of="$node" bs=512 seek="$sector" conv=notrunc status=none; then exit 1; fi; done; dd if=/dev/vde bs=512 skip=232 count=1 status=none | cmp - <(head -c 512 /dev/zero); echo BOUNDS_OK'"#,
         "BOUNDS_OK",
     )?;
     nixos_shell.run_cmd_and_expect_display(

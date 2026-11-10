@@ -792,36 +792,41 @@ FN_TEST(device_mapper_active_table_failure_and_bounds)
 	memcpy(resume.version, kernel_version, sizeof(resume.version));
 	resume.data_size = sizeof(resume);
 	strcpy(resume.name, name);
-	TEST(ioctl(control, DM_DEV_SUSPEND, &resume), EINVAL, _ret == -1);
+	CHECK(ioctl(control, DM_DEV_SUSPEND, &resume));
 	TEST_RES(pread(mapped, observed, sizeof(observed), 0),
 		 _ret == sizeof(observed));
-	TEST_RES(memcmp(observed, expected, sizeof(expected)), _ret == 0);
+	TEST_RES(memcmp(observed, zero, sizeof(zero)), _ret == 0);
 	memset(replacement, 0x97, sizeof(replacement));
 	TEST_RES(pwrite(mapped, replacement, 512, 0), _ret == 512);
-	memcpy(expected, replacement, 512);
 	TEST_RES(pread(backing, observed, sizeof(observed), 192 * 512),
 		 _ret == sizeof(observed));
 	TEST_RES(memcmp(observed, expected, sizeof(expected)), _ret == 0);
-	TEST_RES(pread(backing, observed, sizeof(observed), 224 * 512),
-		 _ret == sizeof(observed));
-	TEST_RES(memcmp(observed, zero, sizeof(zero)), _ret == 0);
+	TEST_RES(pread(backing, observed, 512, 224 * 512), _ret == 512);
+	TEST_RES(memcmp(observed, replacement, 512), _ret == 0);
+	TEST_RES(pread(backing, observed, 512, 199 * 512), _ret == 512);
+	TEST_RES(memcmp(observed, expected + 7 * 512, 512), _ret == 0);
 
 	memset(observed, 0x6d, sizeof(observed));
 	TEST_RES(pread(mapped, observed, 1024, 7 * 512), _ret == 512);
-	TEST_RES(memcmp(observed, expected + 7 * 512, 512), _ret == 0);
+	TEST_RES(memcmp(observed, zero + 7 * 512, 512), _ret == 0);
 	TEST_RES(observed[512], _ret == 0x6d);
 	TEST_RES(pwrite(mapped, replacement, 1024, 7 * 512), _ret == 512);
-	memcpy(expected + 7 * 512, replacement, 512);
+	TEST_RES(pread(backing, observed, 512, 199 * 512), _ret == 512);
+	TEST_RES(memcmp(observed, expected + 7 * 512, 512), _ret == 0);
 	TEST_RES(pread(mapped, observed, 512, 8 * 512), _ret == 0);
 	TEST(pwrite(mapped, replacement, 512, 8 * 512), ENOSPC, _ret == -1);
 	TEST_RES(pread(mapped, observed, 512, 9 * 512), _ret == 0);
 	TEST(pwrite(mapped, replacement, 512, 9 * 512), ENOSPC, _ret == -1);
-	TEST_RES(pread(backing, observed, sizeof(observed), 192 * 512),
+	TEST_RES(pread(backing, observed, sizeof(observed), 224 * 512),
 		 _ret == sizeof(observed));
-	TEST_RES(memcmp(observed, expected, sizeof(expected)), _ret == 0);
-	TEST_RES(pread(backing, observed, 512, 200 * 512), _ret == 512);
+	TEST_RES(memcmp(observed, replacement, 512), _ret == 0);
+	TEST_RES(memcmp(observed + 512, zero + 512, 6 * 512), _ret == 0);
+	TEST_RES(memcmp(observed + 7 * 512, replacement, 512), _ret == 0);
+	TEST_RES(pread(backing, observed, 512, 232 * 512), _ret == 512);
 	TEST_RES(memcmp(observed, zero, 512), _ret == 0);
 	TEST_RES(pwrite(backing, zero, sizeof(zero), 192 * 512),
+		 _ret == sizeof(zero));
+	TEST_RES(pwrite(backing, zero, sizeof(zero), 224 * 512),
 		 _ret == sizeof(zero));
 	TEST_SUCC(close(mapped));
 	TEST_SUCC(close(backing));
