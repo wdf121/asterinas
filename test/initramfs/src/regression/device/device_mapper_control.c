@@ -475,9 +475,8 @@ FN_TEST(device_mapper_first_resume_linear_io)
 	strcpy(suspend.name, name);
 	suspend.flags = DM_SUSPEND_FLAG | DM_NOFLUSH_FLAG;
 	TEST(ioctl(control, DM_DEV_SUSPEND, &suspend), EINVAL, _ret == -1);
+	/* Skipping filesystem freeze still uses the normal draining suspend. */
 	suspend.flags = DM_SUSPEND_FLAG | DM_SKIP_LOCKFS_FLAG;
-	TEST(ioctl(control, DM_DEV_SUSPEND, &suspend), EINVAL, _ret == -1);
-	suspend.flags = DM_SUSPEND_FLAG;
 	TEST_SUCC(ioctl(control, DM_DEV_SUSPEND, &suspend));
 	TEST_RES(suspend.flags & DM_SUSPEND_FLAG, _ret != 0);
 	memcpy(status.version, kernel_version, sizeof(status.version));

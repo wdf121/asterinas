@@ -593,11 +593,11 @@ fn resume_device(buffer: &mut [u8]) -> Result<()> {
 
 fn resume_device_for(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
     let flags = read_u32(buffer, OFF_FLAGS);
-    if flags & (NOFLUSH_FLAG | SKIP_LOCKFS_FLAG) != 0 {
-        return_errno_with_message!(
-            Errno::EINVAL,
-            "noflush and lockfs control are not supported"
-        );
+    // Filesystem freezing is not implemented; accept SKIP_LOCKFS (the caller
+    // explicitly requests no freeze), but reject NOFLUSH: it needs distinct I/O
+    // semantics rather than the draining suspend implemented here.
+    if flags & NOFLUSH_FLAG != 0 {
+        return_errno_with_message!(Errno::EINVAL, "noflush suspend is not supported");
     }
     if flags & SUSPEND_FLAG != 0 {
         device.suspend().map_err(|_| Error::new(Errno::EINVAL))?;
@@ -1287,6 +1287,21 @@ mod tests {
             Errno::EINVAL
         );
         assert!(!device.is_suspended());
+        // LVM may request SKIP_LOCKFS for an unmounted raw LV. It must still
+        // take the normal draining suspend path with the flags LVM sends.
+        write_u32(
+            &mut resume,
+            OFF_FLAGS,
+            SUSPEND_FLAG | SKIP_LOCKFS_FLAG | PERSISTENT_DEV_FLAG | (1 << 9),
+        );
+        write_u64(&mut resume, OFF_DEV, device.id().as_encoded_u64());
+        resume_device_for(&mut resume, &device).unwrap();
+        assert!(device.is_suspended());
+        assert_ne!(read_u32(&resume, OFF_FLAGS) & SUSPEND_FLAG, 0);
+        write_u32(&mut resume, OFF_FLAGS, 0);
+        resume_device_for(&mut resume, &device).unwrap();
+        assert!(!device.is_suspended());
+        write_u64(&mut resume, OFF_DEV, 0);
         write_u32(&mut resume, OFF_FLAGS, SUSPEND_FLAG);
         resume_device_for(&mut resume, &device).unwrap();
         assert_eq!(read_u32(&resume, OFF_FLAGS) & SUSPEND_FLAG, SUSPEND_FLAG);

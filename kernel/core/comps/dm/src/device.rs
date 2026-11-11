@@ -613,6 +613,91 @@ mod tests {
     }
 
     #[ktest]
+    fn suspend_waits_for_old_bio_and_replays_postponed_on_new_table() {
+        use ostd::task::TaskOptions;
+
+        let (manager, device) = mapper();
+        let old_backing = PendingBacking::new();
+        let new_backing = PendingBacking::new();
+        let old_table = table_with_range(old_backing.clone(), 8, 100, false);
+        let old_weak = Arc::downgrade(&old_table);
+        device.load_table(old_table.clone());
+        device.resume_initial().unwrap();
+        let mut old_batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(
+            BioType::Read,
+            Sid::new(1),
+            vec![BioSegment::alloc_exact(1, 512, BioDirection::FromDevice)],
+            None,
+        )
+        .submit(device.as_ref(), &mut old_batch)
+        .unwrap();
+        assert_eq!(
+            old_backing.pending.lock().as_ref().unwrap().sid_range(),
+            &(Sid::new(101)..Sid::new(102))
+        );
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let result = Arc::new(Mutex::new(None));
+        let worker_device = device.clone();
+        let worker_finished = finished.clone();
+        let worker_result = result.clone();
+        TaskOptions::new(move || {
+            *worker_result.lock() = Some(worker_device.suspend());
+            worker_finished.store(true, Ordering::Release);
+        })
+        .spawn()
+        .unwrap();
+        // Observe that suspend has closed admission before testing its drain.
+        wait_for_test_condition(|| device.is_suspended());
+        assert!(!finished.load(Ordering::Acquire));
+        assert_eq!(device.io.inner.lock().in_flight, 1);
+
+        let mut postponed_batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(
+            BioType::Read,
+            Sid::new(2),
+            vec![BioSegment::alloc_exact(1, 512, BioDirection::FromDevice)],
+            None,
+        )
+        .submit(device.as_ref(), &mut postponed_batch)
+        .unwrap();
+        assert_eq!(device.io.inner.lock().postponed.len(), 1);
+        assert!(new_backing.pending.lock().is_none());
+        old_backing.finish();
+        assert!(old_batch.wait_all().is_ok());
+        wait_for_test_condition(|| finished.load(Ordering::Acquire));
+        assert_eq!(result.lock().take().unwrap(), Ok(()));
+        assert!(old_backing.pending.lock().is_none());
+
+        device.load_table(table_with_range(new_backing.clone(), 8, 200, false));
+        device.resume_suspended().unwrap();
+        assert_eq!(
+            new_backing.pending.lock().as_ref().unwrap().sid_range(),
+            &(Sid::new(202)..Sid::new(203))
+        );
+        assert!(old_backing.pending.lock().is_none());
+        drop(old_table);
+        assert!(old_weak.upgrade().is_none());
+        new_backing.finish();
+        assert!(postponed_batch.wait_all().is_ok());
+        assert_eq!(device.io.inner.lock().in_flight, 0);
+        drop(manager);
+        drop(device);
+    }
+
+    fn wait_for_test_condition(mut condition: impl FnMut() -> bool) {
+        // A stalled worker must fail the test rather than hang the entire ktest run.
+        for _ in 0..1_000_000 {
+            if condition() {
+                return;
+            }
+            ostd::task::Task::yield_now();
+        }
+        panic!("device-mapper test worker did not reach the expected state");
+    }
+
+    #[ktest]
     fn suspend_switches_table_and_replays_on_new_generation() {
         let (manager, device) = mapper();
         let old_backing = PendingBacking::new();

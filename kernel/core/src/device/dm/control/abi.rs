@@ -31,6 +31,7 @@ pub(super) const OFF_UUID: usize = 176;
 pub(super) const UUID_LEN: usize = 129;
 pub(super) const READONLY_FLAG: u32 = 1;
 pub(super) const SUSPEND_FLAG: u32 = 1 << 1;
+#[cfg(ktest)]
 pub(super) const SKIP_LOCKFS_FLAG: u32 = 1 << 10;
 pub(super) const NOFLUSH_FLAG: u32 = 1 << 11;
 pub(super) const PERSISTENT_DEV_FLAG: u32 = 1 << 3;
