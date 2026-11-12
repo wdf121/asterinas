@@ -738,6 +738,7 @@ FN_TEST(device_mapper_active_table_failure_and_bounds)
 {
 	char name[DM_NAME_LEN], primary[64], backing_id[32];
 	unsigned char expected[4096], observed[4096], replacement[1024];
+	unsigned char guard[512];
 	union dm_table_buffer table;
 	struct dm_ioctl create = {}, resume = {};
 	struct stat st;
@@ -748,6 +749,9 @@ FN_TEST(device_mapper_active_table_failure_and_bounds)
 		 _ret == sizeof(zero));
 	TEST_RES(pwrite(backing, zero, sizeof(zero), 224 * 512),
 		 _ret == sizeof(zero));
+	memset(guard, 0xa7, sizeof(guard));
+	CHECK_WITH(pwrite(backing, guard, sizeof(guard), 232 * 512),
+		   _ret == sizeof(guard));
 	CHECK(fstat(backing, &st));
 	snprintf(backing_id, sizeof(backing_id), "%u:%u", major(st.st_rdev),
 		 minor(st.st_rdev));
@@ -822,11 +826,13 @@ FN_TEST(device_mapper_active_table_failure_and_bounds)
 	TEST_RES(memcmp(observed + 512, zero + 512, 6 * 512), _ret == 0);
 	TEST_RES(memcmp(observed + 7 * 512, replacement, 512), _ret == 0);
 	TEST_RES(pread(backing, observed, 512, 232 * 512), _ret == 512);
-	TEST_RES(memcmp(observed, zero, 512), _ret == 0);
+	TEST_RES(memcmp(observed, guard, sizeof(guard)), _ret == 0);
 	TEST_RES(pwrite(backing, zero, sizeof(zero), 192 * 512),
 		 _ret == sizeof(zero));
 	TEST_RES(pwrite(backing, zero, sizeof(zero), 224 * 512),
 		 _ret == sizeof(zero));
+	TEST_RES(pwrite(backing, zero, sizeof(guard), 232 * 512),
+		 _ret == sizeof(guard));
 	TEST_SUCC(close(mapped));
 	TEST_SUCC(close(backing));
 	TEST_SUCC(remove_mapper(control, name));

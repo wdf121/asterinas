@@ -109,12 +109,84 @@ Both the initramfs and NixOS runners use the **same** numbered images, `test/ini
 
 The images live in the initramfs build directory, so `make clean` deletes them along with other initramfs build artifacts. Ordinary test runs and VM shutdowns do not clear them. Existing device-mapper tests assume blank backing ranges; run tests that consume a prior boot's data separately from tests that assume blank disks. A recovery test must run setup and verification in separate VM boots.
 
-The `device-mapper-lvm` suite is an **opt-in, destructive integration test**. It requires `raw_disk=1`, uses the first numbered image (`raw_test_1.img`, `/dev/vde` in NixOS), and clears that entire 512 MiB disk before running `pvcreate`. Do not invoke it if that image contains data to retain, including data from another suite or a recovery test. The LVM and ordinary device-mapper suites run independently; their test images are persistent, not reserved for either suite. This single-boot test runs `pvcreate`, `vgcreate`, inactive linear `lvcreate`, activation, `/dev/dm-N` I/O, then ext2 format, mount, file read/write verification, and unmount. It does not test multiple PVs, LV growth, or reboot recovery. It is not part of the ordinary device-mapper suite or the NixOS CI matrix. After building the suite's NixOS image, invoke it explicitly:
+The `device-mapper-control-plane` suite groups checks by behavior rather than giving each dmsetup command its own case.
+Related probes, creation/loading, state queries, suspend/resume, removal states, and capacity changes share focused lifecycle cases.
+Same-disk and cross-disk I/O, ext2 workflows, explicit and implicit replacement, and concurrent replacement remain independently selectable.
+Each case prepares and removes its own mapping, so it can run alone through `NIXOS_TEST_CASE`.
+The suite requires a clean guest without unrelated DM mappings and destructively overwrites ranges on both raw disks.
+After a failure, inspect leftover mappings, mounts, and background I/O before retrying.
+
+`concurrent_hot_table_replacement` runs a background write/read/checksum loop in an unchanged mapping prefix.
+The foreground repeatedly adds a second-disk tail through implicit replacement and removes it through explicit suspend/load/resume.
+It checks capacity, tail writes, progress after each resume, and the worker's exit status.
+This is a bounded concurrency correctness test, not a throughput benchmark or proof of a particular kernel interleaving.
+Each suite uses its own fixed guest directory: `/tmp/aster-dm-control-plane`,
+`/tmp/aster-dm-lvm`, or `/tmp/aster-dm-lvm-recovery`.
+Every case clears and recreates only its suite's directory before doing test work,
+including when selected individually with `NIXOS_TEST_CASE`.
+Cleanup refuses symbolic-link directories, an existing `/dev/dm-0`, remaining mounts
+at or below the directory, or a failed mount inspection. Inspect and resolve such
+leftovers before retrying; the tests do not automatically unmount or remove stale mappings.
+Mountpoints, table files, payloads, checksums, and worker output stay beneath the directory.
+Cases still unmount filesystems, stop and wait for workers, and remove or deactivate mappings
+as required, but do not delete the temporary directory at the end.
+Files remain available for inspection until the next case starts; that case also deletes
+any earlier failure artifacts in the same suite directory, including `dm_hot.log`.
+Cleanup does not touch another suite's directory, persistent raw images, or the LVM state
+retained for recovery. Directories left by older random-directory versions are not removed automatically.
+
+The `device-mapper-lvm` suite is an **opt-in, destructive integration test**. The full suite requires `raw_disk=2` and overwrites the first two numbered images (`raw_test_1.img` and `raw_test_2.img`, `/dev/vde` and `/dev/vdf` in NixOS). Do not run it on images containing data to retain, or between the preparation and verification boots of a recovery test. The images are persistent and shared with the ordinary device-mapper suite, not reserved for LVM.
+
+The suite contains two single-boot functional workflows:
+
+- `linear_lv_create_and_use`: create and activate a single-PV linear LV, verify raw I/O and an ext2 file after remount, then remove the VG and PV.
+- `linear_lv_offline_ext2_resize`: grow a 192 MiB LV to 256 MiB using a second PV, grow unmounted ext2, and verify non-sparse file data exceeding the original segment. Remove the growth payload, shrink ext2 before reducing the LV back to 192 MiB, and verify retained data and new writes after remount.
+
+The final workflow deliberately preserves `phase1_offline_vg/ext2_lv` and both PVs for a later recovery-verification boot. It unmounts ext2 and deactivates the LV. The filesystem contains `retained`, `after-shrink`, and their original SHA256 manifests with relative filenames. The `added` payload and its manifest have been removed. Do not rerun this suite, run another destructive disk test, or run `make clean` before consuming that state. Cross-boot verification is performed by the separate `device-mapper-lvm-recovery` suite.
+
+Concurrent-I/O and hot raw-mapping resize tests belong to the dmsetup suite, not these LVM workflows. Cases use `/dev/dm-0` and require a clean guest with no unrelated mappers. After a failure, inspect leftover mounts and mappings before retrying. The suite is not part of the ordinary device-mapper suite or the NixOS CI matrix.
+
+Both LVM suites use the guest's default LVM configuration and require `e2fsprogs` and `lvm2`.
+All three suite configurations supply these packages, but package availability alone does not establish an old image's LVM configuration.
+The suite Rust sources and `extra_config.nix` files do not set `LVM_SYSTEM_DIR`, `udev_sync`, `udev_rules`, or `use_devicesfile`.
+The shared distribution configuration still disables the udev service (`services.udev.enable = false`); this is separate from LVM's own synchronization settings.
+`make run_nixos` recompiles the Rust runner but does not rebuild the guest image.
+Before reusing an old image, inspect `printenv LVM_SYSTEM_DIR` and `lvmconfig --type full` inside the guest, as well as `/etc/lvm/lvm.conf` and any selected alternate LVM configuration directory.
+If image configuration needs updating, rebuild with `make nixos NIXOS_TEST_SUITE=device-mapper-lvm` before preparation, not between preparation and recovery.
+Removing temporary files is not a substitute for checking or rebuilding the image configuration.
+
+### LVM recovery across VM boots
+
+Run preparation to completion and wait for its VM to shut down before starting recovery:
 
 ```bash
-make nixos NIXOS_TEST_SUITE=device-mapper-lvm
-make run_nixos NIXOS_TEST_SUITE=device-mapper-lvm raw_disk=1
+# First boot: destructive preparation, ending with an unmounted, inactive LV.
+make run_nixos NIXOS_TEST_SUITE=device-mapper-lvm raw_disk=2
+
+# Second boot: reuse the same image and raw disks; no preparation or formatting.
+make run_nixos NIXOS_TEST_SUITE=device-mapper-lvm-recovery raw_disk=2
 ```
+
+If the preparation suite has already passed and its disks have not been changed, run only the second command.
+Do not run another destructive disk suite or `make clean` between boots.
+Each invocation starts a separate QEMU process; merely selecting another case within one invocation is not a reboot.
+The framework sends `poweroff` and waits for QEMU to exit after the suite finishes.
+
+The recovery case scans existing PV/VG metadata, explicitly activates `phase1_offline_vg/ext2_lv`, checks the LV and ext2 sizes, and mounts it read-only.
+It checks the retained file sizes, validates the original on-disk SHA256 manifests, and confirms the growth payload is absent.
+It then unmounts and deactivates the LV without deleting any PV, VG, LV, or baseline, so verification can be repeated in another boot.
+A clean guest with no active `/dev/dm-0` mapping is required before explicit activation.
+
+Explicit deactivation in preparation defines a controlled end state; it is not required to make LVM metadata persistent.
+The filesystem is unmounted first to flush its data and metadata before the mapping is removed.
+Across shutdown, the in-memory DM table disappears while the PV/VG/LV metadata remains on the raw disks.
+The next boot must reconstruct the table from that metadata before mounting the filesystem.
+This tests clean-shutdown persistence and explicit reactivation, not sudden power-loss recovery or automatic boot activation.
+
+Automatic activation is a separate userspace boot policy, not something persistent DM tables provide.
+It can be implemented with a boot service or a working LVM/udev autoactivation path, followed by an explicitly configured mount.
+That requires validating the guest's startup ordering, device discovery, and device paths; these suites do not install such a policy.
+Automatically launching the next QEMU after `poweroff` is instead host-side orchestration and does not prove guest autoactivation.
 
 ## Running Tests
 

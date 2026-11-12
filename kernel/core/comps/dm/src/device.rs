@@ -536,9 +536,18 @@ mod tests {
         let mut batch = io_util::batch::IoBatch::with_capacity(1);
         bio.submit(device.as_ref(), &mut batch).unwrap();
         assert!(backing.pending.lock().is_some());
-        // Completing an accepted request still holds the table even when the
-        // mapper has stopped accepting fresh requests.
-        device.io.inner.lock().stopped = true;
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_device = device.clone();
+        let worker_finished = finished.clone();
+        ostd::task::TaskOptions::new(move || {
+            worker_device.stop_and_drain_io();
+            worker_finished.store(true, Ordering::Release);
+        })
+        .spawn()
+        .unwrap();
+        wait_for_test_condition(|| device.io.inner.lock().stopped);
+        assert!(!finished.load(Ordering::Acquire));
+        assert!(device.active_table().is_some());
         let rejected = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
         assert_eq!(
             rejected.submit_and_wait(device.as_ref()),
@@ -547,7 +556,7 @@ mod tests {
         assert_eq!(device.io.inner.lock().in_flight, 1);
         backing.finish();
         assert!(batch.wait_all().is_ok());
-        device.stop_and_drain_io();
+        wait_for_test_condition(|| finished.load(Ordering::Acquire));
         assert_eq!(device.io.inner.lock().in_flight, 0);
         device.clear_removed_tables();
         assert!(device.active_table().is_none());

@@ -1118,11 +1118,15 @@ mod tests {
 
     #[ktest]
     fn nested_remap_and_split_preserve_parent_completion() {
+        let completions = Arc::new(SpinLock::<Vec<BioStatus>, LocalIrqDisabled>::new(Vec::new()));
+        let callback_completions = completions.clone();
         let bio = Bio::new(
             BioType::Read,
             Sid::new(0),
             vec![BioSegment::alloc(2, BioDirection::FromDevice)],
-            None,
+            Some(Box::new(move |status| {
+                callback_completions.lock().push(status);
+            })),
         )
         .submit_for_test();
         let children = bio
@@ -1138,10 +1142,17 @@ mod tests {
                 Sid::new(104)..Sid::new(108),
             ])
             .unwrap();
-        for mut grandchild in grandchildren {
+        for (index, mut grandchild) in grandchildren.into_iter().enumerate() {
             grandchild.offset_mapped_sid_range(1_000).unwrap();
+            let start = 1_100 + index as u64 * 4;
+            assert_eq!(
+                grandchild.sid_range(),
+                &(Sid::new(start)..Sid::new(start + 4))
+            );
             grandchild.complete(BioStatus::Complete);
+            assert!(completions.lock().is_empty());
         }
         second.complete(BioStatus::Complete);
+        assert_eq!(*completions.lock(), vec![BioStatus::Complete]);
     }
 }
