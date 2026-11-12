@@ -5,7 +5,7 @@
 //! Ordinary tokens borrow the ioctl input. Escaped tokens own a bounded scratch
 //! copy that is wiped on drop, including parse failures in secure table loads.
 
-use alloc::vec::Vec;
+use alloc::{collections::TryReserveError, vec::Vec};
 use core::ops::Deref;
 
 use ostd::mm::VmWriter;
@@ -67,15 +67,14 @@ fn is_space(byte: u8) -> bool {
     byte == b' ' || (b'\t'..=b'\r').contains(&byte)
 }
 
-impl<'a> Iterator for Arguments<'a> {
-    type Item = Argument<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl<'a> Arguments<'a> {
+    /// Decodes the next token while allowing callers to recover from allocation failure.
+    pub(super) fn try_next(&mut self) -> Result<Option<Argument<'a>>, TryReserveError> {
         let input = self
             .remaining
             .trim_start_matches(|ch: char| ch.is_ascii() && is_space(ch as u8));
         if input.is_empty() {
-            return None;
+            return Ok(None);
         }
         let bytes = input.as_bytes();
         let mut end = 0;
@@ -92,11 +91,12 @@ impl<'a> Iterator for Arguments<'a> {
         }
         self.remaining = &input[end..];
         if !escaped {
-            return Some(Argument::Borrowed(&input[..end]));
+            return Ok(Some(Argument::Borrowed(&input[..end])));
         }
         // Reserve once so no old allocation containing parameters is abandoned
         // during growth. The resulting token is no longer than the input.
-        let mut decoded = Vec::with_capacity(end);
+        let mut decoded = Vec::new();
+        decoded.try_reserve_exact(end)?;
         let mut cursor = 0;
         while cursor < end {
             if bytes[cursor] == b'\\' && cursor + 1 < end {
@@ -105,11 +105,11 @@ impl<'a> Iterator for Arguments<'a> {
             decoded.push(bytes[cursor]);
             cursor += 1;
         }
-        Some(Argument::Escaped {
+        Ok(Some(Argument::Escaped {
             bytes: decoded,
             #[cfg(ktest)]
             wipe_observer: None,
-        })
+        }))
     }
 }
 
@@ -131,13 +131,13 @@ mod tests {
         }
         fn parse(params: &str) -> Result<(), ()> {
             let mut args = Arguments::new(params);
-            let mut path = args.next().ok_or(())?;
+            let mut path = args.try_next().map_err(|_| ())?.ok_or(())?;
             let Argument::Escaped { wipe_observer, .. } = &mut path else {
                 panic!("expected an owned escaped argument");
             };
             *wipe_observer = Some(observe);
             assert_eq!(&*path, "/dev/a b");
-            let offset = args.next().ok_or(())?;
+            let offset = args.try_next().map_err(|_| ())?.ok_or(())?;
             offset.parse::<u64>().map_err(|_| ())?;
             Ok(())
         }
@@ -153,16 +153,19 @@ mod tests {
     #[ktest]
     fn decodes_linux_quoted_arguments() {
         let mut args = Arguments::new("  /dev/a\\ b\t8\\ 0  a\\\\b trail\\");
-        assert_eq!(&*args.next().unwrap(), "/dev/a b");
-        assert_eq!(&*args.next().unwrap(), "8 0");
-        assert_eq!(&*args.next().unwrap(), "a\\b");
-        assert_eq!(&*args.next().unwrap(), "trail\\");
-        assert!(args.next().is_none());
-        assert_eq!(&*Arguments::new("设备\\ 名").next().unwrap(), "设备 名");
+        assert_eq!(&*args.try_next().unwrap().unwrap(), "/dev/a b");
+        assert_eq!(&*args.try_next().unwrap().unwrap(), "8 0");
+        assert_eq!(&*args.try_next().unwrap().unwrap(), "a\\b");
+        assert_eq!(&*args.try_next().unwrap().unwrap(), "trail\\");
+        assert!(args.try_next().unwrap().is_none());
+        assert_eq!(
+            &*Arguments::new("设备\\ 名").try_next().unwrap().unwrap(),
+            "设备 名"
+        );
         let mut args = Arguments::new("\x0b\x0cfirst\x0bsecond\r\n");
-        assert_eq!(&*args.next().unwrap(), "first");
-        assert_eq!(&*args.next().unwrap(), "second");
-        assert!(args.next().is_none());
-        assert!(args.next().is_none());
+        assert_eq!(&*args.try_next().unwrap().unwrap(), "first");
+        assert_eq!(&*args.try_next().unwrap().unwrap(), "second");
+        assert!(args.try_next().unwrap().is_none());
+        assert!(args.try_next().unwrap().is_none());
     }
 }

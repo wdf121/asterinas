@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Linux Device Mapper control-device registration and supported commands, including static queries and ordinary REMOVE.
+//! Linux Device Mapper control device and file interface.
 //!
-//! LOAD validates an inactive linear table and publishes only `/dev/dm-N`.
-//! First RESUME activates it for mapped I/O; running mappings support suspend
-//! and resume without table replacement. Hot replacement remains unsupported.
+//! Command dispatch delegates device management, table operations, target queries,
+//! and mapping configuration parsing to sibling modules. Runtime publication and
+//! lower-level DM objects retain their existing ownership and lifecycle rules.
 
 use device_id::{DeviceId, MinorId};
 use ostd::mm::VmIo;
@@ -31,7 +31,13 @@ use crate::{
 
 mod abi;
 mod commands;
+mod device;
 mod ioctl;
+mod parse;
+mod table;
+mod target;
+#[cfg(ktest)]
+mod test_support;
 
 const DM_CONTROL_MINOR: u32 = 236;
 const DM_IOCTL_MAGIC: u32 = 0xfd;

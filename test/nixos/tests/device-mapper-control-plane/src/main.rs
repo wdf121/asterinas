@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! dmsetup command semantics, linear I/O, and concurrent raw table replacement.
+//! dmsetup semantics, linear and striped I/O, ext2, and raw table replacement.
 //!
 //! Each case prepares and removes its own mapping and can be selected separately.
 //! Requires raw_disk=2 and a clean guest with no unrelated DM mappings. The cases
@@ -29,6 +29,14 @@ nixos_test_main!(
         "explicit_table_replacement",
         "raw_mapping_growth_and_shrink",
         "concurrent_hot_table_replacement",
+        "striped_cross_disk_reads_and_writes",
+        "striped_same_disk_reads_and_writes",
+        "mixed_linear_and_striped_reads_and_writes",
+        "invalid_striped_load_preserves_tables",
+        "striped_readonly_and_io_bounds",
+        "striped_table_replacement",
+        "striped_raw_mapping_growth_and_shrink",
+        "ext2_striped_cross_disk",
     ]
 );
 
@@ -1207,5 +1215,1693 @@ fn concurrent_hot_table_replacement(nixos_shell: &mut Session) -> Result<(), Err
     )?;
     nixos_shell
         .run_cmd_and_expect_regex("dmsetup remove phase1_test", &Regex::new("(?s).*").unwrap())?;
+    Ok(())
+}
+
+// Check numeric backings against four independently enumerated physical chunks.
+#[nixos_test]
+fn striped_cross_disk_reads_and_writes(nixos_shell: &mut Session) -> Result<(), Error> {
+    // Refuse stale mappings and mounts before replacing this case's artifacts.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"export dm_work=/tmp/aster-dm-control-plane; test ! -L "$dm_work" && test ! -e /dev/dm-0 && dm_mounts=$(findmnt -rn -o TARGET) && awk -v work="$dm_work" '$0 == work || index($0, work "/") == 1 { mounted = 1 } END { exit mounted }' <<< "$dm_mounts" && rm -rf -- "$dm_work" && mkdir -- "$dm_work""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_e_hex=$(stat -c "%t %T" /dev/vde) && read -r dm_e_major dm_e_minor <<< "$dm_e_hex" && dm_e="$((16#$dm_e_major)):$((16#$dm_e_minor))" && dm_f_hex=$(stat -c "%t %T" /dev/vdf) && read -r dm_f_major dm_f_minor <<< "$dm_f_hex" && dm_f="$((16#$dm_f_major)):$((16#$dm_f_minor))""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Logical chunks [0,2), [2,4), [4,6), [6,8) alternate between the two disks.
+    // Random chunks distinguish both sectors within each chunk and successive rows.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/expected" bs=512 count=8 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/expected")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vde bs=512 skip=0 seek=4096 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vdf bs=512 skip=2 seek=8192 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vde bs=512 skip=4 seek=4098 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vdf bs=512 skip=6 seek=8194 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup create phase1_test --notable"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test --table "0 8 striped 2 2 $dm_e 4096 $dm_f 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table phase1_test"#,
+        &Regex::new(r#"^\s*$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_table=$(dmsetup table --inactive phase1_test) && test "$dm_table" = "0 8 striped 2 2 $dm_e 4096 $dm_f 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_status=$(dmsetup status --inactive phase1_test) && test "$dm_status" = "0 8 striped 2 $dm_e $dm_f 1 AA""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup deps --inactive phase1_test"#,
+        &Regex::new(r#"^2 dependencies\s*:\s*\([0-9]+, [0-9]+\)\s*\([0-9]+, [0-9]+\)$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^4096$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_table=$(dmsetup table phase1_test) && test "$dm_table" = "0 8 striped 2 2 $dm_e 4096 $dm_f 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table --inactive phase1_test"#,
+        &Regex::new(r#"^\s*$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_deps=$(dmsetup deps phase1_test) && read -r -a dm_dep_fields <<< "$dm_deps" && test "${dm_dep_fields[*]}" = "2 dependencies : ($((16#$dm_e_major)), $((16#$dm_e_minor))) ($((16#$dm_f_major)), $((16#$dm_f_minor)))""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/expected" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Exercise a chunk interior, a chunk boundary, a row boundary, and the final sector.
+    // These user-space requests do not assert a particular BIO split.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of="${dm_work}/slice" bs=512 skip=1 count=1 status=none && test "$(stat -c %s "${dm_work}/slice")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=1 count=1 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/slice" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of="${dm_work}/slice" bs=512 skip=1 count=2 status=none && test "$(stat -c %s "${dm_work}/slice")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=1 count=2 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/slice" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of="${dm_work}/slice" bs=512 skip=3 count=2 status=none && test "$(stat -c %s "${dm_work}/slice")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=3 count=2 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/slice" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of="${dm_work}/slice" bs=512 skip=7 count=1 status=none && test "$(stat -c %s "${dm_work}/slice")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=7 count=1 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/slice" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/written" bs=512 count=8 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/written")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/written" of=/dev/dm-0 bs=512 skip=0 seek=0 count=8 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8192 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4098 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8194 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/written" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/patch" bs=512 count=4 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/patch")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/patch" of=/dev/dm-0 bs=512 skip=0 seek=1 count=4 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/patch" of="${dm_work}/written" bs=512 skip=0 seek=1 count=4 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8192 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4098 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8194 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/written" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/last" bs=512 count=1 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/last")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/last" of=/dev/dm-0 bs=512 skip=0 seek=7 count=1 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/last" of="${dm_work}/written" bs=512 skip=0 seek=7 count=1 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8192 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4098 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8194 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/written" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_status=$(dmsetup status phase1_test) && test "$dm_status" = "0 8 striped 2 $dm_e $dm_f 1 AA""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup remove phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex(r#"test ! -e /dev/dm-0"#, &Regex::new(r#"(?s).*"#).unwrap())?;
+    Ok(())
+}
+
+// Keep two stripe parameters but report one unique backing dependency.
+#[nixos_test]
+fn striped_same_disk_reads_and_writes(nixos_shell: &mut Session) -> Result<(), Error> {
+    // Refuse stale mappings and mounts before replacing this case's artifacts.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"export dm_work=/tmp/aster-dm-control-plane; test ! -L "$dm_work" && test ! -e /dev/dm-0 && dm_mounts=$(findmnt -rn -o TARGET) && awk -v work="$dm_work" '$0 == work || index($0, work "/") == 1 { mounted = 1 } END { exit mounted }' <<< "$dm_mounts" && rm -rf -- "$dm_work" && mkdir -- "$dm_work""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_e_hex=$(stat -c "%t %T" /dev/vde) && read -r dm_e_major dm_e_minor <<< "$dm_e_hex" && dm_e="$((16#$dm_e_major)):$((16#$dm_e_minor))" && dm_f_hex=$(stat -c "%t %T" /dev/vdf) && read -r dm_f_major dm_f_minor <<< "$dm_f_hex" && dm_f="$((16#$dm_f_major)):$((16#$dm_f_minor))""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/expected" bs=512 count=8 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/expected")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vde bs=512 skip=0 seek=4096 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vde bs=512 skip=2 seek=8192 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vde bs=512 skip=4 seek=4098 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vde bs=512 skip=6 seek=8194 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup create phase1_test --notable"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test --table "0 8 striped 2 2 /dev/vde 4096 /dev/vde 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_table=$(dmsetup table phase1_test) && test "$dm_table" = "0 8 striped 2 2 $dm_e 4096 $dm_e 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_deps=$(dmsetup deps phase1_test) && read -r -a dm_dep_fields <<< "$dm_deps" && test "${dm_dep_fields[*]}" = "1 dependencies : ($((16#$dm_e_major)), $((16#$dm_e_minor)))""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/expected" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/written" bs=512 count=8 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/written")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/written" of=/dev/dm-0 bs=512 skip=0 seek=0 count=8 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=8192 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4098 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=8194 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/written" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Dependency deduplication does not prove a particular number of backing flushes.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup remove phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex(r#"test ! -e /dev/dm-0"#, &Regex::new(r#"(?s).*"#).unwrap())?;
+    Ok(())
+}
+
+// Use a non-row-aligned target start and a non-power-of-two chunk.
+#[nixos_test]
+fn mixed_linear_and_striped_reads_and_writes(nixos_shell: &mut Session) -> Result<(), Error> {
+    // Refuse stale mappings and mounts before replacing this case's artifacts.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"export dm_work=/tmp/aster-dm-control-plane; test ! -L "$dm_work" && test ! -e /dev/dm-0 && dm_mounts=$(findmnt -rn -o TARGET) && awk -v work="$dm_work" '$0 == work || index($0, work "/") == 1 { mounted = 1 } END { exit mounted }' <<< "$dm_mounts" && rm -rf -- "$dm_work" && mkdir -- "$dm_work""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // The striped target starts at sector 2, with six-sector rows and three-sector chunks.
+    // The fixed physical list also includes both neighboring linear targets.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/expected" bs=512 count=16 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/expected")" -eq 8192"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vde bs=512 skip=0 seek=12288 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vde bs=512 skip=2 seek=4096 count=3 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vdf bs=512 skip=5 seek=8192 count=3 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vde bs=512 skip=8 seek=4099 count=3 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vdf bs=512 skip=11 seek=8195 count=3 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vdf bs=512 skip=14 seek=16384 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/sentinel" bs=512 count=1 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/sentinel")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/sentinel" of=/dev/vde bs=512 skip=0 seek=12287 count=1 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/sentinel" of=/dev/vde bs=512 skip=0 seek=12290 count=1 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/sentinel" of=/dev/vdf bs=512 skip=0 seek=16383 count=1 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/sentinel" of=/dev/vdf bs=512 skip=0 seek=16386 count=1 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup create phase1_test --notable"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"printf '%s\n' '0 2 linear /dev/vde 12288' '2 12 striped 2 3 /dev/vde 4096 /dev/vdf 8192' '14 2 linear /dev/vdf 16384' > "${dm_work}/table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test "${dm_work}/table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^8192$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=16 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 8192"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/expected" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of="${dm_work}/slice" bs=512 skip=1 count=2 status=none && test "$(stat -c %s "${dm_work}/slice")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=1 count=2 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/slice" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of="${dm_work}/slice" bs=512 skip=13 count=2 status=none && test "$(stat -c %s "${dm_work}/slice")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=13 count=2 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/slice" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // First write only the striped region; both linear regions must retain their contents.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/patch" bs=512 count=12 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/patch")" -eq 6144"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/patch" of=/dev/dm-0 bs=512 skip=0 seek=2 count=12 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/patch" of="${dm_work}/expected" bs=512 skip=0 seek=2 count=12 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=12288 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=3 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2560"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8192 count=3 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4099 count=3 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 5632"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8195 count=3 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 7168"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=16384 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 8192"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/expected" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Then cross both target boundaries and compare the entire independent layout.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/crossing" bs=512 count=14 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/crossing")" -eq 7168"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/crossing" of=/dev/dm-0 bs=512 skip=0 seek=1 count=14 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/crossing" of="${dm_work}/expected" bs=512 skip=0 seek=1 count=14 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=12288 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=3 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2560"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8192 count=3 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4099 count=3 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 5632"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8195 count=3 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 7168"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=16384 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 8192"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/expected" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=16 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 8192"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/expected" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde of="${dm_work}/actual" bs=512 skip=12287 count=1 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/sentinel" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde of="${dm_work}/actual" bs=512 skip=12290 count=1 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/sentinel" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf of="${dm_work}/actual" bs=512 skip=16383 count=1 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/sentinel" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf of="${dm_work}/actual" bs=512 skip=16386 count=1 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/sentinel" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup remove phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex(r#"test ! -e /dev/dm-0"#, &Regex::new(r#"(?s).*"#).unwrap())?;
+    Ok(())
+}
+
+// Reject invalid loads without losing either the active or pending generation.
+#[nixos_test]
+fn invalid_striped_load_preserves_tables(nixos_shell: &mut Session) -> Result<(), Error> {
+    // Refuse stale mappings and mounts before replacing this case's artifacts.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"export dm_work=/tmp/aster-dm-control-plane; test ! -L "$dm_work" && test ! -e /dev/dm-0 && dm_mounts=$(findmnt -rn -o TARGET) && awk -v work="$dm_work" '$0 == work || index($0, work "/") == 1 { mounted = 1 } END { exit mounted }' <<< "$dm_mounts" && rm -rf -- "$dm_work" && mkdir -- "$dm_work""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_e_hex=$(stat -c "%t %T" /dev/vde) && read -r dm_e_major dm_e_minor <<< "$dm_e_hex" && dm_e="$((16#$dm_e_major)):$((16#$dm_e_minor))" && dm_f_hex=$(stat -c "%t %T" /dev/vdf) && read -r dm_f_major dm_f_minor <<< "$dm_f_hex" && dm_f="$((16#$dm_f_major)):$((16#$dm_f_minor))""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/active" bs=512 count=8 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/active")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/active" of=/dev/vde bs=512 skip=0 seek=4096 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/active" of=/dev/vdf bs=512 skip=2 seek=8192 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/active" of=/dev/vde bs=512 skip=4 seek=4098 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/active" of=/dev/vdf bs=512 skip=6 seek=8194 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/candidate" bs=512 count=8 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/candidate")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/candidate" of=/dev/vdf bs=512 skip=0 seek=12288 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/candidate" of=/dev/vde bs=512 skip=2 seek=16384 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/candidate" of=/dev/vdf bs=512 skip=4 seek=12290 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/candidate" of=/dev/vde bs=512 skip=6 seek=16386 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup create phase1_test --notable"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test --table "0 8 striped 2 2 /dev/vde 4096 /dev/vdf 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test --table "0 8 striped 2 2 /dev/vdf 12288 /dev/vde 16384""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_table=$(dmsetup table phase1_test) && test "$dm_table" = "0 8 striped 2 2 $dm_e 4096 $dm_f 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_table=$(dmsetup table --inactive phase1_test) && test "$dm_table" = "0 8 striped 2 2 $dm_f 12288 $dm_e 16384""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table phase1_test > "${dm_work}/active.table" && dmsetup table --inactive phase1_test > "${dm_work}/candidate.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_e_sectors=$(blockdev --getsz /dev/vde) && test "$dm_e_sectors" -gt 0"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Each rejected LOAD is followed by separate table and data checks.
+    // The capacity-derived offset is outside the backing regardless of persistent disk contents.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"test ! -e /dev/phase1_missing_backing"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Zero stripe count.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dmsetup load phase1_test --table "0 8 striped 0 2"; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/active.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table --inactive phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/candidate.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/active" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Zero chunk size.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dmsetup load phase1_test --table "0 8 striped 2 0 /dev/vde 4096 /dev/vdf 8192"; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/active.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table --inactive phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/candidate.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/active" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Missing offset.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dmsetup load phase1_test --table "0 8 striped 2 2 /dev/vde 4096 /dev/vdf"; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/active.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table --inactive phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/candidate.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/active" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Extra parameter.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dmsetup load phase1_test --table "0 8 striped 2 2 /dev/vde 4096 /dev/vdf 8192 extra"; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/active.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table --inactive phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/candidate.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/active" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Invalid numeric field.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dmsetup load phase1_test --table "0 8 striped 2 invalid /dev/vde 4096 /dev/vdf 8192"; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/active.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table --inactive phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/candidate.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/active" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Incomplete stripe row.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dmsetup load phase1_test --table "0 6 striped 2 2 /dev/vde 4096 /dev/vdf 8192"; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/active.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table --inactive phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/candidate.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/active" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Backing capacity exceeded.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dmsetup load phase1_test --table "0 8 striped 2 2 /dev/vde $dm_e_sectors /dev/vdf 8192"; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/active.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table --inactive phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/candidate.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/active" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Missing backing.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dmsetup load phase1_test --table "0 8 striped 2 2 /dev/phase1_missing_backing 0 /dev/vdf 8192"; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/active.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table --inactive phase1_test > "${dm_work}/actual.table" && cmp "${dm_work}/candidate.table" "${dm_work}/actual.table""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/active" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^4096$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_table=$(dmsetup table phase1_test) && test "$dm_table" = "0 8 striped 2 2 $dm_f 12288 $dm_e 16384""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table --inactive phase1_test"#,
+        &Regex::new(r#"^\s*$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/candidate" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup remove phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex(r#"test ! -e /dev/dm-0"#, &Regex::new(r#"(?s).*"#).unwrap())?;
+    Ok(())
+}
+
+// Protect both backings and nonzero sentinels at the logical end.
+#[nixos_test]
+fn striped_readonly_and_io_bounds(nixos_shell: &mut Session) -> Result<(), Error> {
+    // Refuse stale mappings and mounts before replacing this case's artifacts.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"export dm_work=/tmp/aster-dm-control-plane; test ! -L "$dm_work" && test ! -e /dev/dm-0 && dm_mounts=$(findmnt -rn -o TARGET) && awk -v work="$dm_work" '$0 == work || index($0, work "/") == 1 { mounted = 1 } END { exit mounted }' <<< "$dm_mounts" && rm -rf -- "$dm_work" && mkdir -- "$dm_work""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/expected" bs=512 count=8 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/expected")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vde bs=512 skip=0 seek=4096 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vdf bs=512 skip=2 seek=8192 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vde bs=512 skip=4 seek=4098 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/expected" of=/dev/vdf bs=512 skip=6 seek=8194 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/sentinel" bs=512 count=2 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/sentinel")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/sentinel" of=/dev/vde bs=512 skip=0 seek=4100 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/sentinel" of=/dev/vdf bs=512 skip=0 seek=8196 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup create phase1_test --notable"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load --readonly phase1_test --table "0 8 striped 2 2 /dev/vde 4096 /dev/vdf 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/expected" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dd if=/dev/zero of=/dev/dm-0 bs=4096 count=1 conv=fsync,notrunc status=none; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8192 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4098 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8194 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/expected" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup remove phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup create phase1_test --notable"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test --table "0 8 striped 2 2 /dev/vde 4096 /dev/vdf 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/last" bs=512 count=1 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/last")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/last" of=/dev/dm-0 bs=512 skip=0 seek=7 count=1 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/last" of="${dm_work}/expected" bs=512 skip=0 seek=7 count=1 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=7 count=1 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/last" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8192 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4098 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8194 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/expected" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // A crossing write may commit its legal prefix before reporting failure.
+    // Use two sector-sized writes: sector 7 succeeds, sector 8 fails; no rollback is assumed.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/crossing" bs=512 count=2 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/crossing")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dd if="${dm_work}/crossing" of=/dev/dm-0 bs=512 seek=7 count=2 conv=fsync,notrunc status=none; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/crossing" of="${dm_work}/expected" bs=512 skip=0 seek=7 count=1 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8192 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4098 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8194 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/expected" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dd if=/dev/zero of=/dev/dm-0 bs=512 seek=8 count=1 conv=fsync,notrunc status=none; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/eof" bs=512 skip=8 count=1 status=none && test "$(stat -c %s "${dm_work}/eof")" -eq 0"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dd if=/dev/zero of=/dev/dm-0 bs=512 seek=9 count=1 conv=fsync,notrunc status=none; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/eof" bs=512 skip=9 count=1 status=none && test "$(stat -c %s "${dm_work}/eof")" -eq 0"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/tail" bs=512 skip=7 count=2 status=none && test "$(stat -c %s "${dm_work}/tail")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/crossing" of="${dm_work}/slice" bs=512 skip=0 count=1 status=none && test "$(stat -c %s "${dm_work}/slice")" -eq 512"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/slice" "${dm_work}/tail""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/expected" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8192 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4098 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8194 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/expected" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde of="${dm_work}/actual" bs=512 skip=4100 count=2 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/sentinel" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf of="${dm_work}/actual" bs=512 skip=8196 count=2 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/sentinel" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup remove phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex(r#"test ! -e /dev/dm-0"#, &Regex::new(r#"(?s).*"#).unwrap())?;
+    Ok(())
+}
+
+// Switch linear to striped implicitly, then back to linear explicitly.
+#[nixos_test]
+fn striped_table_replacement(nixos_shell: &mut Session) -> Result<(), Error> {
+    // Refuse stale mappings and mounts before replacing this case's artifacts.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"export dm_work=/tmp/aster-dm-control-plane; test ! -L "$dm_work" && test ! -e /dev/dm-0 && dm_mounts=$(findmnt -rn -o TARGET) && awk -v work="$dm_work" '$0 == work || index($0, work "/") == 1 { mounted = 1 } END { exit mounted }' <<< "$dm_mounts" && rm -rf -- "$dm_work" && mkdir -- "$dm_work""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_e_hex=$(stat -c "%t %T" /dev/vde) && read -r dm_e_major dm_e_minor <<< "$dm_e_hex" && dm_e="$((16#$dm_e_major)):$((16#$dm_e_minor))" && dm_f_hex=$(stat -c "%t %T" /dev/vdf) && read -r dm_f_major dm_f_minor <<< "$dm_f_hex" && dm_f="$((16#$dm_f_major)):$((16#$dm_f_minor))""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/linear" bs=512 count=8 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/linear")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/linear" of=/dev/vde bs=512 skip=0 seek=12288 count=8 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/striped" bs=512 count=8 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/striped")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/striped" of=/dev/vde bs=512 skip=0 seek=4096 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/striped" of=/dev/vdf bs=512 skip=2 seek=8192 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/striped" of=/dev/vde bs=512 skip=4 seek=4098 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/striped" of=/dev/vdf bs=512 skip=6 seek=8194 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/replacement" bs=512 count=4 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/replacement")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/replacement" of=/dev/vdf bs=512 skip=0 seek=16384 count=4 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup create phase1_test --notable"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test --table "0 8 linear /dev/vde 12288""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/linear" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test --table "0 8 striped 2 2 /dev/vde 4096 /dev/vdf 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_table=$(dmsetup table phase1_test) && test "$dm_table" = "0 8 linear $dm_e 12288""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_table=$(dmsetup table --inactive phase1_test) && test "$dm_table" = "0 8 striped 2 2 $dm_e 4096 $dm_f 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^4096$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/linear" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_table=$(dmsetup table phase1_test) && test "$dm_table" = "0 8 striped 2 2 $dm_e 4096 $dm_f 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table --inactive phase1_test"#,
+        &Regex::new(r#"^\s*$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^4096$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/striped" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Suspended I/O is queued, so inspect tables and capacity without reading until resume.
+    // The new linear layout has independent data; replacement does not migrate the old data.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup suspend phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup info phase1_test"#,
+        &Regex::new(r#"(?m)^State:\s+SUSPENDED$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test --table "0 4 linear /dev/vdf 16384""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_table=$(dmsetup table phase1_test) && test "$dm_table" = "0 8 striped 2 2 $dm_e 4096 $dm_f 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_table=$(dmsetup table --inactive phase1_test) && test "$dm_table" = "0 4 linear $dm_f 16384""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^4096$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dm_table=$(dmsetup table phase1_test) && test "$dm_table" = "0 4 linear $dm_f 16384""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup table --inactive phase1_test"#,
+        &Regex::new(r#"^\s*$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^2048$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=4 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/replacement" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8192 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4098 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8194 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/striped" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde of="${dm_work}/actual" bs=512 skip=12288 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/linear" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup remove phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex(r#"test ! -e /dev/dm-0"#, &Regex::new(r#"(?s).*"#).unwrap())?;
+    Ok(())
+}
+
+// Resize complete stripe rows without changing their physical geometry.
+#[nixos_test]
+fn striped_raw_mapping_growth_and_shrink(nixos_shell: &mut Session) -> Result<(), Error> {
+    // Refuse stale mappings and mounts before replacing this case's artifacts.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"export dm_work=/tmp/aster-dm-control-plane; test ! -L "$dm_work" && test ! -e /dev/dm-0 && dm_mounts=$(findmnt -rn -o TARGET) && awk -v work="$dm_work" '$0 == work || index($0, work "/") == 1 { mounted = 1 } END { exit mounted }' <<< "$dm_mounts" && rm -rf -- "$dm_work" && mkdir -- "$dm_work""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/prefix" bs=512 count=8 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/prefix")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/added" bs=512 count=8 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/added")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/sentinel" bs=512 count=2 iflag=fullblock status=none && test "$(stat -c %s "${dm_work}/sentinel")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // Initialize only the maximum mapped ranges and their immediate outside sentinels.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/zero of=/dev/vde bs=512 seek=4096 count=8 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/zero of=/dev/vdf bs=512 seek=8192 count=8 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/sentinel" of=/dev/vde bs=512 skip=0 seek=4104 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/sentinel" of=/dev/vdf bs=512 skip=0 seek=8200 count=2 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup create phase1_test --notable"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test --table "0 8 striped 2 2 /dev/vde 4096 /dev/vdf 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^4096$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/prefix" of=/dev/dm-0 bs=512 skip=0 seek=0 count=8 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/prefix" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8192 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4098 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8194 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/prefix" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test --table "0 16 striped 2 2 /dev/vde 4096 /dev/vdf 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^4096$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^8192$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/prefix" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/added" of=/dev/dm-0 bs=512 skip=0 seek=8 count=8 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=8 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/added" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4100 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8196 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4102 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8198 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/added" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup suspend phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test --table "0 8 striped 2 2 /dev/vde 4096 /dev/vdf 8192""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^8192$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^4096$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/actual" bs=512 skip=0 count=8 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/prefix" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="${dm_work}/eof" bs=512 skip=8 count=1 status=none && test "$(stat -c %s "${dm_work}/eof")" -eq 0"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dd if=/dev/zero of=/dev/dm-0 bs=512 seek=8 count=1 conv=fsync,notrunc status=none; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"if dd if=/dev/zero of=/dev/dm-0 bs=512 seek=10 count=1 conv=fsync,notrunc status=none; then false; else true; fi"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4096 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8192 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4098 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8194 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/prefix" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // The old tail now acts as nonzero sentinels on both disks; no data relocation is expected.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4100 count=2 status=none > "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8196 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 2048"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde bs=512 skip=4102 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 3072"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf bs=512 skip=8198 count=2 status=none >> "${dm_work}/physical" && test "$(stat -c %s "${dm_work}/physical")" -eq 4096"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/added" "${dm_work}/physical""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde of="${dm_work}/actual" bs=512 skip=4104 count=2 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/sentinel" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vdf of="${dm_work}/actual" bs=512 skip=8200 count=2 status=none && test "$(stat -c %s "${dm_work}/actual")" -eq 1024"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/sentinel" "${dm_work}/actual""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup remove phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex(r#"test ! -e /dev/dm-0"#, &Regex::new(r#"(?s).*"#).unwrap())?;
+    Ok(())
+}
+
+// Verify a non-sparse ext2 payload across unmount, fsck, and remount.
+#[nixos_test]
+fn ext2_striped_cross_disk(nixos_shell: &mut Session) -> Result<(), Error> {
+    // Refuse stale mappings and mounts before replacing this case's artifacts.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"export dm_work=/tmp/aster-dm-control-plane; test ! -L "$dm_work" && test ! -e /dev/dm-0 && dm_mounts=$(findmnt -rn -o TARGET) && awk -v work="$dm_work" '$0 == work || index($0, work "/") == 1 { mounted = 1 } END { exit mounted }' <<< "$dm_mounts" && rm -rf -- "$dm_work" && mkdir -- "$dm_work""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+
+    // A 32 MiB mapping uses 4 KiB chunks; initialize its 16 MiB range on each disk.
+    // Raw mapping cases, not filesystem allocation assumptions, prove the physical layout.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/zero of=/dev/vde bs=1M seek=16 count=16 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/zero of=/dev/vdf bs=1M seek=48 count=16 conv=fsync,notrunc status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup create phase1_test --notable"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup load phase1_test --table "0 65536 striped 2 8 /dev/vde 32768 /dev/vdf 98304""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup resume phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"blockdev --getsize64 /dev/dm-0"#,
+        &Regex::new(r#"^33554432$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"mkfs.ext2 -q -F -b 4096 -m 0 /dev/dm-0"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"mkdir "${dm_work}/mnt""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"mount -t ext2 /dev/dm-0 "${dm_work}/mnt""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/mnt/payload" bs=1M count=24 iflag=fullblock conv=fsync status=none"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"stat -c %s "${dm_work}/mnt/payload""#,
+        &Regex::new(r#"^25165824$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"sha256sum "${dm_work}/mnt/payload" > "${dm_work}/payload.sha256""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(r#"sync"#, &Regex::new(r#"(?s).*"#).unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"umount "${dm_work}/mnt""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"e2fsck -f -n /dev/dm-0"#,
+        &Regex::new(r#"(?s)Pass 5:.*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"mount -t ext2 /dev/dm-0 "${dm_work}/mnt""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"stat -c %s "${dm_work}/mnt/payload""#,
+        &Regex::new(r#"^25165824$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"sha256sum -c "${dm_work}/payload.sha256""#,
+        &Regex::new(r#"(?m)^/tmp/aster-dm-control-plane/mnt/payload: OK$"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"umount "${dm_work}/mnt""#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dmsetup remove phase1_test"#,
+        &Regex::new(r#"(?s).*"#).unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex(r#"test ! -e /dev/dm-0"#, &Regex::new(r#"(?s).*"#).unwrap())?;
     Ok(())
 }

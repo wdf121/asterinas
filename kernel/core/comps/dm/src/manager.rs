@@ -284,7 +284,8 @@ mod tests {
             .unwrap();
         let id = old.id();
         manager.remove("dm-reuse").unwrap();
-        old.drain_removed();
+        old.lock_lifecycle().stop_and_drain_io();
+        old.lock_lifecycle().drain_removed().unwrap();
         let replacement = manager
             .create("dm-reuse".to_string(), None, Some(7))
             .unwrap();
@@ -292,7 +293,7 @@ mod tests {
         assert_eq!(old.id(), id);
         assert_eq!(manager.lookup_id(id).unwrap().id(), replacement.id());
         // Repeated cleanup and the old object's drop must not free the new allocation.
-        old.drain_removed();
+        old.lock_lifecycle().drain_removed().unwrap();
         drop(old);
         assert_eq!(
             manager
@@ -301,7 +302,8 @@ mod tests {
             DmError::MinorBusy
         );
         manager.remove("dm-reuse").unwrap();
-        replacement.drain_removed();
+        replacement.lock_lifecycle().stop_and_drain_io();
+        replacement.lock_lifecycle().drain_removed().unwrap();
         assert!(manager.create("dm-next".to_string(), None, Some(7)).is_ok());
     }
 

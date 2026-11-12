@@ -91,3 +91,10 @@ pub(super) fn write_u32(buffer: &mut [u8], offset: usize, value: u32) {
 pub(super) fn write_u64(buffer: &mut [u8], offset: usize, value: u64) {
     buffer[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
+
+pub(super) fn output_start(buffer: &mut [u8]) -> usize {
+    let end = buffer.len().min(DM_IOCTL_HEADER_SIZE);
+    buffer[FIXED_PREFIX_SIZE..end].fill(0);
+    write_u32(buffer, OFF_DATA_START, DM_IOCTL_HEADER_SIZE as u32);
+    DM_IOCTL_HEADER_SIZE
+}

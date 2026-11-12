@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Linear target parsing, geometry, and BIO mapping.
+//! Target parsing, geometry, and BIO mapping.
 
 use alloc::{boxed::Box, string::String, vec::Vec};
 #[cfg(ktest)]
 use core::any::Any;
 use core::{fmt::Debug, ops::Range};
 
-use aster_block::{BlockDevice, BlockDeviceLease, id::Sid};
+use aster_block::{BlockDevice, bio::BioStatus, id::Sid};
 use device_id::DeviceId;
 
-use self::linear::LinearTarget;
 use crate::TableError;
 
 mod args;
+mod registry;
+
+pub use registry::{
+    BackingLookupError, DmTargetType, TargetRegistrationError, parse_target_with,
+    register_target_type, reported_target_metadata,
+};
 pub mod linear;
+mod striped;
 
 /// Common logical sector range owned by every resolved target variant.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +99,8 @@ pub trait DmTarget: Debug + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     /// Returns static Linux-visible metadata for this target implementation.
+    ///
+    /// The name and version must remain unchanged and match the registered factory.
     fn metadata(&self) -> DmTargetMetadata;
 
     /// Returns the Linux-visible target type name for table/status output.
@@ -109,17 +117,46 @@ pub trait DmTarget: Debug + Send + Sync {
         range.end.to_raw() - range.start.to_raw()
     }
 
-    /// Visits backing IDs referenced by this target in Linux table order.
-    fn for_each_backing_id(&self, f: &mut dyn FnMut(DeviceId));
-
-    /// Visits resolved backing devices referenced by this target in Linux table order.
+    /// Visits resolved backing devices in Linux table order, including duplicates.
+    ///
+    /// The enumeration order and device identities must remain stable while the
+    /// target belongs to a table. The target must retain references or leases that
+    /// keep these devices alive. Within a table, equal `DeviceId`s must identify
+    /// the same effective device; consumers such as flush may deduplicate by ID.
+    /// Device identities are obtained from these objects rather than enumerated separately.
     fn for_each_backing<'a>(&'a self, f: &mut dyn FnMut(&'a dyn BlockDevice));
 
-    /// Maps a target-local logical range to backing I/O actions.
+    /// Maps a table-relative logical subrange owned by this target to backing actions.
+    ///
+    /// Actions must cover the requested range exactly, in order and without gaps or
+    /// overlap. Each action maps an equal-length backing range without sector
+    /// overflow. Each backing must be one of the devices exposed by this target's
+    /// `for_each_backing()`, retained by the target throughout execution.
+    /// Returns `None` when the requested range cannot be mapped.
     fn map_io_range(&self, logical: Range<Sid>) -> Option<Vec<TargetIoAction<'_>>>;
+
+    /// Returns target-specific completion processing, if this target needs it.
+    ///
+    /// Whether this returns `Some` or `None` must remain stable for the instance's
+    /// lifetime. DM may query it again when an asynchronous request completes.
+    fn io_completion(&self) -> Option<&dyn TargetIoCompletion> {
+        None
+    }
 
     /// Formats target-specific Linux table/status parameters.
     fn status_params(&self, mode: TargetStatusMode) -> Result<String, TableError>;
+}
+
+/// Target-specific processing of terminal backing I/O results.
+///
+/// DM invokes this before completing the corresponding logical request. Admission
+/// failures are not terminal backing results and do not invoke this interface.
+/// Notifications report only completed backing operations belonging to this target.
+/// This observer cannot replace the result, retry or requeue the request, or take
+/// over asynchronous completion. It must finish before the parent is notified.
+pub trait TargetIoCompletion: Send + Sync {
+    /// Processes a completed operation on a backing device used by this target.
+    fn complete_io(&self, backing: DeviceId, status: BioStatus);
 }
 
 /// Owned target instance installed in a `DmTable`.
@@ -134,7 +171,7 @@ impl dyn DmTarget + '_ {
 }
 
 /// Static identity exported through `dmsetup targets` and target-version ioctls.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DmTargetMetadata {
     /// Linux target type name used in table-load, table/status, and target-version records.
     name: &'static str,
@@ -159,16 +196,6 @@ impl DmTargetMetadata {
     }
 }
 
-const LINEAR_METADATA: DmTargetMetadata = DmTargetMetadata::new("linear", [1, 4, 0]);
-// LVM probes striped support even when creating an inactive linear LV. Only
-// advertise its version for now; table loading remains limited to linear.
-const STRIPED_METADATA: DmTargetMetadata = DmTargetMetadata::new("striped", [1, 6, 0]);
-
-/// Target versions reported to userspace, including probe-only entries.
-pub fn reported_target_metadata() -> &'static [DmTargetMetadata] {
-    &[LINEAR_METADATA, STRIPED_METADATA]
-}
-
 /// Error boundary between target semantics and environment-specific backing lookup.
 #[derive(Debug, Eq, PartialEq)]
 pub enum DmTargetParseError<E> {
@@ -186,27 +213,6 @@ impl<E> From<TableError> for DmTargetParseError<E> {
     }
 }
 
-/// Parses one Linux table target while keeping VFS/registry lookup in caller hooks.
-pub fn parse_target_with<E>(
-    target_type: &str,
-    logical_start: Sid,
-    length: u64,
-    params: &str,
-    parse_backing: &mut impl FnMut(&str) -> Result<DeviceId, E>,
-    resolve_backing: &mut impl FnMut(DeviceId) -> Result<BlockDeviceLease, E>,
-) -> Result<DmTargetBox, DmTargetParseError<E>> {
-    if target_type != LINEAR_METADATA.name() {
-        return Err(DmTargetParseError::UnsupportedTarget);
-    }
-    Ok(Box::new(LinearTarget::parse_with(
-        logical_start,
-        length,
-        params,
-        parse_backing,
-        resolve_backing,
-    )?))
-}
-
 #[cfg(ktest)]
 mod tests {
     use alloc::sync::Arc;
@@ -218,7 +224,7 @@ mod tests {
     use device_id::{MajorId, MinorId};
     use ostd::prelude::ktest;
 
-    use super::*;
+    use super::{linear::LinearTarget, *};
 
     #[derive(Debug)]
     struct TestBlockDevice(DeviceId);
@@ -276,7 +282,7 @@ mod tests {
         assert_eq!((parses.get(), resolves.get()), (0, 0));
         assert!(matches!(
             parse_target_with(
-                "striped",
+                "unknown",
                 Sid::new(0),
                 1,
                 "510:33 1",

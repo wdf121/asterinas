@@ -13,8 +13,8 @@ use device_id::DeviceId;
 use crate::{
     TableError,
     target::{
-        DmTarget, DmTargetMetadata, DmTargetParseError, LINEAR_METADATA, TargetIoAction,
-        TargetRange, TargetStatusMode,
+        DmTarget, DmTargetMetadata, DmTargetParseError, TargetIoAction, TargetRange,
+        TargetStatusMode,
         args::{Argument, Arguments},
     },
 };
@@ -32,14 +32,45 @@ pub struct LinearTarget {
     backing: BlockDeviceLease,
 }
 
+/// Factory for the built-in linear target.
+pub(super) struct TargetType;
+
+pub(super) static TARGET_TYPE: TargetType = TargetType;
+
+impl super::DmTargetType for TargetType {
+    fn metadata(&self) -> DmTargetMetadata {
+        DmTargetMetadata::new("linear", [1, 4, 0])
+    }
+
+    fn create(
+        &self,
+        logical_start: Sid,
+        length: u64,
+        params: &str,
+        parse_backing: &mut dyn FnMut(&str) -> Result<DeviceId, super::BackingLookupError>,
+        resolve_backing: &mut dyn FnMut(
+            DeviceId,
+        )
+            -> Result<BlockDeviceLease, super::BackingLookupError>,
+    ) -> Result<super::DmTargetBox, DmTargetParseError<super::BackingLookupError>> {
+        Ok(alloc::boxed::Box::new(LinearTarget::parse_with(
+            logical_start,
+            length,
+            params,
+            parse_backing,
+            resolve_backing,
+        )?))
+    }
+}
+
 impl LinearTarget {
     /// Parses one Linux `linear` target and resolves its single backing lease.
     pub(super) fn parse_with<E>(
         logical_start: Sid,
         length: u64,
         params: &str,
-        parse_backing: &mut impl FnMut(&str) -> Result<DeviceId, E>,
-        resolve_backing: &mut impl FnMut(DeviceId) -> Result<BlockDeviceLease, E>,
+        parse_backing: &mut (impl FnMut(&str) -> Result<DeviceId, E> + ?Sized),
+        resolve_backing: &mut (impl FnMut(DeviceId) -> Result<BlockDeviceLease, E> + ?Sized),
     ) -> Result<Self, DmTargetParseError<E>> {
         let (backing, backing_start) = parse_linear_params(params)?;
         let backing_start = Sid::new(backing_start);
@@ -127,7 +158,7 @@ impl DmTarget for LinearTarget {
     }
 
     fn metadata(&self) -> DmTargetMetadata {
-        LINEAR_METADATA
+        super::DmTargetType::metadata(&TARGET_TYPE)
     }
 
     fn logical_range(&self) -> &Range<Sid> {
@@ -136,10 +167,6 @@ impl DmTarget for LinearTarget {
 
     fn length(&self) -> u64 {
         self.length()
-    }
-
-    fn for_each_backing_id(&self, f: &mut dyn FnMut(DeviceId)) {
-        f(self.backing_id());
     }
 
     fn for_each_backing<'a>(&'a self, f: &mut dyn FnMut(&'a dyn BlockDevice)) {
@@ -176,13 +203,21 @@ impl DmTarget for LinearTarget {
 /// Parses the two-field Linux `linear` parameter string without resolving the backing.
 fn parse_linear_params(params: &str) -> Result<(Argument<'_>, u64), TableError> {
     let mut fields = Arguments::new(params);
-    let backing = fields.next().ok_or(TableError::InvalidTargetParams)?;
+    let backing = fields
+        .try_next()
+        .map_err(|_| TableError::OutOfMemory)?
+        .ok_or(TableError::InvalidTargetParams)?;
     let backing_start = fields
-        .next()
+        .try_next()
+        .map_err(|_| TableError::OutOfMemory)?
         .ok_or(TableError::InvalidTargetParams)?
         .parse::<u64>()
         .map_err(|_| TableError::InvalidTargetParams)?;
-    if fields.next().is_some() {
+    if fields
+        .try_next()
+        .map_err(|_| TableError::OutOfMemory)?
+        .is_some()
+    {
         return Err(TableError::InvalidTargetParams);
     }
 

@@ -109,12 +109,66 @@ Both the initramfs and NixOS runners use the **same** numbered images, `test/ini
 
 The images live in the initramfs build directory, so `make clean` deletes them along with other initramfs build artifacts. Ordinary test runs and VM shutdowns do not clear them. Existing device-mapper tests assume blank backing ranges; run tests that consume a prior boot's data separately from tests that assume blank disks. A recovery test must run setup and verification in separate VM boots.
 
-The `device-mapper-control-plane` suite groups checks by behavior rather than giving each dmsetup command its own case.
-Related probes, creation/loading, state queries, suspend/resume, removal states, and capacity changes share focused lifecycle cases.
-Same-disk and cross-disk I/O, ext2 workflows, explicit and implicit replacement, and concurrent replacement remain independently selectable.
+The `device-mapper-control-plane` suite contains 25 independently selectable cases,
+grouped by behavior rather than giving each dmsetup command its own case.
+The original 17 linear and general control cases remain unchanged:
+
+- `interface_and_target_probes`
+- `create_and_first_load`
+- `numeric_backing_load`
+- `first_linear_resume_reads_and_writes`
+- `query_table_states`
+- `suspend_and_resume_linear_mapping`
+- `remove_mapping_lifecycle`
+- `failed_load_preserves_active_mapping`
+- `readonly_and_io_bounds`
+- `multi_target_linear_reads_and_writes`
+- `multi_disk_linear_reads_and_writes`
+- `ext2_multi_target_same_disk`
+- `ext2_multi_target_cross_disk`
+- `implicit_table_replacement`
+- `explicit_table_replacement`
+- `raw_mapping_growth_and_shrink`
+- `concurrent_hot_table_replacement`
+
+Eight additional cases cover striped mappings:
+
+| Case | Coverage |
+|---|---|
+| `striped_cross_disk_reads_and_writes` | Numeric backing identities resolved at runtime, active/inactive queries, dependencies, healthy status, and independent two-disk physical layout checks in both I/O directions. |
+| `striped_same_disk_reads_and_writes` | Two non-overlapping offsets on one backing, independent reads/writes, and dependency deduplication. |
+| `mixed_linear_and_striped_reads_and_writes` | Linear/striped/linear composition, a non-row-aligned striped start, three-sector chunks, cross-target I/O, and neighboring data/sentinels. |
+| `invalid_striped_load_preserves_tables` | Invalid geometry, parameters, and backings preserve both active and inactive tables; the original candidate remains usable. |
+| `striped_readonly_and_io_bounds` | Read-only rejection, the last legal sector, short reads, rejected end/beyond-end writes, and nonzero physical sentinels. |
+| `striped_table_replacement` | Implicit linear-to-striped and explicit striped-to-linear replacement, activation timing, capacities, and independent data layouts. |
+| `striped_raw_mapping_growth_and_shrink` | Complete-row growth/shrink with fixed geometry, retained prefix, new-region I/O, and inaccessible but physically preserved truncated data. |
+| `ext2_striped_cross_disk` | A 32 MiB striped mapping with 4 KiB chunks, a non-sparse 24 MiB payload, offline fsck, and size/SHA256 verification after remount. |
+
 Each case prepares and removes its own mapping, so it can run alone through `NIXOS_TEST_CASE`.
-The suite requires a clean guest without unrelated DM mappings and destructively overwrites ranges on both raw disks.
+The suite requires `raw_disk=2` and a clean guest without unrelated DM mappings.
+It destructively overwrites ranges on `/dev/vde` and `/dev/vdf`;
+striped cases initialize their tested backing ranges rather than relying on persistent disk contents.
+Do not run this suite between LVM preparation and recovery verification,
+on disks holding data to retain, or concurrently with another VM sharing the raw images.
 After a failure, inspect leftover mappings, mounts, and background I/O before retrying.
+
+Striped raw I/O checks compare fixed physical positions, not just mapper write/read round trips.
+They check read exit status and byte length before comparing temporary files.
+A failed crossing write may have committed its legal prefix; these cases do not assume rollback.
+The tests do not prove a particular BIO split, flush count, health-failure transition, or power-loss safety.
+Type conversion and resizing do not migrate data or resize filesystems.
+Striped LVM, concurrent striped replacement, and cross-boot striped recovery are outside this suite's coverage.
+Final dynamic acceptance should run the entire 25-case suite, not only the new cases:
+
+```bash
+# Rebuild the guest image only when needed.
+make nixos NIXOS_TEST_SUITE=device-mapper-control-plane
+
+# Destructive: check disk ownership and recovery state first.
+make run_nixos NIXOS_TEST_SUITE=device-mapper-control-plane raw_disk=2
+```
+
+The registered case count and successful static checks are not evidence of a dynamic pass.
 
 `concurrent_hot_table_replacement` runs a background write/read/checksum loop in an unchanged mapping prefix.
 The foreground repeatedly adds a second-disk tail through implicit replacement and removes it through explicit suspend/load/resume.
@@ -124,8 +178,9 @@ Each suite uses its own fixed guest directory: `/tmp/aster-dm-control-plane`,
 `/tmp/aster-dm-lvm`, or `/tmp/aster-dm-lvm-recovery`.
 Every case clears and recreates only its suite's directory before doing test work,
 including when selected individually with `NIXOS_TEST_CASE`.
-Cleanup refuses symbolic-link directories, an existing `/dev/dm-0`, remaining mounts
-at or below the directory, or a failed mount inspection. Inspect and resolve such
+Cleanup refuses symbolic-link directories, remaining mounts at or below the directory,
+or a failed mount inspection. The control-plane suite also refuses an existing `/dev/dm-0`;
+the LVM suites refuse any published `/dev/dm-*` node. Inspect and resolve such
 leftovers before retrying; the tests do not automatically unmount or remove stale mappings.
 Mountpoints, table files, payloads, checksums, and worker output stay beneath the directory.
 Cases still unmount filesystems, stop and wait for workers, and remove or deactivate mappings
@@ -137,14 +192,21 @@ retained for recovery. Directories left by older random-directory versions are n
 
 The `device-mapper-lvm` suite is an **opt-in, destructive integration test**. The full suite requires `raw_disk=2` and overwrites the first two numbered images (`raw_test_1.img` and `raw_test_2.img`, `/dev/vde` and `/dev/vdf` in NixOS). Do not run it on images containing data to retain, or between the preparation and verification boots of a recovery test. The images are persistent and shared with the ordinary device-mapper suite, not reserved for LVM.
 
-The suite contains two single-boot functional workflows:
+The suite contains three explicitly ordered cases in one preparation boot:
 
-- `linear_lv_create_and_use`: create and activate a single-PV linear LV, verify raw I/O and an ext2 file after remount, then remove the VG and PV.
-- `linear_lv_offline_ext2_resize`: grow a 192 MiB LV to 256 MiB using a second PV, grow unmounted ext2, and verify non-sparse file data exceeding the original segment. Remove the growth payload, shrink ext2 before reducing the LV back to 192 MiB, and verify retained data and new writes after remount.
+1. `prepare_shared_lvm_storage`: the only case that erases the disks and creates both PVs. It creates `phase1_offline_vg` with 4 MiB extents on `/dev/vde` only.
+2. `linear_lv_offline_ext2_resize`: create `phase1_offline_vg/ext2_lv` at 192 MiB on `/dev/vde`, add `/dev/vdf` to the VG, extend the LV to 256 MiB using that second PV, then shrink back to 192 MiB. This incorporates the former ordinary create/use case's table, dependencies, raw I/O, and initial remount checks.
+3. `striped_lv_offline_ext2_resize`: require the retained inactive linear LV and both PVs, then create `phase1_offline_vg/striped_ext2_lv`. Exercise the same 192 → 256 → 192 MiB lifecycle with two stripes and 64 KiB chunks, explicitly retaining that geometry when extending.
 
-The final workflow deliberately preserves `phase1_offline_vg/ext2_lv` and both PVs for a later recovery-verification boot. It unmounts ext2 and deactivates the LV. The filesystem contains `retained`, `after-shrink`, and their original SHA256 manifests with relative filenames. The `added` payload and its manifest have been removed. Do not rerun this suite, run another destructive disk test, or run `make clean` before consuming that state. Cross-boot verification is performed by the separate `device-mapper-lvm-recovery` suite.
+Both target workflows check raw I/O before formatting and ext2 data after the initial remount, growth, and shrink. Each leaves its own unmounted filesystem and inactive LV. Each filesystem contains a 48 MiB `retained` file, a 32 MiB `after-shrink` file, and their original SHA256 manifests with relative filenames. During growth, the additional non-sparse 160 MiB `added` file makes the total payload exceed the original LV size; that file and its manifest are deleted before shrinking ext2 and then the LV. Neither workflow deletes the shared VG, PVs, or the other LV.
 
-Concurrent-I/O and hot raw-mapping resize tests belong to the dmsetup suite, not these LVM workflows. Cases use `/dev/dm-0` and require a clean guest with no unrelated mappers. After a failure, inspect leftover mounts and mappings before retrying. The suite is not part of the ordinary device-mapper suite or the NixOS CI matrix.
+The two 512 MiB PVs are budgeted individually, not just by total VG free space. Linear retains 48 extents on `/dev/vde`; its temporary extension uses 16 on `/dev/vdf`. Striped uses 24 extents per PV initially/finally and 32 at its peak. The combined peak allocation is therefore 80 extents on `/dev/vde` and 32 on `/dev/vdf`. Tests verify actual extent counts and allocations, including the second PV's capacity after it joins the VG.
+
+These are **ordered integration cases**, not independently self-preparing tests. `NIXOS_TEST_CASE` is useful only with the correct existing predecessor state. A missing or incorrect prerequisite fails instead of being silently rebuilt. A partial prepare failure is not a valid recovery baseline. Inspect leftovers before explicitly restarting destructive shared preparation.
+
+Do not rerun preparation, run another destructive disk test, run `make clean`, or share the images with another VM from the start of preparation until both recovery cases complete. Both final LVs must survive together for the separate `device-mapper-lvm-recovery` suite.
+
+Concurrent-I/O and hot raw-mapping resize tests belong to the dmsetup suite, not these LVM workflows. Both preparation and recovery reuse `/dev/dm-0` for each LV: cases run sequentially, activate only their own LV, and deactivate it before the next case. They require no published `/dev/dm-*` nodes at each case boundary and check that `/dev/dm-0` is a block device after activation. They do not depend on `/dev/mapper` aliases or query LVM's kernel device numbers. The suite is not part of the ordinary device-mapper suite or the NixOS CI matrix.
 
 Both LVM suites use the guest's default LVM configuration and require `e2fsprogs` and `lvm2`.
 All three suite configurations supply these packages, but package availability alone does not establish an old image's LVM configuration.
@@ -160,7 +222,7 @@ Removing temporary files is not a substitute for checking or rebuilding the imag
 Run preparation to completion and wait for its VM to shut down before starting recovery:
 
 ```bash
-# First boot: destructive preparation, ending with an unmounted, inactive LV.
+# First boot: all three preparation cases; both LVs end unmounted and inactive.
 make run_nixos NIXOS_TEST_SUITE=device-mapper-lvm raw_disk=2
 
 # Second boot: reuse the same image and raw disks; no preparation or formatting.
@@ -172,10 +234,20 @@ Do not run another destructive disk suite or `make clean` between boots.
 Each invocation starts a separate QEMU process; merely selecting another case within one invocation is not a reboot.
 The framework sends `poweroff` and waits for QEMU to exit after the suite finishes.
 
-The recovery case scans existing PV/VG metadata, explicitly activates `phase1_offline_vg/ext2_lv`, checks the LV and ext2 sizes, and mounts it read-only.
-It checks the retained file sizes, validates the original on-disk SHA256 manifests, and confirms the growth payload is absent.
-It then unmounts and deactivates the LV without deleting any PV, VG, LV, or baseline, so verification can be repeated in another boot.
-A clean guest with no active `/dev/dm-0` mapping is required before explicit activation.
+The recovery suite has two explicitly registered cases in the same second boot:
+`linear_lv_recovers_after_reboot` and `striped_lv_recovers_after_reboot`.
+Each independently scans existing PV/VG metadata, locates and explicitly activates its own LV,
+checks every actual DM table segment, backing dependencies, LV capacity, and ext2 size,
+and mounts its filesystem read-only in a target-specific directory.
+Each verifies both retained file sizes and the original on-disk SHA256 manifests,
+and confirms the growth file and manifest are absent. Recovery never formats, reconstructs
+missing volumes, repairs missing data, or generates replacement checksum baselines.
+Each unmounts and deactivates only its own LV without deleting either LV, the shared VG/PVs,
+or baselines, so verification can be repeated. Neither case depends on the other activating
+its volume, and both expect the two prepared LVs to be inactive at their boundaries.
+A clean guest with no published `/dev/dm-*` nodes is required before explicit activation.
+The full acceptance run covers all three prepare cases followed by both recovery cases;
+source registration counts and static checks alone are not dynamic pass results.
 
 Explicit deactivation in preparation defines a controlled end state; it is not required to make LVM metadata persistent.
 The filesystem is unmounted first to flush its data and metadata before the mapping is removed.

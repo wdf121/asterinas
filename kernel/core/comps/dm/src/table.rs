@@ -1,24 +1,21 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Validated Device Mapper tables and linear I/O forwarding.
+//! Immutable Device Mapper table topology and I/O planning.
+//!
+//! Targets own mapping semantics; the I/O module executes the resulting plan.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use alloc::{sync::Arc, vec::Vec};
 
 use aster_block::{
-    BlockDevice, BlockDeviceLease,
-    bio::{Bio, BioEnqueueError, BioStatus, BioType, SubmittedBio},
-    id::Sid,
+    BlockDevice,
+    bio::{BioEnqueueError, BioType, SubmittedBio},
 };
 use device_id::DeviceId;
-use ostd::sync::SpinLock;
 
 use crate::{
-    TableError,
-    target::{DmTarget, DmTargetBox, TargetIoAction, linear::LinearTarget},
+    TableError, io,
+    target::{DmTargetBox, TargetIoAction},
 };
-
-type BioPart<'a> = (core::ops::Range<Sid>, &'a dyn DmTarget);
 
 /// A contiguous, immutable Device Mapper table installed on a mapped device.
 #[derive(Debug)]
@@ -31,17 +28,19 @@ pub struct DmTable {
     readonly: bool,
 }
 
-impl DmTable {
-    /// Creates a compatibility table for tests and legacy callers that still build linear lists.
-    pub fn new_linear(targets: Vec<LinearTarget>) -> Result<Self, TableError> {
-        Self::new_targets(
-            targets
-                .into_iter()
-                .map(|target| Box::new(target) as DmTargetBox)
-                .collect(),
-        )
-    }
+/// A mapping action paired with its owning target, retained through execution.
+pub(super) struct PlannedIo<'a> {
+    pub(super) mapping: TargetIoAction<'a>,
+    pub(super) target_index: usize,
+}
 
+/// One distinct flush destination and the targets that reference it.
+pub(super) struct PlannedFlush<'a> {
+    pub(super) backing: &'a dyn BlockDevice,
+    pub(super) target_indices: Vec<usize>,
+}
+
+impl DmTable {
     /// Creates a writable table after enforcing Linux-visible table invariants not owned by targets.
     pub fn new_targets(targets: Vec<DmTargetBox>) -> Result<Self, TableError> {
         Self::new_targets_with_readonly(targets, false)
@@ -59,6 +58,9 @@ impl DmTable {
         let mut has_unsupported_backing = false;
         let mut expected_start = 0_u64;
         for target in &targets {
+            if target.logical_range().start >= target.logical_range().end {
+                return Err(TableError::ZeroLength);
+            }
             if target.logical_range().start.to_raw() != expected_start {
                 return Err(TableError::UnsupportedLogicalStart);
             }
@@ -79,21 +81,6 @@ impl DmTable {
             length: expected_start,
             readonly,
         })
-    }
-
-    /// Creates a mapping table from a single `linear` target.
-    pub fn new_single_linear(
-        logical_start: Sid,
-        length: u64,
-        backing_start: Sid,
-        backing: BlockDeviceLease,
-    ) -> Result<Self, TableError> {
-        Self::new_linear(alloc::vec![LinearTarget::new(
-            logical_start,
-            length,
-            backing_start,
-            backing,
-        )?])
     }
 
     /// Returns the mapped device capacity in 512-byte sectors.
@@ -120,12 +107,13 @@ impl DmTable {
     pub fn backing_ids(&self) -> Vec<DeviceId> {
         let mut ids = Vec::new();
         for target in &self.targets {
-            let mut collect_id = |id| {
+            let mut collect_id = |backing: &dyn BlockDevice| {
+                let id = backing.id();
                 if !ids.contains(&id) {
                     ids.push(id);
                 }
             };
-            target.for_each_backing_id(&mut collect_id);
+            target.for_each_backing(&mut collect_id);
         }
         ids
     }
@@ -148,181 +136,118 @@ impl DmTable {
         }
     }
 
-    /// Forwards one BIO through the linear targets, splitting at target boundaries.
+    /// Forwards one BIO, splitting at target and chunk boundaries.
+    ///
+    /// All ordinary mappings are validated before any backing admission. This
+    /// does not reserve every execution resource in advance or make writes atomic
+    /// across backings. Planning allocations follow the crate's allocation policy.
     pub fn enqueue(self: &Arc<Self>, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
         if bio.type_() != BioType::Flush {
             // Reject out-of-range I/O before taking completion ownership.
             let parts = self.plan_normal_io(&bio)?;
             let table = self.clone();
             bio.chain_complete_fn(move |_| drop(table));
-            return Self::execute_normal_io(bio, parts);
+            return io::execute_normal_io(self, bio, parts);
         }
+        let plan = self.plan_flush();
         let table = self.clone();
         bio.chain_complete_fn(move |_| drop(table));
-        self.enqueue_flush(bio)
+        io::execute_flush(self, bio, plan)
     }
 
-    fn plan_normal_io(
-        &self,
-        bio: &SubmittedBio,
-    ) -> Result<Vec<TargetIoAction<'_>>, BioEnqueueError> {
-        let range = bio.sid_range();
-        let mut parts = Vec::new();
-        for (logical, target) in self.bio_parts(range.start, range.end.to_raw())? {
-            parts.extend(
-                target
-                    .map_io_range(logical)
-                    .ok_or(BioEnqueueError::Refused)?,
-            );
-        }
-        Ok(parts)
-    }
-
-    fn execute_normal_io(
-        mut bio: SubmittedBio,
-        parts: Vec<TargetIoAction<'_>>,
-    ) -> Result<(), BioEnqueueError> {
-        if parts.len() == 1 {
-            let part = parts.into_iter().next().unwrap();
-            bio.remap_sid_start(part.backing_start)?;
-            return part.backing.enqueue(bio);
-        }
-
-        let ranges = parts
-            .iter()
-            .map(|part| part.logical_range.clone())
-            .collect();
-        let children = match bio.split(ranges) {
-            Ok(children) => children,
-            Err((error, original)) => {
-                // No child has been accepted; the immediate submitter owns this failure.
-                drop(original);
-                return Err(error);
-            }
-        };
-        for (mut child, part) in children.into_iter().zip(parts) {
-            if child.remap_sid_start(part.backing_start).is_ok() {
-                // Split children complete as IoError on drop if a backing refuses them.
-                let _ = part.backing.enqueue(child);
-            }
-        }
-        Ok(())
-    }
-
-    fn bio_parts(&self, start: Sid, end: u64) -> Result<Vec<BioPart<'_>>, BioEnqueueError> {
-        let mut cursor = start.to_raw();
-        let mut parts = Vec::new();
-        while cursor < end {
-            let target = self.target_at(cursor).ok_or(BioEnqueueError::Refused)?;
-            let part_end = core::cmp::min(end, target.logical_range().end.to_raw());
-            parts.push((Sid::new(cursor)..Sid::new(part_end), target));
-            cursor = part_end;
-        }
-        Ok(parts)
-    }
-
-    fn target_at(&self, sector: u64) -> Option<&dyn DmTarget> {
-        self.targets
-            .iter()
-            .map(|target| target.as_ref())
-            .find(|target| {
-                sector >= target.logical_range().start.to_raw()
-                    && sector < target.logical_range().end.to_raw()
-            })
-    }
-
-    /// Sends a flush once to every distinct backing and aggregates all completions.
-    fn enqueue_flush(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
-        let mut flushed = Vec::new();
-        for target in &self.targets {
-            target.for_each_backing_id(&mut |id| {
-                if !flushed.contains(&id) {
-                    flushed.push(id);
+    fn plan_flush(&self) -> Vec<PlannedFlush<'_>> {
+        let mut plan: Vec<PlannedFlush<'_>> = Vec::new();
+        for (target_index, target) in self.targets.iter().enumerate() {
+            target.for_each_backing(&mut |backing| {
+                if let Some(part) = plan
+                    .iter_mut()
+                    .find(|part| part.backing.id() == backing.id())
+                {
+                    // A striped target may reference the same backing more than once.
+                    if part.target_indices.last() != Some(&target_index) {
+                        part.target_indices.push(target_index);
+                    }
+                } else {
+                    plan.push(PlannedFlush {
+                        backing,
+                        target_indices: alloc::vec![target_index],
+                    });
                 }
             });
         }
-        if flushed.is_empty() {
-            bio.complete(BioStatus::Complete);
-            return Ok(());
-        }
-
-        let completion = Arc::new(FlushCompletion::new(flushed.len(), bio));
-        let mut submitted = Vec::new();
-        for target in &self.targets {
-            let mut submit_flush = |backing: &dyn BlockDevice| {
-                if submitted.contains(&backing.id()) {
-                    return;
-                }
-                submitted.push(backing.id());
-                let callback_completion = completion.clone();
-                let flush = Bio::new(
-                    BioType::Flush,
-                    Sid::new(0),
-                    Vec::new(),
-                    Some(Box::new(move |status| {
-                        callback_completion.complete_one(status)
-                    })),
-                );
-                let mut io_batch = io_util::batch::IoBatch::with_capacity(1);
-                if flush.submit(backing, &mut io_batch).is_err() {
-                    completion.complete_one(BioStatus::IoError);
-                }
-            };
-            target.for_each_backing(&mut submit_flush);
-        }
-        Ok(())
-    }
-}
-
-struct FlushCompletion {
-    remaining: AtomicUsize,
-    status: AtomicU32,
-    original: SpinLock<Option<SubmittedBio>>,
-}
-
-impl FlushCompletion {
-    fn new(remaining: usize, original: SubmittedBio) -> Self {
-        Self {
-            remaining: AtomicUsize::new(remaining),
-            status: AtomicU32::new(BioStatus::Complete as u32),
-            original: SpinLock::new(Some(original)),
-        }
+        plan
     }
 
-    fn complete_one(&self, status: BioStatus) {
-        if status != BioStatus::Complete {
-            let _ = self.status.compare_exchange(
-                BioStatus::Complete as u32,
-                status as u32,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
+    fn plan_normal_io(&self, bio: &SubmittedBio) -> Result<Vec<PlannedIo<'_>>, BioEnqueueError> {
+        let range = bio.sid_range();
+        if range.start >= range.end || range.end.to_raw() > self.length {
+            return Err(BioEnqueueError::Refused);
         }
-        let previous = self.remaining.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0);
-        if previous == 1 {
-            let status = BioStatus::try_from(self.status.load(Ordering::Acquire)).unwrap();
-            let original = self.original.disable_irq().lock().take().unwrap();
-            original.complete(status);
+
+        // Table construction guarantees ordered, contiguous target ranges.
+        let first = self
+            .targets
+            .partition_point(|target| target.logical_range().end <= range.start);
+        let mut cursor = range.start;
+        let mut parts = Vec::new();
+        for (target_index, target) in self.targets.iter().enumerate().skip(first) {
+            let end = range.end.min(target.logical_range().end);
+            let mappings = target
+                .map_io_range(cursor..end)
+                .ok_or(BioEnqueueError::Refused)?;
+            for mapping in mappings {
+                // Validate before any backing admission. The single-action fast
+                // path does not pass through SubmittedBio::split validation.
+                if mapping.logical_range.start != cursor
+                    || mapping.logical_range.end <= cursor
+                    || mapping.logical_range.end > end
+                    || mapping
+                        .backing_start
+                        .to_raw()
+                        .checked_add(mapping.logical_range.end.to_raw() - cursor.to_raw())
+                        .is_none()
+                {
+                    return Err(BioEnqueueError::Refused);
+                }
+                cursor = mapping.logical_range.end;
+                parts.push(PlannedIo {
+                    mapping,
+                    target_index,
+                });
+            }
+            if cursor != end {
+                return Err(BioEnqueueError::Refused);
+            }
+            if cursor == range.end {
+                break;
+            }
         }
+        Ok(parts)
     }
 }
 
 #[cfg(ktest)]
 mod tests {
-    use alloc::{string::ToString, vec};
+    use alloc::{boxed::Box, string::ToString, vec};
     use core::ops::Range;
 
     use aster_block::{
-        BlockDeviceMeta,
-        bio::{BioDirection, BioSegment},
+        BlockDeviceLease, BlockDeviceMeta,
+        bio::{Bio, BioDirection, BioSegment, BioStatus},
+        id::Sid,
         lookup_lease, register, unregister,
     };
     use device_id::{MajorId, MinorId};
-    use ostd::{prelude::ktest, sync::Mutex};
+    use ostd::{
+        prelude::ktest,
+        sync::{Mutex, SpinLock},
+    };
 
     use super::*;
-    use crate::DmManager;
+    use crate::{
+        DmManager,
+        target::{DmTarget, DmTargetMetadata, TargetStatusMode, linear::LinearTarget},
+    };
 
     #[derive(Debug)]
     struct TestBlockDevice(DeviceId);
@@ -420,6 +345,29 @@ mod tests {
         }
     }
 
+    fn linear_table(targets: Vec<LinearTarget>) -> Result<DmTable, TableError> {
+        DmTable::new_targets(
+            targets
+                .into_iter()
+                .map(|target| Box::new(target) as DmTargetBox)
+                .collect(),
+        )
+    }
+
+    fn single_linear_table(
+        logical_start: Sid,
+        length: u64,
+        backing_start: Sid,
+        backing: BlockDeviceLease,
+    ) -> Result<DmTable, TableError> {
+        linear_table(vec![LinearTarget::new(
+            logical_start,
+            length,
+            backing_start,
+            backing,
+        )?])
+    }
+
     fn linear(backing: Arc<RecordingBlockDevice>, start: u64, offset: u64) -> LinearTarget {
         LinearTarget::new(
             Sid::new(start),
@@ -430,10 +378,518 @@ mod tests {
         .unwrap()
     }
 
+    #[derive(Debug)]
+    struct InvalidMappingTarget {
+        inner: LinearTarget,
+        ranges: Vec<Range<Sid>>,
+        backing_start: Sid,
+    }
+
+    impl DmTarget for InvalidMappingTarget {
+        fn as_any(&self) -> &dyn core::any::Any {
+            self
+        }
+
+        fn metadata(&self) -> DmTargetMetadata {
+            self.inner.metadata()
+        }
+
+        fn logical_range(&self) -> &Range<Sid> {
+            self.inner.logical_range()
+        }
+
+        fn for_each_backing<'a>(&'a self, f: &mut dyn FnMut(&'a dyn BlockDevice)) {
+            self.inner.for_each_backing(f);
+        }
+
+        fn map_io_range(&self, _logical: Range<Sid>) -> Option<Vec<TargetIoAction<'_>>> {
+            Some(
+                self.ranges
+                    .iter()
+                    .map(|range| TargetIoAction {
+                        logical_range: range.clone(),
+                        backing_start: self.backing_start,
+                        backing: self.inner.backing(),
+                    })
+                    .collect(),
+            )
+        }
+
+        fn status_params(
+            &self,
+            mode: TargetStatusMode,
+        ) -> Result<alloc::string::String, TableError> {
+            self.inner.status_params(mode)
+        }
+    }
+
+    #[ktest]
+    fn rejects_invalid_target_mappings_before_any_backing_admission() {
+        let cases = [
+            (vec![], Sid::new(0)),
+            (
+                core::iter::once(Sid::new(4)..Sid::new(7)).collect(),
+                Sid::new(0),
+            ),
+            (
+                core::iter::once(Sid::new(5)..Sid::new(8)).collect(),
+                Sid::new(0),
+            ),
+            (
+                vec![Sid::new(4)..Sid::new(6), Sid::new(5)..Sid::new(8)],
+                Sid::new(0),
+            ),
+            (
+                core::iter::once(Sid::new(4)..Sid::new(9)).collect(),
+                Sid::new(0),
+            ),
+            (
+                core::iter::once(Sid::new(4)..Sid::new(4)).collect(),
+                Sid::new(0),
+            ),
+            (
+                core::iter::once(Sid::new(8)..Sid::new(4)).collect(),
+                Sid::new(0),
+            ),
+            (
+                core::iter::once(Sid::new(4)..Sid::new(8)).collect(),
+                Sid::new(u64::MAX),
+            ),
+        ];
+        for (ranges, backing_start) in cases {
+            let backing = RecordingBlockDevice::new(85, false, 8);
+            let target = InvalidMappingTarget {
+                inner: linear(backing.clone(), 4, 0),
+                ranges,
+                backing_start,
+            };
+            let table = Arc::new(
+                DmTable::new_targets(vec![
+                    Box::new(linear(backing.clone(), 0, 0)),
+                    Box::new(target),
+                ])
+                .unwrap(),
+            );
+            // Exercise both the single-action path and a preceding valid target.
+            for start in [4, 0] {
+                let notified = Arc::new(SpinLock::<bool>::new(false));
+                let on_complete = notified.clone();
+                let bio = Bio::new(
+                    BioType::Read,
+                    Sid::new(start),
+                    vec![BioSegment::alloc_exact(
+                        1,
+                        ((8 - start) * 512) as usize,
+                        BioDirection::FromDevice,
+                    )],
+                    Some(Box::new(move |_| *on_complete.lock() = true)),
+                );
+                assert_eq!(
+                    bio.submit_and_wait(&TableDevice(table.clone())),
+                    Err(BioEnqueueError::Refused)
+                );
+                assert!(!*notified.lock());
+                assert!(backing.ranges.lock().is_empty());
+                assert!(backing.pending.lock().is_empty());
+            }
+        }
+    }
+
+    fn striped_table(backings: &[Arc<RecordingBlockDevice>]) -> Arc<DmTable> {
+        let target = crate::target::parse_target_with(
+            "striped",
+            Sid::new(0),
+            12,
+            "3 2 a 100 b 200 c 300",
+            &mut |token| {
+                Ok::<_, ()>(
+                    backings[match token {
+                        "a" => 0,
+                        "b" => 1,
+                        _ => 2,
+                    }]
+                    .id(),
+                )
+            },
+            &mut |id| {
+                Ok(BlockDeviceLease::new_untracked(
+                    backings.iter().find(|b| b.id() == id).unwrap().clone(),
+                ))
+            },
+        )
+        .unwrap();
+        Arc::new(DmTable::new_targets(vec![target]).unwrap())
+    }
+
+    #[ktest]
+    fn striped_read_preserves_chunk_data_and_waits_for_all_children() {
+        use ostd::mm::VmIo;
+
+        let devices = [
+            RecordingBlockDevice::new(71, false, 8),
+            RecordingBlockDevice::new(72, false, 4),
+            RecordingBlockDevice::new(73, false, 6),
+        ];
+        let table = striped_table(&devices);
+        assert_eq!(
+            table.backing_ids(),
+            devices.iter().map(|d| d.id()).collect::<Vec<_>>()
+        );
+        assert_eq!(table.metadata().max_nr_segments_per_bio, 4);
+        let segment = BioSegment::alloc_exact(1, 4096, BioDirection::FromDevice);
+        let completed = Arc::new(Mutex::new(None));
+        let completion = completed.clone();
+        let bio = Bio::new(
+            BioType::Read,
+            Sid::new(1),
+            vec![segment.clone()],
+            Some(Box::new(move |status| *completion.lock() = Some(status))),
+        );
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        bio.submit(&TableDevice(table), &mut batch).unwrap();
+        assert_eq!(
+            *devices[0].ranges.lock(),
+            vec![Sid::new(101)..Sid::new(102), Sid::new(102)..Sid::new(104)]
+        );
+        assert_eq!(
+            *devices[1].ranges.lock(),
+            vec![Sid::new(200)..Sid::new(202), Sid::new(202)..Sid::new(203)]
+        );
+        assert_eq!(
+            *devices[2].ranges.lock(),
+            vec![Sid::new(300)..Sid::new(302)]
+        );
+        for (device_index, device) in devices.iter().enumerate() {
+            for (index, child) in device.pending.lock().iter().enumerate() {
+                let value = (device_index + index * 3 + 1) as u8;
+                for part in child.segments() {
+                    part.dma_slice()
+                        .write_bytes(0, &alloc::vec![value; part.nbytes()])
+                        .unwrap();
+                }
+            }
+        }
+        devices[2].finish(BioStatus::Complete);
+        devices[1].finish(BioStatus::Complete);
+        devices[1].finish(BioStatus::Complete);
+        devices[0].finish(BioStatus::Complete);
+        assert_eq!(*completed.lock(), None);
+        devices[0].finish(BioStatus::Complete);
+        assert!(batch.wait_all().is_ok());
+        let mut data = [0; 4096];
+        segment.dma_slice().read_bytes(0, &mut data).unwrap();
+        for (range, value) in [
+            (0..512, 1),
+            (512..1536, 2),
+            (1536..2560, 3),
+            (2560..3584, 4),
+            (3584..4096, 5),
+        ] {
+            assert!(data[range].iter().all(|byte| *byte == value));
+        }
+    }
+
+    #[ktest]
+    fn striped_flush_deduplicates_devices_and_tracks_failures() {
+        use crate::target::TargetStatusMode;
+
+        let first = RecordingBlockDevice::new(74, false, 8);
+        let second = RecordingBlockDevice::new(75, false, 8);
+        let table = striped_table(&[first.clone(), second.clone(), first.clone()]);
+        assert_eq!(table.backing_ids(), vec![first.id(), second.id()]);
+        let bio = Bio::new(BioType::Flush, Sid::new(0), Vec::new(), None);
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        bio.submit(&TableDevice(table.clone()), &mut batch).unwrap();
+        assert_eq!(first.pending.lock().len(), 1);
+        assert_eq!(second.pending.lock().len(), 1);
+        first.finish(BioStatus::IoError);
+        second.finish(BioStatus::Complete);
+        assert!(batch.wait_all().is_err());
+        assert_eq!(
+            table.targets()[0]
+                .status_params(TargetStatusMode::Status)
+                .unwrap(),
+            "3 1:74 1:75 1:74 1 DAD"
+        );
+    }
+
+    #[ktest]
+    fn striped_write_enqueue_failure_waits_without_marking_device_failed() {
+        use crate::target::TargetStatusMode;
+
+        let first = RecordingBlockDevice::new(76, false, 8);
+        let second = RecordingBlockDevice::new(77, true, 8);
+        let third = RecordingBlockDevice::new(78, false, 8);
+        let table = striped_table(&[first.clone(), second, third.clone()]);
+        let completed = Arc::new(Mutex::new(None));
+        let completion = completed.clone();
+        let bio = Bio::new(
+            BioType::Write,
+            Sid::new(0),
+            vec![BioSegment::alloc_exact(1, 3072, BioDirection::ToDevice)],
+            Some(Box::new(move |status| *completion.lock() = Some(status))),
+        );
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        bio.submit(&TableDevice(table.clone()), &mut batch).unwrap();
+        first.finish(BioStatus::NotSupported);
+        assert_eq!(*completed.lock(), None);
+        third.finish(BioStatus::Complete);
+        assert!(batch.wait_all().is_err());
+        assert_eq!(
+            table.targets()[0]
+                .status_params(TargetStatusMode::Status)
+                .unwrap(),
+            "3 1:76 1:77 1:78 1 AAA"
+        );
+    }
+
+    #[ktest]
+    fn striped_admission_errors_preserve_health() {
+        use crate::target::TargetStatusMode;
+
+        #[derive(Debug)]
+        struct RejectingDevice(BioEnqueueError);
+        impl BlockDevice for RejectingDevice {
+            fn enqueue(&self, _: SubmittedBio) -> Result<(), BioEnqueueError> {
+                Err(self.0)
+            }
+            fn metadata(&self) -> BlockDeviceMeta {
+                BlockDeviceMeta {
+                    nr_sectors: 1024,
+                    max_nr_segments_per_bio: 1,
+                }
+            }
+            fn name(&self) -> &str {
+                "striped-admission-test"
+            }
+            fn id(&self) -> DeviceId {
+                DeviceId::new(MajorId::new(1), MinorId::new(81))
+            }
+        }
+        for error in [BioEnqueueError::TooBig, BioEnqueueError::IsFull] {
+            let backing = Arc::new(RejectingDevice(error));
+            let target = crate::target::parse_target_with(
+                "striped",
+                Sid::new(0),
+                8,
+                "1 2 a 0",
+                &mut |_| Ok::<_, ()>(backing.id()),
+                &mut |_| Ok(BlockDeviceLease::new_untracked(backing.clone())),
+            )
+            .unwrap();
+            let table = Arc::new(DmTable::new_targets(vec![target]).unwrap());
+            for sectors in [1, 8] {
+                let bio = Bio::new(
+                    BioType::Write,
+                    Sid::new(0),
+                    vec![BioSegment::alloc_exact(
+                        1,
+                        sectors * 512,
+                        BioDirection::ToDevice,
+                    )],
+                    None,
+                );
+                let mut batch = io_util::batch::IoBatch::with_capacity(1);
+                let result = bio.submit(&TableDevice(table.clone()), &mut batch);
+                if sectors == 1 {
+                    assert_eq!(result, Err(error));
+                } else {
+                    result.unwrap();
+                    assert!(batch.wait_all().is_err());
+                }
+                assert_eq!(
+                    table.targets()[0]
+                        .status_params(TargetStatusMode::Status)
+                        .unwrap(),
+                    "1 1:81 1 A"
+                );
+            }
+            let flush = Bio::new(BioType::Flush, Sid::new(0), Vec::new(), None);
+            let mut batch = io_util::batch::IoBatch::with_capacity(1);
+            flush
+                .submit(&TableDevice(table.clone()), &mut batch)
+                .unwrap();
+            assert!(batch.wait_all().is_err());
+            assert_eq!(
+                table.targets()[0]
+                    .status_params(TargetStatusMode::Status)
+                    .unwrap(),
+                "1 1:81 1 A"
+            );
+        }
+    }
+
+    #[ktest]
+    fn striped_terminal_error_updates_health_before_single_or_split_callback() {
+        use crate::target::TargetStatusMode;
+
+        for sectors in [1, 6] {
+            let backing = RecordingBlockDevice::new(82, false, 8);
+            let table = striped_table(&[backing.clone(), backing.clone(), backing.clone()]);
+            let observed = Arc::new(Mutex::new(None));
+            let callback_observed = observed.clone();
+            let callback_table = table.clone();
+            let bio = Bio::new(
+                BioType::Read,
+                Sid::new(0),
+                vec![BioSegment::alloc_exact(
+                    1,
+                    sectors * 512,
+                    BioDirection::FromDevice,
+                )],
+                Some(Box::new(move |_| {
+                    *callback_observed.lock() = Some(
+                        callback_table.targets()[0]
+                            .status_params(TargetStatusMode::Status)
+                            .unwrap(),
+                    );
+                })),
+            );
+            let mut batch = io_util::batch::IoBatch::with_capacity(1);
+            bio.submit(&TableDevice(table), &mut batch).unwrap();
+            while backing.pending.lock().len() > 1 {
+                backing.finish(BioStatus::Complete);
+                assert!(observed.lock().is_none());
+            }
+            // The last child's error must be published before parent notification.
+            backing.finish(BioStatus::IoError);
+            assert!(batch.wait_all().is_err());
+            assert_eq!(observed.lock().as_deref(), Some("3 1:82 1:82 1:82 1 DDD"));
+        }
+    }
+
+    #[ktest]
+    fn striped_terminal_error_only_updates_owning_target() {
+        use crate::target::TargetStatusMode;
+
+        let backing = RecordingBlockDevice::new(84, false, 8);
+        let mut targets = Vec::new();
+        for start in [0, 4] {
+            targets.push(
+                crate::target::parse_target_with(
+                    "striped",
+                    Sid::new(start),
+                    4,
+                    "1 2 a 0",
+                    &mut |_| Ok::<_, ()>(backing.id()),
+                    &mut |_| Ok(BlockDeviceLease::new_untracked(backing.clone())),
+                )
+                .unwrap(),
+            );
+        }
+        let table = Arc::new(DmTable::new_targets(targets).unwrap());
+        let bio = Bio::new(
+            BioType::Read,
+            Sid::new(4),
+            vec![BioSegment::alloc_exact(1, 512, BioDirection::FromDevice)],
+            None,
+        );
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        bio.submit(&TableDevice(table.clone()), &mut batch).unwrap();
+        backing.finish(BioStatus::IoError);
+        assert!(batch.wait_all().is_err());
+        assert_eq!(
+            table.targets()[0]
+                .status_params(TargetStatusMode::Status)
+                .unwrap(),
+            "1 1:84 1 A"
+        );
+        assert_eq!(
+            table.targets()[1]
+                .status_params(TargetStatusMode::Status)
+                .unwrap(),
+            "1 1:84 1 D"
+        );
+    }
+
+    #[ktest]
+    fn striped_replacement_changes_capacity_without_remapping_old_io() {
+        let first = RecordingBlockDevice::new(79, false, 8);
+        let second = RecordingBlockDevice::new(80, false, 8);
+        register(first.clone()).unwrap();
+        register(second.clone()).unwrap();
+        let make_table_fn = |length| {
+            let target = crate::target::parse_target_with(
+                "striped",
+                Sid::new(0),
+                length,
+                "2 2 a 10 b 20",
+                &mut |token| {
+                    Ok::<_, ()>(if token == "a" {
+                        first.id()
+                    } else {
+                        second.id()
+                    })
+                },
+                &mut |id| Ok(lookup_lease(id).unwrap()),
+            )
+            .unwrap();
+            Arc::new(DmTable::new_targets(vec![target]).unwrap())
+        };
+        let manager = DmManager::new().unwrap();
+        let mapper = manager.create("striped-resize".into(), None, None).unwrap();
+        mapper
+            .lock_lifecycle()
+            .load_table(make_table_fn(8))
+            .unwrap();
+        mapper.lock_lifecycle().resume_initial().unwrap();
+        let old = mapper.active_table().unwrap();
+        let bio = Bio::new(
+            BioType::Write,
+            Sid::new(2),
+            vec![BioSegment::alloc_exact(1, 1024, BioDirection::ToDevice)],
+            None,
+        );
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        bio.submit(&TableDevice(old.clone()), &mut batch).unwrap();
+        // Direct table submission deliberately retains an old-table user outside
+        // mapper admission, isolating table lifetime from suspend/drain behavior.
+        mapper
+            .lock_lifecycle()
+            .load_table(make_table_fn(16))
+            .unwrap();
+        mapper.lock_lifecycle().suspend().unwrap();
+        mapper.lock_lifecycle().resume_suspended().unwrap();
+        assert_eq!(mapper.metadata().nr_sectors, 16);
+        mapper
+            .lock_lifecycle()
+            .load_table(make_table_fn(4))
+            .unwrap();
+        mapper.lock_lifecycle().suspend().unwrap();
+        mapper.lock_lifecycle().resume_suspended().unwrap();
+        assert_eq!(mapper.metadata().nr_sectors, 4);
+        let beyond = Bio::new(
+            BioType::Read,
+            Sid::new(4),
+            vec![BioSegment::alloc_exact(1, 512, BioDirection::FromDevice)],
+            None,
+        );
+        assert_eq!(
+            beyond.submit(&TableDevice(mapper.active_table().unwrap()), &mut batch),
+            Err(BioEnqueueError::Refused)
+        );
+        assert_eq!(*second.ranges.lock(), vec![Sid::new(20)..Sid::new(22)]);
+        drop(old);
+        manager.remove("striped-resize").unwrap();
+        drop(mapper);
+        assert_eq!(
+            unregister(first.id()).unwrap_err(),
+            aster_block::Error::Busy
+        );
+        assert_eq!(
+            unregister(second.id()).unwrap_err(),
+            aster_block::Error::Busy
+        );
+        second.finish(BioStatus::Complete);
+        assert!(batch.wait_all().is_ok());
+        unregister(first.id()).unwrap();
+        unregister(second.id()).unwrap();
+    }
+
     #[ktest]
     fn forwards_single_linear_bio_and_reports_metadata() {
         let backing = RecordingBlockDevice::new(1, false, 3);
-        let table = Arc::new(DmTable::new_linear(vec![linear(backing.clone(), 0, 100)]).unwrap());
+        let table = Arc::new(linear_table(vec![linear(backing.clone(), 0, 100)]).unwrap());
         assert_eq!(table.metadata().nr_sectors, 4);
         assert_eq!(table.metadata().max_nr_segments_per_bio, 3);
         let bio = Bio::new(
@@ -454,7 +910,7 @@ mod tests {
         let first = RecordingBlockDevice::new(11, false, 8);
         let second = RecordingBlockDevice::new(12, false, 8);
         let table = Arc::new(
-            DmTable::new_linear(vec![
+            linear_table(vec![
                 linear(first.clone(), 0, 100),
                 linear(second.clone(), 4, 200),
             ])
@@ -482,7 +938,7 @@ mod tests {
         let first = RecordingBlockDevice::new(21, false, 8);
         let second = RecordingBlockDevice::new(22, false, 8);
         let table = Arc::new(
-            DmTable::new_linear(vec![
+            linear_table(vec![
                 linear(first.clone(), 0, 100),
                 linear(second.clone(), 4, 200),
             ])
@@ -525,8 +981,7 @@ mod tests {
         let first = RecordingBlockDevice::new(1, false, 8);
         let second = RecordingBlockDevice::new(2, true, 2);
         let table = Arc::new(
-            DmTable::new_linear(vec![linear(first.clone(), 0, 100), linear(second, 4, 200)])
-                .unwrap(),
+            linear_table(vec![linear(first.clone(), 0, 100), linear(second, 4, 200)]).unwrap(),
         );
         assert_eq!(table.metadata().max_nr_segments_per_bio, 2);
         let completed = Arc::new(Mutex::new(None));
@@ -535,7 +990,11 @@ mod tests {
             BioType::Read,
             Sid::new(0),
             vec![BioSegment::alloc_exact(1, 4096, BioDirection::FromDevice)],
-            Some(Box::new(move |status| *on_complete.lock() = Some(status))),
+            Some(Box::new(move |status| {
+                let mut completed = on_complete.lock();
+                assert!(completed.is_none(), "parent completed more than once");
+                *completed = Some(status);
+            })),
         );
         let mut batch = io_util::batch::IoBatch::with_capacity(1);
         bio.submit(&TableDevice(table), &mut batch).unwrap();
@@ -552,7 +1011,7 @@ mod tests {
         let first = RecordingBlockDevice::new(1, false, 8);
         let second = RecordingBlockDevice::new(2, false, 8);
         let table = Arc::new(
-            DmTable::new_linear(vec![
+            linear_table(vec![
                 linear(first.clone(), 0, 0),
                 linear(first.clone(), 4, 4),
                 linear(second.clone(), 8, 8),
@@ -574,7 +1033,7 @@ mod tests {
         let refusing = RecordingBlockDevice::new(1, true, 8);
         let pending = RecordingBlockDevice::new(2, false, 8);
         let table = Arc::new(
-            DmTable::new_linear(vec![
+            linear_table(vec![
                 linear(refusing.clone(), 0, 0),
                 linear(pending.clone(), 4, 4),
             ])
@@ -586,7 +1045,11 @@ mod tests {
             BioType::Flush,
             Sid::new(0),
             vec![],
-            Some(Box::new(move |status| *on_complete.lock() = Some(status))),
+            Some(Box::new(move |status| {
+                let mut completed = on_complete.lock();
+                assert!(completed.is_none(), "parent completed more than once");
+                *completed = Some(status);
+            })),
         );
         let mut batch = io_util::batch::IoBatch::with_capacity(1);
         bio.submit(&TableDevice(table), &mut batch).unwrap();
@@ -602,7 +1065,7 @@ mod tests {
     #[ktest]
     fn refuses_bio_past_linear_table_end() {
         let backing = RecordingBlockDevice::new(1, false, 8);
-        let table = Arc::new(DmTable::new_linear(vec![linear(backing.clone(), 0, 0)]).unwrap());
+        let table = Arc::new(linear_table(vec![linear(backing.clone(), 0, 0)]).unwrap());
         let bio = Bio::new(
             BioType::Read,
             Sid::new(3),
@@ -619,7 +1082,7 @@ mod tests {
     #[ktest]
     fn split_failure_returns_enqueue_error_without_completing_parent() {
         let backing = RecordingBlockDevice::new(42, false, 8);
-        let table = Arc::new(DmTable::new_linear(vec![linear(backing.clone(), 0, 0)]).unwrap());
+        let table = Arc::new(linear_table(vec![linear(backing.clone(), 0, 0)]).unwrap());
         let completed = Arc::new(Mutex::new(false));
         let on_complete = completed.clone();
         // A zero-length normal BIO produces no mapping parts, so splitting it fails
@@ -644,8 +1107,7 @@ mod tests {
         let id = backing.id();
         register(backing.clone()).unwrap();
         let table = Arc::new(
-            DmTable::new_single_linear(Sid::new(0), 4, Sid::new(0), lookup_lease(id).unwrap())
-                .unwrap(),
+            single_linear_table(Sid::new(0), 4, Sid::new(0), lookup_lease(id).unwrap()).unwrap(),
         );
         let bio = Bio::new(
             BioType::Read,
@@ -670,9 +1132,8 @@ mod tests {
             .create("inactive-io".to_string(), None, None)
             .unwrap();
         let table =
-            DmTable::new_single_linear(Sid::new(0), 8, Sid::new(0), lookup_lease(id).unwrap())
-                .unwrap();
-        mapper.load_table(Arc::new(table));
+            single_linear_table(Sid::new(0), 8, Sid::new(0), lookup_lease(id).unwrap()).unwrap();
+        mapper.lock_lifecycle().load_table(Arc::new(table)).unwrap();
         let bio = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
         assert_eq!(
             bio.submit_and_wait(mapper.as_ref()),
@@ -694,15 +1155,21 @@ mod tests {
         let mapper = manager
             .create("table-replace".to_string(), None, None)
             .unwrap();
-        let make_table = |id| {
+        let make_table_fn = |id| {
             Arc::new(
-                DmTable::new_single_linear(Sid::new(0), 8, Sid::new(0), lookup_lease(id).unwrap())
+                single_linear_table(Sid::new(0), 8, Sid::new(0), lookup_lease(id).unwrap())
                     .unwrap(),
             )
         };
-        mapper.load_table(make_table(old_id));
+        mapper
+            .lock_lifecycle()
+            .load_table(make_table_fn(old_id))
+            .unwrap();
         assert_eq!(unregister(old_id).unwrap_err(), aster_block::Error::Busy);
-        mapper.load_table(make_table(new_id));
+        mapper
+            .lock_lifecycle()
+            .load_table(make_table_fn(new_id))
+            .unwrap();
         unregister(old_id).unwrap();
         assert_eq!(unregister(new_id).unwrap_err(), aster_block::Error::Busy);
         drop(manager);
@@ -722,10 +1189,13 @@ mod tests {
             .unwrap();
 
         let old_table = Arc::new(
-            DmTable::new_single_linear(Sid::new(0), 8, Sid::new(0), lookup_lease(old_id).unwrap())
+            single_linear_table(Sid::new(0), 8, Sid::new(0), lookup_lease(old_id).unwrap())
                 .unwrap(),
         );
-        mapper.load_table(old_table.clone());
+        mapper
+            .lock_lifecycle()
+            .load_table(old_table.clone())
+            .unwrap();
         let first = LinearTarget::new(
             Sid::new(0),
             8,
@@ -741,7 +1211,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            DmTable::new_linear(vec![first, gap]).unwrap_err(),
+            linear_table(vec![first, gap]).unwrap_err(),
             TableError::UnsupportedLogicalStart
         );
         assert!(Arc::ptr_eq(&mapper.inactive_table().unwrap(), &old_table));
@@ -773,7 +1243,7 @@ mod tests {
         let gap =
             LinearTarget::new(Sid::new(9), 8, Sid::new(16), lookup_lease(id).unwrap()).unwrap();
         assert_eq!(
-            DmTable::new_linear(vec![first, gap]).unwrap_err(),
+            linear_table(vec![first, gap]).unwrap_err(),
             TableError::UnsupportedLogicalStart
         );
         // A rejected candidate drops both leases and leaves the inactive slot empty.
@@ -785,11 +1255,11 @@ mod tests {
             LinearTarget::new(Sid::new(0), 8, Sid::new(1), lookup_lease(id).unwrap()).unwrap();
         let second =
             LinearTarget::new(Sid::new(8), 8, Sid::new(16), lookup_lease(id).unwrap()).unwrap();
-        let table = Arc::new(DmTable::new_linear(vec![first, second]).unwrap());
+        let table = Arc::new(linear_table(vec![first, second]).unwrap());
         assert_eq!(table.length(), 16);
         assert_eq!(table.target_count(), 2);
         assert_eq!(table.backing_ids(), vec![id]);
-        mapper.load_table(table);
+        mapper.lock_lifecycle().load_table(table).unwrap();
         assert_eq!(mapper.inactive_table().unwrap().length(), 16);
         assert_eq!(unregister(id).unwrap_err(), aster_block::Error::Busy);
         drop(manager);
