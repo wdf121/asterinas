@@ -11,7 +11,7 @@ use aster_block::{
     bio::{BioEnqueueError, BioStatus, BioType, SubmittedBio},
 };
 use device_id::DeviceId;
-use ostd::sync::{Mutex, WaitQueue};
+use ostd::sync::{LocalIrqDisabled, Mutex, SpinLock, WaitQueue};
 
 use crate::{DmError, DmTable, manager::DmDeviceIdOwner};
 
@@ -31,7 +31,7 @@ pub struct DmDevice {
 }
 
 struct DmIoState {
-    inner: Mutex<DmIoInner>,
+    inner: SpinLock<DmIoInner, LocalIrqDisabled>,
     drained: WaitQueue,
 }
 
@@ -52,17 +52,23 @@ impl core::fmt::Debug for DmIoState {
 
 impl DmIoState {
     fn complete(&self) {
-        let mut inner = self.inner.lock();
-        inner.in_flight -= 1;
-        if inner.in_flight == 0 && inner.admitting == 0 {
+        let drained = {
+            let mut inner = self.inner.lock();
+            inner.in_flight -= 1;
+            inner.in_flight == 0 && inner.admitting == 0
+        };
+        if drained {
             self.drained.wake_all();
         }
     }
 
     fn leave_enqueue(&self) {
-        let mut inner = self.inner.lock();
-        inner.admitting -= 1;
-        if inner.in_flight == 0 && inner.admitting == 0 {
+        let drained = {
+            let mut inner = self.inner.lock();
+            inner.admitting -= 1;
+            inner.in_flight == 0 && inner.admitting == 0
+        };
+        if drained {
             self.drained.wake_all();
         }
     }
@@ -89,7 +95,7 @@ impl DmDevice {
             tables: Mutex::new(DmDeviceTables::default()),
             lifecycle: Mutex::new(()),
             io: Arc::new(DmIoState {
-                inner: Mutex::new(DmIoInner::default()),
+                inner: SpinLock::new(DmIoInner::default()),
                 drained: WaitQueue::new(),
             }),
             removal_isolated: AtomicBool::new(false),
@@ -255,26 +261,29 @@ impl DmDeviceLifecycle<'_> {
     /// so a new BIO cannot select the old table after the switch.
     pub fn resume_suspended(&mut self) -> Result<(), DmError> {
         self.ensure_live()?;
-        let (table, postponed) = {
+        let (table, postponed, retired) = {
+            // Lock order: tables (sleeping) before the IRQ-safe admission state.
+            let mut tables = self.device.tables.lock();
             let mut io = self.device.io.inner.lock();
             if io.stopped || !io.suspended || io.admitting != 0 || io.in_flight != 0 {
                 return Err(DmError::InvalidState);
             }
-            let mut tables = self.device.tables.lock();
             if tables.active.is_none() {
                 return Err(DmError::InvalidState);
             }
-            if let Some(replacement) = tables.inactive.take() {
-                tables.active = Some(replacement);
-            }
+            let retired = tables
+                .inactive
+                .take()
+                .and_then(|replacement| tables.active.replace(replacement));
             let table = tables.active.as_ref().unwrap().clone();
             // Reserve replay completions before opening admission to new requests.
             let postponed = core::mem::take(&mut io.postponed);
             io.admitting += postponed.len();
             io.in_flight += postponed.len();
             io.suspended = false;
-            (table, postponed)
+            (table, postponed, retired)
         };
+        drop(retired);
         for bio in postponed {
             if table.is_readonly() && bio.type_() == BioType::Write {
                 bio.complete(BioStatus::IoError);
@@ -349,11 +358,12 @@ impl DmDeviceLifecycle<'_> {
 impl BlockDevice for DmDevice {
     fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
         let table = {
+            let tables = self.tables.lock();
             let mut io = self.io.inner.lock();
             if io.stopped {
                 return Err(BioEnqueueError::Refused);
             }
-            let table = self.active_table().ok_or(BioEnqueueError::Refused)?;
+            let table = tables.active.as_ref().ok_or(BioEnqueueError::Refused)?;
             // BIOs that reach a suspended mapper belong to the postponed queue,
             // regardless of the old table's mode. Judge writes against the new
             // active table on replay; the block-file or filesystem layer may
@@ -368,7 +378,7 @@ impl BlockDevice for DmDevice {
             }
             io.admitting += 1;
             io.in_flight += 1;
-            table
+            table.clone()
         };
         self.forward_assigned(table, bio, false)
     }
@@ -484,6 +494,57 @@ mod tests {
     }
 
     #[ktest]
+    fn completion_accounting_is_safe_with_local_irqs_disabled() {
+        let io = DmIoState {
+            inner: SpinLock::new(DmIoInner {
+                admitting: 1,
+                in_flight: 1,
+                ..Default::default()
+            }),
+            drained: WaitQueue::new(),
+        };
+        // This compile-time check rejects both a sleeping Mutex and a spinlock
+        // that only disables preemption: task-side holders must exclude IRQs.
+        let _: &SpinLock<DmIoInner, LocalIrqDisabled> = &io.inner;
+        {
+            let _irq_guard = ostd::irq::disable_local();
+            io.complete();
+            io.leave_enqueue();
+            let inner = io.inner.lock();
+            assert_eq!((inner.admitting, inner.in_flight), (0, 0));
+        }
+        ostd::task::atomic_mode::might_sleep();
+    }
+
+    #[ktest]
+    fn mapper_irq_completion_drains_accounting() {
+        let (_manager, device) = mapper();
+        let backing = PendingBacking::new();
+        device
+            .lock_lifecycle()
+            .load_table(table(backing.clone(), false))
+            .unwrap();
+        device.lock_lifecycle().resume_initial().unwrap();
+        let mut batch = io_util::batch::IoBatch::with_capacity(1);
+        Bio::new(BioType::Flush, Sid::new(0), vec![], None)
+            .submit(device.as_ref(), &mut batch)
+            .unwrap();
+        let pending = backing.pending.lock().take().unwrap();
+        assert_eq!(device.io.inner.lock().in_flight, 1);
+        {
+            let _irq_guard = ostd::irq::disable_local();
+            pending.complete(BioStatus::Complete);
+        }
+        assert!(batch.wait_all().is_ok());
+        assert_eq!(device.io.inner.lock().in_flight, 0);
+        assert_eq!(device.io.inner.lock().admitting, 0);
+        device.lock_lifecycle().suspend().unwrap();
+        device.lock_lifecycle().stop_and_drain_io();
+        device.lock_lifecycle().clear_removed_tables().unwrap();
+        crate::reclaim::reclaim_for_test();
+    }
+
+    #[ktest]
     fn lifecycle_guard_serializes_transitions_and_releases_on_drop() {
         let (_manager, device) = mapper();
         let mut lifecycle = device.lock_lifecycle();
@@ -593,6 +654,7 @@ mod tests {
         assert!(weak.upgrade().is_some());
         backing.finish();
         assert!(batch.wait_all().is_ok());
+        crate::reclaim::reclaim_for_test();
         assert!(weak.upgrade().is_none());
         drop(manager);
         drop(device);
@@ -808,6 +870,7 @@ mod tests {
         );
         assert!(old_backing.pending.lock().is_none());
         drop(old_table);
+        crate::reclaim::reclaim_for_test();
         assert!(old_weak.upgrade().is_none());
         new_backing.finish();
         assert!(postponed_batch.wait_all().is_ok());

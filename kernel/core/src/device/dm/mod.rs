@@ -11,6 +11,7 @@ mod runtime;
 static DM_MANAGER: Once<DmManager> = Once::new();
 
 pub(super) fn init_in_first_kthread() {
+    crate::thread::kernel_thread::ThreadOptions::new(|| aster_dm::run_table_reclaimer()).spawn();
     // Reserve the block major before exposing the control device to userspace.
     DM_MANAGER.call_once(|| DmManager::new().unwrap());
     control::init_in_first_kthread();

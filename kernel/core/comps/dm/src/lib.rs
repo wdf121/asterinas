@@ -21,11 +21,13 @@ extern crate alloc;
 mod device;
 mod io;
 mod manager;
+mod reclaim;
 mod table;
 pub mod target;
 
 pub use device::{DmDevice, DmDeviceLifecycle};
 pub use manager::DmManager;
+pub use reclaim::run_table_reclaimer;
 pub use table::DmTable;
 
 /// Reasons why a core Device Mapper operation failed.

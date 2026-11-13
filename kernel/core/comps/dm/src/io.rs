@@ -24,6 +24,7 @@ use ostd::sync::SpinLock;
 
 use crate::{
     DmTable,
+    reclaim::CompletionTable,
     table::{PlannedFlush, PlannedIo},
 };
 
@@ -70,7 +71,7 @@ fn enqueue_part(
 
     // Completion capability is stable for the target's lifetime. Retaining the
     // table keeps both the observer and its backing references alive until callback.
-    let table = table.clone();
+    let table = CompletionTable::new(table);
     let backing = part.mapping.backing.id();
     enqueue_with_completion(bio, part.mapping.backing, move |status| {
         table.targets()[part.target_index]
@@ -95,7 +96,7 @@ pub(super) fn execute_flush(
     let completion = Arc::new(FlushCompletion::new(plan.len(), bio));
     for part in plan {
         let callback_completion = completion.clone();
-        let table = table.clone();
+        let table = CompletionTable::new(table);
         let backing_id = part.backing.id();
         let flush = Bio::new(
             BioType::Flush,
@@ -459,6 +460,7 @@ mod tests {
             assert_eq!(notified.load(Ordering::Relaxed), 0);
             pending.complete(status);
             assert_eq!(notified.load(Ordering::Relaxed), 1);
+            crate::reclaim::reclaim_for_test();
             assert!(weak_table.upgrade().is_none());
             assert!(weak_backing.upgrade().is_none());
         }

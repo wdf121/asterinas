@@ -14,6 +14,7 @@ use device_id::DeviceId;
 
 use crate::{
     TableError, io,
+    reclaim::CompletionTable,
     target::{DmTargetBox, TargetIoAction},
 };
 
@@ -145,12 +146,12 @@ impl DmTable {
         if bio.type_() != BioType::Flush {
             // Reject out-of-range I/O before taking completion ownership.
             let parts = self.plan_normal_io(&bio)?;
-            let table = self.clone();
+            let table = CompletionTable::new(self);
             bio.chain_complete_fn(move |_| drop(table));
             return io::execute_normal_io(self, bio, parts);
         }
         let plan = self.plan_flush();
-        let table = self.clone();
+        let table = CompletionTable::new(self);
         bio.chain_complete_fn(move |_| drop(table));
         io::execute_flush(self, bio, plan)
     }
@@ -882,6 +883,7 @@ mod tests {
         );
         second.finish(BioStatus::Complete);
         assert!(batch.wait_all().is_ok());
+        crate::reclaim::reclaim_for_test();
         unregister(first.id()).unwrap();
         unregister(second.id()).unwrap();
     }
@@ -1120,7 +1122,40 @@ mod tests {
         assert_eq!(unregister(id).unwrap_err(), aster_block::Error::Busy);
         backing.finish(BioStatus::Complete);
         assert!(batch.wait_all().is_ok());
+        crate::reclaim::reclaim_for_test();
         unregister(id).unwrap();
+    }
+
+    #[ktest]
+    fn irq_completion_defers_final_tracked_table_reference() {
+        for type_ in [BioType::Read, BioType::Flush] {
+            let backing = RecordingBlockDevice::new(49, false, 8);
+            let id = backing.id();
+            register(backing.clone()).unwrap();
+            let table = Arc::new(
+                single_linear_table(Sid::new(0), 4, Sid::new(0), lookup_lease(id).unwrap())
+                    .unwrap(),
+            );
+            let segments = if type_ == BioType::Read {
+                vec![BioSegment::alloc_exact(1, 512, BioDirection::FromDevice)]
+            } else {
+                vec![]
+            };
+            let mut batch = io_util::batch::IoBatch::with_capacity(1);
+            Bio::new(type_, Sid::new(0), segments, None)
+                .submit(&TableDevice(table), &mut batch)
+                .unwrap();
+            let pending = backing.pending.lock().remove(0);
+            {
+                let _irq_guard = ostd::irq::disable_local();
+                pending.complete(BioStatus::Complete);
+            }
+            assert!(batch.wait_all().is_ok());
+            // Logical completion does not release the tracked lease in IRQ context.
+            assert_eq!(unregister(id).unwrap_err(), aster_block::Error::Busy);
+            crate::reclaim::reclaim_for_test();
+            unregister(id).unwrap();
+        }
     }
 
     #[ktest]
