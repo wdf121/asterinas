@@ -21,7 +21,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use aster_block::bio::BioCompleteFn;
+use aster_block::{BlockDeviceLease, bio::BioCompleteFn};
 use device_id::DeviceId;
 
 use super::{
@@ -50,8 +50,6 @@ pub(super) const ROOT_INO: u32 = 2;
 /// the target inode or block address.
 #[derive(Debug)]
 pub(crate) struct Ext2 {
-    /// Backing block device.
-    block_device: Arc<dyn BlockDevice>,
     /// Superblock with dirty tracking.
     super_block: RwMutex<Dirty<SuperBlock>>,
     /// Block group descriptors and caches.
@@ -70,6 +68,8 @@ pub(crate) struct Ext2 {
     next_generation: AtomicU32,
     /// Weak self reference for inode back-pointers.
     self_ref: Weak<Ext2>,
+    /// Keeps the backing registered until all metadata and block groups are dropped.
+    block_device: BlockDeviceLease,
 }
 
 /// Policy for how `statfs` reports the total block count.
@@ -116,7 +116,7 @@ impl Ext2MountOptions {
 impl Ext2 {
     /// Opens and loads an Ext2 filesystem from a block device.
     pub(super) fn open(
-        device: Arc<dyn BlockDevice>,
+        device: BlockDeviceLease,
         flags: FsFlags,
         data: Option<&str>,
     ) -> Result<Arc<Self>> {
@@ -168,7 +168,7 @@ impl Ext2 {
                     &group_descriptors_segment,
                     group_idx,
                     &super_block,
-                    device.clone(),
+                    device.device().clone(),
                 )?;
                 block_groups.push(group);
             }
@@ -176,7 +176,6 @@ impl Ext2 {
         };
 
         let ext2 = Arc::new_cyclic(|weak_self| Ext2 {
-            block_device: device,
             super_block: RwMutex::new(Dirty::new(super_block)),
             block_groups,
             nr_inodes_per_group,
@@ -186,6 +185,7 @@ impl Ext2 {
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             next_generation: AtomicU32::new(utils::duration_to_ext2_secs(utils::now())),
             self_ref: weak_self.clone(),
+            block_device: device,
         });
 
         Ok(ext2)
@@ -193,7 +193,7 @@ impl Ext2 {
 
     /// Returns the block device.
     pub(super) fn block_device(&self) -> &dyn BlockDevice {
-        self.block_device.as_ref()
+        &*self.block_device
     }
 
     /// Returns the maximum regular file size supported by this ext2 instance.
@@ -742,7 +742,7 @@ mod test {
     fn stat_minixdf_reports_total() {
         let f = Ext2FixtureBuilder::new(3, 512).build().unwrap();
         let ext2 = Ext2::open(
-            f.disk.clone() as Arc<dyn BlockDevice>,
+            BlockDeviceLease::new_untracked(f.disk.clone()),
             FsFlags::empty(),
             Some("minixdf"),
         )

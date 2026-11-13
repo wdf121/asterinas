@@ -2,7 +2,7 @@
 
 use alloc::collections::btree_map::Entry;
 
-use aster_block::BlockDevice;
+use aster_block::BlockDeviceLease;
 use aster_systree::{
     AttrLessBranchNodeFields, SysNode, SysObj, SysPerms, SysStr, inherit_sys_branch_node,
 };
@@ -111,7 +111,7 @@ pub(crate) struct FsCreationCtx<'a> {
 
 enum BlockDeviceResolution<'a> {
     Pending(&'a Context<'a>),
-    Resolved(Arc<dyn BlockDevice>),
+    Resolved(BlockDeviceLease),
 }
 
 impl<'a> FsCreationCtx<'a> {
@@ -132,7 +132,7 @@ impl<'a> FsCreationCtx<'a> {
 
     /// Creates a file system creation context from an already resolved block device.
     pub(in crate::fs) fn from_block_device(
-        block_device: Arc<dyn BlockDevice>,
+        block_device: BlockDeviceLease,
         flags: FsFlags,
         args: Option<&'a str>,
     ) -> Self {
@@ -167,8 +167,10 @@ impl<'a> FsCreationCtx<'a> {
         }
     }
 
-    /// Resolves the mount source into a block device.
-    pub(in crate::fs) fn resolve_block_device(&mut self) -> Result<&Arc<dyn BlockDevice>> {
+    /// Resolves the mount source and protects it against removal during creation.
+    ///
+    /// Persistent filesystems must retain a clone for their entire I/O-capable lifetime.
+    pub(in crate::fs) fn resolve_block_device(&mut self) -> Result<&BlockDeviceLease> {
         if self.block_device().is_none() {
             self.do_resolve_block_device()?;
         }
@@ -176,7 +178,7 @@ impl<'a> FsCreationCtx<'a> {
         Ok(self.block_device().unwrap())
     }
 
-    fn block_device(&self) -> Option<&Arc<dyn BlockDevice>> {
+    fn block_device(&self) -> Option<&BlockDeviceLease> {
         match &self.block_device {
             BlockDeviceResolution::Pending(_) => None,
             BlockDeviceResolution::Resolved(block_device) => Some(block_device),
@@ -206,7 +208,7 @@ impl<'a> FsCreationCtx<'a> {
         let id = path.metadata()?.self_dev_id;
 
         let block_device = id
-            .and_then(aster_block::lookup)
+            .and_then(aster_block::lookup_lease)
             .ok_or_else(|| Error::with_message(Errno::ENODEV, "the device is not found"))?;
         self.block_device = BlockDeviceResolution::Resolved(block_device);
 

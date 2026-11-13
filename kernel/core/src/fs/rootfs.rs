@@ -97,11 +97,22 @@ fn open_rootfs(root: &str, fs_flags: FsFlags) -> Result<FsAndRoot> {
         .ok_or_else(|| Error::with_message(Errno::EINVAL, "root must name a /dev block device"))?;
     let device = aster_block::lookup_by_name(device_name)
         .ok_or_else(|| Error::with_message(Errno::ENODEV, "root block device not found"))?;
-    open_rootfs_from_candidates(device, rootfs_types(), fs_flags)
+    let lease = lease_root_device(device)?;
+    open_rootfs_from_candidates(lease, rootfs_types(), fs_flags)
+}
+
+fn lease_root_device(
+    device: Arc<dyn aster_block::BlockDevice>,
+) -> Result<aster_block::BlockDeviceLease> {
+    aster_block::lookup_lease(device.id())
+        .filter(|lease| Arc::ptr_eq(lease.device(), &device))
+        .ok_or_else(|| {
+            Error::with_message(Errno::ENODEV, "root block device is no longer available")
+        })
 }
 
 fn open_rootfs_from_candidates(
-    device: Arc<dyn aster_block::BlockDevice>,
+    device: aster_block::BlockDeviceLease,
     rootfs_types: &[&dyn DynFsType],
     fs_flags: FsFlags,
 ) -> Result<FsAndRoot> {
@@ -201,3 +212,63 @@ static RO_PARAM: SetRootMountReadOnly = SetRootMountReadOnly;
 static RW_PARAM: SetRootMountReadWrite = SetRootMountReadWrite;
 aster_cmdline::define_flag_param!("ro", RO_PARAM);
 aster_cmdline::define_flag_param!("rw", RW_PARAM);
+
+#[cfg(ktest)]
+mod test {
+    use aster_block::{
+        BlockDevice, BlockDeviceMeta,
+        bio::{BioEnqueueError, SubmittedBio},
+    };
+    use device_id::{DeviceId, MajorId, MinorId};
+    use ostd::prelude::*;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct RootDevice;
+
+    impl BlockDevice for RootDevice {
+        fn enqueue(&self, _bio: SubmittedBio) -> core::result::Result<(), BioEnqueueError> {
+            unreachable!("identity handoff must not submit I/O")
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: 1,
+                nr_sectors: 8,
+            }
+        }
+
+        fn name(&self) -> &str {
+            "root-lease-test"
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(240), MinorId::new(103))
+        }
+    }
+
+    #[ktest]
+    fn root_device_handoff_rejects_replaced_identity() {
+        let original: Arc<dyn BlockDevice> = Arc::new(RootDevice);
+        aster_block::register(original.clone()).unwrap();
+        let resolved = aster_block::lookup_by_name(original.name()).unwrap();
+        let lease = lease_root_device(resolved.clone()).unwrap();
+        assert!(matches!(
+            aster_block::begin_unregister(original.id()),
+            Err(aster_block::Error::Busy)
+        ));
+        drop(lease);
+        aster_block::unregister(original.id()).unwrap();
+        let replacement: Arc<dyn BlockDevice> = Arc::new(RootDevice);
+        aster_block::register(replacement.clone()).unwrap();
+        assert_eq!(
+            lease_root_device(resolved).unwrap_err().error(),
+            Errno::ENODEV
+        );
+        let lease = lease_root_device(replacement.clone()).unwrap();
+        assert!(Arc::ptr_eq(lease.device(), &replacement));
+        drop(lease);
+        aster_block::unregister(replacement.id()).unwrap();
+    }
+}

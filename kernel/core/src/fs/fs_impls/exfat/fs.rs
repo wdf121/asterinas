@@ -10,7 +10,7 @@ use core::{
 };
 
 use aster_block::{
-    BlockDevice,
+    BlockDevice, BlockDeviceLease,
     bio::{BioCompleteFn, BioSegment},
     id::BlockId,
 };
@@ -43,7 +43,6 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) struct ExfatFs {
-    block_device: Arc<dyn BlockDevice>,
     super_block: ExfatSuperBlock,
 
     bitmap: Arc<Mutex<ExfatBitmap>>,
@@ -65,6 +64,8 @@ pub(crate) struct ExfatFs {
     mutex: Mutex<()>,
 
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    // Keep removal blocked until all filesystem metadata has been dropped.
+    block_device: BlockDeviceLease,
 }
 
 const FAT_LRU_CACHE_SIZE: usize = 1024;
@@ -73,14 +74,13 @@ pub(super) const EXFAT_ROOT_INO: Ino = 1;
 
 impl ExfatFs {
     pub(crate) fn open(
-        block_device: Arc<dyn BlockDevice>,
+        block_device: BlockDeviceLease,
         mount_option: ExfatMountOptions,
     ) -> Result<Arc<Self>> {
         // Load the super_block
-        let super_block = Self::read_super_block(block_device.as_ref())?;
+        let super_block = Self::read_super_block(&*block_device)?;
         let fs_size = super_block.num_clusters as usize * super_block.cluster_size as usize;
         let exfat_fs = Arc::new_cyclic(|weak_self| ExfatFs {
-            block_device,
             super_block,
             bitmap: Arc::new(Mutex::new(ExfatBitmap::default())),
             upcase_table: Arc::new(SpinLock::new(ExfatUpcaseTable::empty())),
@@ -93,6 +93,7 @@ impl ExfatFs {
             meta_cache: PageCache::new_with_backend(fs_size, weak_self.clone() as _).unwrap(),
             mutex: Mutex::new(()),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            block_device,
         });
 
         // TODO: if the main superblock is corrupted, should we load the backup?
@@ -309,7 +310,7 @@ impl ExfatFs {
     }
 
     pub(super) fn block_device(&self) -> &dyn BlockDevice {
-        self.block_device.as_ref()
+        &*self.block_device
     }
 
     pub(super) fn container_device_id(&self) -> DeviceId {
@@ -511,5 +512,197 @@ impl FsType for ExfatType {
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {
         None
+    }
+}
+
+#[cfg(ktest)]
+mod test {
+    use core::sync::atomic::AtomicUsize;
+
+    use aster_block::{
+        BlockDeviceMeta,
+        bio::{BioEnqueueError, BioStatus, BioType, SubmittedBio},
+    };
+    use device_id::{MajorId, MinorId};
+    use ostd::{
+        mm::{FrameAllocOptions, Segment, io::util::HasVmReaderWriter},
+        prelude::*,
+    };
+
+    use super::*;
+    use crate::fs::{
+        exfat::{
+            dentry::{DENTRY_SIZE, ExfatBitmapDentry, ExfatUpcaseDentry},
+            utils::calc_checksum_32,
+        },
+        vfs::{
+            file_system::FsFlags,
+            path::{Mount, PerMountFlags},
+            registry::DynFsType,
+        },
+    };
+
+    const SECTOR_SIZE: usize = 512;
+
+    #[derive(Debug)]
+    struct ExfatMemoryDisk {
+        segment: Segment<()>,
+        read_count: AtomicUsize,
+    }
+
+    impl ExfatMemoryDisk {
+        fn new() -> Arc<Self> {
+            const CLUSTER_SIZE: usize = PAGE_SIZE;
+            const CLUSTER_COUNT: usize = 8;
+            const FAT_OFFSET: usize = PAGE_SIZE;
+            const ROOT_OFFSET: usize = 2 * PAGE_SIZE;
+            const BITMAP_OFFSET: usize = ROOT_OFFSET + CLUSTER_SIZE;
+            const UPCASE_OFFSET: usize = BITMAP_OFFSET + CLUSTER_SIZE;
+
+            let segment = FrameAllocOptions::new()
+                .zeroed(true)
+                .alloc_segment(2 + CLUSTER_COUNT)
+                .unwrap();
+
+            // Only the structures consumed by the current parser are needed;
+            // boot-region verification is not implemented yet.
+            let boot = ExfatBootSector {
+                fs_name: *b"EXFAT   ",
+                vol_length: (segment.size() / SECTOR_SIZE) as u64,
+                fat_offset: (FAT_OFFSET / SECTOR_SIZE) as u32,
+                fat_length: 1,
+                cluster_offset: (ROOT_OFFSET / SECTOR_SIZE) as u32,
+                cluster_count: CLUSTER_COUNT as u32,
+                root_cluster: 2,
+                fs_revision: [0, 1],
+                sector_size_bits: 9,
+                sector_per_cluster_bits: 3,
+                num_fats: 1,
+                signature: BOOT_SIGNATURE,
+                ..ExfatBootSector::new_zeroed()
+            };
+            segment.write_val(0, &boot).unwrap();
+            for cluster in 2..=4 {
+                segment
+                    .write_val(FAT_OFFSET + cluster * FAT_ENTRY_SIZE, &u32::MAX)
+                    .unwrap();
+            }
+
+            let bitmap = ExfatBitmapDentry {
+                dentry_type: 0x81,
+                start_cluster: 3,
+                size: CLUSTER_COUNT.div_ceil(8) as u64,
+                ..Default::default()
+            };
+            segment.write_val(ROOT_OFFSET, &bitmap).unwrap();
+            // Root directory, allocation bitmap, and upcase table are allocated.
+            segment.write_val(BITMAP_OFFSET, &0b111u8).unwrap();
+
+            let mut upcase = [0u8; 128 * size_of::<u16>()];
+            for (value, bytes) in upcase.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                let uppercase = (value as u8).to_ascii_uppercase() as u16;
+                bytes.copy_from_slice(&uppercase.to_le_bytes());
+            }
+            let upcase_dentry = ExfatUpcaseDentry {
+                dentry_type: 0x82,
+                checksum: calc_checksum_32(&upcase),
+                start_cluster: 4,
+                size: upcase.len() as u64,
+                ..Default::default()
+            };
+            segment
+                .write_val(ROOT_OFFSET + DENTRY_SIZE, &upcase_dentry)
+                .unwrap();
+            segment.write_bytes(UPCASE_OFFSET, &upcase).unwrap();
+
+            Arc::new(Self {
+                segment,
+                read_count: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl BlockDevice for ExfatMemoryDisk {
+        fn enqueue(&self, bio: SubmittedBio) -> core::result::Result<(), BioEnqueueError> {
+            if bio.type_() != BioType::Read {
+                bio.complete(BioStatus::NotSupported);
+                return Ok(());
+            }
+
+            self.read_count.fetch_add(1, Ordering::Relaxed);
+            let mut offset = bio.sid_range().start.to_raw() as usize * SECTOR_SIZE;
+            for segment in bio.segments() {
+                offset += segment
+                    .dma_slice()
+                    .writer()
+                    .unwrap()
+                    .write(self.segment.reader().skip(offset));
+            }
+            bio.complete(BioStatus::Complete);
+            Ok(())
+        }
+
+        fn metadata(&self) -> BlockDeviceMeta {
+            BlockDeviceMeta {
+                max_nr_segments_per_bio: usize::MAX,
+                nr_sectors: self.segment.size() / SECTOR_SIZE,
+            }
+        }
+
+        fn name(&self) -> &str {
+            "exfat-mount-lease-test"
+        }
+
+        fn id(&self) -> DeviceId {
+            DeviceId::new(MajorId::new(240), MinorId::new(104))
+        }
+    }
+
+    #[ktest]
+    fn detached_filesystem_holds_registered_device_lease() {
+        let disk = ExfatMemoryDisk::new();
+        aster_block::register(disk.clone()).unwrap();
+        let fs_type = ExfatType {
+            cache: FsCache::new(),
+        };
+        let mut ctx = FsCreationCtx::from_block_device(
+            aster_block::lookup_lease(disk.id()).unwrap(),
+            FsFlags::empty(),
+            None,
+        );
+        let fs_and_root = fs_type.get_or_create(&mut ctx).unwrap();
+        drop(ctx);
+        assert!(matches!(
+            aster_block::begin_unregister(disk.id()),
+            Err(aster_block::Error::Busy)
+        ));
+
+        // Transfer both filesystem and root ownership to an unattached mount.
+        let fs_weak = Arc::downgrade(fs_and_root.fs());
+        let mount =
+            Mount::new_detached(fs_and_root, PerMountFlags::empty(), Weak::new(), None).unwrap();
+        assert!(matches!(
+            aster_block::begin_unregister(disk.id()),
+            Err(aster_block::Error::Busy)
+        ));
+
+        // Opening reads the boot sector directly, so this metadata-cache read
+        // must submit a fresh BIO after the creation context has been dropped.
+        let reads_before = disk.read_count.load(Ordering::Relaxed);
+        let mut fs_name = [0; 8];
+        mount
+            .fs()
+            .downcast_ref::<ExfatFs>()
+            .unwrap()
+            .read_meta_at(3, &mut fs_name)
+            .unwrap();
+        assert_eq!(&fs_name, b"EXFAT   ");
+        assert!(disk.read_count.load(Ordering::Relaxed) > reads_before);
+
+        drop(mount);
+        assert!(fs_weak.upgrade().is_none());
+        let removal = aster_block::begin_unregister(disk.id()).unwrap();
+        aster_block::commit_unregister(removal).unwrap();
+        assert!(aster_block::lookup_lease(disk.id()).is_none());
     }
 }

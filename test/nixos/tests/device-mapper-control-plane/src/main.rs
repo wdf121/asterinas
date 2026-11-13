@@ -943,6 +943,29 @@ fn ext2_multi_target_same_disk(nixos_shell: &mut Session) -> Result<(), Error> {
         "sha256sum \"${dm_work}/phase1_dm_mnt\"/payload > \"${dm_work}/dm_payload.sha256\"",
         &Regex::new("(?s).*").unwrap(),
     )?;
+
+    // No raw device or regular file is open: the mount alone must prevent removal.
+    nixos_shell.run_cmd_and_expect_regex(
+        "if dmsetup remove phase1_test; then false; else true; fi",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex("test -b /dev/dm-0", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "sha256sum -c \"${dm_work}/dm_payload.sha256\"",
+        &Regex::new("payload: OK").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="${dm_work}/lease_expected" bs=4096 count=1 status=none"#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="${dm_work}/lease_expected" of="${dm_work}/phase1_dm_mnt/lease_payload" bs=4096 conv=fsync status=none"#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/lease_expected" "${dm_work}/phase1_dm_mnt/lease_payload""#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
     nixos_shell.run_cmd_and_expect_regex("sync", &Regex::new("(?s).*").unwrap())?;
     nixos_shell.run_cmd_and_expect_regex("cmp <(dd if=/dev/dm-0 bs=1M count=16 status=none) <(dd if=/dev/vde bs=512 skip=32768 count=32768 status=none)", &Regex::new("(?s).*").unwrap())?;
     nixos_shell.run_cmd_and_expect_regex("cmp <(dd if=/dev/dm-0 bs=1M skip=16 count=16 status=none) <(dd if=/dev/vde bs=512 skip=98304 count=32768 status=none)", &Regex::new("(?s).*").unwrap())?;
@@ -962,12 +985,62 @@ fn ext2_multi_target_same_disk(nixos_shell: &mut Session) -> Result<(), Error> {
         "sha256sum -c \"${dm_work}/dm_payload.sha256\"",
         &Regex::new("payload: OK").unwrap(),
     )?;
+
+    // Lazy unmount lets a regular file outlive the mount on both Linux and Asterinas.
+    // Keep no raw block-device descriptor, so only the filesystem retains its lease.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"exec 9<"${dm_work}/phase1_dm_mnt/lease_payload""#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "umount -l \"${dm_work}/phase1_dm_mnt\"",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "if dmsetup remove phase1_test; then false; else true; fi",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex("test -b /dev/dm-0", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/lease_expected" - <&9"#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex("exec 9<&-", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell
+        .run_cmd_and_expect_regex("dmsetup remove phase1_test", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex("test ! -e /dev/dm-0", &Regex::new("(?s).*").unwrap())?;
+
+    // Reuse the released minor without formatting and verify the original contents.
+    nixos_shell.run_cmd_and_expect_regex(
+        "dmsetup create phase1_test --notable",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "dmsetup load phase1_test \"${dm_work}/dm_table\"",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex("test -b /dev/dm-0", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell
+        .run_cmd_and_expect_regex("dmsetup resume phase1_test", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "mount -t ext2 /dev/dm-0 \"${dm_work}/phase1_dm_mnt\"",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "sha256sum -c \"${dm_work}/dm_payload.sha256\"",
+        &Regex::new("payload: OK").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"cmp "${dm_work}/lease_expected" "${dm_work}/phase1_dm_mnt/lease_payload""#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
     nixos_shell.run_cmd_and_expect_regex(
         "umount \"${dm_work}/phase1_dm_mnt\"",
         &Regex::new("(?s).*").unwrap(),
     )?;
     nixos_shell
         .run_cmd_and_expect_regex("dmsetup remove phase1_test", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex("test ! -e /dev/dm-0", &Regex::new("(?s).*").unwrap())?;
     Ok(())
 }
 
