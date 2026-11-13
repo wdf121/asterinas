@@ -6,9 +6,9 @@ use ostd::mm::VmIo;
 
 use super::abi::{
     self, DM_DEV_CREATE_CMD, DM_DEV_REMOVE_CMD, DM_DEV_STATUS_CMD, DM_DEV_SUSPEND_CMD,
-    DM_GET_TARGET_VERSION_CMD, DM_LIST_DEVICES_CMD, DM_LIST_VERSIONS_CMD, DM_TABLE_DEPS_CMD,
-    DM_TABLE_LOAD_CMD, DM_TABLE_STATUS_CMD, FIXED_PREFIX_SIZE, OFF_DATA_SIZE, OFF_FLAGS,
-    SECURE_DATA_FLAG,
+    DM_GET_TARGET_VERSION_CMD, DM_LIST_DEVICES_CMD, DM_LIST_VERSIONS_CMD, DM_TABLE_CLEAR_CMD,
+    DM_TABLE_DEPS_CMD, DM_TABLE_LOAD_CMD, DM_TABLE_STATUS_CMD, FIXED_PREFIX_SIZE, OFF_DATA_SIZE,
+    OFF_FLAGS, SECURE_DATA_FLAG,
 };
 use crate::{context::current_userspace, prelude::*};
 
@@ -57,7 +57,11 @@ pub(super) fn process_ioctl_parameters(
     } else {
         debug_assert!(matches!(
             command,
-            DM_DEV_CREATE_CMD | DM_DEV_REMOVE_CMD | DM_DEV_SUSPEND_CMD | DM_DEV_STATUS_CMD
+            DM_DEV_CREATE_CMD
+                | DM_DEV_REMOVE_CMD
+                | DM_DEV_SUSPEND_CMD
+                | DM_DEV_STATUS_CMD
+                | DM_TABLE_CLEAR_CMD
         ));
         FIXED_PREFIX_SIZE
     };
@@ -139,6 +143,10 @@ mod tests {
         }
         let mut load = vec![0; 512];
         abi::write_u32(&mut load, OFF_DATA_SIZE, 512);
+        assert_eq!(
+            output_len(DM_TABLE_CLEAR_CMD, false, &load),
+            FIXED_PREFIX_SIZE
+        );
         assert_eq!(
             output_len(DM_TABLE_LOAD_CMD, true, &load),
             FIXED_PREFIX_SIZE

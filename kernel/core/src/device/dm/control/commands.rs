@@ -20,6 +20,7 @@ pub(super) fn handler_for(command: u8) -> Result<CommandHandler> {
         DM_TABLE_STATUS_CMD => Ok(table::table_status),
         DM_DEV_SUSPEND_CMD => Ok(table::resume_device),
         DM_TABLE_LOAD_CMD => Ok(table::table_load),
+        DM_TABLE_CLEAR_CMD => Ok(table::table_clear),
         _ => return_errno_with_message!(Errno::ENOTTY, "unsupported device-mapper ioctl command"),
     }
 }

@@ -109,7 +109,7 @@ Both the initramfs and NixOS runners use the **same** numbered images, `test/ini
 
 The images live in the initramfs build directory, so `make clean` deletes them along with other initramfs build artifacts. Ordinary test runs and VM shutdowns do not clear them. Existing device-mapper tests assume blank backing ranges; run tests that consume a prior boot's data separately from tests that assume blank disks. A recovery test must run setup and verification in separate VM boots.
 
-The `device-mapper-control-plane` suite contains 25 independently selectable cases,
+The `device-mapper-control-plane` suite contains 27 independently selectable cases,
 grouped by behavior rather than giving each dmsetup command its own case.
 The original 17 linear and general control cases remain unchanged:
 
@@ -130,6 +130,13 @@ The original 17 linear and general control cases remain unchanged:
 - `explicit_table_replacement`
 - `raw_mapping_growth_and_shrink`
 - `concurrent_hot_table_replacement`
+
+Two additional control cases cover pending-table clearing:
+
+| Case | Coverage |
+|---|---|
+| `clear_pending_table_preserves_active_mapping` | Clear a pending replacement while preserving the active table, capacity, and read/write path; a later resume must not restore the discarded replacement. |
+| `clear_without_pending_table_and_remove` | Clear with no pending table, preserve a published primary node after clearing the first load, reject resume without a table, and reject control operations after removal. |
 
 Eight additional cases cover striped mappings:
 
@@ -158,7 +165,7 @@ A failed crossing write may have committed its legal prefix; these cases do not 
 The tests do not prove a particular BIO split, flush count, health-failure transition, or power-loss safety.
 Type conversion and resizing do not migrate data or resize filesystems.
 Striped LVM, concurrent striped replacement, and cross-boot striped recovery are outside this suite's coverage.
-Final dynamic acceptance should run the entire 25-case suite, not only the new cases:
+Final dynamic acceptance should run the entire 27-case suite, not only the new cases:
 
 ```bash
 # Rebuild the guest image only when needed.

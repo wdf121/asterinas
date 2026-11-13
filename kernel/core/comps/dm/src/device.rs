@@ -195,6 +195,14 @@ impl DmDeviceLifecycle<'_> {
         Ok(())
     }
 
+    /// Discards only the pending table.
+    /// A running table and primary node remain intact.
+    pub fn clear_inactive_table(&mut self) -> Result<(), DmError> {
+        self.ensure_live()?;
+        self.device.tables.lock().inactive = None;
+        Ok(())
+    }
+
     /// Activates the first loaded table, or leaves an already active table unchanged.
     /// A pending replacement requires suspend/resume instead.
     pub fn resume_initial(&mut self) -> Result<(), DmError> {

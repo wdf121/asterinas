@@ -158,6 +158,28 @@ fn table_load_for_device_with_primary(
     Ok(())
 }
 
+/// Discards a pending table without disturbing an active mapping or its primary node.
+pub(super) fn table_clear(buffer: &mut [u8]) -> Result<()> {
+    let device = lookup_load_device(buffer)?;
+    table_clear_for(buffer, &device)
+}
+
+fn table_clear_for(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
+    let mut lifecycle = device.lock_lifecycle();
+    ensure_control_live(device)?;
+    lifecycle
+        .clear_inactive_table()
+        .map_err(|_| Error::new(Errno::EINVAL))?;
+    let (active, inactive) = device.table_snapshot();
+    let table = selected_table(
+        &active,
+        &inactive,
+        read_u32(buffer, OFF_FLAGS) & QUERY_INACTIVE_TABLE_FLAG != 0,
+    );
+    query_header(buffer, device, active.as_ref(), inactive.as_ref(), table);
+    Ok(())
+}
+
 /// Suspends a running mapping or resumes it, switching a pending table if present.
 pub(super) fn resume_device(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_load_device(buffer)?;
@@ -204,6 +226,115 @@ mod tests {
 
     use super::{super::test_support::*, *};
     use crate::device::registry::block;
+
+    #[ktest]
+    fn clear_discards_only_inactive_table_and_respects_removal() {
+        let manager = aster_dm::DmManager::new().unwrap();
+        let device = manager.create("clear-test".into(), None, None).unwrap();
+        let backing = DeviceId::new(MajorId::new(510), MinorId::new(168));
+        aster_block::register(Arc::new(Backing(backing))).unwrap();
+        let mut clear = vec![0u8; FIXED_PREFIX_SIZE];
+        clear[OFF_NAME..OFF_NAME + 10].copy_from_slice(b"clear-test");
+        write_u32(&mut clear, OFF_DATA_SIZE, FIXED_PREFIX_SIZE as u32);
+        table_clear_for(&mut clear, &device).unwrap();
+        assert_eq!(read_u32(&clear, OFF_DATA_SIZE), FIXED_PREFIX_SIZE as u32);
+        assert_eq!(read_u32(&clear, OFF_TARGET_COUNT), 0);
+        assert!(device.active_table().is_none());
+        assert!(device.inactive_table().is_none());
+
+        let mut request = buffer("clear-test", backing);
+        table_load_for_device_with_primary(&mut request, &device, |_| Ok(())).unwrap();
+        let mut resume = vec![0u8; FIXED_PREFIX_SIZE];
+        resume[OFF_NAME..OFF_NAME + 10].copy_from_slice(b"clear-test");
+        resume_device_for(&mut resume, &device).unwrap();
+        let active = device.active_table().unwrap();
+        write_u32(&mut request, OFF_FLAGS, READONLY_FLAG);
+        table_load_for_device_with_primary(&mut request, &device, |_| Ok(())).unwrap();
+        assert!(device.inactive_table().unwrap().is_readonly());
+        table_clear_for(&mut clear, &device).unwrap();
+        assert_eq!(
+            read_u32(&clear, OFF_FLAGS) & ACTIVE_PRESENT_FLAG,
+            ACTIVE_PRESENT_FLAG
+        );
+        assert_eq!(read_u32(&clear, OFF_FLAGS) & INACTIVE_PRESENT_FLAG, 0);
+        assert_eq!(read_u32(&clear, OFF_TARGET_COUNT), 1);
+        assert!(Arc::ptr_eq(&active, &device.active_table().unwrap()));
+        assert!(device.inactive_table().is_none());
+        resume_device_for(&mut resume, &device).unwrap();
+        assert!(Arc::ptr_eq(&active, &device.active_table().unwrap()));
+        assert!(!device.active_table().unwrap().is_readonly());
+        table_clear_for(&mut clear, &device).unwrap();
+        assert!(Arc::ptr_eq(&active, &device.active_table().unwrap()));
+
+        {
+            let mut lifecycle = device.lock_lifecycle();
+            lifecycle.isolate_removal();
+            lifecycle.stop_and_drain_io();
+            lifecycle.clear_removed_tables().unwrap();
+        }
+        assert_eq!(
+            table_clear_for(&mut clear, &device).unwrap_err().error(),
+            Errno::ENXIO
+        );
+        manager.remove("clear-test").unwrap();
+        drop(active);
+        drop(device);
+        aster_block::unregister(backing).unwrap();
+    }
+
+    #[ktest]
+    fn clear_reports_selected_table_and_preserves_suspension() {
+        let manager = aster_dm::DmManager::new().unwrap();
+        let device = manager.create("clear-status".into(), None, None).unwrap();
+        let backing = DeviceId::new(MajorId::new(510), MinorId::new(169));
+        aster_block::register(Arc::new(Backing(backing))).unwrap();
+        let mut request = buffer("clear-status", backing);
+        write_u32(&mut request, OFF_FLAGS, READONLY_FLAG);
+        table_load_for_device_with_primary(&mut request, &device, |_| Ok(())).unwrap();
+        let mut resume = vec![0u8; FIXED_PREFIX_SIZE];
+        resume_device_for(&mut resume, &device).unwrap();
+        let active = device.active_table().unwrap();
+        assert!(active.is_readonly());
+
+        write_u32(&mut request, OFF_FLAGS, 0);
+        table_load_for_device_with_primary(&mut request, &device, |_| Ok(())).unwrap();
+        device.lock_lifecycle().suspend().unwrap();
+        let mut clear = vec![0u8; FIXED_PREFIX_SIZE];
+        write_u32(
+            &mut clear,
+            OFF_FLAGS,
+            QUERY_INACTIVE_TABLE_FLAG | READONLY_FLAG,
+        );
+        table_clear_for(&mut clear, &device).unwrap();
+        assert_eq!(read_u32(&clear, OFF_TARGET_COUNT), 0);
+        assert_eq!(
+            read_u32(&clear, OFF_FLAGS),
+            QUERY_INACTIVE_TABLE_FLAG | ACTIVE_PRESENT_FLAG | SUSPEND_FLAG
+        );
+        assert!(device.inactive_table().is_none());
+        assert!(Arc::ptr_eq(&active, &device.active_table().unwrap()));
+        assert!(device.is_suspended());
+
+        write_u32(&mut clear, OFF_FLAGS, 0);
+        table_clear_for(&mut clear, &device).unwrap();
+        assert_eq!(read_u32(&clear, OFF_TARGET_COUNT), 1);
+        assert_eq!(
+            read_u32(&clear, OFF_FLAGS),
+            READONLY_FLAG | ACTIVE_PRESENT_FLAG | SUSPEND_FLAG
+        );
+        resume_device_for(&mut resume, &device).unwrap();
+        assert!(!device.is_suspended());
+        assert!(Arc::ptr_eq(&active, &device.active_table().unwrap()));
+        {
+            let mut lifecycle = device.lock_lifecycle();
+            lifecycle.stop_and_drain_io();
+            lifecycle.clear_removed_tables().unwrap();
+        }
+        manager.remove("clear-status").unwrap();
+        drop(active);
+        drop(device);
+        aster_block::unregister(backing).unwrap();
+    }
 
     #[ktest]
     fn deps_select_inactive_and_active_tables_and_report_buffer_full() {

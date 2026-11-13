@@ -17,6 +17,8 @@ nixos_test_main!(
         "numeric_backing_load",
         "first_linear_resume_reads_and_writes",
         "query_table_states",
+        "clear_pending_table_preserves_active_mapping",
+        "clear_without_pending_table_and_remove",
         "suspend_and_resume_linear_mapping",
         "remove_mapping_lifecycle",
         "failed_load_preserves_active_mapping",
@@ -268,6 +270,143 @@ fn query_table_states(nixos_shell: &mut Session) -> Result<(), Error> {
     nixos_shell
         .run_cmd_and_expect_regex("dmsetup remove phase1_test", &Regex::new("(?s).*").unwrap())?;
 
+    Ok(())
+}
+
+// Discard a replacement without changing the live mapping or its data path.
+#[nixos_test]
+fn clear_pending_table_preserves_active_mapping(nixos_shell: &mut Session) -> Result<(), Error> {
+    // Refuse an existing mapping or mount before clearing only this suite's scratch files.
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"export dm_work=/tmp/aster-dm-control-plane; test ! -L "$dm_work" && test ! -e /dev/dm-0 && dm_mounts=$(findmnt -rn -o TARGET) && awk -v work="$dm_work" '$0 == work || index($0, work "/") == 1 { mounted = 1 } END { exit mounted }' <<< "$dm_mounts" && rm -rf -- "$dm_work" && mkdir -- "$dm_work""#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="$dm_work/expected" bs=4096 count=1 iflag=fullblock status=none"#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="$dm_work/expected" of=/dev/vde bs=512 seek=4096 conv=fsync,notrunc status=none"#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "dd if=/dev/zero of=/dev/vdf bs=512 seek=8192 count=8 conv=fsync,notrunc status=none",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "dmsetup create phase1_test --notable",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "dmsetup load phase1_test --table \"0 8 linear /dev/vde 4096\"",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex("dmsetup resume phase1_test", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "dmsetup load phase1_test --table \"0 8 linear /dev/vdf 8192\"",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "dmsetup table phase1_test",
+        &Regex::new("0\\ 8\\ linear.*4096").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "dmsetup table --inactive phase1_test",
+        &Regex::new("0\\ 8\\ linear.*8192").unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex("dmsetup clear phase1_test", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "dmsetup table phase1_test",
+        &Regex::new("0\\ 8\\ linear.*4096").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"test -z "$(dmsetup table --inactive phase1_test)""#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "test -b /dev/dm-0 && test \"$(blockdev --getsize64 /dev/dm-0)\" -eq 4096",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="$dm_work/actual" bs=4096 count=1 iflag=fullblock status=none && test "$(stat -c %s "$dm_work/actual")" -eq 4096 && cmp "$dm_work/expected" "$dm_work/actual""#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/urandom of="$dm_work/updated" bs=4096 count=1 iflag=fullblock status=none && test "$(stat -c %s "$dm_work/updated")" -eq 4096"#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if="$dm_work/updated" of=/dev/dm-0 bs=4096 count=1 iflag=fullblock conv=fsync,notrunc status=none"#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/vde of="$dm_work/physical" bs=4096 skip=512 count=1 iflag=fullblock status=none && test "$(stat -c %s "$dm_work/physical")" -eq 4096 && cmp "$dm_work/updated" "$dm_work/physical""#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    // A subsequent RESUME must not resurrect the discarded replacement.
+    nixos_shell
+        .run_cmd_and_expect_regex("dmsetup resume phase1_test", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "dmsetup table phase1_test",
+        &Regex::new("0\\ 8\\ linear.*4096").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"dd if=/dev/dm-0 of="$dm_work/actual" bs=4096 count=1 iflag=fullblock status=none && test "$(stat -c %s "$dm_work/actual")" -eq 4096 && cmp "$dm_work/updated" "$dm_work/actual""#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex("dmsetup remove phase1_test", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex("test ! -e /dev/dm-0", &Regex::new("(?s).*").unwrap())?;
+    Ok(())
+}
+
+// Clearing without a candidate is a no-op; removing the mapper ends its control lifetime.
+#[nixos_test]
+fn clear_without_pending_table_and_remove(nixos_shell: &mut Session) -> Result<(), Error> {
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"export dm_work=/tmp/aster-dm-control-plane; test ! -L "$dm_work" && test ! -e /dev/dm-0 && dm_mounts=$(findmnt -rn -o TARGET) && awk -v work="$dm_work" '$0 == work || index($0, work "/") == 1 { mounted = 1 } END { exit mounted }' <<< "$dm_mounts" && rm -rf -- "$dm_work" && mkdir -- "$dm_work""#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "dmsetup create phase1_test --notable",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex("dmsetup clear phase1_test", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex("test ! -e /dev/dm-0", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "dmsetup load phase1_test --table \"0 8 linear /dev/vde 4096\"",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex("dmsetup clear phase1_test", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "test -b /dev/dm-0 && test \"$(blockdev --getsize64 /dev/dm-0)\" -eq 0",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        r#"test -z "$(dmsetup table --inactive phase1_test)""#,
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "if dmsetup resume phase1_test; then false; else true; fi",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell
+        .run_cmd_and_expect_regex("dmsetup clear phase1_test", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell
+        .run_cmd_and_expect_regex("dmsetup remove phase1_test", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex("test ! -e /dev/dm-0", &Regex::new("(?s).*").unwrap())?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "if dmsetup clear phase1_test; then false; else true; fi",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
+    nixos_shell.run_cmd_and_expect_regex(
+        "if dmsetup info phase1_test; then false; else true; fi",
+        &Regex::new("(?s).*").unwrap(),
+    )?;
     Ok(())
 }
 

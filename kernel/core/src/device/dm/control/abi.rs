@@ -10,6 +10,7 @@ pub(super) const DM_DEV_REMOVE_CMD: u8 = 4;
 pub(super) const DM_DEV_SUSPEND_CMD: u8 = 6;
 pub(super) const DM_DEV_STATUS_CMD: u8 = 7;
 pub(super) const DM_TABLE_LOAD_CMD: u8 = 9;
+pub(super) const DM_TABLE_CLEAR_CMD: u8 = 10;
 pub(super) const DM_TABLE_DEPS_CMD: u8 = 11;
 pub(super) const DM_TABLE_STATUS_CMD: u8 = 12;
 pub(super) const DM_LIST_VERSIONS_CMD: u8 = 13;
