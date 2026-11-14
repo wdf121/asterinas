@@ -154,7 +154,7 @@ fn table_load_for_device_with_primary(
     lifecycle
         .load_table(table)
         .map_err(|_| Error::new(Errno::EINVAL))?;
-    fill_device_header(buffer, device, true);
+    fill_device_header(buffer, device);
     Ok(())
 }
 
@@ -216,7 +216,7 @@ fn resume_device_for(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
             )
         })?;
     }
-    fill_device_header(buffer, device, false);
+    fill_device_header(buffer, device);
     Ok(())
 }
 
@@ -226,6 +226,201 @@ mod tests {
 
     use super::{super::test_support::*, *};
     use crate::device::registry::block;
+
+    #[ktest]
+    fn mutation_headers_follow_query_selection_and_primary_opens() {
+        crate::fs::devtmpfs::init_for_ktest();
+        let manager =
+            super::super::super::DM_MANAGER.call_once(|| aster_dm::DmManager::new().unwrap());
+        let device = manager
+            .create("mutation-status".into(), None, None)
+            .unwrap();
+        let backing = DeviceId::new(MajorId::new(510), MinorId::new(170));
+        aster_block::register(Arc::new(Backing(backing))).unwrap();
+
+        let mut first = buffer("mutation-status", backing);
+        write_u32(&mut first, OFF_FLAGS, READONLY_FLAG);
+        table_load_for_device_with_primary(&mut first, &device, runtime::ensure_primary).unwrap();
+        assert_eq!(read_u32(&first, OFF_TARGET_COUNT), 0);
+        assert_eq!(read_u32(&first, OFF_FLAGS), INACTIVE_PRESENT_FLAG);
+        assert_eq!(read_u32(&first, OFF_OPEN_COUNT), 0);
+
+        let primary = crate::device::lookup(crate::device::DeviceType::Block, device.id()).unwrap();
+        let opened = primary.open().unwrap();
+        let second_open = primary.open().unwrap();
+        assert_eq!(block::open_count(device.id()), Some(2));
+
+        // Reloading the candidate with an inactive query reports its own mode.
+        let mut first = buffer("mutation-status", backing);
+        write_u32(
+            &mut first,
+            OFF_FLAGS,
+            READONLY_FLAG | QUERY_INACTIVE_TABLE_FLAG,
+        );
+        table_load_for_device_with_primary(&mut first, &device, runtime::ensure_primary).unwrap();
+        assert_eq!(read_u32(&first, OFF_TARGET_COUNT), 1);
+        assert_eq!(
+            read_u32(&first, OFF_FLAGS),
+            READONLY_FLAG | QUERY_INACTIVE_TABLE_FLAG | INACTIVE_PRESENT_FLAG
+        );
+        assert_eq!(read_u32(&first, OFF_OPEN_COUNT), 2);
+
+        let mut transition = vec![0u8; FIXED_PREFIX_SIZE];
+        write_u32(&mut transition, OFF_FLAGS, QUERY_INACTIVE_TABLE_FLAG);
+        resume_device_for(&mut transition, &device).unwrap();
+        assert_eq!(read_u32(&transition, OFF_TARGET_COUNT), 0);
+        assert_eq!(
+            read_u32(&transition, OFF_FLAGS),
+            QUERY_INACTIVE_TABLE_FLAG | ACTIVE_PRESENT_FLAG
+        );
+        assert_eq!(read_u32(&transition, OFF_OPEN_COUNT), 2);
+        assert!(device.active_table().unwrap().is_readonly());
+
+        // Use fresh request bytes: LOAD overwrites the input target count and mode.
+        for query in [0, QUERY_INACTIVE_TABLE_FLAG] {
+            let mut replacement = vec![0u8; DM_IOCTL_HEADER_SIZE + 2 * 64];
+            write_u32(
+                &mut replacement,
+                OFF_DATA_START,
+                DM_IOCTL_HEADER_SIZE as u32,
+            );
+            write_u32(&mut replacement, OFF_TARGET_COUNT, 2);
+            write_u32(&mut replacement, OFF_FLAGS, query);
+            for index in 0..2 {
+                let spec = DM_IOCTL_HEADER_SIZE + index * 64;
+                write_u64(&mut replacement, spec, index as u64 * 8);
+                write_u64(&mut replacement, spec + 8, 8);
+                write_u32(&mut replacement, spec + 20, 64);
+                replacement[spec + 24..spec + 30].copy_from_slice(b"linear");
+                let params =
+                    alloc::format!("{}:{} 0", backing.major().get(), backing.minor().get());
+                replacement[spec + DM_TARGET_SPEC_SIZE..spec + DM_TARGET_SPEC_SIZE + params.len()]
+                    .copy_from_slice(params.as_bytes());
+            }
+            table_load_for_device_with_primary(&mut replacement, &device, runtime::ensure_primary)
+                .unwrap();
+            let (count, mode) = if query == 0 {
+                (1, READONLY_FLAG)
+            } else {
+                (2, 0)
+            };
+            assert_eq!(read_u32(&replacement, OFF_TARGET_COUNT), count);
+            assert_eq!(
+                read_u32(&replacement, OFF_FLAGS),
+                query | mode | ACTIVE_PRESENT_FLAG | INACTIVE_PRESENT_FLAG
+            );
+            assert_eq!(read_u32(&replacement, OFF_OPEN_COUNT), 2);
+        }
+
+        for query in [0, QUERY_INACTIVE_TABLE_FLAG] {
+            write_u32(&mut transition, OFF_FLAGS, SUSPEND_FLAG | query);
+            resume_device_for(&mut transition, &device).unwrap();
+            let (count, mode) = if query == 0 {
+                (1, READONLY_FLAG)
+            } else {
+                (2, 0)
+            };
+            assert_eq!(read_u32(&transition, OFF_TARGET_COUNT), count);
+            assert_eq!(
+                read_u32(&transition, OFF_FLAGS),
+                query | mode | SUSPEND_FLAG | ACTIVE_PRESENT_FLAG | INACTIVE_PRESENT_FLAG
+            );
+            assert_eq!(read_u32(&transition, OFF_OPEN_COUNT), 2);
+        }
+        write_u32(
+            &mut transition,
+            OFF_FLAGS,
+            QUERY_INACTIVE_TABLE_FLAG | READONLY_FLAG,
+        );
+        resume_device_for(&mut transition, &device).unwrap();
+        assert_eq!(read_u32(&transition, OFF_TARGET_COUNT), 0);
+        assert_eq!(
+            read_u32(&transition, OFF_FLAGS),
+            QUERY_INACTIVE_TABLE_FLAG | ACTIVE_PRESENT_FLAG
+        );
+        assert_eq!(read_u32(&transition, OFF_OPEN_COUNT), 2);
+        assert_eq!(device.active_table().unwrap().target_count(), 2);
+        assert!(!device.active_table().unwrap().is_readonly());
+
+        // Exercise STATUS lookup and selection, not only the shared encoder.
+        let assert_status_fn = |query, count, flags| {
+            let mut status = vec![0u8; FIXED_PREFIX_SIZE];
+            write_u64(&mut status, OFF_DEV, device.id().as_encoded_u64());
+            write_u32(&mut status, OFF_FLAGS, query | READONLY_FLAG);
+            super::super::device::device_status(&mut status).unwrap();
+            assert_eq!(read_u32(&status, OFF_TARGET_COUNT), count);
+            assert_eq!(read_u32(&status, OFF_FLAGS), query | flags);
+            assert_eq!(read_u32(&status, OFF_OPEN_COUNT), 2);
+        };
+        assert_status_fn(0, 2, ACTIVE_PRESENT_FLAG);
+        assert_status_fn(QUERY_INACTIVE_TABLE_FLAG, 0, ACTIVE_PRESENT_FLAG);
+
+        // CLEAR must preserve open accounting and strictly select the remaining table.
+        for query in [0, QUERY_INACTIVE_TABLE_FLAG] {
+            let mut candidate = buffer("mutation-status", backing);
+            write_u32(&mut candidate, OFF_FLAGS, READONLY_FLAG);
+            table_load_for_device_with_primary(&mut candidate, &device, runtime::ensure_primary)
+                .unwrap();
+            assert_status_fn(0, 2, ACTIVE_PRESENT_FLAG | INACTIVE_PRESENT_FLAG);
+            assert_status_fn(
+                QUERY_INACTIVE_TABLE_FLAG,
+                1,
+                ACTIVE_PRESENT_FLAG | INACTIVE_PRESENT_FLAG | READONLY_FLAG,
+            );
+            let mut clear = vec![0u8; FIXED_PREFIX_SIZE];
+            write_u32(&mut clear, OFF_FLAGS, query | READONLY_FLAG);
+            table_clear_for(&mut clear, &device).unwrap();
+            assert_eq!(
+                read_u32(&clear, OFF_TARGET_COUNT),
+                if query == 0 { 2 } else { 0 }
+            );
+            assert_eq!(read_u32(&clear, OFF_FLAGS), query | ACTIVE_PRESENT_FLAG);
+            assert_eq!(read_u32(&clear, OFF_OPEN_COUNT), 2);
+            assert!(device.inactive_table().is_none());
+            assert_eq!(device.active_table().unwrap().target_count(), 2);
+            assert!(!device.active_table().unwrap().is_readonly());
+        }
+
+        // A running mapper implicitly suspends and switches on RESUME.
+        for query in [0, QUERY_INACTIVE_TABLE_FLAG] {
+            let mut candidate = buffer("mutation-status", backing);
+            write_u32(&mut candidate, OFF_FLAGS, READONLY_FLAG);
+            table_load_for_device_with_primary(&mut candidate, &device, runtime::ensure_primary)
+                .unwrap();
+            assert!(!device.is_suspended());
+            write_u32(&mut transition, OFF_FLAGS, query | READONLY_FLAG);
+            resume_device_for(&mut transition, &device).unwrap();
+            assert_eq!(
+                read_u32(&transition, OFF_TARGET_COUNT),
+                if query == 0 { 1 } else { 0 }
+            );
+            assert_eq!(
+                read_u32(&transition, OFF_FLAGS),
+                query | ACTIVE_PRESENT_FLAG | if query == 0 { READONLY_FLAG } else { 0 }
+            );
+            assert_eq!(read_u32(&transition, OFF_OPEN_COUNT), 2);
+            assert!(!device.is_suspended());
+            assert!(device.inactive_table().is_none());
+            assert_eq!(device.active_table().unwrap().target_count(), 1);
+            assert!(device.active_table().unwrap().is_readonly());
+            assert_status_fn(0, 1, ACTIVE_PRESENT_FLAG | READONLY_FLAG);
+            assert_status_fn(QUERY_INACTIVE_TABLE_FLAG, 0, ACTIVE_PRESENT_FLAG);
+        }
+        drop(second_open);
+        write_u32(&mut transition, OFF_FLAGS, 0);
+        resume_device_for(&mut transition, &device).unwrap();
+        assert_eq!(read_u32(&transition, OFF_OPEN_COUNT), 1);
+        assert_eq!(read_u32(&transition, OFF_TARGET_COUNT), 1);
+        drop(opened);
+        resume_device_for(&mut transition, &device).unwrap();
+        assert_eq!(read_u32(&transition, OFF_OPEN_COUNT), 0);
+
+        drop(primary);
+        block::unregister_runtime_primary(device.id()).unwrap();
+        manager.remove("mutation-status").unwrap();
+        drop(device);
+        aster_block::unregister(backing).unwrap();
+    }
 
     #[ktest]
     fn clear_discards_only_inactive_table_and_respects_removal() {
@@ -248,6 +443,7 @@ mod tests {
         resume[OFF_NAME..OFF_NAME + 10].copy_from_slice(b"clear-test");
         resume_device_for(&mut resume, &device).unwrap();
         let active = device.active_table().unwrap();
+        let mut request = buffer("clear-test", backing);
         write_u32(&mut request, OFF_FLAGS, READONLY_FLAG);
         table_load_for_device_with_primary(&mut request, &device, |_| Ok(())).unwrap();
         assert!(device.inactive_table().unwrap().is_readonly());
@@ -296,7 +492,7 @@ mod tests {
         let active = device.active_table().unwrap();
         assert!(active.is_readonly());
 
-        write_u32(&mut request, OFF_FLAGS, 0);
+        let mut request = buffer("clear-status", backing);
         table_load_for_device_with_primary(&mut request, &device, |_| Ok(())).unwrap();
         device.lock_lifecycle().suspend().unwrap();
         let mut clear = vec![0u8; FIXED_PREFIX_SIZE];
@@ -637,7 +833,7 @@ mod tests {
             read_u32(&replacement, OFF_FLAGS) & INACTIVE_PRESENT_FLAG,
             INACTIVE_PRESENT_FLAG
         );
-        assert_eq!(read_u32(&replacement, OFF_TARGET_COUNT), 1);
+        assert_eq!(read_u32(&replacement, OFF_TARGET_COUNT), 0);
         drop(replacement);
         drop(striped);
         drop(invalid);
@@ -728,7 +924,10 @@ mod tests {
             read_u32(&replacement, OFF_FLAGS) & (ACTIVE_PRESENT_FLAG | INACTIVE_PRESENT_FLAG),
             ACTIVE_PRESENT_FLAG | INACTIVE_PRESENT_FLAG
         );
-        assert_eq!(read_u32(&replacement, OFF_FLAGS) & READONLY_FLAG, 0);
+        assert_eq!(
+            read_u32(&replacement, OFF_FLAGS) & READONLY_FLAG,
+            READONLY_FLAG
+        );
         write_u32(&mut resume, OFF_FLAGS, SUSPEND_FLAG);
         resume_device_for(&mut resume, &device).unwrap();
         assert!(device.is_suspended());

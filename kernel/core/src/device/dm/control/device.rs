@@ -43,7 +43,7 @@ pub(super) fn remove_device(buffer: &mut [u8]) -> Result<()> {
     }
     lifecycle.isolate_removal();
     lifecycle.stop_and_drain_io();
-    fill_device_header(buffer, &device, false);
+    fill_device_header(buffer, &device);
     lifecycle
         .clear_removed_tables()
         .map_err(|_| Error::new(Errno::EINVAL))?;
@@ -75,7 +75,7 @@ pub(super) fn create_device(buffer: &mut [u8]) -> Result<()> {
         .unwrap()
         .create(name, uuid, requested_minor)
         .map_err(map_create_error)?;
-    fill_device_header(buffer, &device, false);
+    fill_device_header(buffer, &device);
     Ok(())
 }
 
@@ -104,48 +104,14 @@ fn validate_mapper_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn fill_device_header(buffer: &mut [u8], device: &DmDevice, prefer_inactive: bool) {
+pub(super) fn fill_device_header(buffer: &mut [u8], device: &DmDevice) {
     let (active, inactive) = device.table_snapshot();
-    // LOAD reports the candidate; RESUME describes the table currently serving I/O.
-    let selected = if prefer_inactive {
-        inactive.as_ref().or(active.as_ref())
-    } else {
-        active.as_ref().or(inactive.as_ref())
-    };
-    write_u32(
-        buffer,
-        OFF_TARGET_COUNT,
-        selected.map_or(0, |table| table.target_count() as u32),
+    let selected = selected_table(
+        &active,
+        &inactive,
+        read_u32(buffer, OFF_FLAGS) & QUERY_INACTIVE_TABLE_FLAG != 0,
     );
-    write_u32(buffer, OFF_OPEN_COUNT, 0);
-    write_u32(buffer, OFF_EVENT_NR, 0);
-    write_u64(buffer, OFF_DEV, device.id().as_encoded_u64());
-    let mut flags = read_u32(buffer, OFF_FLAGS)
-        & !(READONLY_FLAG
-            | SUSPEND_FLAG
-            | ACTIVE_PRESENT_FLAG
-            | INACTIVE_PRESENT_FLAG
-            | INTERNAL_SUSPEND_FLAG);
-    if active.is_some() {
-        flags |= ACTIVE_PRESENT_FLAG;
-    }
-    if inactive.is_some() {
-        flags |= INACTIVE_PRESENT_FLAG;
-    }
-    if selected.is_some_and(|table| table.is_readonly()) {
-        flags |= READONLY_FLAG;
-    }
-    if device.is_suspended() {
-        flags |= SUSPEND_FLAG;
-    }
-    write_u32(buffer, OFF_FLAGS, flags);
-    let name = device.mapper_name();
-    buffer[OFF_NAME..OFF_NAME + NAME_LEN].fill(0);
-    buffer[OFF_NAME..OFF_NAME + name.len()].copy_from_slice(name.as_bytes());
-    buffer[OFF_UUID..OFF_UUID + UUID_LEN].fill(0);
-    if let Some(uuid) = device.uuid() {
-        buffer[OFF_UUID..OFF_UUID + uuid.len()].copy_from_slice(&uuid);
-    }
+    query_header(buffer, device, active.as_ref(), inactive.as_ref(), selected);
 }
 
 pub(super) fn query_header(
@@ -161,7 +127,7 @@ pub(super) fn query_header(
         selected.map_or(0, |table| table.target_count() as u32),
     );
     // CREATE has no published block wrapper; after LOAD, absence is a transient registry state.
-    // Queries report zero opens when there is no published primary device.
+    // Report zero opens when there is no published primary device.
     write_u32(
         buffer,
         OFF_OPEN_COUNT,
