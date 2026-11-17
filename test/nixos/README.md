@@ -215,7 +215,10 @@ Do not rerun preparation, run another destructive disk test, run `make clean`, o
 
 Concurrent-I/O and hot raw-mapping resize tests belong to the dmsetup suite, not these LVM workflows. Both preparation and recovery reuse `/dev/dm-0` for each LV: cases run sequentially, activate only their own LV, and deactivate it before the next case. They require no published `/dev/dm-*` nodes at each case boundary and check that `/dev/dm-0` is a block device after activation. They do not depend on `/dev/mapper` aliases or query LVM's kernel device numbers. The suite is not part of the ordinary device-mapper suite or the NixOS CI matrix.
 
-Both LVM suites use the guest's default LVM configuration and require `e2fsprogs` and `lvm2`.
+Both LVM suites require `e2fsprogs` and `lvm2`.
+The `device-mapper-lvm` suite's `extra_config.nix` sets `global/use_aio = 0` because Asterinas does not yet support Linux native AIO.
+This selects LVM's synchronous I/O engine directly instead of warning and falling back on each invocation; it does not add kernel AIO support or change application I/O through activated LVs.
+This override applies to images built for that suite, not the shared distribution defaults; the recovery suite does not independently specify it.
 All three suite configurations supply these packages, but package availability alone does not establish an old image's LVM configuration.
 The suite Rust sources and `extra_config.nix` files do not set `LVM_SYSTEM_DIR`, `udev_sync`, `udev_rules`, or `use_devicesfile`.
 The shared distribution configuration still disables the udev service (`services.udev.enable = false`); this is separate from LVM's own synchronization settings.
