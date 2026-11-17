@@ -19,9 +19,9 @@ pub(super) fn sys_semctl(
     arg: Vaddr,
     ctx: &Context,
 ) -> Result<SyscallReturn> {
-    let Ok(semid) = IpcId::try_from(semid.cast_unsigned()) else {
-        return_errno_with_message!(Errno::EINVAL, "non-positive semaphore IDs are invalid");
-    };
+    if semid < 0 {
+        return_errno_with_message!(Errno::EINVAL, "the semaphore ID is negative");
+    }
     let cmd = IpcControlCmd::try_from(op)?;
 
     debug!(
@@ -32,7 +32,19 @@ pub(super) fn sys_semctl(
     let ns_proxy = ctx.thread_local.borrow_ns_proxy();
     let ipc_ns = ns_proxy.unwrap().ipc_ns();
 
+    // SEM_INFO queries the namespace, so neither semid nor semnum selects an object.
+    if matches!(cmd, IpcControlCmd::SEM_INFO) {
+        let (info, max_id) = ipc_ns.sem_info();
+        ctx.user_space().write_val(arg, &info)?;
+        return Ok(SyscallReturn::Return(max_id as isize));
+    }
+
+    let Ok(semid) = IpcId::try_from(semid.cast_unsigned()) else {
+        return_errno_with_message!(Errno::EINVAL, "non-positive semaphore IDs are invalid");
+    };
+
     match cmd {
+        IpcControlCmd::SEM_INFO => unreachable!("SEM_INFO is handled before object lookup"),
         IpcControlCmd::IPC_RMID => {
             ipc_ns.remove_sem_set(semid, ctx.posix_thread)?;
         }

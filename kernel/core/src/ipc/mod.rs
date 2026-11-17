@@ -53,6 +53,7 @@ pub(crate) enum IpcControlCmd {
     SEM_GETZCNT = 15,
     SEM_SETVAL = 16,
     // SEM_SETALL = 17,
+    SEM_INFO = 19,
 }
 
 #[derive(Debug)]

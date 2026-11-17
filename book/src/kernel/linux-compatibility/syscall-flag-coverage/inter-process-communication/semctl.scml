@@ -29,3 +29,11 @@ semctl(
     cmd = IPC_STAT,
     arg
 );
+
+// Retrieve semaphore limits and usage in the current IPC namespace
+semctl(
+    semid,
+    semnum,
+    cmd = SEM_INFO,
+    arg
+);

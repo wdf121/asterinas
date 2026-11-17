@@ -63,9 +63,13 @@ Supported functionality in SCML:
 {{#include semctl.scml}}
 ```
 
+`SEM_INFO` returns semaphore limits and current usage in the caller's IPC namespace,
+and the highest occupied ID slot (zero for an empty namespace).
+No semaphore set is selected by `semid`, and `semnum` is ignored for this command.
+As on Linux, a negative `semid` is rejected with `EINVAL`.
+
 Unsupported commands:
 * `IPC_INFO`
-* `SEM_INFO`
 * `SEM_STAT`
 * `SEM_STAT_ANY`
 * `GETALL`

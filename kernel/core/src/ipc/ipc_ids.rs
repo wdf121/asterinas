@@ -44,6 +44,12 @@ impl<T> IpcIds<T> {
         Ok(op(object))
     }
 
+    /// Calls `op` with a consistent, read-only view of all objects.
+    pub(super) fn with_objects<R>(&self, op: impl FnOnce(&BTreeMap<IpcId, T>) -> R) -> R {
+        let objects = self.objects.read();
+        op(&objects)
+    }
+
     /// Removes the object identified by `id`.
     pub(super) fn remove<F>(&self, id: IpcId, may_remove: F) -> Result<()>
     where

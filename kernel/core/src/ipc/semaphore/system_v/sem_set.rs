@@ -21,7 +21,6 @@ pub(crate) const SEMMNI: usize = 32000;
 /// Maximum number of semaphores per semaphore ID.
 pub(crate) const SEMMSL: usize = 32000;
 /// Maximum number of semaphores in all semaphore sets.
-#[expect(dead_code)]
 pub(crate) const SEMMNS: usize = SEMMNI * SEMMSL;
 /// Maximum number of operations for semop.
 pub(crate) const SEMOPM: usize = 500;
@@ -30,6 +29,45 @@ pub(crate) const SEMVMX: i32 = 32767;
 /// Maximum value that can be recorded for semaphore adjustment (SEM_UNDO).
 #[expect(dead_code)]
 pub(crate) const SEMAEM: i32 = SEMVMX;
+
+/// Semaphore limits and usage returned by `SEM_INFO`.
+// Reference: <https://elixir.bootlin.com/linux/v6.18/source/include/uapi/linux/sem.h>.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod)]
+pub(crate) struct SemInfo {
+    semmap: i32,
+    semmni: i32,
+    semmns: i32,
+    semmnu: i32,
+    semmsl: i32,
+    semopm: i32,
+    semume: i32,
+    semusz: i32,
+    semvmx: i32,
+    semaem: i32,
+}
+
+impl SemInfo {
+    pub(in crate::ipc) fn new(num_sets: usize, num_sems: usize) -> Self {
+        // The namespace has at most SEMMNI sets, each with at most SEMMSL semaphores.
+        const { assert!(SEMMNS <= i32::MAX as usize) };
+        debug_assert!(num_sets <= SEMMNI && num_sems <= SEMMNS);
+
+        Self {
+            // Linux retains these unused historical limits for ABI compatibility.
+            semmap: SEMMNS as i32,
+            semmni: SEMMNI as i32,
+            semmns: SEMMNS as i32,
+            semmnu: SEMMNS as i32,
+            semmsl: SEMMSL as i32,
+            semopm: SEMOPM as i32,
+            semume: SEMOPM as i32,
+            semusz: num_sets as i32,
+            semvmx: SEMVMX,
+            semaem: num_sems as i32,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct SemaphoreSet {
@@ -306,5 +344,34 @@ impl Drop for SemaphoreSet {
             }
         }
         pending_const.clear();
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn sem_info_matches_linux_abi() {
+        assert_eq!(size_of::<SemInfo>(), 40);
+        assert_eq!(align_of::<SemInfo>(), 4);
+        let info = SemInfo::new(2, 5);
+        let expected: [i32; 10] = [
+            1_024_000_000,
+            32_000,
+            1_024_000_000,
+            1_024_000_000,
+            32_000,
+            500,
+            500,
+            2,
+            32_767,
+            5,
+        ];
+        for (actual, expected) in info.as_bytes().as_chunks::<4>().0.iter().zip(expected) {
+            assert_eq!(*actual, expected.to_ne_bytes());
+        }
     }
 }

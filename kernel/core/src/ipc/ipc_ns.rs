@@ -17,7 +17,7 @@ use super::{
     ipc_ids::IpcIds,
     semaphore::system_v::{
         PermissionMode,
-        sem_set::{SEMMNI, SemaphoreSet},
+        sem_set::{SEMMNI, SemInfo, SemaphoreSet},
     },
 };
 use crate::{
@@ -88,6 +88,16 @@ impl IpcNamespace {
             CapSet::SYS_ADMIN,
         ))?;
         Ok(Self::new(owner))
+    }
+
+    /// Returns semaphore limits, usage, and the highest occupied ID slot.
+    pub(crate) fn sem_info(&self) -> (SemInfo, u32) {
+        self.sem_ids.with_objects(|objects| {
+            let num_sems = objects.values().map(SemaphoreSet::num_sems).sum();
+            // IDs are allocator slots; zero is reserved and also denotes an empty table.
+            let max_id = objects.last_key_value().map_or(0, |(id, _)| id.get());
+            (SemInfo::new(objects.len(), num_sems), max_id)
+        })
     }
 
     /// Calls `op` with the semaphore set identified by `semid`.
@@ -233,5 +243,48 @@ impl NsCommonOps for IpcNamespace {
 
     fn stashed_dentry(&self) -> &StashedDentry {
         &self.stashed_dentry
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    fn assert_sem_info(ns: &IpcNamespace, num_sets: usize, num_sems: usize, max_id: u32) {
+        let (info, actual_max_id) = ns.sem_info();
+        assert_eq!(info.as_bytes(), SemInfo::new(num_sets, num_sems).as_bytes());
+        assert_eq!(actual_max_id, max_id);
+    }
+
+    #[ktest]
+    fn sem_info_tracks_creation_and_removal() {
+        let ns = IpcNamespace::new(UserNamespace::get_init_singleton().clone());
+        let credentials: Credentials = Credentials::new_root();
+        assert_sem_info(&ns, 0, 0, 0);
+
+        let first = ns
+            .create_sem_set(2, 0o600, credentials.dup().restrict())
+            .unwrap();
+        let second = ns.create_sem_set(3, 0o600, credentials.restrict()).unwrap();
+        assert_sem_info(&ns, 2, 5, second.get());
+
+        ns.sem_ids.remove(second, |_| Ok(())).unwrap();
+        assert_sem_info(&ns, 1, 2, first.get());
+        ns.sem_ids.remove(first, |_| Ok(())).unwrap();
+        assert_sem_info(&ns, 0, 0, 0);
+    }
+
+    #[ktest]
+    fn sem_info_is_namespace_local() {
+        let owner = UserNamespace::get_init_singleton();
+        let first = IpcNamespace::new(owner.clone());
+        let second = IpcNamespace::new(owner.clone());
+        let credentials = Credentials::<ReadOp>::new_root();
+        let id = first.create_sem_set(4, 0o600, credentials).unwrap();
+
+        assert_sem_info(&first, 1, 4, id.get());
+        assert_sem_info(&second, 0, 0, 0);
     }
 }
