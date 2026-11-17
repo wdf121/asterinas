@@ -31,7 +31,6 @@ use crate::{
         posix_thread::{PosixThread, ThreadLocal, allocate_posix_tid},
         stats::PROCESS_CREATION_COUNTER,
     },
-    sched::Nice,
     thread::{AsThread, Tid},
     vm::vmar::{Vmar, VmarHandle},
 };
@@ -450,6 +449,7 @@ fn clone_child_task(
             credentials,
             child_vmar,
         )
+        .sched_attr(ctx.thread.sched_attr().inherit())
         .process(posix_thread.weak_process().clone())
         .sig_mask(sig_mask)
         .file_table(child_file_table)
@@ -559,9 +559,6 @@ fn clone_child_process(
     // Inherit the parent's resource limits
     let child_resource_limits = process.resource_limits().clone();
 
-    // Inherit the parent's nice value
-    let child_nice = process.nice().load(Ordering::Relaxed);
-
     // Inherit the parent's OOM score adjustment
     let child_oom_score_adj = process.oom_score_adj().load(Ordering::Relaxed);
 
@@ -586,6 +583,7 @@ fn clone_child_process(
                 credentials,
                 child_vmar,
             )
+            .sched_attr(ctx.thread.sched_attr().inherit())
             .sig_mask(child_sig_mask)
             .file_table(child_file_table)
             .fs(child_fs)
@@ -612,7 +610,6 @@ fn clone_child_process(
             child_tid,
             child_vmar_arc,
             child_resource_limits,
-            child_nice,
             child_oom_score_adj,
             child_sig_dispositions,
             child_user_ns,
@@ -831,12 +828,10 @@ fn clone_ns_proxy(
     parent_ns_proxy.new_clone(user_ns, process, posix_thread, clone_flags)
 }
 
-#[expect(clippy::too_many_arguments)]
 fn create_child_process(
     pid: Pid,
     vmar: Arc<Vmar>,
     resource_limits: ResourceLimits,
-    nice: Nice,
     oom_score_adj: i16,
     sig_dispositions: Arc<Mutex<SigDispositions>>,
     user_ns: Arc<UserNamespace>,
@@ -846,7 +841,6 @@ fn create_child_process(
         pid,
         vmar,
         resource_limits,
-        nice,
         oom_score_adj,
         sig_dispositions,
         user_ns,

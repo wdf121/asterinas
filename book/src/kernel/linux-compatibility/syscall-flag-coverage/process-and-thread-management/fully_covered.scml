@@ -86,7 +86,7 @@ setfsgid(fsgid);
 // Determine CPU and NUMA node on which the calling thread is running
 getcpu(cpu, node);
 
-// Get/set program scheduling priority
+// Get/set per-thread nice; who selects a TID, process group, or real UID
 getpriority(which = PRIO_PROCESS | PRIO_PGRP | PRIO_USER, who);
 setpriority(which = PRIO_PROCESS | PRIO_PGRP | PRIO_USER, who, prio);
 

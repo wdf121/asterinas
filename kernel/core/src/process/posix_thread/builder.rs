@@ -21,7 +21,7 @@ use crate::{
         posix_thread::{ThreadName, thread_local::SuppUserContext},
         signal::{sig_mask::AtomicSigMask, sig_queues::SigQueues},
     },
-    sched::{Nice, SchedPolicy},
+    sched::{SchedAttr, SchedPolicy},
     thread::{Thread, Tid, task},
     time::{TimerManager, clocks::ProfClock},
     vm::vmar::VmarHandle,
@@ -44,7 +44,7 @@ pub(crate) struct PosixThreadBuilder {
     fs: Option<Arc<ThreadFsInfo>>,
     sig_mask: AtomicSigMask,
     sig_queues: SigQueues,
-    sched_policy: SchedPolicy,
+    sched_attr: SchedAttr,
     supp_user_context: SuppUserContext,
     user_ns: Option<Arc<UserNamespace>>,
     ns_proxy: Option<Arc<NsProxy>>,
@@ -72,12 +72,17 @@ impl PosixThreadBuilder {
             fs: None,
             sig_mask: AtomicSigMask::new_empty(),
             sig_queues: SigQueues::new(),
-            sched_policy: SchedPolicy::Fair(Nice::default()),
+            sched_attr: SchedAttr::new(SchedPolicy::default()),
             supp_user_context: SuppUserContext::new(),
             user_ns: None,
             ns_proxy: None,
             default_timer_slack_ns: 50_000, // 50 usec default slack
         }
+    }
+
+    pub(crate) fn sched_attr(mut self, sched_attr: SchedAttr) -> Self {
+        self.sched_attr = sched_attr;
+        self
     }
 
     pub(crate) fn process(mut self, process: Weak<Process>) -> Self {
@@ -162,7 +167,7 @@ impl PosixThreadBuilder {
             fs,
             sig_mask,
             sig_queues,
-            sched_policy,
+            sched_attr,
             supp_user_context,
             user_ns,
             ns_proxy,
@@ -214,7 +219,7 @@ impl PosixThreadBuilder {
                 weak_task.clone(),
                 posix_thread,
                 cpu_affinity,
-                sched_policy,
+                sched_attr,
             ));
 
             let thread_local = ThreadLocal::new(

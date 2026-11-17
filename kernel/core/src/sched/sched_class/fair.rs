@@ -154,7 +154,7 @@ impl FairAttr {
         self.vruntime.fetch_add(delta, Ordering::Relaxed) + delta
     }
 
-    fn fetch_weight(&self) -> (u64, u64) {
+    pub(super) fn fetch_weight(&self) -> (u64, u64) {
         // Synchronization is done via the `pending_weight` lock. Therefore, no additional ordering
         // is required to access the atomic variable.
         let weight = self.weight.load(Ordering::Relaxed);

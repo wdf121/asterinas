@@ -2,7 +2,7 @@
 
 #![short_vis_path::add(pid)]
 
-use core::{sync::atomic::Ordering, time::Duration};
+use core::time::Duration;
 
 use aster_util::printer::VmPrinter;
 use ostd::timer::TIMER_FREQ;
@@ -196,8 +196,7 @@ impl ProcFileOps for StatFileOps {
             )
         };
 
-        let (priority, rt_priority, policy) = sched_values(&thread);
-        let nice = process.nice().load(Ordering::Relaxed).value().get();
+        let (priority, rt_priority, policy, nice) = sched_values(&thread);
         let num_threads = process.tasks().lock().as_slice().len();
         let itrealvalue =
             duration_to_jiffies(process.timer_manager().alarm_timer().lock().remain());
@@ -357,13 +356,13 @@ fn duration_to_jiffies(duration: Duration) -> u64 {
     sec_jiffies.saturating_add(subsec_jiffies)
 }
 
-/// Returns the `priority`, `rt_priority`, and `policy` values for `/proc/<pid>/stat`.
-fn sched_values(thread: &Thread) -> (i32, u8, i32) {
+/// Returns the `priority`, `rt_priority`, `policy`, and `nice` values for `/proc/<pid>/stat`.
+fn sched_values(thread: &Thread) -> (i32, u8, i32, i8) {
     const MAX_RT_PRIORITY: u8 = RealTimePriority::MAX.get();
     const RT_PRIORITY_LIMIT: u8 = MAX_RT_PRIORITY + 1;
     const NICE_TO_PRIORITY_OFFSET: i32 = 20;
 
-    let policy = thread.sched_attr().policy();
+    let (policy, nice) = thread.sched_attr().snapshot();
 
     let (priority, rt_priority) = match policy {
         SchedPolicy::Stop => (-i32::from(MAX_RT_PRIORITY) - 1, MAX_RT_PRIORITY),
@@ -379,12 +378,19 @@ fn sched_values(thread: &Thread) -> (i32, u8, i32) {
             let rt_priority = RT_PRIORITY_LIMIT - rt_prio.get();
             (-i32::from(rt_priority) - 1, rt_priority)
         }
-        SchedPolicy::Fair(nice) => (NICE_TO_PRIORITY_OFFSET + nice.value().get() as i32, 0),
+        SchedPolicy::Fair(_) | SchedPolicy::FairIdle => {
+            (NICE_TO_PRIORITY_OFFSET + i32::from(nice.value().get()), 0)
+        }
         SchedPolicy::Idle => (NICE_TO_PRIORITY_OFFSET, 0),
     };
     let linux_policy = LinuxSchedPolicy::from(policy);
 
-    (priority, rt_priority, linux_policy as i32)
+    (
+        priority,
+        rt_priority,
+        linux_policy as i32,
+        nice.value().get(),
+    )
 }
 
 /// Returns the ignored and caught standard-signal masks for `/proc/<pid>/stat`.

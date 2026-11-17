@@ -28,7 +28,7 @@ pub(super) fn sys_sched_setscheduler(
 
     let policy = attr.try_into()?;
     access_sched_attr_with(tid, ctx, |attr| {
-        attr.set_policy(policy);
+        attr.set_policy_preserving_nice(policy);
         Ok(())
     })?;
 

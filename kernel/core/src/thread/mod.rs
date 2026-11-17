@@ -12,10 +12,7 @@ use ostd::{
 };
 
 use self::{kernel_thread::AsKernelThread, stats::CONTEXT_SWITCH_COUNTER};
-use crate::{
-    prelude::*,
-    sched::{SchedAttr, SchedPolicy},
-};
+use crate::{prelude::*, sched::SchedAttr};
 
 pub(crate) mod exception;
 pub(crate) mod kernel_thread;
@@ -99,14 +96,14 @@ impl Thread {
         task: Weak<Task>,
         data: impl Send + Sync + Any,
         cpu_affinity: CpuSet,
-        sched_policy: SchedPolicy,
+        sched_attr: SchedAttr,
     ) -> Self {
         Thread {
             task,
             data: Box::new(data),
             is_exited: AtomicBool::new(false),
             cpu_affinity: AtomicCpuSet::new(cpu_affinity),
-            sched_attr: SchedAttr::new(sched_policy),
+            sched_attr,
         }
     }
 

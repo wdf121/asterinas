@@ -68,10 +68,7 @@ impl TryFrom<SchedPolicy> for LinuxSchedAttr {
                 ..Default::default()
             },
 
-            // The SCHED_IDLE policy is mapped to the highest nice value of
-            // `SchedPolicy::Fair` instead of `SchedPolicy::Idle`. Tasks of the
-            // latter policy are invisible to the user API.
-            SchedPolicy::Fair(Nice::MAX) => LinuxSchedAttr {
+            SchedPolicy::FairIdle => LinuxSchedAttr {
                 sched_policy: LinuxSchedPolicy::Idle as u32,
                 ..Default::default()
             },
@@ -119,10 +116,7 @@ impl TryFrom<LinuxSchedAttr> for SchedPolicy {
                     .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid nice number"))?,
             )),
 
-            // The SCHED_IDLE policy is mapped to the highest nice value of
-            // `SchedPolicy::Fair` instead of `SchedPolicy::Idle`. Tasks of the
-            // latter policy are invisible to the user API.
-            LinuxSchedPolicy::Idle => SchedPolicy::Fair(Nice::MAX),
+            LinuxSchedPolicy::Idle => SchedPolicy::FairIdle,
 
             LinuxSchedPolicy::Batch
             | LinuxSchedPolicy::Iso
@@ -228,10 +222,13 @@ pub(super) fn sys_sched_getattr(
         return_errno_with_message!(Errno::EINVAL, "invalid flags");
     }
 
-    let policy = access_sched_attr_with(tid, ctx, |attr| Ok(attr.policy()))?;
-    let attr: LinuxSchedAttr = policy
+    let (policy, nice) = access_sched_attr_with(tid, ctx, |attr| Ok(attr.snapshot()))?;
+    let mut attr: LinuxSchedAttr = policy
         .try_into()
         .expect("all user-visible scheduling attributes should be valid");
+    if matches!(policy, SchedPolicy::Fair(_) | SchedPolicy::FairIdle) {
+        attr.sched_nice = i32::from(nice.value().get());
+    }
     write_linux_sched_attr_to_user(attr, addr, user_size, ctx)?;
 
     Ok(SyscallReturn::Return(0))

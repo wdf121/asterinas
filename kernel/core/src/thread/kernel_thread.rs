@@ -8,7 +8,7 @@ use ostd::{
 use super::{AsThread, Thread, oops};
 use crate::{
     prelude::*,
-    sched::{Nice, SchedPolicy},
+    sched::{Nice, SchedAttr, SchedPolicy},
     vm::vmar::Vmar,
 };
 
@@ -113,7 +113,7 @@ impl ThreadOptions {
                     weak_task.clone(),
                     kernel_thread,
                     cpu_affinity,
-                    sched_policy,
+                    SchedAttr::new(sched_policy),
                 ))
             };
 

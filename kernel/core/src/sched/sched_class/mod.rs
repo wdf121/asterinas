@@ -153,8 +153,16 @@ pub(crate) struct SchedAttr {
 impl SchedAttr {
     /// Constructs a new `SchedAttr` with the given scheduling policy.
     pub(crate) fn new(policy: SchedPolicy) -> Self {
+        let nice = match policy {
+            SchedPolicy::Fair(nice) => nice,
+            _ => Nice::default(),
+        };
+        Self::with_nice(policy, nice)
+    }
+
+    fn with_nice(policy: SchedPolicy, nice: Nice) -> Self {
         Self {
-            policy: SchedPolicyState::new(policy),
+            policy: SchedPolicyState::new(policy, nice),
             last_cpu: AtomicCpuId::default(),
             real_time: {
                 let (prio, policy) = match policy {
@@ -165,6 +173,7 @@ impl SchedAttr {
             },
             fair: fair::FairAttr::new(match policy {
                 SchedPolicy::Fair(nice) => nice,
+                SchedPolicy::FairIdle => Nice::MAX,
                 _ => Nice::default(),
             }),
         }
@@ -173,6 +182,47 @@ impl SchedAttr {
     /// Retrieves the current scheduling policy of the thread.
     pub(crate) fn policy(&self) -> SchedPolicy {
         self.policy.get()
+    }
+
+    /// Returns a consistent policy and retained nice snapshot.
+    pub(crate) fn snapshot(&self) -> (SchedPolicy, Nice) {
+        self.policy.snapshot()
+    }
+
+    /// Returns the thread's nice, including while a non-normal policy is active.
+    pub(crate) fn nice(&self) -> Nice {
+        self.snapshot().1
+    }
+
+    /// Creates child attributes without inheriting runqueue accounting.
+    pub(crate) fn inherit(&self) -> Self {
+        let (policy, nice) = self.snapshot();
+        Self::with_nice(policy, nice)
+    }
+
+    /// Checks and changes nice atomically with respect to policy changes.
+    ///
+    /// `check` runs with interrupts disabled and must not acquire sleeping locks.
+    pub(crate) fn update_nice<E>(
+        &self,
+        nice: Nice,
+        check: impl FnOnce(Nice) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.policy
+            .update_nice(nice, check, |nice| self.fair.update(nice))
+    }
+
+    /// Changes policy without resetting the thread's retained nice.
+    pub(crate) fn set_policy_preserving_nice(&self, policy: SchedPolicy) {
+        self.policy
+            .set_preserving_nice(policy, |policy| match policy {
+                SchedPolicy::RealTime { rt_prio, rt_policy } => {
+                    self.real_time.update(rt_prio.get(), rt_policy);
+                }
+                SchedPolicy::Fair(nice) => self.fair.update(nice),
+                SchedPolicy::FairIdle => self.fair.update(Nice::MAX),
+                _ => {}
+            });
     }
 
     fn policy_kind(&self) -> SchedPolicyKind {
@@ -189,6 +239,7 @@ impl SchedAttr {
                 self.real_time.update(rt_prio.get(), rt_policy);
             }
             SchedPolicy::Fair(nice) => self.fair.update(nice),
+            SchedPolicy::FairIdle => self.fair.update(Nice::MAX),
             _ => {}
         });
     }
@@ -201,6 +252,7 @@ impl SchedAttr {
                     self.real_time.update(rt_prio.get(), rt_policy);
                 }
                 SchedPolicy::Fair(nice) => self.fair.update(nice),
+                SchedPolicy::FairIdle => self.fair.update(Nice::MAX),
                 _ => {}
             }
             ret
@@ -439,5 +491,67 @@ impl SchedulerStats for ClassScheduler {
 impl Default for ClassScheduler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn nice_changes_normal_policy_and_runtime_weight() {
+        let attr = SchedAttr::new(SchedPolicy::default());
+        let nice = Nice::try_from(-18).unwrap();
+        attr.update_nice(nice, |_| Ok::<(), ()>(())).unwrap();
+        assert_eq!(attr.snapshot(), (SchedPolicy::Fair(nice), nice));
+        assert_eq!(attr.fair.fetch_weight().1, fair::nice_to_weight(nice));
+        let child = attr.inherit();
+        assert_eq!(child.snapshot(), attr.snapshot());
+        assert_eq!(child.fair.fetch_weight().1, fair::nice_to_weight(nice));
+
+        let rejected = attr.update_nice(Nice::MIN, |_| Err(()));
+        assert_eq!(rejected, Err(()));
+        assert_eq!(attr.nice(), nice);
+        assert_eq!(attr.fair.fetch_weight().1, fair::nice_to_weight(nice));
+    }
+
+    #[ktest]
+    fn nice_survives_real_time_and_policy_changes() {
+        let attr = SchedAttr::new(SchedPolicy::default());
+        let rt = SchedPolicy::RealTime {
+            rt_prio: RealTimePriority::MAX,
+            rt_policy: RealTimePolicy::Fifo,
+        };
+        attr.set_policy(rt);
+        let nice = Nice::try_from(-18).unwrap();
+        attr.update_nice(nice, |_| Ok::<(), ()>(())).unwrap();
+        assert_eq!(attr.snapshot(), (rt, nice));
+        let child = attr.inherit();
+        assert_eq!(child.snapshot(), (rt, nice));
+        attr.set_policy_preserving_nice(SchedPolicy::default());
+        assert_eq!(attr.snapshot(), (SchedPolicy::Fair(nice), nice));
+        assert_eq!(attr.fair.fetch_weight().1, fair::nice_to_weight(nice));
+        // Child scheduler attributes are independent of subsequent parent updates.
+        assert_eq!(child.snapshot(), (rt, nice));
+    }
+
+    #[ktest]
+    fn maximum_nice_does_not_select_idle_policy() {
+        let attr = SchedAttr::new(SchedPolicy::default());
+        attr.update_nice(Nice::MAX, |_| Ok::<(), ()>(())).unwrap();
+        assert_eq!(
+            LinuxSchedPolicy::from(attr.policy()),
+            LinuxSchedPolicy::Normal
+        );
+        attr.set_policy(SchedPolicy::FairIdle);
+        attr.update_nice(Nice::MIN, |_| Ok::<(), ()>(())).unwrap();
+        assert_eq!(attr.snapshot(), (SchedPolicy::FairIdle, Nice::MIN));
+        assert_eq!(attr.fair.fetch_weight().1, fair::nice_to_weight(Nice::MAX));
+        assert_eq!(attr.inherit().snapshot(), attr.snapshot());
+        attr.set_policy_preserving_nice(SchedPolicy::default());
+        assert_eq!(attr.snapshot(), (SchedPolicy::Fair(Nice::MIN), Nice::MIN));
+        assert_eq!(attr.fair.fetch_weight().1, fair::nice_to_weight(Nice::MIN));
     }
 }

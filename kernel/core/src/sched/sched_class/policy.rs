@@ -21,6 +21,8 @@ pub(crate) enum SchedPolicy {
         rt_policy: RealTimePolicy,
     },
     Fair(Nice),
+    // User-visible SCHED_IDLE; distinct from the kernel-only idle class.
+    FairIdle,
     Idle,
 }
 
@@ -63,6 +65,7 @@ impl From<SchedPolicy> for LinuxSchedPolicy {
                 ..
             } => LinuxSchedPolicy::RoundRobin,
             SchedPolicy::Fair(_) | SchedPolicy::Idle => LinuxSchedPolicy::Normal,
+            SchedPolicy::FairIdle => LinuxSchedPolicy::Idle,
         }
     }
 }
@@ -81,7 +84,7 @@ impl SchedPolicy {
         match self {
             SchedPolicy::Stop => SchedPolicyKind::Stop,
             SchedPolicy::RealTime { .. } => SchedPolicyKind::RealTime,
-            SchedPolicy::Fair(_) => SchedPolicyKind::Fair,
+            SchedPolicy::Fair(_) | SchedPolicy::FairIdle => SchedPolicyKind::Fair,
             SchedPolicy::Idle => SchedPolicyKind::Idle,
         }
     }
@@ -101,14 +104,26 @@ impl From<SchedPolicyKind> for u8 {
 #[derive(Debug)]
 pub(super) struct SchedPolicyState {
     kind: AtomicSchedPolicyKind,
-    policy: SpinLock<SchedPolicy>,
+    params: SpinLock<SchedParams>,
+}
+
+enum NiceUpdate {
+    FromPolicy,
+    Preserve,
+}
+
+#[derive(Debug)]
+struct SchedParams {
+    policy: SchedPolicy,
+    // Linux retains nice even while an RT or SCHED_IDLE policy is active.
+    nice: Nice,
 }
 
 impl SchedPolicyState {
-    pub(crate) fn new(policy: SchedPolicy) -> Self {
+    pub(crate) fn new(policy: SchedPolicy, nice: Nice) -> Self {
         Self {
             kind: AtomicSchedPolicyKind::new(policy.kind()),
-            policy: SpinLock::new(policy),
+            params: SpinLock::new(SchedParams { policy, nice }),
         }
     }
 
@@ -117,11 +132,31 @@ impl SchedPolicyState {
     }
 
     pub(crate) fn get(&self) -> SchedPolicy {
-        *self.policy.disable_irq().lock()
+        self.params.disable_irq().lock().policy
     }
 
-    pub(crate) fn set(&self, mut policy: SchedPolicy, update: impl FnOnce(SchedPolicy)) {
-        let mut this = self.policy.disable_irq().lock();
+    pub(crate) fn set(&self, policy: SchedPolicy, update: impl FnOnce(SchedPolicy)) {
+        self.set_with(policy, update, NiceUpdate::FromPolicy);
+    }
+
+    pub(crate) fn set_preserving_nice(
+        &self,
+        policy: SchedPolicy,
+        update: impl FnOnce(SchedPolicy),
+    ) {
+        self.set_with(policy, update, NiceUpdate::Preserve);
+    }
+
+    fn set_with(
+        &self,
+        mut policy: SchedPolicy,
+        update: impl FnOnce(SchedPolicy),
+        nice_update: NiceUpdate,
+    ) {
+        let mut this = self.params.disable_irq().lock();
+        if matches!(nice_update, NiceUpdate::Preserve) && matches!(policy, SchedPolicy::Fair(_)) {
+            policy = SchedPolicy::Fair(this.nice);
+        }
 
         // Keep the old base slice factor if the new policy doesn't specify one.
         if let (
@@ -136,17 +171,47 @@ impl SchedPolicyState {
                 rt_policy: RealTimePolicy::RoundRobin { base_slice_factor },
                 ..
             },
-        ) = (*this, &mut policy)
+        ) = (this.policy, &mut policy)
         {
             *base_slice_factor = slot.or(*base_slice_factor);
         }
 
         update(policy);
         self.kind.store(policy.kind(), Relaxed);
-        *this = policy;
+        if let SchedPolicy::Fair(nice) = policy {
+            this.nice = nice;
+        }
+        this.policy = policy;
     }
 
     pub(crate) fn update<T>(&self, update: impl FnOnce(&mut SchedPolicy) -> T) -> T {
-        update(&mut self.policy.disable_irq().lock())
+        let mut params = self.params.disable_irq().lock();
+        let result = update(&mut params.policy);
+        if let SchedPolicy::Fair(nice) = params.policy {
+            params.nice = nice;
+        }
+        self.kind.store(params.policy.kind(), Relaxed);
+        result
+    }
+
+    pub(crate) fn snapshot(&self) -> (SchedPolicy, Nice) {
+        let params = self.params.disable_irq().lock();
+        (params.policy, params.nice)
+    }
+
+    pub(crate) fn update_nice<E>(
+        &self,
+        nice: Nice,
+        check: impl FnOnce(Nice) -> Result<(), E>,
+        update_fair: impl FnOnce(Nice),
+    ) -> Result<(), E> {
+        let mut params = self.params.disable_irq().lock();
+        check(params.nice)?;
+        params.nice = nice;
+        if let SchedPolicy::Fair(old_nice) = &mut params.policy {
+            *old_nice = nice;
+            update_fair(nice);
+        }
+        Ok(())
     }
 }

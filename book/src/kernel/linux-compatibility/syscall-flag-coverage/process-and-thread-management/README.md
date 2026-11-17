@@ -7,6 +7,20 @@ getpid, getppid, gettid, setuid, setgid, getuid, getgid, prctl and ptrace
 under this category.
 -->
 
+### `getpriority` and `setpriority`
+
+Nice values are per-thread, as on Linux.
+`PRIO_PROCESS` selects a TID, with zero selecting the calling thread.
+`PRIO_PGRP` and `PRIO_USER` select all matching threads;
+`getpriority` returns the highest priority among them.
+
+`setpriority` checks target ownership or `CAP_SYS_NICE`.
+Raising priority additionally requires an adequate target `RLIMIT_NICE`
+(encoded as `20 - nice`) or `CAP_SYS_NICE`.
+Changing nice updates normal scheduling weights without changing the policy.
+Real-time and `SCHED_IDLE` threads retain nice for later normal scheduling,
+and children inherit the calling thread's policy and nice.
+
 ### `sched_getattr` and `sched_setattr`
 
 Supported functionality in SCML:
