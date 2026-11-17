@@ -218,10 +218,11 @@ Concurrent-I/O and hot raw-mapping resize tests belong to the dmsetup suite, not
 Both LVM suites require `e2fsprogs` and `lvm2`.
 The `device-mapper-lvm` suite's `extra_config.nix` sets `global/use_aio = 0` because Asterinas does not yet support Linux native AIO.
 This selects LVM's synchronous I/O engine directly instead of warning and falling back on each invocation; it does not add kernel AIO support or change application I/O through activated LVs.
-This override applies to images built for that suite, not the shared distribution defaults; the recovery suite does not independently specify it.
+That suite also sets `activation/udev_rules = 0` and `activation/udev_sync = 0` so LVM manages its own device nodes and symlinks without waiting for udev notifications.
+These overrides apply to images built for that suite, not the shared distribution defaults; the recovery suite does not independently specify them.
 All three suite configurations supply these packages, but package availability alone does not establish an old image's LVM configuration.
-The suite Rust sources and `extra_config.nix` files do not set `LVM_SYSTEM_DIR`, `udev_sync`, `udev_rules`, or `use_devicesfile`.
-The shared distribution configuration still disables the udev service (`services.udev.enable = false`); this is separate from LVM's own synchronization settings.
+The suite Rust sources and `extra_config.nix` files do not set `LVM_SYSTEM_DIR` or `use_devicesfile`.
+The shared distribution configuration still disables the udev service (`services.udev.enable = false`); disabling that service alone does not explicitly select LVM's node-management policy.
 `make run_nixos` recompiles the Rust runner but does not rebuild the guest image.
 Before reusing an old image, inspect `printenv LVM_SYSTEM_DIR` and `lvmconfig --type full` inside the guest, as well as `/etc/lvm/lvm.conf` and any selected alternate LVM configuration directory.
 If image configuration needs updating, rebuild with `make nixos NIXOS_TEST_SUITE=device-mapper-lvm` before preparation, not between preparation and recovery.
