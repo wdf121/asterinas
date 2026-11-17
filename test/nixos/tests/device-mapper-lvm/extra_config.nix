@@ -17,6 +17,12 @@
     activation {
       udev_rules = 0
       udev_sync = 0
+
+      # Memory locking is not supported yet. Disabling this protection can
+      # cause resize failures or I/O deadlocks under memory pressure while
+      # devices are suspended; this is a test-suite workaround, not a fix.
+      reserved_stack = 0
+      reserved_memory = 0
     }
   '';
 }

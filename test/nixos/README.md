@@ -219,6 +219,11 @@ Both LVM suites require `e2fsprogs` and `lvm2`.
 The `device-mapper-lvm` suite's `extra_config.nix` sets `global/use_aio = 0` because Asterinas does not yet support Linux native AIO.
 This selects LVM's synchronous I/O engine directly instead of warning and falling back on each invocation; it does not add kernel AIO support or change application I/O through activated LVs.
 That suite also sets `activation/udev_rules = 0` and `activation/udev_sync = 0` so LVM manages its own device nodes and symlinks without waiting for udev notifications.
+That suite also sets `activation/reserved_stack = 0` and `activation/reserved_memory = 0` to disable LVM memory locking because Asterinas does not yet implement `mlock`/`munlock`.
+**Warning: this disables a safety mechanism, not just an optimization.** LVM normally locks memory to avoid page faults requiring I/O while devices are suspended for mapping-table changes.
+Without that protection, extending or shrinking LVs under high memory pressure is particularly vulnerable to failures or I/O deadlocks if required pages must be reread through a suspended device.
+Passing this suite does not establish safe operation under memory pressure; these settings only avoid unsupported syscall attempts and their warnings, and do not implement memory locking or eliminate the underlying risk.
+This workaround is limited to the test suite and must not be treated as a production safety recommendation; remove it when proper kernel memory-locking support is available.
 These overrides apply to images built for that suite, not the shared distribution defaults; the recovery suite does not independently specify them.
 All three suite configurations supply these packages, but package availability alone does not establish an old image's LVM configuration.
 The suite Rust sources and `extra_config.nix` files do not set `LVM_SYSTEM_DIR` or `use_devicesfile`.
