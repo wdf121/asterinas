@@ -59,7 +59,7 @@ fn linear_lv_recovers_after_reboot(nixos_shell: &mut Session) -> Result<(), Erro
         &Regex::new(r#"(?s).*"#).unwrap(),
     )?;
     nixos_shell.run_cmd_and_expect_regex(
-        r#"export dm_lv=phase1_offline_vg/ext2_lv dm_name=phase1_offline_vg-ext2_lv dm_dev=/dev/dm-0; test -b "$dm_dev""#,
+        r#"export dm_lv=phase1_offline_vg/ext2_lv dm_name=phase1_offline_vg-ext2_lv; export dm_dev="/dev/$dm_lv"; test -L "$dm_dev" && test -L "/dev/mapper/$dm_name" && test -b "$dm_dev" && test "$dm_dev" -ef "/dev/mapper/$dm_name""#,
         &Regex::new(r#"(?s).*"#).unwrap(),
     )?;
     nixos_shell.run_cmd_and_expect_regex(
@@ -166,7 +166,7 @@ fn striped_lv_recovers_after_reboot(nixos_shell: &mut Session) -> Result<(), Err
         &Regex::new(r#"(?s).*"#).unwrap(),
     )?;
     nixos_shell.run_cmd_and_expect_regex(
-        r#"export dm_lv=phase1_offline_vg/striped_ext2_lv dm_name=phase1_offline_vg-striped_ext2_lv dm_dev=/dev/dm-0; test -b "$dm_dev""#,
+        r#"export dm_lv=phase1_offline_vg/striped_ext2_lv dm_name=phase1_offline_vg-striped_ext2_lv; export dm_dev="/dev/$dm_lv"; test -L "$dm_dev" && test -L "/dev/mapper/$dm_name" && test -b "$dm_dev" && test "$dm_dev" -ef "/dev/mapper/$dm_name""#,
         &Regex::new(r#"(?s).*"#).unwrap(),
     )?;
     nixos_shell.run_cmd_and_expect_regex(

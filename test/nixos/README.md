@@ -213,7 +213,7 @@ These are **ordered integration cases**, not independently self-preparing tests.
 
 Do not rerun preparation, run another destructive disk test, run `make clean`, or share the images with another VM from the start of preparation until both recovery cases complete. Both final LVs must survive together for the separate `device-mapper-lvm-recovery` suite.
 
-Concurrent-I/O and hot raw-mapping resize tests belong to the dmsetup suite, not these LVM workflows. Both preparation and recovery reuse `/dev/dm-0` for each LV: cases run sequentially, activate only their own LV, and deactivate it before the next case. They require no published `/dev/dm-*` nodes at each case boundary and check that `/dev/dm-0` is a block device after activation. They do not depend on `/dev/mapper` aliases or query LVM's kernel device numbers. The suite is not part of the ordinary device-mapper suite or the NixOS CI matrix.
+Concurrent-I/O and hot raw-mapping resize tests belong to the dmsetup suite, not these LVM workflows. Preparation and recovery activate one LV at a time and require no published `/dev/dm-*` nodes at case boundaries. After activation, both suites check that `/dev/<VG>/<LV>` and `/dev/mapper/<name>` are symlinks resolving to the same block device. They access the LV through `/dev/<VG>/<LV>` without assuming a kernel minor number. The suite is not part of the ordinary device-mapper suite or the NixOS CI matrix.
 
 Both LVM suites require `e2fsprogs` and `lvm2`.
 The `device-mapper-lvm` suite's `extra_config.nix` sets `global/use_aio = 0` because Asterinas does not yet support Linux native AIO.
