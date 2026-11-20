@@ -105,7 +105,7 @@ Set `raw_disk=2` when running tests that need `/dev/vde` and `/dev/vdf`:
 make run_nixos NIXOS_TEST_SUITE=device-mapper-control-plane raw_disk=2
 ```
 
-Both the initramfs and NixOS runners use the **same** numbered images, `test/initramfs/build/raw_test_1.img` through `raw_test_18.img`. `raw_disk=N` attaches the first N images. Missing images are created as 512 MiB unformatted disks; existing images are reused without clearing, resizing, or formatting them. An existing image with a different size causes an error rather than being silently changed. The `/dev/vd*` names differ between the two guests because their other devices differ; the underlying numbered host files are identical.
+The NixOS runner uses numbered images, `test/initramfs/build/raw_test_1.img` through `raw_test_18.img`. `raw_disk=N` attaches the first N images. Missing images are created as 512 MiB unformatted disks; existing images are reused without clearing, resizing, or formatting them. An existing image with a different size causes an error rather than being silently changed.
 
 The images live in the initramfs build directory, so `make clean` deletes them along with other initramfs build artifacts. Ordinary test runs and VM shutdowns do not clear them. Existing device-mapper tests assume blank backing ranges; run tests that consume a prior boot's data separately from tests that assume blank disks. A recovery test must run setup and verification in separate VM boots.
 

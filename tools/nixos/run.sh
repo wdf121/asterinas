@@ -22,7 +22,7 @@ TARGET_ARCH=${TARGET_ARCH:-x86_64}
 SCRIPT_DIR=$(dirname "$0")
 ASTERINAS_DIR=$(realpath "${SCRIPT_DIR}/../..")
 
-# Reuse the same numbered raw images as the initramfs runner across boots.
+# Reuse numbered NixOS test disks across boots.
 append_raw_test_disks() {
     count=${raw_disk:-0}
     case "${count}" in
@@ -63,7 +63,7 @@ fi
 cd "${ASTERINAS_DIR}"
 
 # Get base QEMU arguments from qemu_args.sh script
-QEMU_ARGS=$(raw_disk=0 ${ASTERINAS_DIR}/tools/qemu_args.sh common 2>/dev/null)
+QEMU_ARGS=$(${ASTERINAS_DIR}/tools/qemu_args.sh common 2>/dev/null)
 append_raw_test_disks
 
 # Add mode-specific disk and device arguments

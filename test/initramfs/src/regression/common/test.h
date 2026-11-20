@@ -89,18 +89,11 @@
 	})
 
 static int __total_failures;
-#ifdef TEST_PROGRAM_SUMMARY
-static int __total_passes;
-#define __RECORD_PASSES(count) (__total_passes += (count))
-#else
-#define __RECORD_PASSES(count) ((void)0)
-#endif
 
 #define __TEST_SUMMARY()                                                  \
 	fprintf(stderr, "%s summary: %d tests passed, %d tests failed\n", \
 		__func__, __tests_passed, __tests_failed);                \
-	__total_failures += __tests_failed;                               \
-	__RECORD_PASSES(__tests_passed);
+	__total_failures += __tests_failed;
 
 /** Starts the definition of a test function. */
 #define FN_TEST(name)                                            \
@@ -226,10 +219,6 @@ static int __total_passes;
 
 int main(void)
 {
-#ifdef TEST_PROGRAM_SUMMARY
-	fprintf(stderr, "total summary: %d tests passed, %d tests failed\n",
-		__total_passes, __total_failures);
-#endif
 	return __total_failures ? 1 : 0;
 }
 

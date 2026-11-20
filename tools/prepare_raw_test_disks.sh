@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: MPL-2.0
 
-# Prepare the same numbered, persistent raw disks for both official VM runners.
+# Prepare the same numbered, persistent raw disks for the NixOS runner.
 set -eu
 
 case "${1-}" in
