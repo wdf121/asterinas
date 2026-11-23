@@ -26,14 +26,19 @@ use crate::{DmError, DmTable, manager::DmDeviceIdOwner};
 #[derive(Debug)]
 pub struct DmDevice {
     id_owner: DmDeviceIdOwner,
+    /// The immutable primary block-node name, `dm-N`.
     primary_name: String,
+    /// The userspace-assigned identity used by name-based control requests.
     mapper_name: Mutex<String>,
     uuid: Mutex<Option<Vec<u8>>>,
-    /// Selected under one lock so BIO admission cannot race first activation.
+    /// The active and inactive table slots.
+    /// Both slots share a lock so BIO admission cannot race first activation.
     tables: Mutex<DmDeviceTables>,
-    /// Serializes LOAD, suspend, resume, and removal transitions for this mapper.
+    /// The lock serializing LOAD, suspend, resume, and removal transitions.
     lifecycle: Mutex<()>,
     io: Arc<DmIoState>,
+    /// The irreversible cleanup-only state that excludes ordinary control operations.
+    /// Setting this flag alone does not stop BIO admission.
     removal_isolated: AtomicBool,
 }
 
@@ -44,10 +49,19 @@ struct DmIoState {
 
 #[derive(Default)]
 struct DmIoInner {
+    /// The permanent shutdown state that rejects further BIO admission.
     stopped: bool,
+    /// The recoverable pause state that queues new BIOs instead of dispatching them.
     suspended: bool,
+    /// The number of admitted submissions whose dispatch paths have not yet exited.
+    /// A synchronous completion can finish while its submission is still counted here.
     admitting: usize,
+    /// The number of admitted BIOs whose completion responsibilities remain outstanding.
+    /// Completion or rejection cleanup releases each responsibility exactly once.
+    /// Draining requires both this count and `admitting` to reach zero.
     in_flight: usize,
+    /// The accepted BIOs awaiting table selection and dispatch after resume.
+    /// Shutdown completes these requests with an error instead of replaying them.
     postponed: VecDeque<SubmittedBio>,
 }
 
@@ -83,7 +97,9 @@ impl DmIoState {
 
 #[derive(Debug, Default)]
 struct DmDeviceTables {
+    /// The mapping selected for admitted I/O, absent before first activation or after cleanup.
     active: Option<Arc<DmTable>>,
+    /// The validated candidate awaiting activation, absent when no replacement is pending.
     inactive: Option<Arc<DmTable>>,
 }
 

@@ -18,11 +18,13 @@ struct ManagerInner {
     name_by_uuid: BTreeMap<Vec<u8>, String>,
 }
 
-/// Owns a minor allocation independently of the immutable device identity.
+/// An owner of a minor allocation independent of the immutable device identity.
 /// Drop releases the number after failed creation or after the last device reference.
 pub(crate) struct DmDeviceIdOwner {
     id: DeviceId,
     _major: Arc<MajorIdOwner>,
+    /// The outstanding minor reservation, consumed by explicit release or destruction.
+    /// Taking it prevents old device references from releasing a reused minor twice.
     minors: Mutex<Option<Arc<Mutex<IdAlloc>>>>,
 }
 
@@ -62,7 +64,7 @@ impl Drop for DmDeviceIdOwner {
     }
 }
 
-/// Manages Device Mapper identities in the current boot session.
+/// The Device Mapper identity manager for the current boot session.
 ///
 /// The manager lock protects name/UUID indexes and serializes creation and detachment.
 /// Lookups return structural references, not a guarantee that a mapper remains live.

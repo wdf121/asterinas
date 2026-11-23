@@ -17,7 +17,9 @@ struct Node {
     next: Option<Box<Node>>,
 }
 
-/// Allocates queue storage at submission, never in the completion callback.
+/// A completion-owned table reference with preallocated reclamation storage.
+///
+/// Queue storage is allocated at submission, never in the completion callback.
 ///
 /// Dropping this wrapper only queues its retained table reference,
 /// even when the drop happens in task context or follows an enqueue rejection.
