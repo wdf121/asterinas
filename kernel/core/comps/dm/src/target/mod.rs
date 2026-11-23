@@ -93,6 +93,12 @@ pub enum TargetStatusMode {
 }
 
 /// Common behavior implemented by every resolved Device Mapper target instance.
+///
+/// A target owns its geometry and backing lifetimes;
+/// the table validates topology and the I/O layer submits the resulting actions.
+/// Mapping and status queries may run concurrently with backing completions.
+/// Implementations must keep mapping geometry stable for the instance's lifetime
+/// and synchronize any mutable runtime state internally.
 pub trait DmTarget: Debug + Send + Sync {
     /// Returns this target as `Any` for ktest-only downcasting of boxed targets.
     #[cfg(ktest)]
@@ -152,8 +158,13 @@ pub trait DmTarget: Debug + Send + Sync {
 /// DM invokes this before completing the corresponding logical request. Admission
 /// failures are not terminal backing results and do not invoke this interface.
 /// Notifications report only completed backing operations belonging to this target.
-/// This observer cannot replace the result, retry or requeue the request, or take
-/// over asynchronous completion. It must finish before the parent is notified.
+/// This observer cannot replace the result, retry or requeue the request,
+/// or take over asynchronous completion.
+/// It must finish before the parent is notified.
+/// Callbacks may run synchronously during submission or in interrupt context,
+/// and may execute concurrently for different backing operations.
+/// Implementations must not sleep or acquire the mapper's lifecycle lock.
+/// Each completed flush destination notifies every target that references it once.
 pub trait TargetIoCompletion: Send + Sync {
     /// Processes a completed operation on a backing device used by this target.
     fn complete_io(&self, backing: DeviceId, status: BioStatus);

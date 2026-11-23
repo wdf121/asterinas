@@ -15,6 +15,7 @@ use super::{
 };
 use crate::prelude::*;
 
+/// Selects exactly the requested table slot, without falling back to the other slot.
 pub(super) fn selected_table<'a>(
     active: &'a Option<Arc<DmTable>>,
     inactive: &'a Option<Arc<DmTable>>,
@@ -136,7 +137,13 @@ fn encode_table_records(buffer: &mut [u8], table: &DmTable, mode: TargetStatusMo
     Ok(())
 }
 
-/// Parses the complete linear table before publishing the primary device.
+/// Builds a complete candidate table, publishes the primary device, and installs inactive.
+///
+/// Holds the device lifecycle guard across parsing, publication, and installation.
+/// Invalid input leaves both table slots unchanged and does not publish a new node.
+/// Publication failure leaves the candidate uninstalled;
+/// any isolated registration residue is handled by the runtime removal path.
+/// A successful LOAD does not change the active mapping or its reported capacity.
 pub(super) fn table_load(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_load_device(buffer)?;
     table_load_for_device_with_primary(buffer, &device, runtime::ensure_primary)
@@ -181,6 +188,12 @@ fn table_clear_for(buffer: &mut [u8], device: &DmDevice) -> Result<()> {
 }
 
 /// Suspends a running mapping or resumes it, switching a pending table if present.
+///
+/// `SUSPEND_FLAG` selects suspend; clearing it selects resume.
+/// Replacing a running table implicitly suspends and drains before switching.
+/// This command neither freezes filesystems nor issues a flush to backing devices.
+/// `SKIP_LOCKFS` is accepted, but `NOFLUSH` is rejected because its semantics differ.
+/// Successful resume does not wait for all replayed I/O to complete.
 pub(super) fn resume_device(buffer: &mut [u8]) -> Result<()> {
     let device = lookup_load_device(buffer)?;
     resume_device_for(buffer, &device)

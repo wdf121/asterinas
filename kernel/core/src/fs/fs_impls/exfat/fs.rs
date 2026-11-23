@@ -64,7 +64,10 @@ pub(crate) struct ExfatFs {
     mutex: Mutex<()>,
 
     fs_event_subscriber_stats: FsEventSubscriberStats,
-    // Keep removal blocked until all filesystem metadata has been dropped.
+    /// Keeps a tracked backing device registered for the filesystem's lifetime,
+    /// even after its mount is detached while filesystem references remain.
+    /// This field must stay last so metadata and caches are dropped
+    /// before the lease releases its removal protection.
     block_device: BlockDeviceLease,
 }
 

@@ -73,6 +73,10 @@ enum RegistrationStatus {
 }
 
 /// A block device registration not yet published to lookups.
+///
+/// The device ID remains reserved while this token is pending.
+/// Dropping an uncommitted token removes its reservation;
+/// dropping it after a successful commit does not unregister the device.
 #[derive(Debug)]
 pub struct PendingBlockDeviceRegistration {
     registered: Arc<RegisteredBlockDevice>,
@@ -85,6 +89,11 @@ impl PendingBlockDeviceRegistration {
 }
 
 /// A block device removed from new lookups while cleanup is in progress.
+///
+/// The device ID remains reserved until unregistration commits.
+/// Dropping the token normally republishes the same registration.
+/// If external cleanup cannot be rolled back,
+/// use [`Self::retain_removing`] to leave it hidden instead.
 #[derive(Debug)]
 pub struct PendingBlockDeviceUnregistration {
     registered: Arc<RegisteredBlockDevice>,
@@ -141,8 +150,13 @@ impl Drop for PendingBlockDeviceUnregistration {
     }
 }
 
-/// A lease that prevents a registered block device from being unregistered while
-/// it is in long-term use.
+/// A lease that prevents a registered block device from being unregistered
+/// while it is in long-term use.
+///
+/// Each clone keeps the registration busy until that clone is dropped.
+/// Cloning only the device `Arc` does not retain this protection.
+/// Leases created with [`Self::new_untracked`] keep the device object alive
+/// but do not prevent registry removal.
 #[derive(Debug)]
 pub struct BlockDeviceLease {
     device: Arc<dyn BlockDevice>,
@@ -226,6 +240,13 @@ pub const DEVICE_MINORS: u32 = 16;
 
 pub trait BlockDevice: Send + Sync + Any + Debug {
     /// Enqueues a new `SubmittedBio` to the block device.
+    ///
+    /// Returning `Ok(())` accepts responsibility for completing the BIO,
+    /// possibly before this method returns.
+    /// An immediate rejection of a BIO from `Bio::submit` must not complete it,
+    /// because the submitter restores its status to `Init` on `Err`.
+    /// Once a layer accepts or splits a BIO,
+    /// later forwarding failures must be reported through completion instead.
     fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError>;
 
     /// Returns the metadata of the block device.
@@ -429,6 +450,9 @@ pub fn collect_all() -> Vec<Arc<dyn BlockDevice>> {
 }
 
 /// Looks up a published block device by device ID.
+///
+/// The returned `Arc` keeps the object alive but does not block unregistration.
+/// Use [`lookup_lease`] when registry removal must wait for the caller's I/O.
 pub fn lookup(id: DeviceId) -> Option<Arc<dyn BlockDevice>> {
     let registry = DEVICE_REGISTRY.lock();
     let registered = registry.get(&id.to_raw())?;

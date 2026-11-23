@@ -18,7 +18,13 @@ use crate::{
     prelude::*,
 };
 
-/// Builds a fully validated inactive table before any runtime publication.
+/// Builds a validated candidate table without publishing or installing it.
+///
+/// The caller supplies a copied ioctl buffer containing the fixed header and LOAD payload.
+/// Validates record bounds, alignment, strings, target geometry, and whole-table continuity.
+/// Backing paths are resolved in the calling thread's filesystem context;
+/// constructed targets retain leases obtained from the block registry.
+/// Any failure drops the candidate built so far without changing the device's table slots.
 pub(super) fn parse_table_load_request(buffer: &[u8]) -> Result<Arc<DmTable>> {
     parse_table_load_request_with(buffer, parse_backing_device_id)
 }

@@ -10,6 +10,9 @@ mod runtime;
 
 static DM_MANAGER: Once<DmManager> = Once::new();
 
+/// Starts table reclamation and reserves the mapper block major before exposing control.
+///
+/// The misc subsystem must already hold the character major used by the control device.
 pub(super) fn init_in_first_kthread() {
     crate::thread::kernel_thread::ThreadOptions::new(|| aster_dm::run_table_reclaimer()).spawn();
     // Reserve the block major before exposing the control device to userspace.

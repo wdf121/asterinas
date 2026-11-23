@@ -29,6 +29,15 @@ impl Drop for IoctlBuffer {
 
 /// Copies a bounded LOAD payload, or a fixed prefix for commands without input records.
 /// Query commands allocate output capacity without reading it from userspace.
+///
+/// The caller must have completed the version handshake and selected a supported command.
+/// `version` contains the negotiated kernel version; `arg` points to the user ioctl buffer.
+/// The dispatcher receives kernel-owned bytes with the common header validated
+/// and output size reset to the prefix; command-specific payload validation remains its job.
+/// Successful dispatch copies back only the bounded result for that command.
+/// Dispatch failure skips result copyout but does not undo side effects of the command.
+/// Secure requests clear user input before dispatch and wipe the kernel copy on drop;
+/// clearing user input can itself fail and is not an unconditional erasure guarantee.
 pub(super) fn process_ioctl_parameters(
     arg: usize,
     version: &[u8; 12],

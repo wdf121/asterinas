@@ -30,6 +30,12 @@ struct Stripe {
 }
 
 /// A target that distributes successive chunks across its backing devices.
+///
+/// Chunk selection is relative to the target's logical start,
+/// and each backing supplies an equal whole-chunk share of the target's length.
+/// Terminal `IoError` and `NoSpace` results latch a device's health as failed
+/// for this instance's lifetime, including all stripes sharing that device ID.
+/// Health reporting does not change mapping, retry requests, or provide redundancy.
 #[derive(Debug)]
 pub(super) struct StripedTarget {
     range: TargetRange,
@@ -70,6 +76,10 @@ impl super::DmTargetType for TargetType {
 
 impl StripedTarget {
     /// Parses Linux stripe parameters and retains every resolved backing lease.
+    ///
+    /// Validates the full token sequence and range arithmetic before any lookup.
+    /// Backing capacities are checked as leases are acquired;
+    /// any later error drops leases already acquired for this candidate.
     pub(super) fn parse_with<E>(
         logical_start: Sid,
         length: u64,

@@ -10,6 +10,10 @@ use aster_dm::DmDevice;
 
 use crate::{device::registry::block, prelude::*};
 
+/// Unregisters the primary node before DM stops I/O or releases its identity.
+///
+/// The control path serializes this operation with the device lifecycle guard.
+/// On failure, the caller must check isolation and retain the identity for retry.
 pub(super) fn unregister_primary(device: &Arc<DmDevice>) -> Result<()> {
     block::unregister_runtime_primary(device.id()).map(|_| ())
 }
@@ -20,8 +24,10 @@ pub(super) fn primary_isolated(device: &DmDevice) -> bool {
 
 /// Publishes `/dev/dm-N` for a mapper after its table has been validated.
 ///
-/// Repeated publication of the same device is a no-op. A failed publication
-/// remains the responsibility of the generic block lifecycle to clean up.
+/// The control path holds the device lifecycle guard across publication and installation.
+/// Repeated publication of a registered primary is a no-op.
+/// Failed publication may leave isolated resources reserved for removal to clean up.
+/// This publishes neither a mapping table nor user-managed `/dev/mapper/<name>` aliases.
 pub(super) fn ensure_primary(device: &Arc<DmDevice>) -> Result<()> {
     if block::is_runtime_primary_registered(device.id()) {
         return Ok(());

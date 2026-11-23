@@ -137,9 +137,12 @@ impl Debug for BioRequestSingleQueue {
 /// that (1) are of the same request type and (2) are contiguous in terms of target sectors.
 /// This helps reduce the number of I/O requests submitted to the underlying storage medium.
 ///
-/// Second, a `BioRequest` exposes the current sector addresses after all upper block layers
-/// have remapped the submitted BIO. One can simply call `BioRequest::sid_range()` to obtain
+/// Second, a `BioRequest` exposes the current sector addresses
+/// after all upper block layers have remapped the submitted BIO.
+/// One can simply call `BioRequest::sid_range()` to obtain
 /// the addresses that should be sent to the storage medium.
+/// Merging compares these mapped ranges, not the original logical ranges,
+/// and retains each BIO's independent completion responsibility.
 #[derive(Debug)]
 pub struct BioRequest {
     /// The type of the I/O

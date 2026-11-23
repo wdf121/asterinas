@@ -406,12 +406,14 @@ impl PerOpenFileOps for OpenBlockFile {
 
 /// Registers a runtime block device with an owned primary node.
 ///
-/// The caller chooses the relative path under `/dev`; no mapper naming policy
-/// belongs to this transaction. Sysfs may become visible before the primary
-/// node, and the node may become visible before block lookups become Live.
-/// Until publication finishes, the wrapper rejects opens. If node creation
-/// fails and sysfs cleanup cannot complete, the pending registration and
-/// wrapper remain reserved for a later `unregister_runtime_primary` retry.
+/// The caller chooses a single-component relative path under `/dev`;
+/// no mapper naming policy belongs to this transaction.
+/// Sysfs may become visible before the primary node,
+/// and the node may become visible before block lookups become live.
+/// Until publication finishes, the wrapper rejects opens.
+/// If node creation fails and sysfs cleanup cannot complete,
+/// the pending registration and wrapper remain reserved
+/// for a later `unregister_runtime_primary` retry.
 pub(crate) fn register_runtime_primary(device: Arc<dyn BlockDevice>, path: String) -> Result<()> {
     // Validate before building the sysfs device: its name cannot contain '/'.
     let meta = DevtmpfsNodeMeta::new(path.clone())
@@ -547,9 +549,17 @@ fn isolate_runtime_unregistration(
 }
 
 /// Removes a runtime primary node and unregisters its device.
+///
+/// Open files and tracked block-device leases prevent removal from starting.
+/// Node deletion checks inode identity,
+/// so a replacement at the same path is left untouched.
+/// A missing or replaced owned node does not prevent device removal.
+///
 /// Failed restoration leaves the registration isolated for a later retry.
-/// A failed publication with a retained pending reservation can also be
-/// cleaned up through this entry point.
+/// A failed publication with a retained pending reservation
+/// can also be cleaned up through this entry point.
+/// An error does not imply that the device is still published:
+/// sysfs teardown can fail after block unregistration has committed.
 pub(crate) fn unregister_runtime_primary(id: DeviceId) -> Result<Arc<dyn BlockDevice>> {
     let block_file = lookup_runtime_block_file(id)?;
     let _lifecycle = block_file.lifecycle.lock();
@@ -602,7 +612,10 @@ pub(crate) fn unregister_runtime_primary(id: DeviceId) -> Result<Arc<dyn BlockDe
     }
 }
 
-/// Returns the current open count of a registered block device, if published.
+/// Returns the current open count while a block-device wrapper is registered.
+///
+/// Pending or isolated wrappers can also be present;
+/// this is not a publication check or a count of block-device leases.
 pub(crate) fn open_count(id: DeviceId) -> Option<usize> {
     let block_file = DEVICE_REGISTRY.lock().get(&id.to_raw()).cloned()?;
     let count = block_file.state.lock().open_count;

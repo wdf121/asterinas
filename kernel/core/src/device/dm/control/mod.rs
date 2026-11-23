@@ -44,7 +44,10 @@ const DM_IOCTL_MAGIC: u32 = 0xfd;
 const DM_VERSION_CMD: u8 = 0;
 const DM_VERSION: [u32; 3] = [4, 48, 0];
 
-/// Character device backing `/dev/mapper/control` (misc major 10, minor 236).
+/// The shared Device Mapper control device at `/dev/mapper/control`.
+///
+/// This character device uses misc major 10 and minor 236.
+/// It handles management requests for all mapped devices, not block data I/O.
 #[derive(Debug)]
 struct DmControlDevice {
     id: DeviceId,
@@ -68,6 +71,7 @@ impl Device for DmControlDevice {
         self.id
     }
 
+    /// Places the shared control node at `mapper/control` relative to the devtmpfs root.
     fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
         Some(DevtmpfsNodeMeta::new("mapper/control").unwrap())
     }
@@ -77,7 +81,10 @@ impl Device for DmControlDevice {
     }
 }
 
-/// Open control handle for VERSION, static queries, CREATE, LOAD, first RESUME and REMOVE.
+/// A stateless control handle created for each open of `/dev/mapper/control`.
+///
+/// The handle is not bound to a mapped device.
+/// Each ioctl request supplies any device selector required by that command.
 struct DmControlFile;
 
 impl Pollable for DmControlFile {
@@ -124,10 +131,12 @@ impl PerOpenFileOps for DmControlFile {
         false
     }
 
-    /// Checks privilege and command type before exchanging the first three ABI words.
+    /// Checks privilege and command type before negotiating the DM ABI version.
     ///
-    /// As in Linux `ctl_ioctl`, copyout failure takes precedence over an
-    /// incompatible client version, and command dispatch follows the handshake.
+    /// Requires `CAP_SYS_ADMIN` in the initial user namespace.
+    /// Writes the kernel version back even when the client version is incompatible;
+    /// a copyout failure takes precedence over the version mismatch.
+    /// VERSION returns after this handshake, while other commands proceed to dispatch.
     fn ioctl(&self, _path: &Path, raw_ioctl: RawIoctl) -> Result<i32> {
         if lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
             UserNamespace::get_init_singleton().as_ref(),

@@ -69,6 +69,10 @@ impl<D: DmaDirection> DmaBuf for Slice<DmaBuffer<D>> {
     }
 }
 
+/// Exposes only the sliced DMA range, even when the allocation is shared.
+///
+/// Split BIOs can reference disjoint parts of one buffer;
+/// virtqueue descriptors must use the slice's length rather than the allocation's.
 impl<D: DmaDirection> DmaBuf for Slice<Arc<DmaBuffer<D>>> {
     fn len(&self) -> usize {
         self.size()

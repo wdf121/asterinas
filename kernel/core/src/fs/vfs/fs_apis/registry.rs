@@ -169,7 +169,11 @@ impl<'a> FsCreationCtx<'a> {
 
     /// Resolves the mount source and protects it against removal during creation.
     ///
-    /// Persistent filesystems must retain a clone for their entire I/O-capable lifetime.
+    /// Persistent filesystems must retain a clone of the lease,
+    /// not just the underlying device `Arc`, for their entire I/O-capable lifetime.
+    /// The context's lease is released when the context is dropped,
+    /// including when filesystem creation fails.
+    /// Already resolved leases are reused without looking up the device ID again.
     pub(in crate::fs) fn resolve_block_device(&mut self) -> Result<&BlockDeviceLease> {
         if self.block_device().is_none() {
             self.do_resolve_block_device()?;

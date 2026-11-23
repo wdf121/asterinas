@@ -69,6 +69,11 @@ fn is_space(byte: u8) -> bool {
 
 impl<'a> Arguments<'a> {
     /// Decodes the next token while allowing callers to recover from allocation failure.
+    ///
+    /// The cursor advances before allocating escaped-token storage,
+    /// so allocation failure consumes that token rather than permitting a retry.
+    /// Borrowed input is never wiped here;
+    /// callers remain responsible for clearing the original secure-load buffer.
     pub(super) fn try_next(&mut self) -> Result<Option<Argument<'a>>, TryReserveError> {
         let input = self
             .remaining

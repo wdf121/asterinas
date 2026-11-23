@@ -19,6 +19,11 @@ use crate::{
 };
 
 /// A contiguous, immutable Device Mapper table installed on a mapped device.
+///
+/// Targets retain their backing devices for the table's lifetime,
+/// including while the table is inactive or retained by an older I/O generation.
+/// Immutability covers mapping topology and read-only mode,
+/// not target-specific runtime state such as completion health counters.
 #[derive(Debug)]
 pub struct DmTable {
     /// Ordered targets whose logical ranges must start at zero and be contiguous.
@@ -48,6 +53,12 @@ impl DmTable {
     }
 
     /// Creates a table with the mode captured from `DM_TABLE_LOAD`.
+    ///
+    /// Requires at least one non-empty target,
+    /// with ordered logical ranges covering a contiguous interval from sector zero.
+    /// Direct mapper backings are rejected because stacked DM devices are unsupported.
+    /// Each target remains responsible for validating its own backing geometry.
+    /// Construction neither installs the table nor changes any existing generation.
     pub fn new_targets_with_readonly(
         targets: Vec<DmTargetBox>,
         readonly: bool,
@@ -139,9 +150,21 @@ impl DmTable {
 
     /// Forwards one BIO, splitting at target and chunk boundaries.
     ///
-    /// All ordinary mappings are validated before any backing admission. This
-    /// does not reserve every execution resource in advance or make writes atomic
-    /// across backings. Planning allocations follow the crate's allocation policy.
+    /// All ordinary mappings are validated before any backing admission.
+    /// This does not reserve every execution resource in advance
+    /// or make writes atomic across backings.
+    /// Planning allocations follow the crate's allocation policy.
+    ///
+    /// A single mapping can return a backing enqueue error directly.
+    /// Once split children or flush destinations are dispatched,
+    /// their admission failures become completion errors on the parent BIO;
+    /// success therefore does not imply successful backing I/O.
+    /// Flushes visit each distinct backing device ID once.
+    ///
+    /// This low-level entry point bypasses mapper suspension, drain accounting,
+    /// and read-only enforcement; normal device I/O must go through [`crate::DmDevice`].
+    /// Completion-owned table references are reclaimed in task context,
+    /// so backing leases may outlive the BIO's logical completion.
     pub fn enqueue(self: &Arc<Self>, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
         if bio.type_() != BioType::Flush {
             // Reject out-of-range I/O before taking completion ownership.

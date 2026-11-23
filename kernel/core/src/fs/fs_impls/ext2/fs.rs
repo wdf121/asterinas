@@ -68,7 +68,10 @@ pub(crate) struct Ext2 {
     next_generation: AtomicU32,
     /// Weak self reference for inode back-pointers.
     self_ref: Weak<Ext2>,
-    /// Keeps the backing registered until all metadata and block groups are dropped.
+    /// Keeps a tracked backing device registered for the filesystem's lifetime,
+    /// even after its mount is detached while filesystem references remain.
+    /// This field must stay last so metadata and block groups are dropped
+    /// before the lease releases its removal protection.
     block_device: BlockDeviceLease,
 }
 

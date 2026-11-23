@@ -16,6 +16,13 @@ use ostd::sync::{LocalIrqDisabled, Mutex, SpinLock, WaitQueue};
 use crate::{DmError, DmTable, manager::DmDeviceIdOwner};
 
 /// A mapper identity with separate active and inactive table generations.
+///
+/// Control transitions require a [`DmDeviceLifecycle`] guard.
+/// BIO admission selects a generation separately from that guard,
+/// so ordinary I/O can proceed while an inactive candidate is loaded.
+/// Suspension queues new BIOs without assigning them to a table;
+/// resume validates and dispatches them against the selected active generation.
+/// Block-device registration and user-visible node publication belong to the caller.
 #[derive(Debug)]
 pub struct DmDevice {
     id_owner: DmDeviceIdOwner,
@@ -123,6 +130,10 @@ impl DmDevice {
     }
 
     /// Serializes control operations until the returned guard is dropped.
+    ///
+    /// Acquiring this sleeping lock does not itself stop I/O admission.
+    /// Hold the guard across the caller's publication or removal steps as well,
+    /// when they must be atomic with respect to other lifecycle transitions.
     pub fn lock_lifecycle(&self) -> DmDeviceLifecycle<'_> {
         DmDeviceLifecycle {
             device: self,
@@ -195,6 +206,11 @@ pub struct DmDeviceLifecycle<'a> {
 
 impl DmDeviceLifecycle<'_> {
     /// Installs a fully validated candidate unless removal has begun.
+    ///
+    /// Replaces only the inactive slot without draining I/O or changing capacity.
+    /// The displaced candidate releases its resources once its last reference is dropped.
+    /// Returns [`DmError::InvalidState`] after removal isolation or I/O shutdown,
+    /// leaving both table slots unchanged.
     pub fn load_table(&mut self, table: Arc<DmTable>) -> Result<(), DmError> {
         self.ensure_live()?;
         self.device.tables.lock().inactive = Some(table);
@@ -227,6 +243,10 @@ impl DmDeviceLifecycle<'_> {
     }
 
     /// Marks a partially removed device as cleanup-only under its lifecycle lock.
+    ///
+    /// This is irreversible and prevents later load, inactive-table clear, suspend, or resume operations.
+    /// It does not stop BIO admission by itself;
+    /// the caller must still unregister the runtime device and drain its I/O.
     pub fn isolate_removal(&mut self) {
         self.device.removal_isolated.store(true, Ordering::Release);
     }
@@ -259,6 +279,10 @@ impl DmDeviceLifecycle<'_> {
     /// A caller performing an implicit replacement must suspend and drain first.
     /// The I/O admission lock covers the swap, replay reservation, and reopening,
     /// so a new BIO cannot select the old table after the switch.
+    ///
+    /// Returning success means replay has been submitted, not that it has completed.
+    /// Rejected replay requests complete with an I/O error rather than failing resume.
+    /// New submissions may interleave with replay after admission reopens.
     pub fn resume_suspended(&mut self) -> Result<(), DmError> {
         self.ensure_live()?;
         let (table, postponed, retired) = {

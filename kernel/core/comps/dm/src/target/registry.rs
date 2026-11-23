@@ -160,6 +160,13 @@ pub fn reported_target_metadata() -> Vec<DmTargetMetadata> {
 }
 
 /// Parses a registered target while preserving the caller's backing lookup errors.
+///
+/// `parse_backing` converts a target's device token to an identity;
+/// `resolve_backing` acquires the corresponding backing lease.
+/// Neither hook runs while the registry lock is held.
+/// Hook failures are returned unchanged as [`DmTargetParseError::ResolveBacking`],
+/// while unknown target names fail before either hook is called.
+/// The returned instance still needs table-wide validation before installation.
 pub fn parse_target_with<E>(
     target_type: &str,
     logical_start: Sid,

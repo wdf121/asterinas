@@ -9,6 +9,9 @@ use super::{DevtmpfsHandle, DevtmpfsNode, tree};
 use crate::{prelude::*, thread::kernel_thread::ThreadOptions};
 
 /// Creates a device node through `devtmpfsd` and returns its ownership handle.
+///
+/// Waits for the worker's result, so the caller must be in a sleepable context.
+/// The handle identifies this inode, not any future node with the same device number.
 pub(crate) fn create_node(node: DevtmpfsNode) -> Result<DevtmpfsHandle> {
     match submit(Request::CreateNode(node))? {
         Response::Handle(handle) => Ok(handle),
@@ -18,8 +21,10 @@ pub(crate) fn create_node(node: DevtmpfsNode) -> Result<DevtmpfsHandle> {
 
 /// Deletes a handle's node through `devtmpfsd` using inode identity.
 ///
-/// The caller retains the handle if deletion fails, so it can preserve its
-/// registration state and retry or recover the operation.
+/// The caller retains the handle if deletion fails,
+/// so it can preserve its registration state and retry or recover the operation.
+/// A replacement inode yields `ESTALE` and is not removed.
+/// Like [`create_node`], this call waits for the worker and requires a sleepable context.
 pub(crate) fn delete(handle: &DevtmpfsHandle) -> Result<()> {
     match submit(Request::Delete(handle.clone()))? {
         Response::Unit => Ok(()),

@@ -11,6 +11,11 @@
 //! independent of the credentials of the device-registration caller, following
 //! Linux's devtmpfs design.
 //!
+//! Runtime device registrations retain the handle returned by [`create_node`]
+//! and use [`delete`] to remove only that inode at its original path.
+//! The legacy [`delete_node`] API matches device metadata instead,
+//! so it cannot distinguish a replacement with the same device number.
+//!
 //! Mounting policy follows the selected init path. If an initramfs init is
 //! selected, either by `rdinit=` or by the default `/init` lookup, the kernel
 //! does not mount devtmpfs automatically; the selected initramfs init program is

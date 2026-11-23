@@ -19,8 +19,12 @@ pub(super) fn ensure_control_live(device: &DmDevice) -> Result<()> {
     Ok(())
 }
 
-/// Removes a mapper only after runtime unregistration succeeds. A partially
-/// unregistered wrapper stays indexed and reserved for a cleanup-only retry.
+/// Removes a mapper only after runtime unregistration succeeds.
+///
+/// Holds the device lifecycle guard throughout removal.
+/// A partially unregistered wrapper stays indexed and reserved for a cleanup-only retry.
+/// Only after unregistration succeeds does removal stop and drain I/O, clear tables,
+/// detach management indexes, and release the minor number.
 pub(super) fn remove_device(buffer: &mut [u8]) -> Result<()> {
     if read_u32(buffer, OFF_FLAGS) & DEFERRED_REMOVE_FLAG != 0 {
         return_errno_with_message!(Errno::EINVAL, "deferred mapper removal is not supported");
@@ -58,7 +62,12 @@ pub(super) fn remove_device(buffer: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// Creates a mapped device and writes its assigned identity back into the ioctl header.
+/// Creates a tableless mapped device and returns its identity in the ioctl header.
+///
+/// Reserves the name, optional UUID, and minor without publishing a block node.
+/// `PERSISTENT_DEV_FLAG` requests the minor encoded in `dev`;
+/// the block major still comes from the DM manager rather than the request.
+/// Read/write mode belongs to a subsequently loaded table, not to CREATE.
 pub(super) fn create_device(buffer: &mut [u8]) -> Result<()> {
     let name = required_name(buffer)?;
     let uuid = optional_uuid(buffer);
@@ -126,8 +135,8 @@ pub(super) fn query_header(
         OFF_TARGET_COUNT,
         selected.map_or(0, |table| table.target_count() as u32),
     );
-    // CREATE has no published block wrapper; after LOAD, absence is a transient registry state.
-    // Report zero opens when there is no published primary device.
+    // CREATE has no block wrapper; pending or isolated wrappers can also report a count.
+    // Report zero when no wrapper is registered.
     write_u32(
         buffer,
         OFF_OPEN_COUNT,
@@ -271,7 +280,12 @@ fn encode_device_list(
     Ok(())
 }
 
-/// Resolves a LOAD selector against the current manager without publishing it.
+/// Resolves one name, UUID, or device-number selector without publishing a device.
+///
+/// Rejects missing or ambiguous selectors instead of choosing one by precedence.
+/// UUIDs are matched as bytes; names must be UTF-8.
+/// The returned reference does not hold the lifecycle guard or exclude isolated devices.
+/// Callers must acquire that guard and check whether their operation is still allowed.
 pub(super) fn lookup_load_device(buffer: &[u8]) -> Result<Arc<DmDevice>> {
     let manager = DM_MANAGER.get().unwrap();
     let name = optional_field(buffer, OFF_NAME, NAME_LEN)?;

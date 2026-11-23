@@ -103,8 +103,11 @@ impl DevtmpfsNode {
 
 /// An owned devtmpfs tree entry.
 ///
-/// The inode identity is private so callers can only remove the original entry
-/// through devtmpfsd. `path` is relative to the devtmpfs root.
+/// The inode identity is private so callers can remove the original entry
+/// through devtmpfsd without deleting a replacement at the same path.
+/// The path is relative to the devtmpfs root.
+/// Holding a handle does not prevent userspace from unlinking or replacing the node,
+/// and dropping a handle does not delete the node.
 #[derive(Clone)]
 pub(crate) struct DevtmpfsHandle {
     inode: Arc<RamInode>,

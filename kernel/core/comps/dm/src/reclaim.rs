@@ -18,6 +18,11 @@ struct Node {
 }
 
 /// Allocates queue storage at submission, never in the completion callback.
+///
+/// Dropping this wrapper only queues its retained table reference,
+/// even when the drop happens in task context or follows an enqueue rejection.
+/// The worker releases the reference outside the IRQ-safe queue lock,
+/// because final target destruction can release leases through sleeping locks.
 pub(super) struct CompletionTable(Option<Box<Node>>);
 
 impl CompletionTable {

@@ -43,6 +43,9 @@ pub struct Bio {
 /// The completion function type for BIO operations.
 ///
 /// The function receives the final `BioStatus` of the I/O operation.
+/// It runs inline in the context that completes or drops the submitted BIO,
+/// before the final status is published to waiters.
+/// Callbacks must not assume a sleepable context or wait for this BIO's completion.
 pub type BioCompleteFn = Box<dyn FnOnce(BioStatus) + Send>;
 
 impl Bio {
@@ -269,6 +272,10 @@ impl SubmittedBio {
     }
 
     /// Returns the sector range mapped for the current block device layer.
+    ///
+    /// Stacked devices translate this range before forwarding the BIO.
+    /// Remapping does not change the original range in the completion metadata
+    /// or the order of bytes in the segments.
     pub fn sid_range(&self) -> &Range<Sid> {
         &self.mapped_sid_range
     }
@@ -302,11 +309,18 @@ impl SubmittedBio {
 
     /// Splits the mapped sector range into children that cover it exactly.
     ///
-    /// Each child owns one completion responsibility. Dropping an incomplete child
-    /// completes the original BIO with `IoError` after every other child terminates.
-    /// On validation or slicing failure, returns the original BIO unchanged: a
-    /// device that has already accepted it must complete it with an error, whereas
-    /// an immediate `enqueue` failure can return the error to `Bio::submit`.
+    /// The ranges must be nonempty, ordered, and contiguous in the current mapping.
+    /// Children share the DMA allocations without copying their data,
+    /// and each child owns one completion responsibility.
+    /// The parent completes once every child terminates,
+    /// with the first non-success status recorded by the completion aggregator.
+    /// Dropping an incomplete child contributes `IoError` to that result.
+    ///
+    /// On validation or slicing failure, returns the original BIO unchanged.
+    /// A device that has already accepted it must complete it with an error,
+    /// whereas an immediate `enqueue` failure can return the error to `Bio::submit`.
+    /// After a successful split, child enqueue failures must terminate the children
+    /// rather than be returned as an enqueue failure for the original BIO.
     pub fn split(self, ranges: Vec<Range<Sid>>) -> Result<Vec<Self>, (BioEnqueueError, Self)> {
         if let Err(error) = self.validate_split_ranges(&ranges) {
             return Err((error, self));
@@ -447,10 +461,12 @@ impl SubmittedBio {
         }));
     }
 
-    /// Completes the `Bio` by consuming `self`, releasing the segments, invoking
-    /// the callback function, and publishing the final status.
+    /// Completes the `Bio` by consuming `self`, invoking the callback function,
+    /// publishing the final status, and waking waiters.
     ///
     /// The final status becomes visible only after the callback returns.
+    /// Segments remain owned by `self` during the callback
+    /// and are released when this method returns.
     ///
     /// When the driver finishes the request for this `Bio`, it will call this method.
     pub fn complete(mut self, status: BioStatus) {

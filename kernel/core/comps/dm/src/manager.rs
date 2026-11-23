@@ -63,6 +63,11 @@ impl Drop for DmDeviceIdOwner {
 }
 
 /// Manages Device Mapper identities in the current boot session.
+///
+/// The manager lock protects name/UUID indexes and serializes creation and detachment.
+/// Lookups return structural references, not a guarantee that a mapper remains live.
+/// Callers must use the device's lifecycle guard for control transitions;
+/// runtime registration, I/O draining, and device-node publication are outside this manager.
 pub struct DmManager {
     major: Arc<MajorIdOwner>,
     minors: Arc<Mutex<IdAlloc>>,
@@ -93,6 +98,11 @@ impl DmManager {
     }
 
     /// Creates a tableless device without assigning a read/write mode.
+    ///
+    /// Reserves a minor before checking name and UUID uniqueness,
+    /// so number-allocation errors take precedence over identity collisions.
+    /// An identity collision releases the temporary minor without changing either index.
+    /// Success indexes the name and optional UUID but does not register a runtime block device.
     pub fn create(
         &self,
         name: String,
@@ -164,8 +174,13 @@ impl DmManager {
         self.inner.lock().by_name.values().cloned().collect()
     }
 
-    /// Detaches a device from the manager indexes. The number remains reserved
-    /// until the final reference is dropped or removal explicitly drains it.
+    /// Detaches a device from the manager indexes.
+    /// The number remains reserved until the final reference is dropped
+    /// or removal explicitly drains it.
+    ///
+    /// This does not unregister the block device, stop I/O, or clear its tables.
+    /// The caller must serialize runtime removal with the device's lifecycle guard
+    /// and must detach these indexes before explicitly releasing the minor.
     pub fn remove(&self, name: &str) -> Result<Arc<DmDevice>, DmError> {
         let mut inner = self.inner.lock();
         let device = inner.by_name.remove(name).ok_or(DmError::DeviceNotFound)?;

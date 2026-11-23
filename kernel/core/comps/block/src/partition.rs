@@ -254,6 +254,10 @@ struct PartitionNode {
 }
 
 impl BlockDevice for PartitionNode {
+    /// Translates the current partition-relative mapping into backing-device sectors.
+    ///
+    /// The offset composes with translations already performed by upper layers;
+    /// it does not replace the submitter's original range or move segment data.
     fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
         bio.offset_mapped_sid_range(self.info.start_sector())?;
         self.device.enqueue(bio)
