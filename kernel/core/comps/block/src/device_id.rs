@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Block major ownership and driver names exported through `/proc/devices`.
+//! Reservation and enumeration of block device major numbers.
+//!
+//! [`acquire_major`] reserves a specified major number,
+//! while [`allocate_major`] selects an available one.
+//! Their `_with_name` variants associate a name with the reservation.
+//! [`major_devices`] returns a snapshot of reserved major numbers and their names.
 
 use alloc::{collections::BTreeMap, string::String};
 
