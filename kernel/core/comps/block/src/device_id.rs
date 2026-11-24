@@ -7,7 +7,10 @@
 //! Their `_with_name` variants associate a name with the reservation.
 //! [`major_devices`] returns a snapshot of reserved major numbers and their names.
 
-use alloc::{collections::BTreeMap, string::String};
+use alloc::{
+    collections::{BTreeMap, btree_map::Entry},
+    string::String,
+};
 
 use device_id::{DeviceId, MajorId, MinorId};
 use id_alloc::IdAlloc;
@@ -31,41 +34,41 @@ static MAJORS: Mutex<BTreeMap<u16, String>> = Mutex::new(BTreeMap::new());
 
 /// Acquires a major ID.
 ///
-/// The returned `MajorIdOwner` object represents the ownership to the major ID.
-/// Until the object is dropped, this major ID cannot be acquired via
-/// `acquire_major` or `allocate_major` again.
+/// The returned `MajorIdOwner` object represents ownership of the major ID.
+/// This major ID remains reserved until the returned owner is dropped.
 pub fn acquire_major(major: MajorId) -> Result<MajorIdOwner, Error> {
     acquire_major_with_name(major, "unknown")
 }
 
-/// Acquires a major ID and records its stable driver name for `/proc/devices`.
+/// Acquires a major ID and associates a registration name with it.
 pub fn acquire_major_with_name(major: MajorId, name: &str) -> Result<MajorIdOwner, Error> {
     if major.get() > MAX_MAJOR {
         return Err(Error::InvalidArgs);
     }
 
     let mut majors = MAJORS.lock();
-    if majors.contains_key(&major.get()) {
-        return Err(Error::IdAcquired);
+    match majors.entry(major.get()) {
+        Entry::Vacant(entry) => {
+            entry.insert(String::from(name));
+            Ok(MajorIdOwner(major))
+        }
+        Entry::Occupied(_) => Err(Error::IdAcquired),
     }
-    majors.insert(major.get(), String::from(name));
-    Ok(MajorIdOwner(major))
 }
 
 /// Allocates a major ID.
 ///
-/// The returned `MajorIdOwner` object represents the ownership to the major ID.
-/// Until the object is dropped, this major ID cannot be acquired via
-/// `acquire_major` or `allocate_major` again.
+/// The returned `MajorIdOwner` object represents ownership of the major ID.
+/// This major ID remains reserved until the returned owner is dropped.
 pub fn allocate_major() -> Result<MajorIdOwner, Error> {
     allocate_major_with_name("unknown")
 }
 
-/// Allocates a dynamic major ID and records its stable driver name for `/proc/devices`.
+/// Allocates a dynamic major ID and associates a registration name with it.
 pub fn allocate_major_with_name(name: &str) -> Result<MajorIdOwner, Error> {
     let mut majors = MAJORS.lock();
     for id in (1..LAST_DYNAMIC_MAJOR + 1).rev() {
-        if let alloc::collections::btree_map::Entry::Vacant(entry) = majors.entry(id) {
+        if let Entry::Vacant(entry) = majors.entry(id) {
             entry.insert(String::from(name));
             return Ok(MajorIdOwner(MajorId::new(id)));
         }
@@ -74,7 +77,8 @@ pub fn allocate_major_with_name(name: &str) -> Result<MajorIdOwner, Error> {
     Err(Error::IdExhausted)
 }
 
-/// Returns a sorted snapshot of the block major ownership registry.
+/// Returns a snapshot of the registered block majors as
+/// `(major_number, registration_name)` pairs, sorted by major number in ascending order.
 pub fn major_devices() -> alloc::vec::Vec<(u16, String)> {
     MAJORS
         .lock()

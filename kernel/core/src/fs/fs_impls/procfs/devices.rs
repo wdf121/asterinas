@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Registered character and block driver names exposed by `/proc/devices`.
+//! Character and block device major numbers and registration names exposed by `/proc/devices`.
 //!
-//! Rows describe number reservations, not individual device nodes. Character
-//! drivers may register disjoint minor ranges under the same major.
+//! Character and block reservations appear in separate sections.
+//! A character major may appear on multiple rows for disjoint minor intervals.
+//!
+//! Reference: <https://github.com/torvalds/linux/blob/v6.6/fs/proc/devices.c>.
 
 use aster_util::printer::VmPrinter;
 
@@ -28,22 +30,26 @@ impl DevicesFileOps {
 
 impl ProcFileOps for DevicesFileOps {
     fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
-        // As in Linux 6.6 (5078a3a23a1e), fs/proc/devices.c, character and block
-        // registrations occupy separate sections. Neither snapshot holds a
-        // registry lock while copying to userspace.
         let characters = char::major_devices();
         let blocks = aster_block::major_devices();
         let mut printer = VmPrinter::new_skip(writer, offset);
-        writeln!(printer, "Character devices:")?;
-        for (major, name) in characters {
-            writeln!(printer, "{major:3} {name}")?;
+        let result: Result<()> = (|| {
+            writeln!(printer, "Character devices:")?;
+            for (major, name) in characters {
+                writeln!(printer, "{major:3} {name}")?;
+            }
+            writeln!(printer)?;
+            writeln!(printer, "Block devices:")?;
+            for (major, name) in blocks {
+                writeln!(printer, "{major:3} {name}")?;
+            }
+            Ok(())
+        })();
+        let written = printer.bytes_written();
+        if written == 0 {
+            result?;
         }
-        writeln!(printer)?;
-        writeln!(printer, "Block devices:")?;
-        for (major, name) in blocks {
-            writeln!(printer, "{major:3} {name}")?;
-        }
-        Ok(printer.bytes_written())
+        Ok(written)
     }
 }
 

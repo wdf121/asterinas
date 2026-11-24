@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! A subsystem for character devices (or char devices for short).
+//!
+//! Number reservations do not register device objects or create device nodes.
 
 use core::ops::Range;
 
@@ -67,64 +69,84 @@ pub(crate) const MAX_MAJOR: u16 = 511;
 /// Reference: <https://elixir.bootlin.com/linux/v6.13/source/include/linux/fs.h#L2840>.
 const DYNAMIC_MAJOR_ID_RANGES: [Range<u16>; 2] = [234..255, 384..512];
 
-/// A registered minor interval, independent of individual device nodes.
-struct RegisteredRegion {
-    end: u32,
-    name: String,
-}
-
 const MINOR_COUNT: u32 = MinorId::MAX.get() + 1;
 
-// Linux chrdev_show lists registrations, not individual cdevs. A major can
-// therefore appear more than once, ordered by the first minor of each region.
-static REGIONS: Mutex<BTreeMap<(u16, u32), RegisteredRegion>> = Mutex::new(BTreeMap::new());
+// Named minor reservations, ordered by major and starting minor.
+// Regions within a major never overlap.
+static REGIONS: Mutex<BTreeMap<RegionKey, RegisteredRegion>> = Mutex::new(BTreeMap::new());
 
-/// Acquires an entire major and records its driver name until the owner drops.
-pub(crate) fn acquire_major(major: MajorId, name: &str) -> Result<MajorIdOwner> {
-    acquire_region(major, 0..MINOR_COUNT, name).map(MajorIdOwner)
+/// Acquires an entire major and associates a registration name with it.
+///
+/// The major remains reserved until the returned owner is dropped.
+pub fn acquire_major(major: MajorId, name: &str) -> Result<MajorIdOwner> {
+    reserve_region(major, 0..MINOR_COUNT, name)?;
+    Ok(MajorIdOwner(major))
 }
 
 /// Acquires a nonempty minor interval within one major.
 ///
 /// Disjoint intervals may share a major, including when their names differ.
-/// Overlapping reservations fail without changing the registry. This records
-/// number ownership only; callers remain responsible for publishing devices.
-///
-/// Reference: Linux 6.6 (5078a3a23a1e), fs/char_dev.c:__register_chrdev_region.
+/// Overlapping reservations fail without changing the registry.
 pub(crate) fn acquire_region(
     major: MajorId,
     minors: Range<u32>,
     name: &str,
 ) -> Result<DeviceRegionOwner> {
-    if major.get() > MAX_MAJOR || minors.start >= minors.end || minors.end > MINOR_COUNT {
-        return_errno_with_message!(Errno::EINVAL, "invalid character device number range");
-    }
-
-    let mut regions = REGIONS.lock();
-    if regions
-        .range((major.get(), 0)..=(major.get(), minors.end - 1))
-        .any(|(_, region)| region.end > minors.start)
-    {
-        return_errno_with_message!(Errno::EEXIST, "character device number range is occupied");
-    }
-    regions.insert(
-        (major.get(), minors.start),
-        RegisteredRegion {
-            end: minors.end,
-            name: name.to_string(),
-        },
-    );
+    reserve_region(major, minors.clone(), name)?;
     Ok(DeviceRegionOwner {
         major,
         first_minor: minors.start,
     })
 }
 
-/// Allocates an unused major and records its driver name.
+/// Acquires a single minor and associates a registration name with it.
+pub(crate) fn acquire_minor(
+    major: MajorId,
+    minor: MinorId,
+    name: &str,
+) -> Result<DeviceRegionOwner> {
+    acquire_region(major, minor.get()..minor.get() + 1, name)
+}
+
+fn reserve_region(major: MajorId, minors: Range<u32>, name: &str) -> Result<()> {
+    if major.get() > MAX_MAJOR || minors.start >= minors.end || minors.end > MINOR_COUNT {
+        return_errno_with_message!(Errno::EINVAL, "invalid character device number range");
+    }
+
+    let mut regions = REGIONS.lock();
+    if regions
+        .range(
+            RegionKey {
+                major: major.get(),
+                first_minor: 0,
+            }..=RegionKey {
+                major: major.get(),
+                first_minor: minors.end - 1,
+            },
+        )
+        .next_back()
+        .is_some_and(|(_, region)| region.end_minor_exclusive > minors.start)
+    {
+        return_errno_with_message!(Errno::EEXIST, "character device number range is occupied");
+    }
+    regions.insert(
+        RegionKey {
+            major: major.get(),
+            first_minor: minors.start,
+        },
+        RegisteredRegion {
+            end_minor_exclusive: minors.end,
+            name: name.to_string(),
+        },
+    );
+    Ok(())
+}
+
+/// Allocates an unused major and associates a registration name with it.
 ///
-/// Even a partially reserved major is skipped. The existing dynamic allocation
-/// order is retained; the owner reserves the complete minor interval.
-#[expect(dead_code)]
+/// Even a partially reserved major is skipped.
+/// The owner reserves the complete minor interval.
+#[cfg_attr(not(ktest), expect(dead_code))]
 pub(crate) fn allocate_major(name: &str) -> Result<MajorIdOwner> {
     let mut regions = REGIONS.lock();
     for id in DYNAMIC_MAJOR_ID_RANGES
@@ -132,40 +154,51 @@ pub(crate) fn allocate_major(name: &str) -> Result<MajorIdOwner> {
         .flat_map(|range| range.clone().rev())
     {
         if regions
-            .range((id, 0)..=(id, MinorId::MAX.get()))
+            .range(
+                RegionKey {
+                    major: id,
+                    first_minor: 0,
+                }..=RegionKey {
+                    major: id,
+                    first_minor: MinorId::MAX.get(),
+                },
+            )
             .next()
             .is_some()
         {
             continue;
         }
         regions.insert(
-            (id, 0),
+            RegionKey {
+                major: id,
+                first_minor: 0,
+            },
             RegisteredRegion {
-                end: MINOR_COUNT,
+                end_minor_exclusive: MINOR_COUNT,
                 name: name.to_string(),
             },
         );
-        return Ok(MajorIdOwner(DeviceRegionOwner {
-            major: MajorId::new(id),
-            first_minor: 0,
-        }));
+        return Ok(MajorIdOwner(MajorId::new(id)));
     }
     return_errno_with_message!(Errno::ENOSPC, "no more major IDs are available");
 }
 
-/// Returns registered names ordered by major and starting minor.
+/// Returns a snapshot of `(major_number, registration_name)` pairs,
+/// sorted by major number and starting minor in ascending order.
 ///
-/// The snapshot owns its strings so procfs does not hold the registry lock while
-/// writing to userspace. Multiple regions of one major remain separate rows.
+/// Each reserved interval contributes one entry.
+/// Entries with the same major remain separate even if their names match.
 pub(crate) fn major_devices() -> Vec<(u16, String)> {
     REGIONS
         .lock()
         .iter()
-        .map(|((major, _), region)| (*major, region.name.clone()))
+        .map(|(key, region)| (key.major, region.name.clone()))
         .collect()
 }
 
-/// Owns a character device number interval until dropped.
+/// An owned character device number interval.
+///
+/// Dropping the owner releases the number reservation.
 pub(crate) struct DeviceRegionOwner {
     major: MajorId,
     first_minor: u32,
@@ -173,18 +206,44 @@ pub(crate) struct DeviceRegionOwner {
 
 impl Drop for DeviceRegionOwner {
     fn drop(&mut self) {
-        REGIONS.lock().remove(&(self.major.get(), self.first_minor));
+        REGIONS.lock().remove(&RegionKey {
+            major: self.major.get(),
+            first_minor: self.first_minor,
+        });
     }
 }
 
-/// Owns every minor of a character device major until dropped.
-pub(crate) struct MajorIdOwner(DeviceRegionOwner);
+/// An owned character device major, including all its minors.
+///
+/// Dropping the owner releases the number reservation.
+pub struct MajorIdOwner(MajorId);
 
 impl MajorIdOwner {
     /// Returns the reserved major ID.
     pub(crate) fn get(&self) -> MajorId {
-        self.0.major
+        self.0
     }
+}
+
+impl Drop for MajorIdOwner {
+    fn drop(&mut self) {
+        REGIONS.lock().remove(&RegionKey {
+            major: self.0.get(),
+            first_minor: 0,
+        });
+    }
+}
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct RegionKey {
+    major: u16,
+    first_minor: u32,
+}
+
+/// A registered minor interval, independent of individual device nodes.
+struct RegisteredRegion {
+    end_minor_exclusive: u32,
+    name: String,
 }
 
 #[cfg(ktest)]
@@ -198,14 +257,14 @@ mod tests {
         let major = MajorId::new(509);
         let second = acquire_region(major, 8..16, "second").unwrap();
         let first = acquire_region(major, 0..8, "first").unwrap();
-        let rows = || {
+        let rows_fn = || {
             major_devices()
                 .into_iter()
                 .filter(|(id, _)| *id == major.get())
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            rows(),
+            rows_fn(),
             vec![(509, "first".to_string()), (509, "second".to_string())]
         );
         for range in [0..1, 7..9, 8..16, 0..17] {
@@ -219,14 +278,65 @@ mod tests {
         }
         assert!(acquire_major(major, "whole").is_err());
         drop(first);
-        assert_eq!(rows(), vec![(509, "second".to_string())]);
+        assert_eq!(rows_fn(), vec![(509, "second".to_string())]);
         let replacement = acquire_region(major, 0..8, "replacement").unwrap();
         drop(second);
         drop(replacement);
-        assert!(rows().is_empty());
+        assert!(rows_fn().is_empty());
         let whole = acquire_major(major, "whole").unwrap();
         assert_eq!(whole.get(), major);
         assert!(acquire_region(major, 0..1, "conflict").is_err());
+    }
+
+    #[ktest]
+    fn minor_boundaries_and_major_owners_release_reservations() {
+        let major = MajorId::new(507);
+        let last = acquire_minor(major, MinorId::MAX, "last").unwrap();
+        let first = acquire_minor(major, MinorId::new(0), "first").unwrap();
+        assert!(acquire_major(major, "whole").is_err());
+        assert!(acquire_minor(major, MinorId::MAX, "overlap").is_err());
+        drop(last);
+        drop(first);
+        let whole = acquire_major(major, "whole").unwrap();
+        assert!(acquire_minor(major, MinorId::MAX, "overlap").is_err());
+        assert!(acquire_major(major, "overlap").is_err());
+        drop(whole);
+        let _replacement = acquire_major(major, "replacement").unwrap();
+    }
+
+    #[ktest]
+    fn interval_neighbors_and_distinct_majors_are_independent() {
+        let major = MajorId::new(505);
+        let middle = acquire_region(major, 8..16, "same").unwrap();
+        let last = acquire_region(major, 24..32, "same").unwrap();
+        let first = acquire_region(major, 0..8, "same").unwrap();
+        let gap = acquire_region(major, 16..24, "same").unwrap();
+        let other = acquire_region(MajorId::new(504), 0..32, "other").unwrap();
+        for range in [1..7, 4..28, 7..9, 23..25] {
+            assert!(acquire_region(major, range, "overlap").is_err());
+        }
+        assert_eq!(
+            major_devices()
+                .iter()
+                .filter(|(id, _)| *id == major.get())
+                .count(),
+            4
+        );
+        drop((first, middle, gap, last, other));
+        let _whole = acquire_major(major, "whole").unwrap();
+    }
+
+    #[ktest]
+    fn dynamic_major_owner_reserves_and_releases_all_minors() {
+        let owner = allocate_major("dynamic").unwrap();
+        let major = owner.get();
+        assert!(acquire_minor(major, MinorId::new(0), "conflict").is_err());
+        drop(owner);
+        let partial = acquire_minor(major, MinorId::MAX, "partial").unwrap();
+        let other = allocate_major("other").unwrap();
+        assert_ne!(other.get(), major);
+        drop((partial, other));
+        let _whole = acquire_major(major, "whole").unwrap();
     }
 
     #[ktest]

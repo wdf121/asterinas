@@ -165,7 +165,7 @@ impl DmTable {
     /// and read-only enforcement; normal device I/O must go through [`crate::DmDevice`].
     /// Completion-owned table references are reclaimed in task context,
     /// so backing leases may outlive the BIO's logical completion.
-    pub fn enqueue(self: &Arc<Self>, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+    pub(crate) fn enqueue(self: &Arc<Self>, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
         if bio.type_() != BioType::Flush {
             // Reject out-of-range I/O before taking completion ownership.
             let parts = self.plan_normal_io(&bio)?;
